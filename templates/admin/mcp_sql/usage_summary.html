@@ -1,0 +1,53 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+  {{ title }}
+{% endblock title %}
+{% block breadcrumbs %}
+  <div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    › <a href="{% url 'admin:mcp_sql_mcpquerylog_changelist' %}">MCP query logs</a>
+    › Usage summary
+  </div>
+{% endblock breadcrumbs %}
+{% block content %}
+  <p>
+    Per-user MCP query and auth-rejection counts per rolling window. Use this
+    to tune <code>MCP_SQL["VOLUME_ALERT_THRESHOLDS"]</code>. The tripwire
+    alerts (it never blocks); these counts show who is approaching a threshold.
+    These are rolling wall-clock windows; the tripwire itself uses fixed
+    windows anchored at each user's first query, so the two can differ
+    slightly near a boundary.
+  </p>
+  <table id="result_list">
+    <thead>
+      <tr>
+        <th rowspan="2">User</th>
+        {% for label in window_labels %}<th colspan="3">{{ label }}</th>{% endfor %}
+      </tr>
+      <tr>
+        {% for label in window_labels %}
+          <th>allowed</th>
+          <th>rejected</th>
+          <th>auth-rej</th>
+        {% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+        <tr class="{% cycle 'row1' 'row2' %}">
+          <td>{{ row.label }}</td>
+          {% for cell in row.cells %}
+            <td>{{ cell.allowed }}</td>
+            <td>{{ cell.rejected }}</td>
+            <td>{{ cell.auth }}</td>
+          {% endfor %}
+        </tr>
+      {% empty %}
+        <tr>
+          <td colspan="{{ col_count }}">No MCP activity in any window.</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock content %}

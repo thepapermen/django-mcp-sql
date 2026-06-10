@@ -1,0 +1,12 @@
+# Root .gitignore of the extracted django-mcp-sql repository (harmless
+# in-tree: covers only build artifacts under this directory).
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+.venv-test/
+.pytest_cache/
+.ruff_cache/
+example/.venv/

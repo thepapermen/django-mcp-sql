@@ -1,0 +1,114 @@
+# CI for the extracted django-mcp-sql repository (this package directory
+# becomes the repo root — see RELEASING.md). Inert while the package lives
+# inside the monorepo: Bitbucket Pipelines ignores `.github/`, and the
+# directory ships in neither the wheel nor the sdist packages list.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        # The documented PostgreSQL floor (README "Compatibility").
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Bootstrap the MCP read-only role
+        # Several tests enter `mcp_readonly_role` on a real connection
+        # (`SET LOCAL ROLE`), so the role must exist cluster-wide.
+        # `app_role=postgres` mirrors the script's contract: the readonly
+        # role is granted TO the role the app connects as. (Separately, the
+        # service's `postgres` user being a superuser is what lets the
+        # role-isolation tests run instead of skipping — they create their
+        # own roles and check `rolsuper`.)
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Install package + test deps
+        run: pip install -e '.[allauth,test]'
+      - name: Run the test suite
+        # tests/settings.py defaults match the service container
+        # (127.0.0.1:5432, postgres/postgres); `--pyargs` collects via the
+        # installed package name, independent of the checkout layout.
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+  # The matrix above resolves the NEWEST in-range versions; this job pins
+  # every runtime dependency to its declared floor so the lower bounds in
+  # pyproject.toml are actually exercised — without it, the floors (and,
+  # for sqlglot, the version the parser's reject-branch behaviour was
+  # written against) would be asserted-compatible but never tested.
+  test-min-versions:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Bootstrap the MCP read-only role
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Pin dependency floors
+        # Keep in sync with the lower bounds in pyproject.toml.
+        run: |
+          cat > /tmp/min-constraints.txt <<'EOF'
+          django==5.2
+          djangorestframework==3.15.2
+          django-oauth-toolkit==3.2
+          sqlglot==30.7
+          mcp==1.27
+          a2wsgi==1.10
+          pydantic==2.11
+          django-allauth==65.14
+          EOF
+      - name: Install package + test deps at floors
+        run: pip install -e '.[allauth,test]' -c /tmp/min-constraints.txt
+      - name: Run the test suite
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          pip install build twine
+          python -m build
+      - name: Validate distribution metadata
+        run: twine check dist/*

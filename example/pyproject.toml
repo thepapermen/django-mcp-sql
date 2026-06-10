@@ -1,0 +1,42 @@
+# Example project for django-mcp-sql.
+#
+# A standalone, stock-Django consumer that demonstrates how to integrate the
+# package. Never published (see the classifier below) and not part of the
+# wheel — lives in the repo so the package's surface can be exercised
+# against a fresh Django setup (no allauth, no vendored sessions, no
+# project-specific user model).
+#
+# Install: from THIS directory, run `make install`. That sets up a uv-managed
+# venv and installs the example's own deps + an editable install of
+# `django-mcp-sql` from the sibling package directory.
+#
+# See `./README.md` for the full runbook.
+
+[project]
+name = "mcp-sql-example"
+version = "0"
+description = "Stock-Django example consumer for django-mcp-sql."
+license = "MIT"
+requires-python = ">=3.11"
+# `Private :: Do Not Upload` is the canonical never-publish guard: PyPI
+# hard-rejects any upload carrying it, so an accidental `twine upload` of
+# this example cannot land.
+classifiers = ["Private :: Do Not Upload"]
+dependencies = [
+    "django-mcp-sql",
+    "psycopg[binary]>=3.2",
+]
+
+[tool.uv.sources]
+# Resolve `django-mcp-sql` to the sibling in-repo package as an editable
+# install, so code edits in the package reflect immediately without
+# reinstall. The runtime deps (django, DRF, DOT, mcp, a2wsgi, sqlglot,
+# pydantic) are declared by the package's pyproject.toml and resolved
+# transitively — no need to duplicate them here.
+# Resolve `django-mcp-sql` to the package at the repo root (this example is
+# the `example/` subdirectory) as an editable install.
+django-mcp-sql = { path = "..", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["example*", "notes*"]

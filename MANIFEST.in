@@ -1,0 +1,6 @@
+# Without this, distutils' legacy default sweeps `tests/test_*.py` (and ONLY
+# those — no conftest.py / settings.py / __init__.py / testapp/) into the
+# sdist: an unimportable fragment. The suite is repo-only by design (see the
+# package-data comment in pyproject.toml); keep the sdist clean instead.
+prune tests
+include CHANGELOG.md

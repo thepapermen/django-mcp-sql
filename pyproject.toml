@@ -1,0 +1,187 @@
+# Packaging metadata for the standalone `django-mcp-sql` distribution.
+#
+# This file lives inside the package directory rather than at a repo root
+# so the metadata travels with the package on extraction (`git filter-repo`
+# or similar — see RELEASING.md for the recipe). The Python distribution
+# name is `django-mcp-sql`; the import name remains `mcp_sql`. The
+# Postgres-specific implementation (NOLOGIN role + GUCs + curated views +
+# sqlglot postgres dialect) is the reason the name is not
+# `django-mcp-mysql` etc. — the package wouldn't port without a redesign.
+#
+# Build mechanics: `pip install <repo>/source/mcp_sql/` installs the
+# package with the explicit `package-dir = {"mcp_sql" = "."}` mapping
+# below; `make build` / `make test-install` verify the wheel. Deps use
+# lower-bound ranges capped at the next major: the caps guard the APIs
+# each dependency comment below calls load-bearing, and the floors are
+# exercised by CI's `test-min-versions` job (the newest-resolve matrix
+# alone would never test them). The test suite runs standalone via
+# `make test` (settings: `mcp_sql/tests/settings.py`) and in CI via
+# `.github/workflows/ci.yml`.
+
+[build-system]
+# setuptools>=77 for the PEP 639 string-expression `license` +
+# `license-files` fields used below.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-mcp-sql"
+# Single-sourced from `mcp_sql.__version__` (see [tool.setuptools.dynamic]).
+dynamic = ["version"]
+description = "Read-only PostgreSQL surface for an LLM agent over the MCP protocol, with defense-in-depth at parser, executor, DB-role, and transport layers."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Ivan Kharlamov"},
+    {name = "Claude (Anthropic)"},
+]
+requires-python = ">=3.11"
+keywords = ["django", "mcp", "postgresql", "llm-agent", "oauth", "read-only-sql"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    # 5.2 LTS line; 6.0 untested (matches the Framework :: Django :: 5.2
+    # classifier and the README compatibility table).
+    "django>=5.2,<6.0",
+    # Stable DRF surface only (auth-class subclass, @api_view, permissions).
+    # Floor 3.15.2 = the version exercised against Django 5.2 in production.
+    "djangorestframework>=3.15.2,<4",
+    # DOT 3.x semantics are load-bearing: loopback port-wildcarding,
+    # validator hooks, skip_authorization flow; RFC 8707 audience binding is
+    # explicitly deferred to DOT 4.x — a major bump must be reviewed, never
+    # auto-resolved.
+    "django-oauth-toolkit>=3.2,<4",
+    # The parser is the security boundary and sqlglot bumps majors often
+    # with breaking AST changes — deliberately the tightest cap; widen
+    # per-major only after the CI matrix proves it.
+    "sqlglot>=30.7,<31",
+    # Official MCP SDK; the FastMCP / ToolAnnotations surface used is stable
+    # within 1.x.
+    "mcp>=1.27,<2",
+    # Single entry point (ASGIMiddleware).
+    "a2wsgi>=1.10,<2",
+    # Plain v2 API. The package's own usage would run on older v2, but
+    # `mcp` floors at pydantic>=2.11, so anything below is unresolvable —
+    # declare the real effective floor.
+    "pydantic>=2.11,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/thepapermen/django-mcp-sql"
+Repository = "https://github.com/thepapermen/django-mcp-sql"
+Issues = "https://github.com/thepapermen/django-mcp-sql/issues"
+Changelog = "https://github.com/thepapermen/django-mcp-sql/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Wire `MCP_SQL["MFA_CHECKER"] = "allauth.mfa.utils.is_mfa_enabled"` so
+# OAuth issuance + per-request auth gates require an enrolled TOTP device.
+# Without this extra the package's fail-closed `deny_unconfigured_mfa`
+# default applies (False for every user — the MFA gate denies until a
+# real checker is wired), so a production consumer must set this.
+allauth = ["django-allauth[mfa]>=65.14,<66"]
+# Everything the standalone test suite needs beyond the runtime deps
+# (settings: `mcp_sql/tests/settings.py`; run: `make test` or
+# `pytest --pyargs mcp_sql.tests --create-db --nomigrations`). An extra
+# rather than a PEP 735 dependency-group so a plain
+# `pip install -e .[allauth,test]` works in CI and for contributors on any
+# pip version.
+test = [
+    "pytest>=8",
+    "pytest-django>=4.8",
+    "psycopg[binary]>=3.2",
+]
+
+[tool.setuptools]
+include-package-data = true
+# Explicit `package-dir` because `pyproject.toml` lives INSIDE the package
+# directory rather than one level above. Mapping `mcp_sql` → "." tells
+# setuptools that everything below this file is the `mcp_sql` package
+# (and its subpackages live at the corresponding relative paths).
+package-dir = {"mcp_sql" = "."}
+packages = [
+    "mcp_sql",
+    "mcp_sql.management",
+    "mcp_sql.management.commands",
+    "mcp_sql.migrations",
+    "mcp_sql.views",
+]
+
+[tool.setuptools.dynamic]
+# `attr` resolves through the `package-dir` mapping above, so the version
+# lives in exactly one place: `mcp_sql/__init__.py::__version__`
+# (`make test-install` cross-checks the installed dist metadata against it).
+version = {attr = "mcp_sql.__version__"}
+
+[tool.setuptools.package-data]
+# Ship the SQL bootstrap, the operational runbooks + architecture doc, and
+# the templates (OAuth consent screen, read-only admin pages) inside the
+# wheel — a consumer who `pip install`s the package needs all three at
+# runtime or on the DBA's desk, not in some source checkout. The templates
+# globs are load-bearing: `include-package-data = true` alone does NOT pull
+# them in (no MANIFEST.in / setuptools-scm here), and an editable install
+# serves them from the source tree, silently masking their absence from the
+# wheel — which is why `make test-install` asserts on them. Tests are
+# repo-only: shipped in neither the wheel (not in `packages`) nor the sdist
+# (MANIFEST.in prunes them — distutils' legacy default would otherwise sweep
+# a broken `tests/test_*.py`-only fragment in). Run them from a checkout via
+# `make test` (standalone settings: `mcp_sql/tests/settings.py`).
+"mcp_sql" = [
+    "sql/*.sql",
+    "sql/*.sh",
+    "docs/*.md",
+    "templates/mcp_sql/*.html",
+    "templates/admin/mcp_sql/*.html",
+]
+
+[tool.pytest.ini_options]
+# Standalone default: `pytest` (or `make test`) picks the package's own
+# settings. The in-tree consumer run (`make mcp_sql_test` at the monorepo
+# root) still wins with its explicit CLI `--ds=config.settings.test`
+# (pytest-django precedence: CLI > env > ini).
+#
+# CAREFUL: the mere presence of this section re-roots pytest config
+# discovery at this file for any run started below this directory — the
+# monorepo root pyproject's `[tool.pytest.ini_options]` (which carries
+# `--import-mode=importlib`) then no longer applies, so the import mode
+# must be repeated here.
+DJANGO_SETTINGS_MODULE = "mcp_sql.tests.settings"
+addopts = "--import-mode=importlib"
+
+[tool.djlint]
+# The package ships admin templates, so it carries its own djLint config
+# rather than leaning on a consumer's root pyproject.toml. djLint resolves
+# configuration from the first source path it is handed, so when a
+# pre-commit batch is led by a template under this directory (files sort
+# before a sibling app's), djLint roots here — without this section it
+# would silently fall back to defaults (which do NOT ignore T002) and
+# flag every other file in that same batch. Kept in sync with the
+# consumer project's root [tool.djlint]; the package's own templates use
+# single-quoted tags, so T002 must stay ignored here too.
+blank_line_after_tag = "load,extends"
+close_void_tags = true
+format_css = true
+format_js = true
+ignore = "H006,H030,H031,T002"
+include = "H017,H035"
+indent = 2
+max_line_length = 119
+profile = "django"
+
+[tool.djlint.css]
+indent_size = 2
+
+[tool.djlint.js]
+indent_size = 2
