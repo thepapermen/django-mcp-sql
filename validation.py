@@ -19,10 +19,18 @@ does not require them.
 """
 
 import re
+import sys
 from collections.abc import Mapping
 from typing import Any
-from typing import NotRequired
-from typing import TypedDict
+
+if sys.version_info >= (3, 12):
+    from typing import NotRequired
+    from typing import TypedDict
+else:
+    # Pydantic rejects `typing.TypedDict` on Python < 3.12 and requires the
+    # `typing_extensions` backport (always installed — pydantic depends on it).
+    from typing_extensions import NotRequired
+    from typing_extensions import TypedDict
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
