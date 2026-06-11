@@ -156,14 +156,58 @@ the package (importable consumers find them under `mcp_sql/docs/`):
 
 ## Compatibility
 
-- **Python**: 3.11+
-- **Django**: 5.2+ (LTS line; 6.0 untested).
+- **Python**: 3.11–3.13
 - **Postgres**: 14+ recommended (uses `pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW` — all of which work on earlier versions, but the test matrix runs on 14+).
 
-The package has been exercised against a 2000+ test suite in a real
-Django CRM. Its own standalone suite (`make test`, settings in
-`tests/settings.py`) runs in CI across Python 3.11–3.13 against
-PostgreSQL 14 (`.github/workflows/ci.yml`).
+### Supported combinations
+
+The package's own surface is Django-version-agnostic; the version coupling
+comes entirely from **DRF**, which gained each Django line in a later release.
+Support is therefore a **staircase** — a higher Django needs a higher minimum
+DRF:
+
+| Django  | Python      | DRF (supported) | django-oauth-toolkit |
+|---------|-------------|-----------------|----------------------|
+| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.2 – 3.3            |
+| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.2 – 3.3            |
+| 6.0     | 3.12, 3.13  | 3.17            | 3.3                  |
+
+- The DRF floor is **3.14** — the lowest we support, i.e. what a legacy
+  Django 4.2 app is likely already pinning. Each Django line has its own DRF
+  minimum (5.x from 3.15, 6.0 from 3.17). A fresh `pip install` always
+  resolves the **newest** in-range DRF (3.17) for whatever Django you run; the
+  older DRF columns matter only when adopting the package into an app that
+  already pins one.
+- **Do not pin DRF below the minimum its Django requires** — e.g. DRF 3.14
+  with Django ≥ 5.0 breaks at runtime. A single dependency floor cannot encode
+  "DRF must track Django", and pip never auto-resolves that pair, but it also
+  cannot stop you from pinning it by hand. Stay on a supported row above.
+- **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13** — hence
+  the ragged Python columns.
+- `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
+  Django-version-coupled within their declared ranges.
+
+### Dropping into an existing app with an older pinned DRF
+
+When you install the package into an **existing** project that already pins an
+older DRF, that project's pins win — the package's floor does not force an
+upgrade. The package's narrow DRF surface (an `OAuth2Authentication` subclass,
+`@api_view`, `IsAuthenticated`) is verified to run on **DRF 3.14 with Django
+4.2** by a dedicated CI leg, even though a greenfield install would never
+select that pair. So a Django 4.2 app on DRF 3.14 can adopt the package without
+touching its DRF pin. (DRF 3.14 + Django ≥ 5.0 is *not* supported — DRF 3.14
+predates those Django lines.)
+
+### MFA / django-allauth
+
+The `allauth` extra (`django-mcp-sql[allauth]`) wires the TOTP gate to
+`django-allauth[mfa] >= 65.14`. On a project running an older allauth without
+`allauth.mfa`, skip the extra and point `MCP_SQL["MFA_CHECKER"]` at your own
+2FA predicate — the core package has no hard allauth dependency.
+
+The standalone suite (`make test`, settings in `tests/settings.py`) runs in CI
+(`.github/workflows/ci.yml`) across every row above, plus pinned floor legs and
+the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14.
 
 ## Postgres role setup
 

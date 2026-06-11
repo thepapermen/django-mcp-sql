@@ -18,8 +18,10 @@ make test            # creates .venv-test, installs -e .[allauth,test], runs pyt
 The suite needs a reachable PostgreSQL with `mcp_readonly_role` bootstrapped
 (`sql/role_setup.sql`); connection env vars and their defaults are at the
 top of `tests/settings.py`. Run against a superuser connection so the
-role-isolation tests execute instead of skipping. CI runs the same suite on
-Python 3.11–3.13 × PostgreSQL 14.
+role-isolation tests execute instead of skipping. CI runs the same suite
+across the Django 4.2/5.2/6.0 lines on their supported interpreters
+(Python 3.11–3.13) × PostgreSQL 14 (see the matrix in
+`.github/workflows/ci.yml`).
 
 ## Expectations
 

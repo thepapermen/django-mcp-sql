@@ -14,8 +14,19 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Ragged Django × Python matrix (each leg resolves the NEWEST in-range
+      # DRF/DOT/allauth for its Django line, so the 6.0 legs pull DRF 3.17).
+      # The columns are ragged because the interpreters differ per Django:
+      # 6.0 dropped Python 3.11, and 4.2 never supported 3.13.
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - { python-version: "3.11", django: "4.2" }
+          - { python-version: "3.12", django: "4.2" }
+          - { python-version: "3.11", django: "5.2" }
+          - { python-version: "3.12", django: "5.2" }
+          - { python-version: "3.13", django: "5.2" }
+          - { python-version: "3.12", django: "6.0" }
+          - { python-version: "3.13", django: "6.0" }
     services:
       postgres:
         # The documented PostgreSQL floor (README "Compatibility").
@@ -46,11 +57,49 @@ jobs:
           PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
           -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
       - name: Install package + test deps
-        run: pip install -e '.[allauth,test]'
+        # Pin only the Django line; DRF/DOT/allauth resolve to the newest
+        # in-range release for that Django (this is the "newest-resolve" arm).
+        run: pip install -e '.[allauth,test]' "Django==${{ matrix.django }}.*"
       - name: Run the test suite
         # tests/settings.py defaults match the service container
         # (127.0.0.1:5432, postgres/postgres); `--pyargs` collects via the
         # installed package name, independent of the checkout layout.
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+  # Drop-in leg: an existing Django 4.2 app may pin an older DRF than this
+  # package's >=3.17 floor. The package's DRF surface is narrow (an
+  # OAuth2Authentication subclass, @api_view, IsAuthenticated) and stable
+  # back to DRF 3.14, so it runs on such a stack even though a greenfield
+  # install would never resolve DRF 3.14 (the floor under-promises it on
+  # purpose). This pins that corner — DRF 3.14 + Django 4.2 — to prove it.
+  # Boundary: DRF 3.14 does NOT support Django >=5.0, so this pairing is
+  # only ever valid on the 4.2 line.
+  test-legacy-drf:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Bootstrap the MCP read-only role
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Install package against a legacy pinned DRF
+        run: pip install -e '.[allauth,test]' "Django==4.2.*" "djangorestframework==3.14.*"
+      - name: Run the test suite
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
   # The matrix above resolves the NEWEST in-range versions; this job pins
@@ -85,8 +134,8 @@ jobs:
         # Keep in sync with the lower bounds in pyproject.toml.
         run: |
           cat > /tmp/min-constraints.txt <<'EOF'
-          django==5.2
-          djangorestframework==3.15.2
+          django==4.2
+          djangorestframework==3.14
           django-oauth-toolkit==3.2
           sqlglot==30.7
           mcp==1.27

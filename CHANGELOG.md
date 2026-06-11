@@ -7,6 +7,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0a2 - unreleased
+
+### Added
+
+- Django 4.2 LTS and Django 6.0 support, alongside the existing 5.2 LTS line
+  (`Framework :: Django` 4.2/5.2/6.0). No source changes were needed — the
+  package uses no Django-version-specific APIs.
+- CI expanded to a ragged Django × Python matrix (4.2, 5.2, 6.0 against their
+  respective supported interpreters), plus a pinned leg verifying the package
+  on DRF 3.14 + Django 4.2 — i.e. drop-in into an app that already pins an
+  older DRF.
+
+### Changed
+
+- Dependency floor `django>=4.2,<6.1` (was `>=5.2,<6.0`).
+- Dependency floor `djangorestframework>=3.14` (was `>=3.15.2`): 3.14 is the
+  lowest DRF supported — what a legacy Django 4.2 app already pins — so the
+  package drops into such a stack without forcing a DRF upgrade. Support is a
+  staircase (5.x needs DRF ≥3.15, 6.0 needs ≥3.17); a greenfield install
+  resolves the newest in-range DRF for whatever Django it runs.
+
 ## 0.1.0a1 - unreleased
 
 First alpha. The feature set below has been exercised in production as part
