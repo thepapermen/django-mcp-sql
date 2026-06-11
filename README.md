@@ -15,6 +15,10 @@ PostgreSQL database over the
 [Model Context Protocol](https://modelcontextprotocol.io/), without handing it
 a database login or the ability to write anything.
 
+**It already runs in production**, mediating an LLM agent's database access
+inside a larger Django application — this package is an extraction of that
+code, not a greenfield experiment.
+
 It's safe by construction, not by asking the model nicely. Even a confused or
 hijacked agent can only ever touch the slice of data you chose to expose — four
 independent layers enforce it, so a bypass has to beat all four:
@@ -35,9 +39,8 @@ independent layers enforce it, so a bypass has to beat all four:
   with PKCE (RFC 7591/8414/9728 discovery); an unauthenticated client can't even
   open the door.
 
-> **Status**: pre-release alpha (`0.1.0a2`). The package is used in
-> production as part of a larger Django project; expect the public API and
-> settings shape to move between alpha releases.
+> **Status**: beta (`0.1.0b1`). The public API and settings shape are
+> stabilizing, but may still shift before `1.0`.
 
 ## Quickstart — try it in 5 minutes
 

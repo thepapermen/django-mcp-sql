@@ -7,7 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
-## 0.1.0a2 - unreleased
+## 0.1.0b1 - unreleased
 
 ### Added
 
@@ -27,6 +27,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Promoted from alpha to **Beta** (`Development Status :: 4 - Beta`).
 - Dependency floor `django>=4.2,<6.1` (was `>=5.2,<6.0`).
 - Dependency floor `djangorestframework>=3.14` (was `>=3.15.2`): 3.14 is the
   lowest DRF supported — what a legacy Django 4.2 app already pins — so the
