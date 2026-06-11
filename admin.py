@@ -28,6 +28,7 @@ the instrument for tuning `MCP_SQL["VOLUME_ALERT_THRESHOLDS"]`.
 
 import contextlib
 from datetime import timedelta
+from typing import Any
 
 from django.contrib import admin
 
@@ -87,7 +88,12 @@ class _ProfileListFilter(admin.SimpleListFilter):
         return queryset
 
 
-class _ReadOnlyModelAdmin(admin.ModelAdmin):
+# django-stubs types `ModelAdmin` as generic, but Django does not make it
+# runtime-subscriptable (`ModelAdmin[Model]` raises `TypeError` on import unless
+# the consumer runs `django_stubs_ext.monkeypatch()`, which a published package
+# must not require). So the base stays bare and the `type-arg` warning is
+# silenced here rather than parameterized.
+class _ReadOnlyModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     """View-only admin: browse rows, never add/change/delete.
 
     The audit tables are append-only — the executor, signal receivers, and
@@ -202,7 +208,7 @@ def _usage_rows():
     `get_username()` without a per-row instance fetch).
     """
     now = timezone.now()
-    table: dict = {}
+    table: dict[object, dict[str, Any]] = {}
 
     def _row(user_id, user_label):
         return table.setdefault(

@@ -39,11 +39,16 @@ from mcp_sql.conf import mcp_sql_config
 logger = logging.getLogger(__name__)
 
 
-def _volume_key(decision: str, window: int, user_id) -> str:
+def _volume_key(decision: str, window: int, user_id: object) -> str:
     return f"mcp_sql:vol:{decision}:{window}:{user_id}"
 
 
-def record_query_volume(*, user_id, decision: str, user_label: str = "") -> None:
+# `user_id` is `object`, not a concrete pk type, on purpose: a consumer's user
+# model may key on an int, a UUID, or anything else, and this only ever `str()`s
+# it into a cache key — every type supports that, so `object` is the honest type.
+def record_query_volume(
+    *, user_id: object, decision: str, user_label: str = ""
+) -> None:
     """Count one audited query toward this user's per-window volume counters.
 
     For each `{window_seconds: threshold}` configured for `decision`,

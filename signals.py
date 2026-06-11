@@ -8,6 +8,7 @@ See `docs/architecture.md` file-map row for `signals.py`."""
 import logging
 from typing import TYPE_CHECKING
 
+from django.apps import AppConfig
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
@@ -17,6 +18,7 @@ from django.db.models import Q
 from django.db.models.signals import m2m_changed
 from django.db.models.signals import post_migrate
 from django.dispatch import receiver
+from django.http import HttpRequest
 from django.utils import timezone
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
@@ -34,8 +36,11 @@ User = get_user_model()
 
 @receiver(user_logged_out)
 def revoke_mcp_tokens_on_logout(
-    sender, request, user: "AbstractBaseUser | None", **kwargs
-):
+    sender: object,
+    request: HttpRequest | None,
+    user: "AbstractBaseUser | None",
+    **kwargs: object,
+) -> None:
     if user is None:
         # Anonymous logout (rare but allowed by Django) — nothing to revoke.
         return
@@ -106,7 +111,7 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
 
 
 @receiver(post_migrate)
-def provision_mcp_profiles(sender, **kwargs) -> None:
+def provision_mcp_profiles(sender: AppConfig | None, **kwargs: object) -> None:
     """Ensure one Permission + one Group per `MCP_SQL["PROFILES"]` entry.
 
     Idempotent (get_or_create); runs after every `migrate` on the default
@@ -154,7 +159,9 @@ def provision_mcp_profiles(sender, **kwargs) -> None:
 
 
 @receiver(post_migrate)
-def audit_grants_drift_after_migrate(sender, **kwargs) -> None:
+def audit_grants_drift_after_migrate(
+    sender: AppConfig | None, **kwargs: object
+) -> None:
     """Detect drift between each profile role's grants and its
     `MCP_SQL["PROFILES"][...]["ALLOWED_MODELS"]` whitelist after `migrate`
     completes. Logs only; never applies.
@@ -219,7 +226,7 @@ def _mcp_group_pks() -> dict[int, str]:
     }
 
 
-def _user_label(user) -> str:
+def _user_label(user: "AbstractBaseUser") -> str:
     """`get_username()` (the email here), guarded so an alert never raises."""
     try:
         return user.get_username()

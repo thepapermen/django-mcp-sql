@@ -10,6 +10,7 @@ import secrets
 from http import HTTPStatus
 from urllib.parse import urlparse
 
+from django.http import HttpRequest
 from django.http import JsonResponse
 from django.urls import reverse
 from django.utils import timezone
@@ -57,7 +58,10 @@ def _is_loopback_redirect(uri: str) -> bool:
 
 
 def _registration_response(
-    request, client_id: str, client_name: str, redirect_uris: list[str]
+    request: HttpRequest,
+    client_id: str,
+    client_name: str,
+    redirect_uris: list[str],
 ) -> JsonResponse:
     """RFC 7591 §3.2.1 success body.
 

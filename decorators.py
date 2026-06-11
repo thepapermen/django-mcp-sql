@@ -17,8 +17,13 @@ which this rejects — declaring less just truncates the sender's own payload.
 """
 
 import functools
+from typing import TYPE_CHECKING
 
+from django.http import HttpRequest
 from django.http import HttpResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # OAuth bodies are sub-kilobyte (form grant params; a small `redirect_uris`
 # array). 64 KiB is generous headroom while refusing the large POST that the
@@ -27,7 +32,7 @@ from django.http import HttpResponse
 OAUTH_REQUEST_BODY_MAX_BYTES = 64 * 1024
 
 
-def normalize_content_length(request) -> int:
+def normalize_content_length(request: HttpRequest) -> int:
     """Return the request's declared `CONTENT_LENGTH` as an int.
 
     A missing or malformed (non-integer) header is normalised to 0 — and
@@ -47,7 +52,9 @@ def normalize_content_length(request) -> int:
         return 0
 
 
-def cap_request_body(max_bytes: int = OAUTH_REQUEST_BODY_MAX_BYTES):
+def cap_request_body(
+    max_bytes: int = OAUTH_REQUEST_BODY_MAX_BYTES,
+) -> "Callable[[Callable[..., HttpResponse]], Callable[..., HttpResponse]]":
     """Reject (HTTP 413) a request whose declared CONTENT_LENGTH exceeds
     `max_bytes`, before the wrapped view reads the body.
 

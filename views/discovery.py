@@ -4,6 +4,7 @@ no side effects. See `docs/architecture.md` "OAuth surface"
 + "Watch out" host-trust bullet for the full design rationale."""
 
 from django.conf import settings
+from django.http import HttpRequest
 from django.http import JsonResponse
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
@@ -11,7 +12,7 @@ from django.views.decorators.http import require_safe
 from mcp_sql.conf import mcp_sql_settings
 
 
-def _issuer(request) -> str:
+def _issuer(request: HttpRequest) -> str:
     """The AS issuer identity — host + `/o`, no trailing slash.
 
     The AS is mounted under `/o/` (DOT convention). RFC 8414 §3.1 supports

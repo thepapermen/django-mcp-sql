@@ -25,10 +25,12 @@ is `logger.exception`-logged but does not mask the underlying
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 from django.apps import apps
 from django.core.cache import cache
 from django.db import DatabaseError
+from django.http import HttpRequest
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import throttle
@@ -42,6 +44,11 @@ from mcp_sql.schemas import AuthRejectionReason
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
 from rest_framework import exceptions
 from rest_framework.exceptions import APIException
+from rest_framework.request import Request
+
+if TYPE_CHECKING:
+    from django.contrib.auth.models import AbstractBaseUser
+    from oauth2_provider.models import AccessToken
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +90,7 @@ class PayloadTooLarge(APIException):
     default_code = "payload_too_large"
 
 
-def _enforce_body_size_cap(django_request) -> None:
+def _enforce_body_size_cap(django_request: HttpRequest) -> None:
     """Raise `PayloadTooLarge` if the declared `CONTENT_LENGTH` exceeds the cap.
 
     Read the header BEFORE force-caching `request.body` so an oversize POST
@@ -340,12 +347,12 @@ class MCPOAuth2Authentication(OAuth2Authentication):
 
     def _audit_rejection(
         self,
-        request,
+        request: Request,
         *,
         reason: str,
         error: str,
-        user,
-        token,
+        user: "AbstractBaseUser",
+        token: "AccessToken",
     ) -> None:
         """Write an `MCPAuthRejectionLog` row for a resolved-user rejection.
 
@@ -382,8 +389,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         `transaction.on_commit` to preserve the invariant.
         """
         try:
+            # `user` is the package-agnostic `AbstractBaseUser`; django-stubs
+            # resolves this FK to the project's concrete `AUTH_USER_MODEL` and
+            # so reports the supertype as incompatible. The package genuinely
+            # accepts any user model, so the plugin's check is stricter than
+            # the contract — suppress just this kwarg.
             MCPAuthRejectionLog.objects.create(
-                user=user,
+                user=user,  # type: ignore[misc]
                 token_pk=str(token.pk),
                 application_name=token.application.name,
                 reason=reason,

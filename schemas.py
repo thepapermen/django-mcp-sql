@@ -5,6 +5,12 @@ the closed enum stays usable from any MCP adapter."""
 from dataclasses import dataclass
 from dataclasses import field
 from enum import StrEnum
+from typing import TypeAlias
+
+# A single JSON-storable cell value, after `executor._cap_cell` coercion
+# (non-primitives are stringified). Flat by construction — never nested — so
+# `QueryResult.rows` is `list[list[Cell]]`, not a recursive JSON type.
+Cell: TypeAlias = str | bool | int | float | None
 
 # Kept in sync with `session.EXPECTED_SESSION_GUCS["statement_timeout"]` via
 # `test_constants.py`. Hardcoded so this module stays Django-free.
@@ -167,7 +173,7 @@ class QueryResult:
     """
 
     columns: list[str] = field(default_factory=list)
-    rows: list[list] = field(default_factory=list)
+    rows: list[list[Cell]] = field(default_factory=list)
     row_count: int = 0
     truncated: bool = False
     duration_ms: int = 0

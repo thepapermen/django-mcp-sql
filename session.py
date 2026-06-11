@@ -6,6 +6,27 @@ invariants."""
 
 import re
 from collections.abc import Mapping
+from collections.abc import Sequence
+from typing import Protocol
+
+
+class SQLCursor(Protocol):
+    """The cursor surface this module needs: any DB-API cursor satisfies it
+    structurally — Django's `CursorWrapper` (every in-tree caller), a raw
+    psycopg cursor, or a test double. Narrower than the full DB-API so the
+    contract a consumer must meet to call `enter_readonly_session` directly
+    is explicit rather than `Any`.
+
+    `execute`'s `params` is `Sequence[str]` — the only shape this module ever
+    binds — rather than the DB-API's wide scalar union, so a real
+    `CursorWrapper` (whose `execute` accepts that union) is a structural
+    subtype. `fetchone`/`fetchall` are satisfied by `CursorWrapper.__getattr__`.
+    """
+
+    def execute(self, sql: str, params: Sequence[str] | None = ...) -> object: ...
+    def fetchone(self) -> tuple[object, ...] | None: ...
+    def fetchall(self) -> Sequence[tuple[object, ...]]: ...
+
 
 EXPECTED_SESSION_GUCS: dict[str, str] = {
     "statement_timeout": "5s",
@@ -36,7 +57,7 @@ for _name, _value in EXPECTED_SESSION_GUCS.items():
 _SAFE_CONTEXT_GUC_NAME = re.compile(r"^mcp_sql\.[a-z_]+$")
 
 
-def validate_session_context(session_context) -> None:
+def validate_session_context(session_context: object) -> None:
     """Raise on a malformed SESSION_CONTEXT hook result.
 
     `TypeError` for a non-Mapping, `ValueError` for a GUC name outside the
@@ -60,7 +81,7 @@ def validate_session_context(session_context) -> None:
 
 
 def enter_readonly_session(
-    cursor,
+    cursor: SQLCursor,
     *,
     role: str,
     session_context: Mapping[str, str] | None = None,
@@ -83,7 +104,7 @@ def enter_readonly_session(
             cursor.execute("SELECT set_config(%s, %s, true)", [name, str(value)])
 
 
-def session_drift(cursor, expected_role: str) -> dict[str, tuple[str, str]]:
+def session_drift(cursor: SQLCursor, expected_role: str) -> dict[str, tuple[str, str]]:
     """Return `{guc_name: (expected, actual)}` for any GUC that does not match.
 
     `expected_role` is the profile role the caller entered via
@@ -93,12 +114,16 @@ def session_drift(cursor, expected_role: str) -> dict[str, tuple[str, str]]:
     """
     drift: dict[str, tuple[str, str]] = {}
     cursor.execute("SELECT current_user")
-    actual_role = cursor.fetchone()[0]
+    row = cursor.fetchone()
+    assert row is not None  # SELECT current_user always returns exactly one row
+    actual_role = str(row[0])
     if actual_role != expected_role:
         drift["current_user"] = (expected_role, actual_role)
     for name, expected in EXPECTED_SESSION_GUCS.items():
         cursor.execute(f"SHOW {name}")
-        actual = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        assert row is not None  # SHOW always returns exactly one row
+        actual = str(row[0])
         if actual != expected:
             drift[name] = (expected, actual)
     return drift

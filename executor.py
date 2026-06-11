@@ -5,8 +5,12 @@ limit-clamp / truncation contract, and the raw-PG-error policy."""
 
 import json
 import logging
+from collections.abc import Sequence
 from time import perf_counter_ns
 from typing import TYPE_CHECKING
+from typing import NotRequired
+from typing import TypedDict
+from typing import Unpack
 
 from django.db import DatabaseError
 from django.db import connections
@@ -23,6 +27,7 @@ from mcp_sql.parser import extract_limit
 from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
 from mcp_sql.schemas import HINTS
+from mcp_sql.schemas import Cell
 from mcp_sql.schemas import OutcomeReason
 from mcp_sql.schemas import QueryResult
 from mcp_sql.session import enter_readonly_session
@@ -403,7 +408,34 @@ def _audit_misconfig(  # noqa: PLR0913
     )
 
 
-def _audit_safely(**fields) -> None:
+class AuditFields(TypedDict):
+    """Keyword payload for `_audit_safely` — the shape of one
+    `MCPQueryLog.objects.create`. The eight required keys are written on
+    every code path (allowed or rejected); the rest are filled in as the
+    pipeline progresses (parse → execute → cap). Typing `**fields` against
+    this `TypedDict` (PEP 692) makes a typo'd field name or wrong value
+    type at any call site a static error instead of a runtime
+    `create()` failure."""
+
+    user: "AbstractBaseUser"
+    profile: str
+    token_id: str
+    decision: str
+    rejection_reason: str
+    raw_sql: str
+    started_at: "datetime.datetime"
+    client_ip: str | None
+    error: NotRequired[str]
+    normalized_sql: NotRequired[str]
+    wrapped_sql: NotRequired[str]
+    duration_ms: NotRequired[int]
+    result_bytes: NotRequired[int]
+    row_count: NotRequired[int]
+    truncated: NotRequired[bool]
+    tool: NotRequired[str]
+
+
+def _audit_safely(**fields: Unpack[AuditFields]) -> None:
     """Best-effort wrapper for every `MCPQueryLog.objects.create` call site.
 
     Audit-row writes happen on the `default` alias after the readonly tx
@@ -458,7 +490,7 @@ def pgcode(exc: BaseException) -> str | None:
     wrappers sometimes nest the SQLSTATE in `exc.__cause__.diag.sqlstate`.
     Falls back through both shapes.
     """
-    code = getattr(exc, "pgcode", None)
+    code: str | None = getattr(exc, "pgcode", None)
     if code:
         return code
     diag = getattr(getattr(exc, "__cause__", None), "diag", None)
@@ -497,7 +529,9 @@ def _classify_db_error(exc: BaseException) -> OutcomeReason:
     return OutcomeReason.EXECUTION_ERROR
 
 
-def _cap_rows(rows: list[tuple]) -> tuple[list[list], int, bool]:
+def _cap_rows(
+    rows: Sequence[Sequence[object]],
+) -> tuple[list[list[Cell]], int, bool]:
     """Per-cell ≤4 KiB string cap + total ≤BYTES_LIMIT payload cap.
 
     Returns `(capped_rows, total_bytes, truncated_by_bytes)`. Non-string,
@@ -509,11 +543,11 @@ def _cap_rows(rows: list[tuple]) -> tuple[list[list], int, bool]:
     can't see the truncation hint until at least one row lands.
     """
     total_cap = mcp_sql_config()["LIMITS"]["BYTES_LIMIT"]
-    out: list[list] = []
+    out: list[list[Cell]] = []
     total = 0
     truncated = False
     for row in rows:
-        capped = [_cap_cell(v) for v in row]
+        capped: list[Cell] = [_cap_cell(v) for v in row]
         row_bytes = len(json.dumps(capped, default=str).encode("utf-8"))
         if out and total + row_bytes > total_cap:
             truncated = True
@@ -523,7 +557,7 @@ def _cap_rows(rows: list[tuple]) -> tuple[list[list], int, bool]:
     return out, total, truncated
 
 
-def _cap_cell(value: object) -> str | bool | int | float | None:
+def _cap_cell(value: object) -> Cell:
     """Truncate per-cell strings to 4 KiB; coerce non-primitives to str()."""
     if value is None or isinstance(value, (bool, int, float)):
         return value

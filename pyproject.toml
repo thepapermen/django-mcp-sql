@@ -245,8 +245,19 @@ exclude_lines = [
 [tool.mypy]
 # The shipped package is type-checked at "pragmatic-strict": untyped-def
 # BODIES are checked (`check_untyped_defs`) so real type bugs surface, but
-# missing annotations are not themselves errors (no `disallow_untyped_defs`) —
+# fully-unannotated defs are not themselves errors (no `disallow_untyped_defs`) —
 # the public surface is annotated without forcing 100% internal coverage.
+# Going further than full strict would buy: most of strict's remaining churn is
+# `no-untyped-def` on framework-shaped boilerplate (signal handlers, view
+# dispatch, admin methods) the django-stubs plugin already understands at the
+# call sites. We do enable the high-signal subset below — the flags that
+# defend the `py.typed` boundary against silent `Any`-leaks and half-typed
+# signatures, without the repo-wide annotation tax:
+#   warn_unused_ignores    — stale `# type: ignore` becomes an error
+#   warn_redundant_casts   — a cast that no longer narrows becomes an error
+#   warn_return_any        — `Any` escaping a typed return becomes an error
+#   disallow_any_generics  — bare `dict`/`list`/`ModelAdmin` must be parameterized
+#   disallow_incomplete_defs — a half-annotated signature (worse than none) is rejected
 #
 # Layout note: `package-dir = {"mcp_sql" = "."}` makes the repo root the
 # `mcp_sql` package, but its checkout dir is named `django-mcp-sql`, which
@@ -260,6 +271,11 @@ plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
 mypy_path = [".mypy-pkg"]
 ignore_missing_imports = true
 check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
 # Tests, the bundled example project, generated migrations, and build trees
 # are not part of the shipped, type-checked surface.
 exclude = "(?x)(/tests/ | /example/ | /migrations/ | /build/ | /dist/ )"

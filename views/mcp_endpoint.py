@@ -11,6 +11,8 @@ import io
 import threading
 from dataclasses import asdict
 from typing import TYPE_CHECKING
+from typing import cast
+from wsgiref.types import WSGIApplication
 
 from a2wsgi import ASGIMiddleware
 from asgiref.sync import sync_to_async
@@ -31,6 +33,7 @@ from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes
 from rest_framework.decorators import permission_classes
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.request import Request
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
@@ -268,7 +271,7 @@ def _build_mcp_server(
             openWorldHint=False,
         )
     )
-    async def describe_table(name: str) -> dict:
+    async def describe_table(name: str) -> dict[str, object]:
         """Return column definitions for a whitelisted table.
 
         `name` is a `db_table` value as returned by `list_tables`. Returns
@@ -314,7 +317,7 @@ def _build_mcp_server(
             openWorldHint=False,
         )
     )
-    async def run_query(sql: str, limit: int | None = None) -> dict:
+    async def run_query(sql: str, limit: int | None = None) -> dict[str, object]:
         """Execute a single read-only SELECT against the whitelisted tables.
 
         Returns `{columns, rows, row_count, truncated, duration_ms, hint,
@@ -363,7 +366,7 @@ def _build_mcp_server(
     return mcp
 
 
-def _invoke_wsgi_app(wsgi_app, request) -> HttpResponse:
+def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpResponse:
     """Bridge a Django request through a WSGI callable and capture the response.
 
     DRF has already read `request.body` (content negotiation, etc.), so the
@@ -405,11 +408,13 @@ def _invoke_wsgi_app(wsgi_app, request) -> HttpResponse:
     environ["SCRIPT_NAME"] = "/mcp/sql"
     environ["PATH_INFO"] = "/mcp"
 
-    captured: dict = {"status": 500, "headers": []}
+    status_code = 500
+    response_headers: list[tuple[str, str]] = []
 
     def start_response(status, headers, exc_info=None):
-        captured["status"] = int(status.split(" ", 1)[0])
-        captured["headers"] = headers
+        nonlocal status_code, response_headers
+        status_code = int(status.split(" ", 1)[0])
+        response_headers = headers
 
     body_iter = wsgi_app(environ, start_response)
     try:
@@ -423,8 +428,8 @@ def _invoke_wsgi_app(wsgi_app, request) -> HttpResponse:
         if hasattr(body_iter, "close"):
             body_iter.close()
 
-    response = HttpResponse(response_body, status=captured["status"])
-    for key, value in captured["headers"]:
+    response = HttpResponse(response_body, status=status_code)
+    for key, value in response_headers:
         response[key] = value
     return response
 
@@ -477,8 +482,14 @@ def mcp_endpoint(request):
     server = _build_mcp_server(
         user=user, profile=profile, token_id=token_id, client_ip=client_ip
     )
-    wsgi_app = ASGIMiddleware(
-        _wrap_lifespan(server.streamable_http_app()), loop=_get_asgi_loop()
+    # a2wsgi's `ASGIMiddleware` is a WSGI application by construction, but its
+    # stubbed `__call__` is not recognised as the `WSGIApplication` callable
+    # shape — assert the contract here rather than loosen `_invoke_wsgi_app`.
+    wsgi_app = cast(
+        "WSGIApplication",
+        ASGIMiddleware(
+            _wrap_lifespan(server.streamable_http_app()), loop=_get_asgi_loop()
+        ),
     )
     return _invoke_wsgi_app(wsgi_app, request)
 
