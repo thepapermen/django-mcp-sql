@@ -131,10 +131,13 @@ jobs:
           PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
           -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
       - name: Pin dependency floors
-        # Keep in sync with the lower bounds in pyproject.toml.
+        # Keep in sync with the lower bounds in pyproject.toml. Django is
+        # pinned to the 4.2 *line* (`4.2.*`), not bare `4.2` (= 4.2.0),
+        # because the allauth extra's django-allauth 65.14 requires
+        # Django>=4.2.16 — a bare 4.2.0 pin is ResolutionImpossible.
         run: |
           cat > /tmp/min-constraints.txt <<'EOF'
-          django==4.2
+          django==4.2.*
           djangorestframework==3.14
           django-oauth-toolkit==3.2
           sqlglot==30.7
