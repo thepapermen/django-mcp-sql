@@ -15,10 +15,25 @@ PostgreSQL database over the
 [Model Context Protocol](https://modelcontextprotocol.io/), without handing it
 a database login or the ability to write anything.
 
-Safety is defense-in-depth at four layers: parser (sqlglot AST validators),
-executor (PG NOLOGIN role + GUCs), DB-role (`mcp_readonly_role` SELECT grants),
-and transport (DRF + django-oauth-toolkit OAuth 2.1 with PKCE + RFC
-7591/8414/9728 discovery).
+It's safe by construction, not by asking the model nicely. Even a confused or
+hijacked agent can only ever touch the slice of data you chose to expose — four
+independent layers enforce it, so a bypass has to beat all four:
+
+- **It sees only what you expose.** Each access profile's whitelist points at
+  the specific tables — or, better, [curated row- and column-limited
+  views](docs/architecture.md#curated-view-pattern) — you pick. You can hand the
+  agent a view that drops the sensitive columns and filters the rows, and the
+  underlying table stays invisible: a login-less Postgres role simply holds no
+  `SELECT` on anything off the list, so "invisible" is enforced by the database,
+  not by trust. (Run several profiles to give different agents different slices.)
+- **It only runs `SELECT`.** Every statement is parsed and checked first;
+  anything that isn't a single read-only query is rejected before it reaches the
+  database.
+- **It runs in a sandbox.** Queries execute in a locked-down, time-limited
+  transaction that can't linger or mutate.
+- **Nothing reaches it unauthenticated.** The endpoint sits behind OAuth 2.1
+  with PKCE (RFC 7591/8414/9728 discovery); an unauthenticated client can't even
+  open the door.
 
 > **Status**: pre-release alpha (`0.1.0a2`). The package is used in
 > production as part of a larger Django project; expect the public API and
