@@ -13,7 +13,13 @@ the documented threat model will be declined.
 ```sh
 # uv once: curl -LsSf https://astral.sh/uv/install.sh | sh
 make test            # creates .venv-test, installs -e .[allauth,test], runs pytest
+make hooks           # installs the pre-commit git hook (run ONCE per clone)
 ```
+
+The hooks are **not** installed automatically by cloning — `make hooks` (i.e.
+`pre-commit install`) wires them into `.git/hooks` so they run on every
+`git commit`. The same hooks run in CI (the `lint` job), so a PR that skipped
+the local install still gets caught; `make lint` runs them all on demand.
 
 The suite needs a reachable PostgreSQL with `mcp_readonly_role` bootstrapped
 (`sql/role_setup.sql`); connection env vars and their defaults are at the
@@ -28,8 +34,10 @@ across the Django 4.2/5.2/6.0 lines on their supported interpreters
 - **Tests**: every behaviour change comes with a test; the suite must stay
   consumer-agnostic (no imports from any consuming project — override-seams
   in `tests/conftest.py` exist for consumer-specific fixtures).
-- **Lint**: ruff (format + lint) for Python; djLint for templates (config in
-  `pyproject.toml`).
+- **Lint**: the pre-commit gate (`.pre-commit-config.yaml`) — ruff (lint +
+  format), djLint for templates, django-upgrade (targeted at the 4.2 floor),
+  and the standard hygiene hooks; ruff/djLint config live in `pyproject.toml`.
+  Run `make lint` (or let the hooks fire on commit).
 - **Migrations**: never edit an applied migration; curated-view migrations
   belong in the consumer's owning app, not here.
 - **CHANGELOG**: add a line under `## Unreleased` in `CHANGELOG.md`.

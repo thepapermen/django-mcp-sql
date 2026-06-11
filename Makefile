@@ -31,6 +31,14 @@ test: ## Run the package test suite standalone (requires uv + a reachable PG; se
 	uv pip install --python .venv-test/bin/python -e '.[allauth,test]'
 	.venv-test/bin/python -m pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
+hooks: ## Install the pre-commit git hook (run once per clone).
+	@command -v pre-commit >/dev/null || { echo "pre-commit not found — install with: pipx install pre-commit (or pip install pre-commit)"; exit 1; }
+	pre-commit install
+
+lint: ## Run every pre-commit hook across all files (same gate as CI's lint job).
+	@command -v pre-commit >/dev/null || { echo "pre-commit not found — install with: pipx install pre-commit (or pip install pre-commit)"; exit 1; }
+	pre-commit run --all-files
+
 cov: ## Run the suite with coverage; write term-missing + coverage.xml (same config CI uploads to Codecov).
 	@command -v uv >/dev/null || { echo "uv not found on PATH — install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 	uv venv .venv-test --python python3 --allow-existing
