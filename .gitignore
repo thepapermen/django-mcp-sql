@@ -10,3 +10,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 example/.venv/
+# Coverage artifacts (`make cov` / the CI coverage job).
+.coverage
+coverage.xml
+htmlcov/

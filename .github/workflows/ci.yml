@@ -148,6 +148,45 @@ jobs:
       - name: Run the test suite
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
+  # Single representative run (newest-resolve on the current Python) that
+  # measures coverage and uploads it to Codecov. One job, not the whole matrix
+  # — coverage of the code is version-independent, so a per-leg upload would
+  # only add noise. Coverage source/omit live in [tool.coverage.run].
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Bootstrap the MCP read-only role
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Install package + test deps
+        run: pip install -e '.[allauth,test]'
+      - name: Run the suite with coverage
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations --cov=mcp_sql --cov-report=xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: thepapermen/django-mcp-sql
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
   build:
     runs-on: ubuntu-latest
     steps:

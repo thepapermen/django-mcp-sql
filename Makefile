@@ -31,6 +31,12 @@ test: ## Run the package test suite standalone (requires uv + a reachable PG; se
 	uv pip install --python .venv-test/bin/python -e '.[allauth,test]'
 	.venv-test/bin/python -m pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
+cov: ## Run the suite with coverage; write term-missing + coverage.xml (same config CI uploads to Codecov).
+	@command -v uv >/dev/null || { echo "uv not found on PATH — install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
+	uv venv .venv-test --python python3 --allow-existing
+	uv pip install --python .venv-test/bin/python -e '.[allauth,test]'
+	.venv-test/bin/python -m pytest --pyargs mcp_sql.tests --create-db --nomigrations --cov=mcp_sql --cov-report=term-missing --cov-report=xml
+
 test-install: ## Build the wheel, install into a fresh venv, run import smoke (ephemeral; requires uv).
 	@command -v uv >/dev/null || { echo "uv not found on PATH — install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 	rm -rf /tmp/mcp_sql_dist /tmp/mcp_sql_test_venv *.egg-info
@@ -68,5 +74,5 @@ test-install: ## Build the wheel, install into a fresh venv, run import smoke (e
 	echo "Wheel install + import smoke + package-data check: OK"; \
 	echo "(Django-coupled modules — auth, executor, views, urls, signals, models, admin — require apps-registry setup; verified by the example-app integration tests.)"
 
-clean: ## Remove build artifacts (dist/, build/, *.egg-info, .venv-test/).
-	rm -rf dist build *.egg-info .venv-test
+clean: ## Remove build + coverage artifacts (dist/, build/, *.egg-info, .venv-test/, coverage.xml, .coverage, htmlcov/).
+	rm -rf dist build *.egg-info .venv-test coverage.xml .coverage htmlcov
