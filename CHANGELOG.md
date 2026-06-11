@@ -7,6 +7,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b2 - unreleased
+
+### Added
+
+- The MCP tools now advertise output schemas: `run_query` and
+  `describe_table` declare `TypedDict` return types (`FencedQueryResult`,
+  `TableDescription | ToolError`), which the MCP SDK turns into each tool's
+  output schema — so a connecting client sees the result shape, including
+  that `run_query`'s `rows` is a fenced JSON string rather than a row matrix.
+- A stricter type-check gate: the high-signal subset of mypy strict
+  (`warn_unused_ignores`, `warn_redundant_casts`, `warn_return_any`,
+  `disallow_any_generics`, `disallow_incomplete_defs`) is now enabled, with
+  the package annotated to satisfy it (full `disallow_untyped_defs` stays
+  off). A consumer's type checker now reads more precise inline types — e.g.
+  `QueryResult.rows` is `list[list[Cell]]`, the cursor surface is a
+  `SQLCursor` protocol, and audit kwargs are a `TypedDict` — instead of
+  `object`/`Any`.
+
+### Changed
+
+- New runtime dependency `typing-extensions>=4.12` (already present
+  transitively via pydantic): the MCP tool-output `TypedDict`s must be the
+  `typing_extensions` variant for pydantic to build their schemas on
+  Python < 3.12.
+
 ## 0.1.0b1 - unreleased
 
 ### Added

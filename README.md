@@ -39,7 +39,7 @@ independent layers enforce it, so a bypass has to beat all four:
   with PKCE (RFC 7591/8414/9728 discovery); an unauthenticated client can't even
   open the door.
 
-> **Status**: beta (`0.1.0b1`). The public API and settings shape are
+> **Status**: beta (`0.1.0b2`). The public API and settings shape are
 > stabilizing, but may still shift before `1.0`.
 
 ## Quickstart — try it in 5 minutes
