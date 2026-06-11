@@ -10,16 +10,47 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
 
-A tightly scoped, read-only PostgreSQL surface for an LLM agent (e.g.
-Claude Code) over the [Model Context Protocol](https://modelcontextprotocol.io/).
-Defense-in-depth at four layers: parser (sqlglot AST validators), executor
-(PG NOLOGIN role + GUCs), DB-role (`mcp_readonly_role` SELECT grants), and
-transport (DRF + django-oauth-toolkit OAuth 2.1 with PKCE + RFC 7591/8414/9728
-discovery).
+Let an LLM agent — like Claude Code — run **read-only** SQL against your
+PostgreSQL database over the
+[Model Context Protocol](https://modelcontextprotocol.io/), without handing it
+a database login or the ability to write anything.
+
+Safety is defense-in-depth at four layers: parser (sqlglot AST validators),
+executor (PG NOLOGIN role + GUCs), DB-role (`mcp_readonly_role` SELECT grants),
+and transport (DRF + django-oauth-toolkit OAuth 2.1 with PKCE + RFC
+7591/8414/9728 discovery).
 
 > **Status**: pre-release alpha (`0.1.0a2`). The package is used in
 > production as part of a larger Django project; expect the public API and
 > settings shape to move between alpha releases.
+
+## Quickstart — try it in 5 minutes
+
+The fastest way to see this work is the bundled **example app** — a vanilla
+Django project (`auth.User`, stock sessions, no allauth) that wires the package
+end to end, including a two-tier curated-view setup. You don't have to touch
+your own project to watch Claude Code query a database.
+
+```sh
+git clone https://github.com/thepapermen/django-mcp-sql
+cd django-mcp-sql/example
+
+# Needs `uv` and a reachable PostgreSQL. See example/README.md for the one-time
+# login-role snippet and the EXAMPLE_PG_* connection defaults.
+make install                                       # venv + editable install of the package
+make createdb migrate roles grants bootstrap_demo  # db, migrations, PG roles + grants, demo users
+make runserver                                     # serves http://127.0.0.1:8001/
+
+# In another terminal, register it with Claude Code — then just ask Claude to use it:
+claude mcp add --transport http mcp-sql-example http://127.0.0.1:8001/mcp/sql/
+```
+
+The first tool call kicks off the OAuth dance (log in as `demo` / `demo`);
+after that, `list_tables` and `run_query` work against the demo data. The full
+walkthrough — the OAuth flow, the second access tier, the MFA note — is in the
+[example README](https://github.com/thepapermen/django-mcp-sql/tree/main/example#end-to-end-runbook).
+
+Ready to wire it into your own project? See [Installation](#installation) below.
 
 ## What you get
 
@@ -46,6 +77,39 @@ usage-summary view (allowed / rejected / auth-rejection counts per rolling
 window). The package emits `logger.error` only — wire a Sentry
 `LoggingIntegration(event_level=logging.ERROR)` to receive these as events;
 the package itself never imports `sentry_sdk`.
+
+## Security model — prompt injection & untrusted data
+
+> [!WARNING]
+> **`run_query` returns database content verbatim to the agent — treat every
+> value as a prompt-injection vector.** Any column an outside party can write
+> to (free-text fields, names, uploaded filenames — anything your app ingested
+> from an outside source) can carry instructions aimed at the
+> *agent*, not at you. An agent that can read this data **and** also act
+> (shell, file write, web fetch, other MCP tools) holds the "lethal trifecta" —
+> private-data access + exposure to untrusted content + the ability to
+> exfiltrate — so an injected row can re-steer its *next* action.
+>
+> As defense-in-depth, `run_query` `rows` and `error` come back wrapped in a
+> **per-response random-UUID `<untrusted-data-…>` fence** with an instruction
+> to treat the contents as data, never commands (the random tag stops an
+> attacker from closing the fence from inside a cell value). **This is
+> belt-and-suspenders, not a guarantee** — nothing forces the model to obey
+> the fence, so it must never be your primary control. Safer designs:
+>
+> - **Exclude user-supplied data from the surface.** Point each profile's
+>   whitelist at [curated, column-limited PostgreSQL views](docs/architecture.md#curated-view-pattern)
+>   that drop the attacker-controllable free-text columns, rather than at raw
+>   tables.
+> - **Don't expose this surface to a privileged agent.** Keep the read-only
+>   SQL context separate from any agent that also holds act/exfiltrate tools,
+>   so a malicious row has nothing to pivot into.
+>
+> Further reading (the prior art this fence design follows):
+> [Defense in Depth for MCP Servers](https://supabase.com/blog/defense-in-depth-mcp) ·
+> ["Supabase MCP can leak your entire SQL database"](https://generalanalysis.com/blog/supabase-mcp-blog) (the disclosure it answers) ·
+> [Supabase MCP docs](https://supabase.com/docs/guides/ai-tools/mcp) ·
+> [reference wrapper source](https://github.com/supabase-community/supabase-mcp/blob/main/packages/mcp-server-supabase/src/tools/database-operation-tools.ts).
 
 ## Postgres-only by design
 
@@ -185,10 +249,6 @@ DRF:
   resolves the **newest** in-range DRF (3.17) for whatever Django you run; the
   older DRF columns matter only when adopting the package into an app that
   already pins one.
-- **Do not pin DRF below the minimum its Django requires** — e.g. DRF 3.14
-  with Django ≥ 5.0 breaks at runtime. A single dependency floor cannot encode
-  "DRF must track Django", and pip never auto-resolves that pair, but it also
-  cannot stop you from pinning it by hand. Stay on a supported row above.
 - **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13** — hence
   the ragged Python columns.
 - `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
@@ -247,17 +307,6 @@ python manage.py mcp_sql_grants --apply
 
 See `docs/role-setup.md` for the full DBA-facing runbook (drift
 detection, CI gates, troubleshooting).
-
-## Local example
-
-A standalone, stock-Django consumer of the package lives in the
-[`example/`](https://github.com/thepapermen/django-mcp-sql/tree/main/example)
-directory of the repository (not shipped in the wheel). It demonstrates the
-package against a vanilla Django setup — `auth.User`, stock sessions, no
-allauth — including a two-profile (multi-tier) configuration with a
-row-and-column-limited curated view. Its own README carries the full
-end-to-end runbook: bootstrap, OAuth dance, and registering the server with
-`claude mcp add`.
 
 ## Development
 
