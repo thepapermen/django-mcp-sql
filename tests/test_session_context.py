@@ -4,7 +4,11 @@ parameterized + namespace-checked when set (TIC-585)."""
 from unittest.mock import MagicMock
 
 import pytest
+from django.db import connection
+from django.db import transaction
+from mcp_sql.session import EXPECTED_SESSION_GUCS
 from mcp_sql.session import enter_readonly_session
+from mcp_sql.session import session_drift
 
 
 def _executed_sql(cursor: MagicMock) -> list[str]:
@@ -74,3 +78,39 @@ def test_hook_rejects_boundary_shaped_guc_names(name):
     cur = MagicMock()
     with pytest.raises(ValueError, match="unsafe SESSION_CONTEXT GUC name"):
         enter_readonly_session(cur, role="r", session_context={name: "1"})
+
+
+_ROLE = "mcp_readonly_role"
+
+
+class TestSessionDrift:
+    """`session_drift` is the smoke/executor pre-flight check that the read
+    connection actually entered the role + the four `SET LOCAL` guards.
+    Exercised against a real connection (the in-package readonly role is
+    bootstrapped by `sql/role_setup.sql`, per CONTRIBUTING)."""
+
+    @pytest.mark.django_db
+    def test_no_drift_after_enter_readonly_session(self):
+        with transaction.atomic(), connection.cursor() as cur:
+            enter_readonly_session(cur, role=_ROLE)
+            assert session_drift(cur, _ROLE) == {}
+
+    @pytest.mark.django_db
+    def test_wrong_expected_role_reported_as_current_user_drift(self):
+        with transaction.atomic(), connection.cursor() as cur:
+            enter_readonly_session(cur, role=_ROLE)
+            drift = session_drift(cur, "some_other_role")
+        assert drift["current_user"] == ("some_other_role", _ROLE)
+        # The four GUCs still match — only current_user drifted.
+        assert set(drift) == {"current_user"}
+
+    @pytest.mark.django_db
+    def test_guc_drift_detected(self):
+        with transaction.atomic(), connection.cursor() as cur:
+            enter_readonly_session(cur, role=_ROLE)
+            # Override one guard transaction-locally to force a mismatch.
+            cur.execute("SET LOCAL statement_timeout = '99s'")
+            drift = session_drift(cur, _ROLE)
+        expected = EXPECTED_SESSION_GUCS["statement_timeout"]
+        assert drift["statement_timeout"] == (expected, "99s")
+        assert "current_user" not in drift

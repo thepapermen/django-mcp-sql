@@ -154,3 +154,28 @@ def test_executor_end_to_end_rejects_table_outside_bound_profile(
     assert log.profile == "second_profile"
     # The rejection happened at the parser layer — nothing reached a cursor.
     assert not mock_conns.__getitem__.return_value.cursor.called
+
+
+def test_view_parity_passes_for_matching_view(two_profiles, second_profile_widget_view):
+    """`_verify_view_parity` is the reconcile safety net against the curated
+    view's column list drifting from its unmanaged model. With the fixture's
+    view (id, name) matching the model, it passes silently."""
+    grants._verify_view_parity(two_profiles["second_profile"])
+
+
+def test_view_parity_detects_column_drift(two_profiles):
+    """A view missing a column the model declares is column drift — the case
+    that would otherwise surface as a runtime ProgrammingError on first query."""
+    # A view that drops `name` (the model still declares it) → model-only diff.
+    drifted = (
+        "CREATE OR REPLACE VIEW mcp_widget_second_profile AS "
+        'SELECT id FROM "mcp_sql_testapp_widget"'
+    )
+    with connection.cursor() as cur:
+        cur.execute(drifted)
+    try:
+        with pytest.raises(grants.GrantsReconcileError, match="column drift"):
+            grants._verify_view_parity(two_profiles["second_profile"])
+    finally:
+        with connection.cursor() as cur:
+            cur.execute("DROP VIEW IF EXISTS mcp_widget_second_profile")

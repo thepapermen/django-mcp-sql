@@ -141,6 +141,60 @@ class TestAllowedModelsShape:
             validate_mcp_sql_settings(_cfg(ALLOWED_MODELS=[entry]))
 
 
+class TestTopLevelInvariants:
+    """The cross-field / numeric guards on the top-level settings dict, above
+    the per-profile checks: TypedDict shape, LIMITS, VOLUME_ALERT_THRESHOLDS,
+    and the BAD_TOKEN_IP_* tripwire knobs."""
+
+    def test_malformed_shape_rejected(self):
+        # A missing required top-level key fails the pydantic TypeAdapter,
+        # which `validate_mcp_sql_settings` wraps as ImproperlyConfigured.
+        cfg = copy.deepcopy(VALID)
+        del cfg["BAN_SELECT_STAR"]
+        with pytest.raises(ImproperlyConfigured, match="Invalid MCP_SQL settings"):
+            validate_mcp_sql_settings(cfg)
+
+    @pytest.mark.parametrize("key", ["DEFAULT_LIMIT", "HARD_LIMIT", "BYTES_LIMIT"])
+    def test_non_positive_limit_rejected(self, key):
+        cfg = copy.deepcopy(VALID)
+        cfg["LIMITS"][key] = 0
+        with pytest.raises(ImproperlyConfigured, match="must be positive"):
+            validate_mcp_sql_settings(cfg)
+
+    def test_default_limit_exceeding_hard_limit_rejected(self):
+        cfg = copy.deepcopy(VALID)
+        cfg["LIMITS"]["DEFAULT_LIMIT"] = cfg["LIMITS"]["HARD_LIMIT"] + 1
+        with pytest.raises(ImproperlyConfigured, match="must not exceed HARD_LIMIT"):
+            validate_mcp_sql_settings(cfg)
+
+    def test_unknown_volume_decision_rejected(self):
+        cfg = copy.deepcopy(VALID)
+        cfg["VOLUME_ALERT_THRESHOLDS"]["bogus"] = {3600: 50}
+        with pytest.raises(ImproperlyConfigured, match="must be one of"):
+            validate_mcp_sql_settings(cfg)
+
+    def test_non_positive_volume_window_rejected(self):
+        cfg = copy.deepcopy(VALID)
+        cfg["VOLUME_ALERT_THRESHOLDS"]["allowed"] = {0: 50}
+        with pytest.raises(ImproperlyConfigured, match="positive number of seconds"):
+            validate_mcp_sql_settings(cfg)
+
+    def test_non_positive_volume_threshold_rejected(self):
+        cfg = copy.deepcopy(VALID)
+        cfg["VOLUME_ALERT_THRESHOLDS"]["allowed"] = {3600: 0}
+        with pytest.raises(ImproperlyConfigured, match="threshold 0 must be positive"):
+            validate_mcp_sql_settings(cfg)
+
+    @pytest.mark.parametrize(
+        "key", ["BAD_TOKEN_IP_THRESHOLD", "BAD_TOKEN_IP_WINDOW_SECONDS"]
+    )
+    def test_non_positive_bad_token_knob_rejected(self, key):
+        cfg = copy.deepcopy(VALID)
+        cfg[key] = 0
+        with pytest.raises(ImproperlyConfigured, match="must be positive"):
+            validate_mcp_sql_settings(cfg)
+
+
 class TestSessionContextImportCheck:
     """A typo'd SESSION_CONTEXT dotted path must fail every process at boot
     (`ready()`), not the first `profiles()` call (in practice: `migrate`) or

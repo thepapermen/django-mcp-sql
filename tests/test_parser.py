@@ -14,6 +14,7 @@ from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
+from sqlglot import parse_one
 
 ALLOWED = {"auth_permission", "auth_group", "django_content_type"}
 
@@ -769,6 +770,48 @@ class TestExtractLimit:
         ).ast
         injected = inject_limit(ast, 11)
         assert extract_limit(injected) == 11
+
+    def test_non_integer_literal_limit_gives_up_cleanly(self):
+        # A string-literal LIMIT can't be reasoned about at parse time;
+        # `extract_limit` returns None and the executor falls back to its clamp.
+        ast = parse_one("SELECT id FROM auth_permission LIMIT '3 apples'")
+        assert extract_limit(ast) is None
+
+    def test_non_literal_limit_expression_gives_up_cleanly(self):
+        # A LIMIT that is an expression (not a bare literal) is also opaque at
+        # parse time — same clean give-up path.
+        ast = parse_one("SELECT id FROM auth_permission LIMIT 2 + 3")
+        assert extract_limit(ast) is None
+
+
+class TestTableValuedFunctionsInFrom:
+    """A FROM-clause table-valued function parses as `exp.Table(name="")`, so
+    the whitelist check would pass it trivially and the function deny-list
+    (which it reaches only AFTER `_check_tables`) never sees it. `_check_tables`
+    rejects the empty-name Table first — `dblink` is an egress channel,
+    `generate_series` a DoS amplifier."""
+
+    def test_dblink_in_from_rejected(self):
+        exc = _expect_reject(
+            "SELECT 1 FROM dblink('host=evil', 'SELECT 1') AS t(a int)",
+            OutcomeReason.DISALLOWED_CONSTRUCT,
+        )
+        assert "Table-valued functions in FROM" in str(exc)
+
+    def test_generate_series_in_from_rejected(self):
+        exc = _expect_reject(
+            "SELECT 1 FROM generate_series(1, 1000000000) g",
+            OutcomeReason.DISALLOWED_CONSTRUCT,
+        )
+        assert "Table-valued functions in FROM" in str(exc)
+
+
+class TestNoTableQuery:
+    def test_tableless_select_passes(self):
+        # No FROM → no table aliases; the whole-row-ref guard returns early
+        # (nothing to compare against) and the query is accepted.
+        out = parse_and_validate("SELECT 1", allowed_tables=set())
+        assert out.referenced_tables == set()
 
 
 class TestCheckOrdering:

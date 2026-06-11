@@ -24,6 +24,20 @@ def _logout_request():
     return RequestFactory().get("/logout/")
 
 
+def _mgr(*, filter_delete_return=(0, {}), filter_delete_side_effect=None):
+    """A stand-in Django manager whose `.filter(...).delete()` returns a
+    `(count, {})` pair (or raises), for driving the receivers' DatabaseError
+    branches without a real DB fault."""
+    from unittest.mock import MagicMock
+
+    manager = MagicMock()
+    if filter_delete_side_effect is not None:
+        manager.filter.return_value.delete.side_effect = filter_delete_side_effect
+    else:
+        manager.filter.return_value.delete.return_value = filter_delete_return
+    return manager
+
+
 @pytest.mark.django_db
 class TestRevokeMcpTokensOnLogout:
     def _mint_token(self, user, mcp_app):
@@ -274,3 +288,87 @@ class TestProvisionMcpProfilesIdempotency:
         assert Group.objects.filter(name="mcp_sql_users").count() == 1
         group = Group.objects.get(name="mcp_sql_users")
         assert group.permissions.filter(codename="use_mcp_session").count() == 1
+
+    def test_non_default_alias_is_skipped(self):
+        # `provision_mcp_profiles` provisions only on the default alias; a
+        # post_migrate on a replica/other alias must no-op (no DB touched).
+        from django.apps import apps as django_apps
+        from mcp_sql.signals import provision_mcp_profiles
+
+        sender = django_apps.get_app_config("mcp_sql")
+        provision_mcp_profiles(sender=sender, using="replica")
+
+
+class TestAlertHelperGuards:
+    """Pure-unit guards on the alert helpers — they must never raise, since an
+    alert path failing would be worse than the privilege change it reports."""
+
+    def test_user_label_falls_back_on_error(self):
+        from unittest.mock import MagicMock
+
+        from mcp_sql.signals import _user_label
+
+        broken = MagicMock()
+        broken.get_username.side_effect = RuntimeError("no username")
+        assert _user_label(broken) == "?"
+
+    def test_alert_with_no_user_ids_is_noop(self):
+        from mcp_sql.signals import _alert_mcp_group_grant
+
+        # Empty user set → returns immediately, no queries.
+        _alert_mcp_group_grant(set(), {1: "default"})
+
+
+@pytest.mark.django_db
+class TestSignalDatabaseErrorResilience:
+    """The logout revocation + audit and the cohort-alert membership lookups
+    are best-effort: a DB blip is logged (Sentry via `logger.exception`) but
+    never propagates — logout must always complete and an alert must never
+    raise."""
+
+    def test_token_delete_db_error_is_swallowed(self, monkeypatch, caplog):
+        from django.db import DatabaseError
+        from mcp_sql.signals import _revoke_and_audit_on_logout
+        from oauth2_provider.models import AccessToken
+
+        user = UserFactory()
+        manager = _mgr(filter_delete_side_effect=DatabaseError("boom"))
+        monkeypatch.setattr(AccessToken, "objects", manager)
+        with caplog.at_level(logging.ERROR):
+            _revoke_and_audit_on_logout(
+                user=user, client_ip="1.2.3.4", logged_out_at=timezone.now()
+            )
+        assert "Failed to revoke MCP tokens on logout" in caplog.text
+
+    def test_audit_write_db_error_is_swallowed(self, monkeypatch, caplog):
+        import mcp_sql.signals as signals_mod
+        from django.db import DatabaseError
+        from mcp_sql.signals import _revoke_and_audit_on_logout
+        from oauth2_provider.models import AccessToken
+
+        user = UserFactory()
+        # Deletion "succeeds" (1 token) so control reaches the audit write,
+        # which then fails.
+        manager = _mgr(filter_delete_return=(1, {}))
+        monkeypatch.setattr(AccessToken, "objects", manager)
+        audit = _mgr()
+        audit.create.side_effect = DatabaseError("audit down")
+        monkeypatch.setattr(signals_mod.MCPAuthRejectionLog, "objects", audit)
+        with caplog.at_level(logging.ERROR):
+            _revoke_and_audit_on_logout(
+                user=user, client_ip=None, logged_out_at=timezone.now()
+            )
+        assert "failed to write the audit row" in caplog.text
+
+    def test_membership_query_db_error_yields_empty(self, monkeypatch, caplog):
+        import mcp_sql.signals as signals_mod
+        from django.db import DatabaseError
+        from mcp_sql.signals import _mcp_memberships
+
+        group_mgr = _mgr()
+        group_mgr.filter.side_effect = DatabaseError("groups down")
+        monkeypatch.setattr(signals_mod.Group, "objects", group_mgr)
+        with caplog.at_level(logging.ERROR):
+            out = _mcp_memberships({7}, {10: "default"})
+        assert out == {7: []}
+        assert "MCP membership query failed" in caplog.text
