@@ -14,9 +14,10 @@ keys per (user, decision) for volume observability rather than per-IP for
 silent blocking.
 
 Thresholds come from `MCP_SQL["VOLUME_ALERT_THRESHOLDS"]`, a
-`{decision: {window_seconds: threshold}}` map (read straight from
-`settings.MCP_SQL`, like the executor reads `LIMITS` — it is a required key,
-not one of the accessor's defaulted keys). `record_query_volume` is called
+`{decision: {window_seconds: threshold}}` map (read via `mcp_sql_config()`,
+the typed view of the raw `settings.MCP_SQL`, like the executor reads
+`LIMITS` — it is a required key, not one of the accessor's defaulted keys).
+`record_query_volume` is called
 from `executor._audit_safely` after each `MCPQueryLog` row is written, so
 every audited query — `run_query` plus the metadata tools, allowed and
 rejected alike — counts toward its decision's windows. (The rare
@@ -32,8 +33,8 @@ SQL text.
 
 import logging
 
-from django.conf import settings
 from django.core.cache import cache
+from mcp_sql.conf import mcp_sql_config
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def record_query_volume(*, user_id, decision: str, user_label: str = "") -> None
     (`get_username()`) is carried only for the alert message so the Sentry
     event names a person, not just a number.
     """
-    windows = settings.MCP_SQL["VOLUME_ALERT_THRESHOLDS"].get(decision)
+    windows = mcp_sql_config()["VOLUME_ALERT_THRESHOLDS"].get(decision)
     if not windows:
         return
     for window, threshold in windows.items():

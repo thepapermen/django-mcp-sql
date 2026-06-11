@@ -10,13 +10,13 @@ import secrets
 from http import HTTPStatus
 from urllib.parse import urlparse
 
-from django.conf import settings
 from django.http import JsonResponse
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from mcp_sql import throttle
+from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from oauth2_provider.models import Application
 
@@ -163,7 +163,8 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     # The IP keyed on is `REMOTE_ADDR` (proxy-stripped client IP) — see the
     # `throttle` module docstring for the edge-proxy invariant it rests on.
     ip = request.META.get("REMOTE_ADDR") or "unknown"
-    threshold = settings.MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]
+    cfg = mcp_sql_config()
+    threshold = cfg["BAD_TOKEN_IP_THRESHOLD"]
     if throttle.is_ip_blocked(ip, scope="register", threshold=threshold):
         return _registration_response(request, client_id, client_name, redirect_uris)
 
@@ -193,7 +194,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     throttle.record_attempt(
         ip,
         scope="register",
-        window=settings.MCP_SQL["BAD_TOKEN_IP_WINDOW_SECONDS"],
+        window=cfg["BAD_TOKEN_IP_WINDOW_SECONDS"],
         threshold=threshold,
     )
 

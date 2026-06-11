@@ -14,3 +14,10 @@ example/.venv/
 .coverage
 coverage.xml
 htmlcov/
+# Type-checking artifacts (`make typecheck` / the CI typecheck job). The
+# `.mypy-pkg/` dir holds the throwaway `mcp_sql -> ..` symlink that lets
+# `mypy -p mcp_sql` resolve the self-rooted package (see [tool.mypy]).
+.mypy_cache/
+.mypy-pkg/
+# Local scratch (throwaway DBs, mypy sandboxes, ad-hoc notes).
+.tmp/

@@ -190,6 +190,30 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
 
+  # Static type-check gate. The package ships `py.typed` (PEP 561), so its
+  # inline annotations are part of the published contract — this proves mypy
+  # (with the django-stubs + DRF-stubs plugins) is clean against them. One
+  # representative env, not the whole matrix: the annotations are
+  # Django-version-agnostic, so the gate pins the 5.2 LTS line (well inside
+  # django-stubs' tested range). No Postgres service — the django-stubs
+  # plugin loads the app registry to introspect models but never connects.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + typecheck deps
+        run: pip install -e '.[allauth,test,typecheck]' "Django==5.2.*"
+      - name: Expose the self-rooted package under its import name
+        # `package-dir = {"mcp_sql" = "."}` self-roots the package, but the
+        # checkout dir is `django-mcp-sql`; symlink the real import name onto
+        # mypy_path so `mypy -p mcp_sql` resolves it (config: [tool.mypy]).
+        run: mkdir -p .mypy-pkg && ln -sfn .. .mypy-pkg/mcp_sql
+      - name: Run mypy
+        run: mypy -p mcp_sql
+
   build:
     runs-on: ubuntu-latest
     steps:

@@ -27,13 +27,13 @@ is `logger.exception`-logged but does not mask the underlying
 import logging
 
 from django.apps import apps
-from django.conf import settings
 from django.core.cache import cache
 from django.db import DatabaseError
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import throttle
 from mcp_sql.conf import ResolutionOutcome
+from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
@@ -183,7 +183,8 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # that keying decision rests on.
         has_auth_header = bool(request.headers.get("authorization"))
         ip = request.META.get("REMOTE_ADDR") or "unknown"
-        threshold = settings.MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]
+        cfg = mcp_sql_config()
+        threshold = cfg["BAD_TOKEN_IP_THRESHOLD"]
         if has_auth_header and throttle.is_ip_blocked(
             ip, scope="bad_token", threshold=threshold
         ):
@@ -194,7 +195,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 throttle.record_attempt(
                     ip,
                     scope="bad_token",
-                    window=settings.MCP_SQL["BAD_TOKEN_IP_WINDOW_SECONDS"],
+                    window=cfg["BAD_TOKEN_IP_WINDOW_SECONDS"],
                     threshold=threshold,
                 )
             return None

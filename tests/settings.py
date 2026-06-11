@@ -95,7 +95,10 @@ LOGIN_URL = "/admin/login/"
 
 # Fast + deterministic test plumbing.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
-AUTH_PASSWORD_VALIDATORS = []
+# Annotated because the django-stubs mypy plugin loads this settings module
+# into the type-check build (the `[tool.mypy]` `/tests/` exclude does not drop
+# the configured settings module), so a bare `[]` trips `var-annotated`.
+AUTH_PASSWORD_VALIDATORS: list[dict[str, object]] = []
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 CACHES = {
     "default": {

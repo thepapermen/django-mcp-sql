@@ -3,11 +3,12 @@
 [![PyPI](https://img.shields.io/pypi/v/django-mcp-sql)](https://pypi.org/project/django-mcp-sql/)
 [![CI](https://github.com/thepapermen/django-mcp-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/thepapermen/django-mcp-sql/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/thepapermen/django-mcp-sql/branch/main/graph/badge.svg)](https://codecov.io/gh/thepapermen/django-mcp-sql)
-[![Django Packages](https://img.shields.io/badge/Django%20Packages-django--mcp--sql-8c3c26.svg)](https://djangopackages.org/packages/p/django-mcp-sql/)
+[![django packages](https://img.shields.io/badge/Django%20Packages-django--mcp--sql-8c3c26.svg)](https://djangopackages.org/packages/p/django-mcp-sql/)
 [![Python versions](https://img.shields.io/pypi/pyversions/django-mcp-sql)](https://pypi.org/project/django-mcp-sql/)
 [![License: MIT](https://img.shields.io/pypi/l/django-mcp-sql)](https://github.com/thepapermen/django-mcp-sql/blob/main/LICENSE)
 [![Development status](https://img.shields.io/pypi/status/django-mcp-sql)](https://pypi.org/project/django-mcp-sql/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
 
 A tightly scoped, read-only PostgreSQL surface for an LLM agent (e.g.
 Claude Code) over the [Model Context Protocol](https://modelcontextprotocol.io/).

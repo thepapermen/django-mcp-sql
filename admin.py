@@ -30,7 +30,12 @@ import contextlib
 from datetime import timedelta
 
 from django.contrib import admin
-from django.contrib.admin.sites import NotRegistered
+
+# `NotRegistered` lives in `admin.sites` across all supported Django lines
+# (it only moved to `admin.exceptions` in 5.0, still re-exported here); the
+# import path is kept on `sites` for 4.2 compat. django-stubs omits it from
+# the `sites` stub, hence the targeted ignore.
+from django.contrib.admin.sites import NotRegistered  # type: ignore[attr-defined]
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
 from django.db.models import Count

@@ -155,7 +155,7 @@ class ParsedQuery:
     """Immutable parser output. Frozen so executor never mutates the AST or
     normalised SQL between parsing and audit-row write."""
 
-    ast: exp.Expression
+    ast: exp.Query
     normalized_sql: str
     referenced_tables: set[str]
 
@@ -251,7 +251,7 @@ def parse_and_validate(
     )
 
 
-def inject_limit(ast: exp.Expression, n: int) -> exp.Expression:
+def inject_limit(ast: exp.Query, n: int) -> exp.Query:
     """Replace any LIMIT on the root with `n`. Returns the modified AST.
 
     Uses sqlglot's `Expression.limit(n)`, which clobbers an existing LIMIT
@@ -260,7 +260,7 @@ def inject_limit(ast: exp.Expression, n: int) -> exp.Expression:
     return ast.limit(n)
 
 
-def extract_limit(ast: exp.Expression) -> int | None:
+def extract_limit(ast: exp.Query) -> int | None:
     """Return the integer LIMIT on the root expression, or `None` if absent
     or non-integer-literal.
 
@@ -290,14 +290,14 @@ def extract_limit(ast: exp.Expression) -> int | None:
     return None
 
 
-def _check_no_select_into(ast: exp.Expression) -> None:
+def _check_no_select_into(ast: exp.Query) -> None:
     for sel in ast.find_all(exp.Select):
         if sel.args.get("into") is not None:
             msg = "SELECT INTO writes a new table and is not allowed"
             raise QueryRejectedError(OutcomeReason.SELECT_INTO, msg)
 
 
-def _check_no_offset(ast: exp.Expression) -> None:
+def _check_no_offset(ast: exp.Query) -> None:
     """Reject OFFSET — there is no server-side pagination tool surface.
 
     The truncation `hint` already steers the agent toward keyset pagination
@@ -313,7 +313,7 @@ def _check_no_offset(ast: exp.Expression) -> None:
         raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
 
 
-def _check_no_fetch(ast: exp.Expression) -> None:
+def _check_no_fetch(ast: exp.Query) -> None:
     """Reject `FETCH FIRST/NEXT N ROWS ONLY` — SQL-standard pagination.
 
     Cousin of OFFSET: same agent-friendly-but-server-hostile pattern. Use
@@ -329,7 +329,7 @@ def _check_no_fetch(ast: exp.Expression) -> None:
         raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
 
 
-def _check_no_locking_reads(ast: exp.Expression) -> None:
+def _check_no_locking_reads(ast: exp.Query) -> None:
     """Reject `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE`.
 
     The `mcp_readonly_role` has no UPDATE / DELETE grants, so PG would
@@ -344,7 +344,7 @@ def _check_no_locking_reads(ast: exp.Expression) -> None:
         raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
 
 
-def _check_ctes_read_only(ast: exp.Expression) -> None:
+def _check_ctes_read_only(ast: exp.Query) -> None:
     for cte in ast.find_all(exp.CTE):
         body = cte.this
         if not isinstance(body, exp.Query):
@@ -356,7 +356,7 @@ def _check_ctes_read_only(ast: exp.Expression) -> None:
             raise QueryRejectedError(OutcomeReason.WRITEABLE_CTE, msg)
 
 
-def _check_no_select_star(ast: exp.Expression) -> None:
+def _check_no_select_star(ast: exp.Query) -> None:
     """Reject every `Star` that reaches a `Select` projection.
 
     Looking at `Star.parent` alone is not enough — three real bypass
@@ -406,7 +406,7 @@ def _check_no_select_star(ast: exp.Expression) -> None:
             cur = cur.parent
 
 
-def _check_no_whole_row_refs(ast: exp.Expression) -> None:
+def _check_no_whole_row_refs(ast: exp.Query) -> None:
     """Reject bare-table-alias columns in any Select's projection list.
 
     The Star check above catches every shape with an `exp.Star` node, but
@@ -456,7 +456,7 @@ def _check_no_whole_row_refs(ast: exp.Expression) -> None:
                     raise QueryRejectedError(OutcomeReason.SELECT_STAR, msg)
 
 
-def _check_no_denied_functions(ast: exp.Expression) -> None:
+def _check_no_denied_functions(ast: exp.Query) -> None:
     """Walk every function-call node and reject anything on the deny list.
 
     `exp.Func` is sqlglot's base class for both typed function nodes
@@ -522,7 +522,7 @@ def _check_no_denied_functions(ast: exp.Expression) -> None:
                 raise QueryRejectedError(OutcomeReason.DISALLOWED_FUNCTION, msg)
 
 
-def _check_no_bare_keyword_columns(ast: exp.Expression) -> None:
+def _check_no_bare_keyword_columns(ast: exp.Query) -> None:
     """Reject parenthesis-less PG built-ins (`SELECT current_user FROM ...`).
 
     PG accepts several built-ins as bare identifiers — no parentheses.
@@ -548,7 +548,7 @@ def _check_no_bare_keyword_columns(ast: exp.Expression) -> None:
             raise QueryRejectedError(OutcomeReason.DISALLOWED_FUNCTION, msg)
 
 
-def _check_no_recursive_cte(ast: exp.Expression) -> None:
+def _check_no_recursive_cte(ast: exp.Query) -> None:
     """Reject `WITH RECURSIVE ...` queries.
 
     Recursive CTEs are a power-user feature unnecessary for the LLM-driven
@@ -608,7 +608,7 @@ def _resolves_to_cte(table: exp.Expression, name: str) -> bool:
 
 
 def _check_tables(
-    ast: exp.Expression,
+    ast: exp.Query,
     *,
     allowed_tables: set[str],
 ) -> set[str]:

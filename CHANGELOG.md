@@ -18,6 +18,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   respective supported interpreters), plus a pinned leg verifying the package
   on DRF 3.14 + Django 4.2 — i.e. drop-in into an app that already pins an
   older DRF.
+- `py.typed` marker (PEP 561): the package now ships its inline type
+  annotations, so a consumer's type checker reads `mcp_sql`'s types instead
+  of treating it as untyped. A `typecheck` extra (`mypy` + `django-stubs` +
+  `djangorestframework-stubs`), a `[tool.mypy]` config, a `make typecheck`
+  target, and a CI `typecheck` job keep those annotations honest (the public
+  surface is annotated; untyped-def bodies are still checked).
 
 ### Changed
 

@@ -13,6 +13,7 @@ the documented threat model will be declined.
 ```sh
 # uv once: curl -LsSf https://astral.sh/uv/install.sh | sh
 make test            # creates .venv-test, installs -e .[allauth,test], runs pytest
+make typecheck       # mypy + django/DRF stubs over the package (CI's typecheck job)
 make hooks           # installs the pre-commit git hook (run ONCE per clone)
 ```
 
@@ -38,6 +39,11 @@ across the Django 4.2/5.2/6.0 lines on their supported interpreters
   format), djLint for templates, django-upgrade (targeted at the 4.2 floor),
   and the standard hygiene hooks; ruff/djLint config live in `pyproject.toml`.
   Run `make lint` (or let the hooks fire on commit).
+- **Types**: the package ships `py.typed`, so its annotations are part of the
+  published contract — keep `make typecheck` green (mypy with the django-stubs
+  + DRF-stubs plugins; config in `[tool.mypy]`). The public surface is
+  annotated; you need not annotate every internal helper, but untyped-def
+  bodies are still checked.
 - **Migrations**: never edit an applied migration; curated-view migrations
   belong in the consumer's owning app, not here.
 - **CHANGELOG**: add a line under `## Unreleased` in `CHANGELOG.md`.

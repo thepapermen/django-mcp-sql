@@ -8,13 +8,13 @@ import logging
 from time import perf_counter_ns
 from typing import TYPE_CHECKING
 
-from django.conf import settings
 from django.db import DatabaseError
 from django.db import connections
 from django.db import transaction
 from django.utils import timezone
 from mcp_sql import observability
 from mcp_sql.conf import Profile
+from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import declared_tables
 from mcp_sql.models import MCPQueryLog
@@ -82,8 +82,9 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
         )
         raise ExecutorMisconfiguredError(msg)
 
-    limits = settings.MCP_SQL["LIMITS"]
-    ban_select_star = settings.MCP_SQL["BAN_SELECT_STAR"]
+    cfg = mcp_sql_config()
+    limits = cfg["LIMITS"]
+    ban_select_star = cfg["BAN_SELECT_STAR"]
     allowed = set(declared_tables(profile).values())
 
     try:
@@ -507,7 +508,7 @@ def _cap_rows(rows: list[tuple]) -> tuple[list[list], int, bool]:
     First row is always kept even if it alone exceeds BYTES_LIMIT — caller
     can't see the truncation hint until at least one row lands.
     """
-    total_cap = settings.MCP_SQL["LIMITS"]["BYTES_LIMIT"]
+    total_cap = mcp_sql_config()["LIMITS"]["BYTES_LIMIT"]
     out: list[list] = []
     total = 0
     truncated = False

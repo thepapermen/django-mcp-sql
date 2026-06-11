@@ -119,6 +119,20 @@ test = [
     "pytest-cov>=5",
     "psycopg[binary]>=3.2",
 ]
+# Static type-checking stack (`make typecheck` / CI's `typecheck` job).
+# `[compatible-mypy]` lets each stubs package pin the mypy range it was
+# tested against, so the three resolve as a matched set rather than fighting
+# over the mypy version. django-stubs floored at 6 because only 6.x knows the
+# full Django 4.2–6.0 span the package supports (5.x predates the 6.0 stubs).
+# This is a dev-only gate that resolves the newest stubs and runs against one
+# representative Django line (5.2); the package's annotations are
+# Django/DRF-version-agnostic, so it does not re-validate every supported
+# Django × DRF pair (those are exercised by the runtime test matrix instead).
+typecheck = [
+    "mypy>=1.13",
+    "django-stubs[compatible-mypy]>=6",
+    "djangorestframework-stubs[compatible-mypy]>=3.15",
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -155,6 +169,10 @@ version = {attr = "mcp_sql.__version__"}
 # a broken `tests/test_*.py`-only fragment in). Run them from a checkout via
 # `make test` (standalone settings: `mcp_sql/tests/settings.py`).
 "mcp_sql" = [
+    # PEP 561 marker — ships the package's inline annotations to consumers'
+    # type checkers. Without it a consumer's mypy treats `import mcp_sql` as
+    # untyped (`Any`), ignoring every annotation below.
+    "py.typed",
     "sql/*.sql",
     "sql/*.sh",
     "docs/*.md",
@@ -223,6 +241,33 @@ exclude_lines = [
     "if __name__ == .__main__.",
     "if TYPE_CHECKING:",
 ]
+
+[tool.mypy]
+# The shipped package is type-checked at "pragmatic-strict": untyped-def
+# BODIES are checked (`check_untyped_defs`) so real type bugs surface, but
+# missing annotations are not themselves errors (no `disallow_untyped_defs`) —
+# the public surface is annotated without forcing 100% internal coverage.
+#
+# Layout note: `package-dir = {"mcp_sql" = "."}` makes the repo root the
+# `mcp_sql` package, but its checkout dir is named `django-mcp-sql`, which
+# mypy cannot import under the real `mcp_sql` name. `make typecheck` (and
+# CI's `typecheck` job) create a throwaway `.mypy-pkg/mcp_sql -> ..` symlink
+# on `mypy_path`, then run `mypy -p mcp_sql`; the `.mypy-pkg/` dir is
+# gitignored. sqlglot ships `py.typed`; the remaining untyped deps (mcp,
+# a2wsgi, oauth2_provider) are silenced by `ignore_missing_imports`.
+python_version = "3.11"
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+mypy_path = [".mypy-pkg"]
+ignore_missing_imports = true
+check_untyped_defs = true
+# Tests, the bundled example project, generated migrations, and build trees
+# are not part of the shipped, type-checked surface.
+exclude = "(?x)(/tests/ | /example/ | /migrations/ | /build/ | /dist/ )"
+
+[tool.django-stubs]
+# The plugin imports this to introspect the ORM. The standalone test
+# settings are the package's own — there are no consumer settings on PyPI.
+django_settings_module = "mcp_sql.tests.settings"
 
 [tool.ruff]
 # Ported from the package's origin monorepo, with one floor-aware change:

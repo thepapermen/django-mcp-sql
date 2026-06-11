@@ -55,7 +55,11 @@ class MCPAuthorizationView(AuthorizationView):
 
     @staticmethod
     def _enforce_gate(user: "AbstractBaseUser") -> None:
-        if not (user.is_active and user.is_staff):
+        # `is_staff` lives on `AbstractUser` / the stock user, not the
+        # `AbstractBaseUser` base a consumer may subclass directly; read it
+        # defensively so a user model without the attribute is treated as
+        # non-staff (fail-closed) rather than raising.
+        if not (user.is_active and getattr(user, "is_staff", False)):
             msg = (
                 "MCP SQL access requires an active staff account. "
                 "Contact an administrator."

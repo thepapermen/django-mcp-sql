@@ -23,12 +23,17 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 
 from django.conf import settings
 from django.core.signals import setting_changed
 from django.dispatch import receiver
 from django.utils.module_loading import import_string
+
+if TYPE_CHECKING:
+    from mcp_sql.validation import McpSqlSettings
 
 
 @dataclass(frozen=True)
@@ -320,6 +325,20 @@ class MCPSQLSettings:
 
 
 mcp_sql_settings = MCPSQLSettings()
+
+
+def mcp_sql_config() -> "McpSqlSettings":
+    """Typed view of the raw `settings.MCP_SQL` dict.
+
+    The required keys that carry no in-package default (LIMITS,
+    BAN_SELECT_STAR, VOLUME_ALERT_THRESHOLDS, BAD_TOKEN_IP_*) are read
+    straight from `settings.MCP_SQL` rather than through the defaulting
+    `mcp_sql_settings` accessor; `validate_mcp_sql_settings` has already
+    pinned their shape to `McpSqlSettings` at startup, so this casts the
+    raw mapping to that validated TypedDict for typed key access at the
+    consuming call sites.
+    """
+    return cast("McpSqlSettings", settings.MCP_SQL)
 
 
 @receiver(setting_changed)
