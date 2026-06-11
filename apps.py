@@ -15,7 +15,6 @@ class McpSqlConfig(AppConfig):
     @staticmethod
     def validate_settings():
         from django.conf import settings
-
         from mcp_sql.validation import validate_mcp_sql_settings
 
         validate_mcp_sql_settings(settings.MCP_SQL)

@@ -29,7 +29,8 @@ if sys.version_info >= (3, 12):
 else:
     # Pydantic rejects `typing.TypedDict` on Python < 3.12 and requires the
     # `typing_extensions` backport (always installed — pydantic depends on it).
-    from typing_extensions import NotRequired
+    from typing import NotRequired
+
     from typing_extensions import TypedDict
 
 from django.core.exceptions import ImproperlyConfigured

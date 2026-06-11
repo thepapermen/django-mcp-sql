@@ -6,7 +6,6 @@ from django.core.management.base import CommandError
 from django.db import DatabaseError
 from django.db import connections
 from django.db import transaction
-
 from mcp_sql import grants
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings

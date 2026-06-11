@@ -29,14 +29,13 @@ import pytest
 from django.test import RequestFactory
 from django.urls import reverse
 from django.utils import timezone
+from mcp_sql.auth import MCPOAuth2Authentication
+from mcp_sql.conf import mcp_sql_settings
 from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Application
 from oauth2_provider.models import Grant
 from rest_framework.test import APIClient
 from rest_framework.test import APIRequestFactory
-
-from mcp_sql.auth import MCPOAuth2Authentication
-from mcp_sql.conf import mcp_sql_settings
 
 
 def _post(client, body) -> object:

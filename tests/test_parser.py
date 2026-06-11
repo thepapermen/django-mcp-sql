@@ -8,13 +8,12 @@ over-reject normal SELECT shapes.
 """
 
 import pytest
-from sqlglot import exp
-
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
 from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
 from mcp_sql.schemas import OutcomeReason
+from sqlglot import exp
 
 ALLOWED = {"auth_permission", "auth_group", "django_content_type"}
 

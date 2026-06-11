@@ -13,7 +13,6 @@ import pytest
 from django.http import HttpResponse
 from django.test import RequestFactory
 from django.urls import reverse
-
 from mcp_sql.decorators import OAUTH_REQUEST_BODY_MAX_BYTES
 from mcp_sql.decorators import cap_request_body
 from mcp_sql.decorators import normalize_content_length

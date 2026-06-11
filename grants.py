@@ -29,7 +29,6 @@ from dataclasses import field
 from django.apps import apps
 from django.db import connection
 from django.db import transaction
-
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings
 

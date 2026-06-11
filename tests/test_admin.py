@@ -8,7 +8,6 @@ from django.contrib import admin as django_admin
 from django.test import RequestFactory
 from django.urls import reverse
 from django.utils import timezone
-
 from mcp_sql.admin import MCPAuthRejectionLogAdmin
 from mcp_sql.admin import MCPQueryLogAdmin
 from mcp_sql.models import MCPAuthRejectionLog

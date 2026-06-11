@@ -6,9 +6,8 @@ from dataclasses import dataclass
 
 import sqlglot
 import sqlglot.errors
-from sqlglot import exp
-
 from mcp_sql.schemas import OutcomeReason
+from sqlglot import exp
 
 DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
     {

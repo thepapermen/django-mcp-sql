@@ -9,7 +9,6 @@ import logging
 
 import pytest
 from django.core.cache import cache
-
 from mcp_sql import throttle
 
 

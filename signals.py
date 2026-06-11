@@ -18,7 +18,6 @@ from django.db.models.signals import m2m_changed
 from django.db.models.signals import post_migrate
 from django.dispatch import receiver
 from django.utils import timezone
-
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
@@ -135,7 +134,6 @@ def provision_mcp_profiles(sender, **kwargs) -> None:
 
     from django.contrib.auth.models import Permission
     from django.contrib.contenttypes.models import ContentType
-
     from mcp_sql.models import MCPQueryLog
 
     content_type = ContentType.objects.get_for_model(MCPQueryLog)

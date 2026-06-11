@@ -3,11 +3,10 @@
 `docs/architecture.md` "OAuth surface" for the full picture
 (consent-screen asymmetry, audience-binding policy, prefix semantics)."""
 
-from oauth2_provider.models import Application
-from oauth2_provider.oauth2_validators import OAuth2Validator
-
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
+from oauth2_provider.models import Application
+from oauth2_provider.oauth2_validators import OAuth2Validator
 
 
 class MCPOAuth2Validator(OAuth2Validator):

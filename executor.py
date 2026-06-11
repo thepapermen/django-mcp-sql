@@ -13,7 +13,6 @@ from django.db import DatabaseError
 from django.db import connections
 from django.db import transaction
 from django.utils import timezone
-
 from mcp_sql import observability
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings

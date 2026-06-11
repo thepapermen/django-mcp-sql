@@ -21,7 +21,6 @@ that reads the connecting role from the psql variable `app_role` via a
 
 from django.core.management.base import BaseCommand
 from django.core.management.base import CommandError
-
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.session import EXPECTED_SESSION_GUCS
 

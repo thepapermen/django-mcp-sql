@@ -12,7 +12,6 @@ import secrets
 
 import pytest
 from django.db import connection
-
 from mcp_sql import grants
 from mcp_sql.executor import pgcode
 from mcp_sql.parser import QueryRejectedError

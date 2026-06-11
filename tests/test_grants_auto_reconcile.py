@@ -19,7 +19,6 @@ from unittest.mock import patch
 
 import pytest
 from django.db.models.signals import post_migrate
-
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
 from mcp_sql.signals import audit_grants_drift_after_migrate

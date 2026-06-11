@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 
 import pytest
 from django.test import override_settings
-
 from mcp_sql.conf import DEFAULTS
 from mcp_sql.conf import IMPORT_STRINGS
 from mcp_sql.conf import MCPSQLSettings

@@ -9,7 +9,6 @@ import copy
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
-
 from mcp_sql.validation import validate_mcp_sql_settings
 
 VALID = {

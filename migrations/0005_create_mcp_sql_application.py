@@ -30,7 +30,7 @@
 from django.db import migrations
 
 
-def create_application(apps, schema_editor):  # noqa: ARG001
+def create_application(apps, schema_editor):
     # Application name is sourced from `mcp_sql_settings.APPLICATION_NAME`
     # at APPLY time (default `"mcp-sql"`). A consumer who overrides
     # `MCP_SQL["APPLICATION_NAME"]` AFTER initial deploy must follow up
@@ -54,7 +54,7 @@ def create_application(apps, schema_editor):  # noqa: ARG001
     )
 
 
-def delete_application(apps, schema_editor):  # noqa: ARG001
+def delete_application(apps, schema_editor):
     from mcp_sql.conf import mcp_sql_settings
 
     Application = apps.get_model("oauth2_provider", "Application")

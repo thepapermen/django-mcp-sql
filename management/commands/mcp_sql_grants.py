@@ -1,6 +1,5 @@
 from django.core.management.base import BaseCommand
 from django.core.management.base import CommandError
-
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants

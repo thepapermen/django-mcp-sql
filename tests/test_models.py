@@ -2,7 +2,6 @@ from datetime import timedelta
 
 import pytest
 from django.utils import timezone
-
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.tests.factories import UserFactory
 

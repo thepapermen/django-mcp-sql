@@ -6,10 +6,9 @@ full design rationale."""
 from typing import TYPE_CHECKING
 
 from django.core.exceptions import PermissionDenied
-from oauth2_provider.views import AuthorizationView
-
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
+from oauth2_provider.views import AuthorizationView
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser

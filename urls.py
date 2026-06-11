@@ -17,14 +17,13 @@ contract every `reverse(...)` call site depends on.
 """
 
 from django.urls import path
-from oauth2_provider import views as oauth2_views
-
 from mcp_sql.decorators import cap_request_body
 from mcp_sql.views.discovery import authorization_server_metadata
 from mcp_sql.views.discovery import protected_resource_metadata
 from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
 from mcp_sql.views.registration import register_client
+from oauth2_provider import views as oauth2_views
 
 urlpatterns = [
     # Curated subset of django-oauth-toolkit URLs. Each OAuth endpoint is

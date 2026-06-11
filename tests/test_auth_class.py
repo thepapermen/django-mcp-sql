@@ -15,14 +15,13 @@ from http import HTTPStatus
 import pytest
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework.exceptions import AuthenticationFailed
-from rest_framework.test import APIRequestFactory
-
 from mcp_sql.auth import MCP_REQUEST_BODY_MAX_BYTES
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.auth import PayloadTooLarge
 from mcp_sql.schemas import AuthRejectionReason
 from mcp_sql.tests.conftest import SECOND_PROFILE_GROUP
+from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.test import APIRequestFactory
 
 
 def _bearer_request(token: str):
@@ -120,7 +119,6 @@ class TestMCPOAuth2AuthenticationRejections:
         """A user assigned to >1 MCP profile is denied AMBIGUOUS_PROFILE and an
         audit row is written (TIC-585 fail-closed: never guess a tier)."""
         from django.contrib.auth.models import Group
-
         from mcp_sql.models import MCPAuthRejectionLog
 
         # mcp_user already holds `use_mcp_session` (the default tier) directly;
@@ -289,10 +287,9 @@ class TestAuthRejectionAuditLog:
         from datetime import timedelta
 
         from django.utils import timezone
+        from mcp_sql.models import MCPAuthRejectionLog
         from oauth2_provider.models import AccessToken
         from oauth2_provider.models import Application
-
-        from mcp_sql.models import MCPAuthRejectionLog
 
         rogue_app = Application.objects.create(
             name="rogue",
@@ -353,7 +350,6 @@ class TestAuthRejectionAuditLog:
         import logging
 
         from django.db import OperationalError
-
         from mcp_sql.models import MCPAuthRejectionLog
 
         def boom(*args, **kwargs):

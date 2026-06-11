@@ -32,10 +32,6 @@ from django.core.cache import cache
 from django.db import DatabaseError
 from django.urls import reverse
 from django.utils import timezone
-from oauth2_provider.contrib.rest_framework import OAuth2Authentication
-from rest_framework import exceptions
-from rest_framework.exceptions import APIException
-
 from mcp_sql import throttle
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
@@ -43,6 +39,9 @@ from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
+from oauth2_provider.contrib.rest_framework import OAuth2Authentication
+from rest_framework import exceptions
+from rest_framework.exceptions import APIException
 
 logger = logging.getLogger(__name__)
 

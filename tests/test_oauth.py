@@ -8,7 +8,6 @@ from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import resolve_url
 from django.urls import reverse
-
 from mcp_sql.oauth import MCPOAuth2Validator
 from mcp_sql.tests.conftest import SECOND_PROFILE_GROUP
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
@@ -303,10 +302,9 @@ class TestOAuthTokenEndpointHappyPath:
         from datetime import timedelta
 
         from django.utils import timezone
+        from mcp_sql.auth import MCPOAuth2Authentication
         from oauth2_provider.models import Grant
         from rest_framework.test import APIRequestFactory
-
-        from mcp_sql.auth import MCPOAuth2Authentication
 
         verifier = _secrets.token_urlsafe(64)
         challenge = (
@@ -435,9 +433,8 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert MCPAuthorizationView.template_name == "mcp_sql/authorize.html"
 
     def test_render_to_response_injects_resource_name(self, monkeypatch):
-        from oauth2_provider.views import AuthorizationView
-
         from mcp_sql.conf import mcp_sql_settings
+        from oauth2_provider.views import AuthorizationView
 
         captured = {}
         monkeypatch.setattr(

@@ -2,11 +2,11 @@
 
 import django.db.models.deletion
 from django.conf import settings
-from django.db import migrations, models
+from django.db import migrations
+from django.db import models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = [
@@ -15,31 +15,66 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
-            name='MCPQueryLog',
+            name="MCPQueryLog",
             fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('token_id', models.CharField(blank=True, default='', max_length=64)),
-                ('decision', models.CharField(choices=[('allowed', 'allowed'), ('rejected', 'rejected')], max_length=16)),
-                ('rejection_reason', models.CharField(blank=True, default='', max_length=64)),
-                ('raw_sql', models.TextField()),
-                ('normalized_sql', models.TextField(blank=True, default='')),
-                ('wrapped_sql', models.TextField(blank=True, default='')),
-                ('started_at', models.DateTimeField()),
-                ('duration_ms', models.PositiveIntegerField(blank=True, null=True)),
-                ('row_count', models.PositiveIntegerField(blank=True, null=True)),
-                ('truncated', models.BooleanField(default=False)),
-                ('result_bytes', models.PositiveIntegerField(blank=True, null=True)),
-                ('result_sample', models.JSONField(blank=True, default=dict)),
-                ('client_ip', models.GenericIPAddressField(blank=True, null=True)),
-                ('error', models.TextField(blank=True, default='')),
-                ('user', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='+', to=settings.AUTH_USER_MODEL)),
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                ("token_id", models.CharField(blank=True, default="", max_length=64)),
+                (
+                    "decision",
+                    models.CharField(
+                        choices=[("allowed", "allowed"), ("rejected", "rejected")],
+                        max_length=16,
+                    ),
+                ),
+                (
+                    "rejection_reason",
+                    models.CharField(blank=True, default="", max_length=64),
+                ),
+                ("raw_sql", models.TextField()),
+                ("normalized_sql", models.TextField(blank=True, default="")),
+                ("wrapped_sql", models.TextField(blank=True, default="")),
+                ("started_at", models.DateTimeField()),
+                ("duration_ms", models.PositiveIntegerField(blank=True, null=True)),
+                ("row_count", models.PositiveIntegerField(blank=True, null=True)),
+                ("truncated", models.BooleanField(default=False)),
+                ("result_bytes", models.PositiveIntegerField(blank=True, null=True)),
+                ("result_sample", models.JSONField(blank=True, default=dict)),
+                ("client_ip", models.GenericIPAddressField(blank=True, null=True)),
+                ("error", models.TextField(blank=True, default="")),
+                (
+                    "user",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="+",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
             options={
-                'verbose_name': 'MCP query log',
-                'verbose_name_plural': 'MCP query logs',
-                'ordering': ('-started_at',),
-                'permissions': (('use_mcp_session', 'Can use the MCP read-only SQL session'),),
-                'indexes': [models.Index(fields=['user', 'started_at'], name='mcp_sql_mcp_user_id_168489_idx'), models.Index(fields=['decision', 'started_at'], name='mcp_sql_mcp_decisio_03955f_idx')],
+                "verbose_name": "MCP query log",
+                "verbose_name_plural": "MCP query logs",
+                "ordering": ("-started_at",),
+                "permissions": (
+                    ("use_mcp_session", "Can use the MCP read-only SQL session"),
+                ),
+                "indexes": [
+                    models.Index(
+                        fields=["user", "started_at"],
+                        name="mcp_sql_mcp_user_id_168489_idx",
+                    ),
+                    models.Index(
+                        fields=["decision", "started_at"],
+                        name="mcp_sql_mcp_decisio_03955f_idx",
+                    ),
+                ],
             },
         ),
     ]

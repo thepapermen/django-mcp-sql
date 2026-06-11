@@ -2,7 +2,6 @@
 
 import pytest
 from django.core.management.base import CommandError
-
 from mcp_sql.management.commands.mcp_sql_smoke import Command
 
 

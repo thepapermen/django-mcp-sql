@@ -15,9 +15,8 @@ import re
 from io import StringIO
 from pathlib import Path
 
-from django.core.management import call_command
-
 import mcp_sql
+from django.core.management import call_command
 from mcp_sql.session import EXPECTED_SESSION_GUCS
 
 # The package-default profile's role (config.settings.test ships only `default`).

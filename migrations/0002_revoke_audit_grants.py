@@ -2,7 +2,6 @@
 
 from django.db import migrations
 
-
 REVOKE_AUDIT_FROM_READONLY = """
 DO $$
 BEGIN
@@ -16,11 +15,12 @@ $$;
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('mcp_sql', '0001_initial'),
+        ("mcp_sql", "0001_initial"),
     ]
 
     operations = [
-        migrations.RunSQL(REVOKE_AUDIT_FROM_READONLY, reverse_sql=migrations.RunSQL.noop),
+        migrations.RunSQL(
+            REVOKE_AUDIT_FROM_READONLY, reverse_sql=migrations.RunSQL.noop
+        ),
     ]

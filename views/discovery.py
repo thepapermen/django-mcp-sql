@@ -8,7 +8,6 @@ from django.http import JsonResponse
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
-
 from mcp_sql.conf import mcp_sql_settings
 
 

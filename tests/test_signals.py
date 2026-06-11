@@ -9,7 +9,6 @@ import pytest
 from django.contrib.auth.signals import user_logged_out
 from django.test import RequestFactory
 from django.utils import timezone
-
 from mcp_sql.tests.conftest import SECOND_PROFILE_GROUP
 from mcp_sql.tests.factories import UserFactory
 
@@ -258,7 +257,6 @@ class TestProvisionMcpProfilesIdempotency:
         from django.apps import apps as django_apps
         from django.contrib.auth.models import Group
         from django.contrib.auth.models import Permission
-
         from mcp_sql.signals import provision_mcp_profiles
 
         sender = django_apps.get_app_config("mcp_sql")

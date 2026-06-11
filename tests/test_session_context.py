@@ -4,7 +4,6 @@ parameterized + namespace-checked when set (TIC-585)."""
 from unittest.mock import MagicMock
 
 import pytest
-
 from mcp_sql.session import enter_readonly_session
 
 

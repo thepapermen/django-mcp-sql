@@ -9,7 +9,6 @@ import logging
 
 import pytest
 from django.core.cache import cache
-
 from mcp_sql import observability
 
 
@@ -128,7 +127,6 @@ class TestAuditSafelyFeedsTripwire:
 
     def test_audit_write_increments_user_decision_counter(self, mcp_user, settings):
         from django.utils import timezone
-
         from mcp_sql import executor
         from mcp_sql.models import MCPQueryLog
 
@@ -144,7 +142,6 @@ class TestAuditSafelyFeedsTripwire:
     def test_failed_audit_write_does_not_count(self, mcp_user, settings, monkeypatch):
         from django.db import DatabaseError
         from django.utils import timezone
-
         from mcp_sql import executor
         from mcp_sql.models import MCPQueryLog
 

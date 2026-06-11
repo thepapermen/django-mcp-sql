@@ -11,8 +11,6 @@ from asgiref.sync import async_to_sync
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework.test import APIClient
-
 from mcp_sql import fencing
 from mcp_sql.conf import Profile
 from mcp_sql.schemas import ToolName
@@ -20,6 +18,7 @@ from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
 from mcp_sql.views.mcp_endpoint import _build_mcp_server
 from mcp_sql.views.mcp_endpoint import _get_asgi_loop
 from mcp_sql.views.mcp_endpoint import _invoke_wsgi_app
+from rest_framework.test import APIClient
 
 _DEFAULT_PROFILE = Profile(
     name="default",
@@ -523,10 +522,9 @@ class TestMcpProfileGuard:
     named — not as an opaque AttributeError inside FastMCP's async dispatch."""
 
     def test_missing_mcp_profile_raises_named_runtime_error(self, mcp_user):
+        from mcp_sql.views.mcp_endpoint import mcp_endpoint
         from rest_framework.test import APIRequestFactory
         from rest_framework.test import force_authenticate
-
-        from mcp_sql.views.mcp_endpoint import mcp_endpoint
 
         request = APIRequestFactory().post(
             reverse("mcp_sql_endpoint"), data=b"", content_type="application/json"

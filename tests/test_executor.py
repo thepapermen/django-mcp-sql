@@ -42,7 +42,6 @@ from unittest.mock import patch
 
 import pytest
 from django.db import DatabaseError
-
 from mcp_sql.conf import Profile
 from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import _cap_cell

@@ -4,14 +4,13 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('mcp_sql', '0005_create_mcp_sql_application'),
+        ("mcp_sql", "0005_create_mcp_sql_application"),
     ]
 
     operations = [
         migrations.RemoveField(
-            model_name='mcpquerylog',
-            name='result_sample',
+            model_name="mcpquerylog",
+            name="result_sample",
         ),
     ]

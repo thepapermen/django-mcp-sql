@@ -5,7 +5,6 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand
 from django.core.management.base import CommandError
-
 from mcp_sql.conf import mcp_sql_settings
 
 ADD_FIELD_RE = re.compile(

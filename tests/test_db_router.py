@@ -1,5 +1,4 @@
 import pytest
-
 from mcp_sql.db_router import McpSqlRouter
 from mcp_sql.models import MCPQueryLog
 

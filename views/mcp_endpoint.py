@@ -21,21 +21,19 @@ from django.views.decorators.csrf import csrf_exempt
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from rest_framework.decorators import api_view
-from rest_framework.decorators import authentication_classes
-from rest_framework.decorators import permission_classes
-from rest_framework.permissions import IsAuthenticated
-
 from mcp_sql import executor
 from mcp_sql import fencing
 from mcp_sql import grants
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.schemas import ToolName
+from rest_framework.decorators import api_view
+from rest_framework.decorators import authentication_classes
+from rest_framework.decorators import permission_classes
+from rest_framework.permissions import IsAuthenticated
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
-
     from mcp_sql.conf import Profile
 
 # WSGI environ keys forwarded to the bridged FastMCP app. Allowlist (not

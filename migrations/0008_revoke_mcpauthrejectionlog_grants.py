@@ -23,7 +23,6 @@ new table including ours).
 
 from django.db import migrations
 
-
 REVOKE_AUTH_REJECTION_FROM_READONLY = """
 DO $$
 BEGIN

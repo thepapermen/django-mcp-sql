@@ -37,15 +37,14 @@ from django.db.models import Count
 from django.template.response import TemplateResponse
 from django.urls import path
 from django.utils import timezone
+from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import MCPQueryLog
 from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Application
 from oauth2_provider.models import Grant
 from oauth2_provider.models import IDToken
 from oauth2_provider.models import RefreshToken
-
-from mcp_sql.conf import mcp_sql_settings
-from mcp_sql.models import MCPAuthRejectionLog
-from mcp_sql.models import MCPQueryLog
 
 for model_cls in (Application, AccessToken, Grant, RefreshToken, IDToken):
     with contextlib.suppress(NotRegistered):

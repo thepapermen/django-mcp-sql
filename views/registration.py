@@ -16,10 +16,9 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
-from oauth2_provider.models import Application
-
 from mcp_sql import throttle
 from mcp_sql.conf import mcp_sql_settings
+from oauth2_provider.models import Application
 
 # RFC 8252 §7.3 specifies `127.0.0.1` and `[::1]` as the loopback hostnames
 # and "SHOULD NOT" `localhost`. In practice Anthropic's MCP SDK, Google's

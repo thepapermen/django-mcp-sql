@@ -4,7 +4,6 @@ superuser-blind (TIC-585)."""
 import pytest
 from django.contrib.auth.models import Group
 from django.contrib.auth.models import Permission
-
 from mcp_sql.conf import Profile
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings

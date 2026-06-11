@@ -132,7 +132,6 @@ def mcp_group(db, use_mcp_perm):
     real group to recognise.
     """
     from django.contrib.auth.models import Group
-
     from mcp_sql.conf import mcp_sql_settings
 
     group_name = mcp_sql_settings.profiles()["default"].group_name
@@ -180,7 +179,6 @@ def mcp_session_factory():
     `user`) override by redefining this fixture.
     """
     from django.apps import apps
-
     from mcp_sql.conf import mcp_sql_settings
 
     def _make(*, user, expire_date=None):
@@ -318,7 +316,6 @@ def two_profiles(db, settings):
     profiles' groups + permissions via the real `provision_mcp_profiles`
     receiver. Returns the `{name: Profile}` mapping."""
     from django.apps import apps as django_apps
-
     from mcp_sql.conf import mcp_sql_settings
     from mcp_sql.signals import provision_mcp_profiles
 
