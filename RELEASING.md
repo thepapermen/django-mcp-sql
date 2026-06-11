@@ -82,9 +82,18 @@ pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ django-mcp-sql==<version>
 python -c "import mcp_sql; print(mcp_sql.__version__)"
 
-# 2. Real release — push the tag, which triggers the `pypi` job:
-git tag v<version> && git push --tags
+# 2. Real release — push an ANNOTATED tag. The tag message becomes the
+#    GitHub Release body (`--notes-from-tag`), so write the release notes
+#    there. The push triggers the `pypi` publish and, on success, the
+#    `github-release` job (alpha/beta/rc tags are flagged "Pre-release").
+git tag -a v<version> -m "<release notes — becomes the GitHub Release body>"
+git push origin v<version>
 ```
+
+A lightweight tag (`git tag v<version>`) has no message, so
+`--notes-from-tag` would fail — always use `git tag -a`. The Release is
+created only after PyPI publish succeeds; to retry just the Release without
+re-publishing, run `gh release create v<version> --notes-from-tag --verify-tag dist/*`.
 
 The example project is never uploaded: `python -m build` runs at the repo
 root and builds only the root package, and the example additionally carries

@@ -1,7 +1,8 @@
 # Publish django-mcp-sql to PyPI via Trusted Publishing (OIDC) — no API
 # tokens stored. Build once, then publish:
 #   * `workflow_dispatch` (manual run)  -> TestPyPI  (dry-run)
-#   * push of a `v*` tag                -> PyPI       (real release)
+#   * push of a `v*` tag                -> PyPI, then a GitHub Release
+#                                          (notes from the annotated tag)
 # One-time setup: register a PyPI/TestPyPI "pending publisher" for this
 # repo + workflow filename, and create the `pypi` / `testpypi` GitHub
 # environments. See RELEASING.md.
@@ -59,3 +60,42 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Mirror each PyPI publish in the repo's "Releases" tab. Runs only after a
+  # successful `pypi` upload, so a Release never points at a version that
+  # failed to publish. The notes come from the ANNOTATED tag's own message
+  # (`git tag -a v<version> -m ...` — see RELEASING.md), not the CHANGELOG or
+  # an auto-generated commit list; the built sdist + wheel are attached.
+  github-release:
+    needs: pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full fetch so the annotated tag object (its message) is present
+          # for `--notes-from-tag`.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create the GitHub Release from the annotated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # PEP 440 pre-release tags (aN / bN / rcN) are flagged so the
+          # Releases tab marks them "Pre-release" instead of "Latest".
+          prerelease=
+          case "$tag" in
+            *a*|*b*|*rc*) prerelease=--prerelease ;;
+          esac
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-from-tag \
+            --verify-tag \
+            $prerelease \
+            dist/*
