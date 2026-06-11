@@ -18,9 +18,13 @@ make hooks           # installs the pre-commit git hook (run ONCE per clone)
 ```
 
 The hooks are **not** installed automatically by cloning — `make hooks` (i.e.
-`pre-commit install`) wires them into `.git/hooks` so they run on every
-`git commit`. The same hooks run in CI (the `lint` job), so a PR that skipped
-the local install still gets caught; `make lint` runs them all on demand.
+`pre-commit install`) wires them into `.git/hooks`. It installs two stages:
+the fast lint/format gate on every `git commit`, and a **pre-push** `mypy`
+hook (`make typecheck`) that type-checks before a push — slower and
+venv-dependent, so it runs once per push rather than per commit. Tests are
+deliberately not a hook (they need a live PostgreSQL). The same checks run in
+CI (the `lint` and `typecheck` jobs), so a PR that skipped the local install
+still gets caught; `make lint` / `make typecheck` run them on demand.
 
 The suite needs a reachable PostgreSQL with `mcp_readonly_role` bootstrapped
 (`sql/role_setup.sql`); connection env vars and their defaults are at the

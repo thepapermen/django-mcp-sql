@@ -5,16 +5,24 @@
 # floor. Enforced in CI by the `lint` job (.github/workflows/ci.yml).
 #
 # Install locally once per clone:  pre-commit install   (or: make hooks)
+# `default_install_hook_types` makes that one command wire BOTH the
+# pre-commit hooks (fast lint/format below) and the pre-push mypy hook.
 exclude: '^example/|(^|/)migrations/'
 default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, pre-push]
 minimum_pre_commit_version: "3.2.0"
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # These two ship `stages: [pre-commit, pre-push, manual]` upstream, which
+      # overrides `default_stages`; pin them to commit-time so pre-push is mypy
+      # only.
       - id: trailing-whitespace
+        stages: [pre-commit]
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: check-json
       - id: check-toml
       - id: check-yaml
@@ -44,3 +52,19 @@ repos:
     hooks:
       - id: djlint-reformat-django
       - id: djlint-django
+
+  # Type-check at PRE-PUSH, not pre-commit. mypy here boots Django through the
+  # django-stubs plugin and needs the dev venv (`make typecheck` builds it on
+  # demand), so it is too slow and too environment-dependent to run on every
+  # commit, but cheap to run once before a push. Tests are deliberately NOT a
+  # hook at any stage — they require a live Postgres, which a push must not
+  # assume. Same gate as CI's `typecheck` job.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (type-check, pre-push)
+        entry: make typecheck
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
