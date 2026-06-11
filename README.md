@@ -16,7 +16,7 @@ Defense-in-depth at four layers: parser (sqlglot AST validators), executor
 transport (DRF + django-oauth-toolkit OAuth 2.1 with PKCE + RFC 7591/8414/9728
 discovery).
 
-> **Status**: pre-release alpha (`0.1.0a1`). The package is used in
+> **Status**: pre-release alpha (`0.1.0a2`). The package is used in
 > production as part of a larger Django project; expect the public API and
 > settings shape to move between alpha releases.
 
