@@ -92,6 +92,11 @@ dependencies = [
     # `mcp` floors at pydantic>=2.11, so anything below is unresolvable —
     # declare the real effective floor.
     "pydantic>=2.11,<3",
+    # The MCP tool output schemas are `TypedDict`s, and pydantic (via the MCP
+    # SDK) requires `typing_extensions.TypedDict` rather than the stdlib one on
+    # Python < 3.12. Always present transitively (pydantic floors it at
+    # 4.12.2), declared here because the package imports it directly.
+    "typing-extensions>=4.12",
 ]
 
 [project.urls]

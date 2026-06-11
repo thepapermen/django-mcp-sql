@@ -35,9 +35,34 @@ from rest_framework.decorators import permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 
+# pydantic builds the MCP tool output schemas from these TypedDicts and rejects
+# `typing.TypedDict` on Python < 3.12 — use the typing_extensions one.
+from typing_extensions import TypedDict
+
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
     from mcp_sql.conf import Profile
+
+
+class ColumnInfo(TypedDict):
+    """One column in `describe_table`'s output."""
+
+    type: str
+    null: bool
+    primary_key: bool
+
+
+class TableDescription(TypedDict):
+    """`describe_table`'s success shape."""
+
+    columns: dict[str, ColumnInfo]
+
+
+class ToolError(TypedDict):
+    """A tool's `{"error": ...}` shape (whitelist miss, etc.)."""
+
+    error: str
+
 
 # WSGI environ keys forwarded to the bridged FastMCP app. Allowlist (not
 # strip-list) so unknown / future headers (X-Api-Key, X-Token,
@@ -271,7 +296,7 @@ def _build_mcp_server(
             openWorldHint=False,
         )
     )
-    async def describe_table(name: str) -> dict[str, object]:
+    async def describe_table(name: str) -> TableDescription | ToolError:
         """Return column definitions for a whitelisted table.
 
         `name` is a `db_table` value as returned by `list_tables`. Returns
@@ -301,11 +326,11 @@ def _build_mcp_server(
         model = django_apps.get_model(model_label)
         return {
             "columns": {
-                f.name: {
-                    "type": type(f).__name__,
-                    "null": bool(f.null),
-                    "primary_key": bool(f.primary_key),
-                }
+                f.name: ColumnInfo(
+                    type=type(f).__name__,
+                    null=bool(f.null),
+                    primary_key=bool(f.primary_key),
+                )
                 for f in model._meta.fields
             }
         }
@@ -317,7 +342,9 @@ def _build_mcp_server(
             openWorldHint=False,
         )
     )
-    async def run_query(sql: str, limit: int | None = None) -> dict[str, object]:
+    async def run_query(
+        sql: str, limit: int | None = None
+    ) -> fencing.FencedQueryResult:
         """Execute a single read-only SELECT against the whitelisted tables.
 
         Returns `{columns, rows, row_count, truncated, duration_ms, hint,
