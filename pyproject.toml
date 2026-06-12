@@ -101,6 +101,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/thepapermen/django-mcp-sql"
+Documentation = "https://github.com/thepapermen/django-mcp-sql/tree/main/docs"
 Repository = "https://github.com/thepapermen/django-mcp-sql"
 Issues = "https://github.com/thepapermen/django-mcp-sql/issues"
 Changelog = "https://github.com/thepapermen/django-mcp-sql/blob/main/CHANGELOG.md"

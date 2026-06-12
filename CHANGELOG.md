@@ -7,6 +7,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b3 - 2026-06-12
+
+### Added
+
+- `Documentation` entry in `[project.urls]` (pointing at the repo's `docs/`
+  tree). Django Packages reads a package's documentation link from PyPI
+  `project_urls` (keys `Documentation`/`Docs`/`docs`/`documentation`); without
+  this key the grid listing showed no documentation despite the docs shipping
+  in the wheel.
+
 ## 0.1.0b2 - unreleased
 
 ### Added
