@@ -7,6 +7,38 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b4 - 2026-06-15
+
+Documentation-only release (no code changes).
+
+### Fixed
+
+- README "Installation" `MCP_SQL` block used the pre-`PROFILES` flat
+  `ALLOWED_MODELS` shape, which fails startup validation
+  (`ImproperlyConfigured`). It now uses the required `PROFILES` shape. A new
+  test (`tests/test_docs_config.py`) runs every paste-ready `MCP_SQL` block in
+  the docs through `validate_mcp_sql_settings`, so the install snippet can't
+  drift from the validator again.
+- The OAuth and role-setup runbooks described the pre-`PROFILES`
+  authorization model (`has_perm("mcp_sql.use_mcp_session")`, flat
+  `ALLOWED_MODELS`); they now match the code's `resolve_profile` /
+  per-profile-whitelist behaviour, with corrected auth-error strings and
+  logout token-scope. MFA (`MFA_CHECKER`) and the runtime session-existence
+  gate (`SESSION_MODEL`) are now documented as opt-in rather than default.
+
+### Added
+
+- README "How it compares" section positioning the package against hosted
+  natural-language→SQL services and reference/platform MCP servers, plus a
+  one-line summary callout near the top.
+
+### Changed
+
+- Removed internal build-phase ("Phase N") references from the shipped docs;
+  added a "Roadmap / known gaps" section instead. Reorganized the
+  architecture doc (curated-view pattern ahead of the OAuth surface; the
+  "Watch out" invariants grouped under per-layer subheadings with a mini-TOC).
+
 ## 0.1.0b3 - 2026-06-12
 
 ### Added
