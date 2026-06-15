@@ -15,6 +15,12 @@ PostgreSQL database over the
 [Model Context Protocol](https://modelcontextprotocol.io/), without handing it
 a database login or the ability to write anything.
 
+> **In one line:** the self-hosted, Postgres-only safe-execution-and-access-control
+> layer that gives Django shops the part of [QueryBear](https://querybear.com) a
+> SaaS can't — an agent reading a precisely-scoped slice of your database, with
+> nothing (credentials, rows, or schema) ever leaving your infrastructure. Bring
+> your own SQL-writing agent. ([How it compares](#how-it-compares).)
+
 **It already runs in production**, mediating an LLM agent's database access
 inside a larger Django application — this package is an extraction of that
 code, not a greenfield experiment.
@@ -139,6 +145,45 @@ GUCs, PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
 semantics, sqlglot's `dialect='postgres'`. There is no design path to
 MySQL / SQLite without a parallel implementation — hence `django-mcp-sql`
 not `django-mcp-mysql` etc.
+
+## How it compares
+
+Most "AI + your database" tools are **hosted services that write the SQL for
+you**: you connect a database, ask a question in English, the service generates
+a query, runs it on *its* infrastructure, and hands back rows. Products like
+[QueryBear](https://querybear.com) work this way. They're a good fit when you
+want answers fast and don't mind your queries — and sometimes your data —
+passing through someone else's servers.
+
+`django-mcp-sql` is the other half of that stack. It does **not** generate SQL
+and it is **not** a service. The agent (Claude Code, or anything that speaks
+MCP) writes the SQL; this package is the part that decides whether that SQL is
+allowed to run, runs it safely, and records it. It's a library you embed in a
+Django app you already operate.
+
+It isn't really a feature-by-feature contest — it's a fork in the road:
+
+| | Hosted NL→SQL service<br/>(e.g. QueryBear) | Reference / platform MCP server<br/>(e.g. Anthropic, Supabase, Neon) | `django-mcp-sql` |
+|---|---|---|---|
+| **Deployment** | Managed SaaS | Standalone or platform-bundled | Library inside your Django app |
+| **Writes the SQL?** | Yes — natural language → SQL | No — the agent writes it | No — the agent writes it |
+| **Data & credentials** | In the vendor's path | Wherever you run it | Never leave your infrastructure |
+| **Safety model** | Vendor-defined | Varies by implementation | Four independent layers (parser → role grants → sandbox → OAuth), by construction |
+| **Audit** | Vendor dashboard | Varies | Append-only tables in your own DB |
+| **Best when** | You want answers fast and SaaS is fine | You want a quick MCP bridge | You run Django + Postgres and the data can't leave the building |
+
+("Varies" is honest, not coy — these servers differ widely in how much
+enforcement, auth, and audit they bring, so we don't claim a blanket verdict.)
+
+Pick a hosted service if you want natural-language answers with the least
+setup. Pick this if you already run a Django + Postgres app, your data can't
+leave your perimeter, and you want access that's safe *by construction* and
+auditable line by line — not safe because you trusted a prompt or a vendor.
+
+And if you ever want **both** — natural-language querying *and* self-hosted,
+safe-by-construction execution — they compose rather than compete: a layer that
+turns English into SQL can submit that SQL through this endpoint instead of
+running it itself.
 
 ## Installation
 
