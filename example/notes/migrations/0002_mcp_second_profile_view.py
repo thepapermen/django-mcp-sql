@@ -1,4 +1,4 @@
-# Curated-view migration for the TIC-585 demonstrator `second_profile` profile.
+# Curated-view migration for the `second_profile` demonstrator profile.
 # Creates `mcp_note_second_profile`, a row- AND column-limited VIEW over
 # `notes_note`: only titles beginning with "S", projecting id/title/created_at
 # (no body, no author_id). The `second_profile` role gets SELECT on this view via

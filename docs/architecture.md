@@ -51,13 +51,13 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 |---|---|
 | `sql/role_setup.sql` | Idempotent SQL to create `mcp_readonly_role` + role-level GUC defaults + the membership GRANT. The app role name is supplied via the psql variable `app_role` (`-v app_role=<role>`); the GRANT lives inside a `DO $$ ... $$` block (so psql variable substitution does not reach it directly), so the script wraps the GRANT in an explicit `BEGIN ... COMMIT` and uses `SET LOCAL mcp_sql.app_role = :'app_role'` (psql substitutes the variable at the call site, and the DO block reads the value via `current_setting(...)` + `EXECUTE format('GRANT mcp_readonly_role TO %I', target_role)`). `SET LOCAL` (not bare `SET`) keeps the library-wide invariant — no session-scope SET in mcp_sql code, even on bootstrap paths that don't traverse pgbouncer today. Portable across environments whose `POSTGRES_USER` differs (the caller passes the matching value via `-v app_role=<role>`). |
 | `sql/10_mcp_role.sh` | Init-dir wrapper for fresh dev clusters. Mounted at `/docker-entrypoint-initdb.d/10_mcp_role.sh`; the Postgres image entrypoint runs it once after `POSTGRES_USER` is created. It `exec`s psql with `-v app_role="$POSTGRES_USER"` against `role_setup.sql` (mounted at `/mcp_sql/role_setup.sql`, deliberately OUTSIDE the init dir so the entrypoint does not also auto-run the SQL without the variable substitution). For long-lived deployments the DBA applies the SQL manually with the matching `-v app_role=<role>` value (see `docs/role-setup.md`). |
-| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor (Phase 2) and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. |
+| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. |
 | `db_router.py` | One universal invariant, nothing else: `allow_migrate` returns `False` for `MCP_SQL["DB_ALIAS"]` so **no** app ever builds or tracks schema through the read-only execution alias — it is a lens onto a database `default` owns (or a read replica), which Django can't infer and would otherwise migrate per-alias (a `migrate --database=<alias>`, or the test runner's per-alias setup). Abstains (`None`) on every other decision: audit writes/reads land on `default` via Django's fallback (no explicit pin needed), and the executor reaches the read alias via an explicit `connections[DB_ALIAS]` that routers don't intercept. Deliberately bakes in **no** consumer-topology assumption (no literal `"default"` home for `mcp_sql`'s own tables — a multi-DB consumer manages that with their own routers). Keyed on the `DB_ALIAS` setting, so it holds whether the alias is the same DB via a read-only role or a separate replica. |
-| `models.py` | Two audit tables. `MCPQueryLog` — every `executor.run_query` call (parser-reject / executor-misconfig / timeout / execution-error / `limit=0` short-circuit / success). `MCPAuthRejectionLog` — every `MCPOAuth2Authentication.authenticate` rejection (bad-token / bad-application / bad-scope / inactive-or-non-staff / no-MFA / no-perm / no-session). Separate tables by design: auth rejections happen before query evaluation, conflating them in `MCPQueryLog` would pollute Phase 4's daily-volume "queries per user" aggregation with bot-probe rejection counts. Phase 4's planned revoked-credential probing alert reads `MCPAuthRejectionLog`. Both tables append-only by convention; admin has no write paths; both have `REVOKE SELECT ... FROM mcp_readonly_role` (migrations 0002 + 0008). |
+| `models.py` | Two audit tables. `MCPQueryLog` — every `executor.run_query` call (parser-reject / executor-misconfig / timeout / execution-error / `limit=0` short-circuit / success). `MCPAuthRejectionLog` — every `MCPOAuth2Authentication.authenticate` rejection (bad-token / bad-application / bad-scope / inactive-or-non-staff / no-MFA / no-perm / no-session). Separate tables by design: auth rejections happen before query evaluation, conflating them in `MCPQueryLog` would pollute the daily-volume "queries per user" aggregation with bot-probe rejection counts. The planned revoked-credential probing alert reads `MCPAuthRejectionLog`. Both tables append-only by convention; admin has no write paths; both have `REVOKE SELECT ... FROM mcp_readonly_role` (migrations 0002 + 0008). |
 | `management/commands/mcp_sql_grants.py` | The single grants-pipeline command. Default mode is read-only: prints the drift diff and exits non-zero if any profile role's grants don't match its `MCP_SQL["PROFILES"][...]["ALLOWED_MODELS"]` whitelist (pre-deploy gate). With `--apply`, executes GRANT / REVOKE — intended as the deploy-pipeline step right after `migrate`, and also runnable against an ephemeral CI test cluster to fail PRs that add a model to a profile's `ALLOWED_MODELS` without the migration that creates its table. Strict in both modes: raises if the role is missing, the app role lacks membership, OR any curated MCPxxx view's column list drifts from its unmanaged-model declaration (verified inside `reconcile_grants` via `_verify_view_parity` so the same gate runs on the deploy command + the post_migrate signal). The `post_migrate` signal (see `signals.py`) only DETECTS drift and logs a WARNING; this command is the only code path that mutates. |
 | `management/commands/mcp_sql_lint.py` | Walks `git diff <base>...HEAD`, fails on column-add migrations targeting whitelisted models without `# MCP-OK: <reason>` annotation. |
-| `management/commands/mcp_sql_smoke.py` | Smoke check, two modes. Default: Phase 1 contract — opens `mcp_readonly`, enters the read-only session, verifies guard GUCs, asserts the audit table is unreadable, asserts a write is rejected. `--run-query "<sql>"`: drives the Phase 2 executor end-to-end (parser → LIMIT N+1 → readonly tx → row caps → audit). |
-| `schemas.py` | `QueryResult` dataclass + `OutcomeReason` short-code vocabulary + `HINTS` map (agent-facing text per reason + truncation hint). Reused by Phase 3 transport. |
+| `management/commands/mcp_sql_smoke.py` | Smoke check, two modes. Default: role/grants contract — opens `mcp_readonly`, enters the read-only session, verifies guard GUCs, asserts the audit table is unreadable, asserts a write is rejected. `--run-query "<sql>"`: drives the executor end-to-end (parser → LIMIT N+1 → readonly tx → row caps → audit). |
+| `schemas.py` | `QueryResult` dataclass + `OutcomeReason` short-code vocabulary + `HINTS` map (agent-facing text per reason + truncation hint). Reused by the MCP transport layer. |
 | `fencing.py` | `fence_query_result(payload)` — wraps `run_query`'s untrusted, DB-sourced fields (`rows`, and `error` when set) in a per-response random-UUID `<untrusted-data-…>` XML fence plus a `data_handling` instruction, so injected DB content (email subjects, contact names, comments, …) can't forge the boundary and be read as agent instructions. Pure-Python / Django-free (travels with the package); called from the `run_query` tool closure in `views/mcp_endpoint.py`. |
 | `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery` and `inject_limit(ast, n) -> Expression`. sqlglot-backed AST validators: single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *`, no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte`; a flat global CTE-name set let an inner CTE shadow an outer-scope real table), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`). Raises `QueryRejectedError(reason, detail)`. |
 | `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → inject `LIMIT N+1` → open `mcp_readonly` tx → `enter_readonly_session` → execute → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, and `rejection_reason` — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
@@ -66,7 +66,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 | `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_staff`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. |
 | `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` and runs the issuance gate (`is_active + is_staff + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects `resource_name = RESOURCE_NAME` so the consent page shows the configured server name (the same identity in the RFC 9728 metadata) instead of DOT's opaque per-client `application.name` (`mcp-sql-<token>` for every DCR client). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
 | `views/mcp_endpoint.py` | `/mcp/sql/` view. Per-request `FastMCP` instantiation with three tool callables (`list_tables`, `describe_table`, `run_query`) closed over the authenticated `user`/`token_id`/`client_ip`. Mounted via `a2wsgi.ASGIMiddleware`; the DRF auth class decorator runs first, so anonymous / wrong-scope requests are rejected before the bridge runs. CSRF exempt (bearer auth, not cookies). The `FastMCP` carries `instructions=_SERVER_INSTRUCTIONS` (the standing untrusted-data + human-in-the-loop security posture, delivered once in the `initialize` response — see "Watch out") and each tool carries honest `readOnlyHint=True` / `openWorldHint=False` `ToolAnnotations`. |
-| `views/discovery.py` | OAuth 2.0 discovery surface. `protected_resource_metadata` (RFC 9728) at `/.well-known/oauth-protected-resource/mcp/sql` advertises the MCP endpoint's `resource`, the env's `resource_name` (sourced from `MCP_SQL["RESOURCE_NAME"]`; consuming projects typically override this to an env-distinct value), and the AS URL. `authorization_server_metadata` (RFC 8414) at `/.well-known/oauth-authorization-server/o` (path-suffix per RFC 8414 §3.1, matching the `https://<host>/o` issuer) advertises `issuer`, the three OAuth endpoints, the `registration_endpoint` (Phase 3.6), scopes, grant types, `code_challenge_methods_supported=["S256"]`, and `token_endpoint_auth_methods_supported=["none"]` (public client). Both anonymous-GET, CSRF-exempt. Referenced by `MCPOAuth2Authentication.authenticate_header()` via the `resource_metadata` parameter in `WWW-Authenticate` so MCP clients can bootstrap the OAuth dance off a 401. |
+| `views/discovery.py` | OAuth 2.0 discovery surface. `protected_resource_metadata` (RFC 9728) at `/.well-known/oauth-protected-resource/mcp/sql` advertises the MCP endpoint's `resource`, the env's `resource_name` (sourced from `MCP_SQL["RESOURCE_NAME"]`; consuming projects typically override this to an env-distinct value), and the AS URL. `authorization_server_metadata` (RFC 8414) at `/.well-known/oauth-authorization-server/o` (path-suffix per RFC 8414 §3.1, matching the `https://<host>/o` issuer) advertises `issuer`, the three OAuth endpoints, the `registration_endpoint`, scopes, grant types, `code_challenge_methods_supported=["S256"]`, and `token_endpoint_auth_methods_supported=["none"]` (public client). Both anonymous-GET, CSRF-exempt. Referenced by `MCPOAuth2Authentication.authenticate_header()` via the `resource_metadata` parameter in `WWW-Authenticate` so MCP clients can bootstrap the OAuth dance off a 401. |
 | `throttle.py` | Shared per-IP fixed-window block backed by the Django cache (use a SHARED backend — Redis, Memcached — in production: with a per-process backend like LocMem the counters, and therefore the block, are per-worker). One primitive, two surfaces: `auth` (`bad_token` scope, silent 401) and `views/registration` (`register` scope, silent inert 201). Both share `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]` / `["BAD_TOKEN_IP_WINDOW_SECONDS"]`; keys are scope-namespaced so one surface never depletes the other's budget. Keys on `REMOTE_ADDR` — sound only behind a hardened edge proxy (see "Watch out: the per-IP throttle trusts the proxy's IP handling"). |
 | `decorators.py` | `cap_request_body(max_bytes)` — the body-size cap on the OAuth endpoints, applied in `urls.py` (64 KiB; `OAUTH_REQUEST_BODY_MAX_BYTES`). Header-only `CONTENT_LENGTH` check (Django's `LimitedStream` truncates an under-declared body to the lie, so the header is the only gate needed), returning a plain 413 before the view reads the body; `functools.wraps` preserves each view's `csrf_exempt` flag. `/mcp/sql/` is capped separately and higher (1 MiB) in `auth.py`, since its body carries the SQL query. |
 | `views/registration.py` | RFC 7591 OAuth 2.0 Dynamic Client Registration endpoint at `/o/register`. Anonymous JSON POST that creates a new `Application` row with the curated public-client / PKCE-required posture and a `mcp-sql-<token>` name (so the prefix-based validator/auth/signal recognise it). Enforces RFC 8252 §7.3 loopback-only `redirect_uris` server-side and applies a **silent** per-IP block via `throttle` — once an IP crosses the threshold it gets an inert 201 (no `Application` row persisted) indistinguishable from success. Request-body size is capped at 64 KiB by `decorators.cap_request_body`, applied to all four OAuth endpoints in `urls.py`; periodic cleanup of stale dynamically-registered Applications is deferred until a concrete abuse pattern names the threat. |
@@ -187,20 +187,6 @@ are out of scope for this subsystem. The DB-role and per-statement guards
 (`VOLUME_ALERT_THRESHOLDS`) are the only enforcement/alerting layers — and
 the tripwire alerts, it does not block. Revisit only if abuse patterns appear.
 
-## OAuth surface
-
-- **Application identity**: two recognised shapes — the exact name `mcp-sql` (the canonical row from migration 0005) and the prefix `mcp-sql-` (every RFC 7591 dynamically-registered client, named `mcp-sql-<urlsafe16>`). Both come from `mcp_sql_settings.APPLICATION_NAME` / `APPLICATION_NAME_PREFIX` (defaults `"mcp-sql"` / `"mcp-sql-"` — note the trailing dash, see "Watch out" for why) plus the helper `consts.is_mcp_application_name(name)`. `MCPOAuth2Validator` / `MCPOAuth2Authentication` use the helper; the logout signal uses `Q(name=APPLICATION_NAME) | Q(name__startswith=APPLICATION_NAME_PREFIX)`. All MCP-purpose Applications carry `client_type=public` (no `client_secret`), `authorization_grant_type=authorization_code`, PKCE-required.
-- **Consent screen asymmetry**: the curated migration-0005 `mcp-sql` Application has `skip_authorization=True`; every DCR-minted `mcp-sql-<token>` Application has `skip_authorization=False`. The curated client is operator-provisioned — its redirect URI is fixed in the migration so there is no rogue-client attack surface — and consent would be friction without security. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template.
-- **Single scope**: `mcp:sql`. `MCPOAuth2Validator` refuses to mint anything else, and `MCPOAuth2Authentication` re-checks the scope on every request.
-- **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The Phase 3.6 registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb`). **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins.
-- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`); refresh tokens "disabled" via `REFRESH_TOKEN_EXPIRE_SECONDS=0` — DOT still mints a `refresh_token` field in the token response (cosmetic), but its lifetime is 0 seconds so it cannot actually be used to refresh. Effective behavior: no usable refresh tokens. Authorization code expires in 60 s.
-- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` (Phase 3.6) are exposed (curated subset of DOT's URLs plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
-- **Issuance gate** at `/o/authorize/`: `is_active AND is_staff AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
-- **Runtime gate** in `MCPOAuth2Authentication.authenticate` (every MCP request): the same issuance checks PLUS an **opt-in** session-existence check. When `MCP_SQL["SESSION_MODEL"]` is set to a session-with-user model, the gate runs `<model>.objects.filter(user=user, expire_date__gt=now()).exists()` and rejects on miss. When `SESSION_MODEL` is unset (`None`, the in-package default), the gate is skipped — stock `django.contrib.sessions.Session` has no `user` FK, so defaulting to it would crash with `FieldError`; making the gate opt-in is the honest contract. Consumers who DO enable the gate get the runtime half of Option D — without it, a Django session can die (cookie cleared, admin deletes the row, `clearsessions` sweeps an expired row, a restart wipes a cache-only session store) while the OAuth bearer outlives it for up to the token's 6h TTL. With the gate enabled, the consumer's `SESSION_COOKIE_AGE` becomes the *real* upper bound on token usefulness rather than just an issuance-time freshness proxy. Explicit logout still has its own fast path via the `user_logged_out` signal regardless of gate setting (revokes tokens immediately so the next request 401s on missing-token, not on missing-session).
-- **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
-- **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` rows (scoped via `application__name__startswith="mcp-sql"`, covering the curated Application and every dynamically-registered client).
-- **Audience binding**: implicit. DOT 3.2.0 + oauthlib 3.3.1 don't natively support RFC 8707 Resource Indicators. Binding is achieved via the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. Revisit when DOT releases first-class RFC 8707 support.
-
 ## Whitelist contract
 
 Each profile's `MCP_SQL["PROFILES"][<name>]["ALLOWED_MODELS"]` is the
@@ -223,7 +209,7 @@ models with `# MCP-EXPOSED: review carefully when adding fields` so
 column-add reviewers see the cue. The `mcp_sql_lint` management
 command is a **local pre-commit aid**, not a CI gate — run it manually
 before opening a PR that adds columns to a whitelisted model.
-Phase 4 may wire it into the pipelines once the gate's signal-to-noise
+It may be wired into the pipelines once the gate's signal-to-noise
 is proven on real PRs; until then "I forgot to run it" is recoverable
 on review, not at merge time.
 
@@ -341,6 +327,20 @@ the standard Django idiom and is more legible — a `git diff` on a single
 view migration shows "we expose these N columns" at a glance, vs
 column-level grants scattered in tooling state.
 
+## OAuth surface
+
+- **Application identity**: two recognised shapes — the exact name `mcp-sql` (the canonical row from migration 0005) and the prefix `mcp-sql-` (every RFC 7591 dynamically-registered client, named `mcp-sql-<urlsafe16>`). Both come from `mcp_sql_settings.APPLICATION_NAME` / `APPLICATION_NAME_PREFIX` (defaults `"mcp-sql"` / `"mcp-sql-"` — note the trailing dash, see "Watch out" for why) plus the helper `consts.is_mcp_application_name(name)`. `MCPOAuth2Validator` / `MCPOAuth2Authentication` use the helper; the logout signal uses `Q(name=APPLICATION_NAME) | Q(name__startswith=APPLICATION_NAME_PREFIX)`. All MCP-purpose Applications carry `client_type=public` (no `client_secret`), `authorization_grant_type=authorization_code`, PKCE-required.
+- **Consent screen asymmetry**: the curated migration-0005 `mcp-sql` Application has `skip_authorization=True`; every DCR-minted `mcp-sql-<token>` Application has `skip_authorization=False`. The curated client is operator-provisioned — its redirect URI is fixed in the migration so there is no rogue-client attack surface — and consent would be friction without security. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template.
+- **Single scope**: `mcp:sql`. `MCPOAuth2Validator` refuses to mint anything else, and `MCPOAuth2Authentication` re-checks the scope on every request.
+- **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb`). **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins.
+- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`); refresh tokens "disabled" via `REFRESH_TOKEN_EXPIRE_SECONDS=0` — DOT still mints a `refresh_token` field in the token response (cosmetic), but its lifetime is 0 seconds so it cannot actually be used to refresh. Effective behavior: no usable refresh tokens. Authorization code expires in 60 s.
+- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
+- **Issuance gate** at `/o/authorize/`: `is_active AND is_staff AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
+- **Runtime gate** in `MCPOAuth2Authentication.authenticate` (every MCP request): the same issuance checks PLUS an **opt-in** session-existence check. When `MCP_SQL["SESSION_MODEL"]` is set to a session-with-user model, the gate runs `<model>.objects.filter(user=user, expire_date__gt=now()).exists()` and rejects on miss. When `SESSION_MODEL` is unset (`None`, the in-package default), the gate is skipped — stock `django.contrib.sessions.Session` has no `user` FK, so defaulting to it would crash with `FieldError`; making the gate opt-in is the honest contract. Consumers who DO enable the gate get the runtime half of Option D — without it, a Django session can die (cookie cleared, admin deletes the row, `clearsessions` sweeps an expired row, a restart wipes a cache-only session store) while the OAuth bearer outlives it for up to the token's 6h TTL. With the gate enabled, the consumer's `SESSION_COOKIE_AGE` becomes the *real* upper bound on token usefulness rather than just an issuance-time freshness proxy. Explicit logout still has its own fast path via the `user_logged_out` signal regardless of gate setting (revokes tokens immediately so the next request 401s on missing-token, not on missing-session).
+- **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
+- **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` rows (scoped via `application__name__startswith="mcp-sql"`, covering the curated Application and every dynamically-registered client).
+- **Audience binding**: implicit. DOT 3.2.0 + oauthlib 3.3.1 don't natively support RFC 8707 Resource Indicators. Binding is achieved via the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. Revisit when DOT releases first-class RFC 8707 support.
+
 ## Naming map
 
 The subsystem's identifiers vary in casing and separator because each
@@ -362,19 +362,18 @@ renaming.
 
 ## Watch out
 
-- **Discovery views trust `ALLOWED_HOSTS` + `SECURE_PROXY_SSL_HEADER`.**
-  `views/discovery.py` builds absolute URLs from `request.scheme` and
-  `request.get_host()`. Two Django-level layers must be sound for the
-  metadata + `WWW-Authenticate` URLs to stay honest: `ALLOWED_HOSTS` is
-  pinned per env (no wildcards), and `SECURE_PROXY_SSL_HEADER` is set
-  whenever a reverse proxy terminates TLS so `request.scheme` reflects
-  the real outer scheme. The proxy itself must also strip
-  client-supplied `X-Forwarded-*` and emit its own. If any of those
-  layers ever loosens — a wildcard `ALLOWED_HOSTS`, a proxy that stops
-  rewriting forwarded headers — the absolute URLs become
-  attacker-influenceable. The `DEBUG=False` branch of `_issuer()` is the
-  structural defense in depth: even if the scheme ever lies, non-dev
-  envs advertise `https://` by construction.
+The load-bearing invariants and footguns, grouped by layer:
+
+- [DB role, connections & `SET LOCAL`](#db-role-connections--set-local)
+- [Parser & executor](#parser--executor)
+- [Auth & permission gating](#auth--permission-gating)
+- [MCP transport & tool dispatch](#mcp-transport--tool-dispatch)
+- [Throttling & proxy trust](#throttling--proxy-trust)
+- [OAuth tokens & client identity](#oauth-tokens--client-identity)
+- [Curated-view migrations](#curated-view-migrations)
+
+### DB role, connections & `SET LOCAL`
+
 - **Role-level GUCs are inert under `SET ROLE`.** `ALTER ROLE r SET param`
   in `role_setup.sql` only fires when something **logs in** as that role.
   `mcp_readonly_role` is `NOLOGIN` and the executor enters via
@@ -440,6 +439,8 @@ renaming.
   migration side — `allow_migrate` refuses to build schema on `mcp_readonly`
   (a lens onto the DB `default` owns) — and abstains from everything else;
   audit writes reach `default` via Django's fallback, not a router pin.
+### Parser & executor
+
 - **Parser-check ordering matters for audit fidelity.** Security-relevant
   reasons fire before ergonomic ones so the audit row names the actual
   problem: WRITEABLE_CTE catches `WITH a AS (DELETE ... RETURNING ...)`
@@ -503,6 +504,8 @@ renaming.
 - **`grants_apply` / `grants_check` refuse `mcp_sql.*` whitelist entries.**
   Letting the agent read its own audit trail defeats the audit. The
   refusal is a code-level guard in addition to the migration-level REVOKE.
+### Auth & permission gating
+
 - **`MCPOAuth2Authentication` is mounted on `/mcp/sql/` only.** It is
   **never** added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
   A token presented to any other DRF endpoint receives no special
@@ -522,6 +525,8 @@ renaming.
   MCP clients (Claude Code) would never receive the challenge they
   need to bootstrap OAuth. The regression is pinned by
   `tests/test_mcp_endpoint.py::TestStockDRFDefaultsDoNotPiercePackage`.
+### MCP transport & tool dispatch
+
 - **`run_query` results are fenced; `rows` is a string, not a list.** The
   `run_query` tool passes `asdict(QueryResult)` through
   `fencing.fence_query_result` before returning, so `rows` (and `error`,
@@ -565,7 +570,7 @@ renaming.
   its asyncio event loop (no auto-thread), and every tool now touches the
   ORM: `run_query` opens the readonly cursor + writes an audit row, and
   `list_tables` / `describe_table` write a metadata audit row via
-  `executor.audit_tool_call` (Phase 4 tool-attribution). A sync ORM call
+  `executor.audit_tool_call` (tool-attribution audit). A sync ORM call
   from inside the running loop trips Django's `SynchronousOnlyOperation`.
   So each tool is `async def` and dispatches its ORM work via
   `sync_to_async(...)(...)` with **`thread_sensitive=False`** — the audit
@@ -611,6 +616,8 @@ renaming.
 - **CSRF is exempt; CORS is default-deny.** Bearer-token auth, not
   session cookies, so CSRF is structurally inapplicable. CORS is not
   added to `CORS_URLS_REGEX`; the endpoint is server-to-server only.
+### Throttling & proxy trust
+
 - **Silent IP block on bad-token probing — observability is one log line per trip.**
   `throttle.is_ip_blocked` (called by `MCPOAuth2Authentication`)
   short-circuits with a generic
@@ -646,6 +653,20 @@ renaming.
   through the cache backend's own health monitoring and the one-shot
   `MCP <scope> counter increment failed` WARNING from
   `throttle.record_attempt`, not through any mcp_sql-maintained counter.
+
+- **Discovery views trust `ALLOWED_HOSTS` + `SECURE_PROXY_SSL_HEADER`.**
+  `views/discovery.py` builds absolute URLs from `request.scheme` and
+  `request.get_host()`. Two Django-level layers must be sound for the
+  metadata + `WWW-Authenticate` URLs to stay honest: `ALLOWED_HOSTS` is
+  pinned per env (no wildcards), and `SECURE_PROXY_SSL_HEADER` is set
+  whenever a reverse proxy terminates TLS so `request.scheme` reflects
+  the real outer scheme. The proxy itself must also strip
+  client-supplied `X-Forwarded-*` and emit its own. If any of those
+  layers ever loosens — a wildcard `ALLOWED_HOSTS`, a proxy that stops
+  rewriting forwarded headers — the absolute URLs become
+  attacker-influenceable. The `DEBUG=False` branch of `_issuer()` is the
+  structural defense in depth: even if the scheme ever lies, non-dev
+  envs advertise `https://` by construction.
 - **The per-IP throttle trusts YOUR deployment's IP handling — you must
   harden it.** Both silent blocks (`bad_token` on `/mcp/sql/`, `register`
   on `/o/register`) key on `request.META["REMOTE_ADDR"]`. The package does
@@ -667,6 +688,8 @@ renaming.
   trusted-proxy list) instead. The same proxy invariant underpins the
   discovery-views bullet above (`ALLOWED_HOSTS` +
   `SECURE_PROXY_SSL_HEADER`).
+### OAuth tokens & client identity
+
 - **Logout revokes the user's MCP tokens** — scoped via
   `Q(application__name=mcp_sql_settings.APPLICATION_NAME) |
   Q(application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX)`.
@@ -692,6 +715,8 @@ renaming.
   the suffix regex); the asymmetry is safe *by direction* — auth **accepts**
   with the strict check, the signal **revokes** with the loose one, so both
   err toward least privilege.
+### Curated-view migrations
+
 - **Curated-view migrations have two mandatory invariants** that any new
   view migration MUST uphold (see the "Curated-view pattern" section
   above for the full recipe):

@@ -4,8 +4,12 @@ The `mcp_readonly_role` is the actual access boundary the MCP read-only SQL
 surface enforces: the layers above it (parser, auth, transport) narrow what
 reaches the database, but the role's `SELECT` grants are what ultimately bound
 which tables are readable. If the role is missing or its grants are wrong, that
-boundary is gone. This runbook covers applying the role and reconciling its
-`SELECT` grants against `MCP_SQL["ALLOWED_MODELS"]`.
+boundary is gone. This runbook covers applying the per-profile read-only
+roles and reconciling their `SELECT` grants against each profile's
+`MCP_SQL["PROFILES"][<name>]["ALLOWED_MODELS"]` whitelist. (Single-tier
+deployments have just the in-package `default` profile and its
+`mcp_readonly_role`; multi-tier deployments add one role per profile — see
+[Profiles](architecture.md#profiles-access-tiers).)
 
 ## Quick Reference
 
@@ -16,11 +20,11 @@ boundary is gone. This runbook covers applying the role and reconciling its
 | Install role on stage/prod | First deploy, or after `role_setup.sql` changes | DBA `psql ... -v app_role=<role> -f role_setup.sql` | Same as above |
 | Reconcile grants (deploy step) | Every deploy, after `migrate` | `python manage.py mcp_sql_grants --apply` | `mcp_sql_grants` exits 0 |
 | Reconcile grants in CI | Every PR | Wire `mcp_sql_grants --apply` against your CI's ephemeral test cluster | CI step exits 0 |
-| Detect grants drift (advisory) | Every `migrate` | `python manage.py migrate` — the `post_migrate` signal in `mcp_sql.signals` LOGs a WARNING when grants drift from `MCP_SQL["ALLOWED_MODELS"]`. Does NOT apply. | WARNING line absent from migrate output |
+| Detect grants drift (advisory) | Every `migrate` | `python manage.py migrate` — the `post_migrate` signal in `mcp_sql.signals` LOGs a WARNING when any profile's grants drift from its whitelist. Does NOT apply. | WARNING line absent from migrate output |
 | Audit grants drift | Pre-deploy verification on stage/prod | `python manage.py mcp_sql_grants` | exit 0 = in sync |
-| End-to-end smoke (Phase 1) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected" |
-| Executor smoke (Phase 2) | After Phase 2 lands, with whitelisted table | `python manage.py mcp_sql_smoke --run-query "SELECT id FROM auth_permission LIMIT 5"` | `QueryResult` printed, audit row created |
-| Add user to MCP cohort | Onboarding / role change | Admin: add user to `mcp_sql_users` group | `user.has_perm("mcp_sql.use_mcp_session")` returns True |
+| End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected" |
+| Executor smoke (full pipeline) | With a whitelisted table | `python manage.py mcp_sql_smoke --run-query "SELECT id FROM auth_permission LIMIT 5"` | `QueryResult` printed, audit row created |
+| Add user to MCP cohort | Onboarding / role change | Admin: add user to the profile's group (`default` profile's is `mcp_sql_users`) | user resolves to exactly one profile (`resolve_profile`) |
 | Revoke a user's MCP tokens | Incident / off-boarding | `AccessToken.objects.filter(user=user).delete()` (or user logs out) | `AccessToken.objects.filter(user=user).count() == 0` |
 | Register Claude Code as MCP client | Once per developer per env | `claude mcp add --transport http <slug-of-RESOURCE_NAME> https://<host>/mcp/sql/` (e.g. `local-my-app`, `stage-my-app`, `my-app`) | First `claude` chat invokes a tool from this surface |
 
@@ -36,7 +40,7 @@ layer only.
 - **Whenever `sql/role_setup.sql` changes** — new GUC,
   new alter, etc. The script is idempotent so re-applying is safe.
 
-After any change to `MCP_SQL["ALLOWED_MODELS"]`, your deploy pipeline
+After any change to any profile's `ALLOWED_MODELS`, your deploy pipeline
 should run `python manage.py mcp_sql_grants --apply` as an explicit step
 (right after `migrate`). The `post_migrate` signal in `mcp_sql.signals` will
 ALSO run on every `migrate`, but only to **detect** drift and log a
@@ -222,8 +226,8 @@ python manage.py mcp_sql_grants --apply
 
 Strict mode — raises `CommandError` if the role is missing or membership
 is absent. **Wire this into the deploy pipeline right after `migrate`** so
-every deploy reconciles `mcp_readonly_role`'s SELECT grants against
-`MCP_SQL["ALLOWED_MODELS"]`. It is the only code path that issues
+every deploy reconciles each profile role's SELECT grants against that
+profile's `ALLOWED_MODELS`. It is the only code path that issues
 `GRANT SELECT` / `REVOKE SELECT` statements; the `post_migrate` signal
 in `mcp_sql.signals` only DETECTS drift and logs a WARNING.
 
@@ -296,8 +300,9 @@ echo "exit: $?"
 
 **3. DB-side ground truth** — `information_schema.role_table_grants`
 lists every grant on `mcp_readonly_role`, sourced directly from PG's
-catalog. The set of tables here must match
-`MCP_SQL["ALLOWED_MODELS"]`'s `_meta.db_table` resolutions exactly:
+catalog. The set of tables here must match the `default` profile's
+`ALLOWED_MODELS` `_meta.db_table` resolutions exactly (substitute the role
+name for another profile):
 
 ```sh
 docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> -d <db_name> -c "
@@ -316,7 +321,7 @@ Expected (with `auth.Permission` whitelisted):
  auth_permission | SELECT
 ```
 
-A divergence between this query and `MCP_SQL["ALLOWED_MODELS"]` means
+A divergence between this query and the profile's `ALLOWED_MODELS` means
 `grants_check` would report drift; the apply step has not run (or has not
 caught up) since the whitelist changed.
 
@@ -327,13 +332,13 @@ caught up) since the whitelist changed.
 After the role is installed and grants are applied, verify the full
 pipeline. There are two modes.
 
-### Phase 1 (default mode)
+### Default mode (role/grants contract)
 
 Asserts the role/grants contract without the parser or executor:
 
 ```sh
-# Env: the `mcp_readonly` DATABASES alias configured; ALLOWED_MODELS
-# committed in your settings (e.g. auth.Permission for a first smoke).
+# Env: the `mcp_readonly` DATABASES alias configured; a profile's
+# ALLOWED_MODELS committed in your settings (e.g. auth.Permission).
 python manage.py mcp_sql_smoke
 ```
 
@@ -353,11 +358,11 @@ security alarm. See the command's source for the diagnostic message.
 If `MCP_READONLY_DATABASE_URL` is not set, the command writes a friendly
 "skipping smoke check" message and exits 0.
 
-### Phase 2 (--run-query)
+### `--run-query` mode (full parser + executor)
 
 Drives the full parser + executor + audit pipeline against a real query.
 Useful for sanity-checking the LIMIT-N+1 truncation contract, the per-cell
-byte cap, and the audit-row shape before opening MCP transport in Phase 3.
+byte cap, and the audit-row shape.
 
 ```sh
 # On stage / prod, pass --as-user so the audit row attributes to a
@@ -399,36 +404,38 @@ python manage.py mcp_sql_smoke --run-query "SELECT pg_read_file('/etc/passwd')"
 
 ---
 
-## Phase 4 scope status
+## What ships today
 
-Phases 1–4 are operational. What ships today:
+The package is operational end to end. The capabilities:
 
-- **Phase 1**: SQL role (`mcp_readonly_role`), audit table
-  (`mcp_sql_mcpquerylog`), grants reconcile/check tooling, lint, smoke
-  (default mode), the `mcp_readonly` DB alias.
-- **Phase 2**: sqlglot AST parser with the full reject vocabulary, the
-  `run_query` executor with LIMIT-N+1 truncation and per-cell byte caps,
-  audit writes on every code path, `mcp_sql_smoke --run-query`.
-- **Phase 3**: OAuth issuance at `/o/authorize/` + `/o/token/`, the
+- **DB-role layer**: per-profile NOLOGIN roles (the in-package `default`
+  ships `mcp_readonly_role`), audit tables (`mcp_sql_mcpquerylog`,
+  `mcp_sql_mcpauthrejectionlog`), grants reconcile/check tooling, the
+  column-add lint command, the smoke command, the `mcp_readonly` DB alias.
+- **Parser + executor**: sqlglot AST parser with the full reject vocabulary,
+  the `run_query` executor with LIMIT-N+1 truncation and per-cell byte caps,
+  an audit write on every code path, `mcp_sql_smoke --run-query`.
+- **OAuth + transport**: issuance at `/o/authorize/` + `/o/token/`, RFC 7591
+  dynamic client registration at `/o/register`, the
   `MCPOAuth2Authentication` DRF auth class with per-request user-state
-  re-validation, the `mcp_sql_users` group, the `mcp-sql` OAuth
-  Application, MCP Streamable HTTP transport at `/mcp/sql/`, logout
-  token revocation. Operational playbooks live in
-  [`oauth.md`](oauth.md).
-- **Phase 4**: per-user query-volume tripwires (hourly + daily, allowed +
-  rejected) emitting one Sentry `ERROR` per window crossing; an `ERROR` when
-  a user is added to the `mcp_sql_users` group; tool-level audit attribution
-  (`MCPQueryLog.tool`); read-only admin browsers for both audit tables + a
-  per-user usage-summary view. Curated PG views for sensitive tables
-  (defined in the owning app) ship via `MCP_SQL["ALLOWED_MODELS"]`.
+  re-validation, per-profile groups/permissions, the `mcp-sql` OAuth
+  Application, MCP Streamable HTTP transport at `/mcp/sql/`, logout token
+  revocation. Operational playbooks live in [`oauth.md`](oauth.md).
+- **Observability**: per-user query-volume tripwires (hourly + daily,
+  allowed + rejected) emitting one Sentry `ERROR` per window crossing; an
+  `ERROR` when a user is added to a profile group; tool-level audit
+  attribution (`MCPQueryLog.tool`); read-only admin browsers for both audit
+  tables + a per-user usage-summary view.
+- **Curated PG views** for sensitive tables (defined in the owning app) ship
+  via a profile's `ALLOWED_MODELS` — see
+  [Curated-view pattern](architecture.md#curated-view-pattern).
 
-What is still pending:
-
-- **Out of scope by design**: per-token / per-minute / concurrent rate
-  limits (the DB role + volume tripwire are the enforcement/alerting
-  layers); periodic cleanup of stale dynamically-registered Applications and
-  audit-table retention.
-- **Phase 5**: independent security hardening review.
+Known gaps and out-of-scope items (each bounded by an existing control) are
+tracked in [`oauth.md` → Roadmap / known gaps](oauth.md#roadmap--known-gaps):
+notably periodic cleanup of stale DCR-minted Applications, expired-token /
+audit-table retention, and (out of scope by design) per-token / per-minute /
+concurrent rate limits. An independent security-hardening review is the
+recommended next milestone before `1.0`.
 
 ---
 

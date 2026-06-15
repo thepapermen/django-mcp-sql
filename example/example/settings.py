@@ -107,7 +107,7 @@ LOGIN_URL = "/admin/login/"
 
 # === MCP SQL config ===
 #
-# Two profiles, to demonstrate TIC-585 multi-role access tiers:
+# Two profiles, to demonstrate multi-role access tiers:
 #
 #   default     — the original flat demo surface: one Django-internal model
 #                 (auth.Permission) so `list_tables` returns something

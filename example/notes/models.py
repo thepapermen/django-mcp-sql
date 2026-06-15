@@ -26,7 +26,7 @@ class Note(models.Model):
 
 
 class MCPNoteSecondProfileView(models.Model):
-    """Curated `mcp_note_second_profile` VIEW — the demonstrator for TIC-585
+    """Curated `mcp_note_second_profile` VIEW — the demonstrator for
     per-role row + column limiting.
 
     The `second_profile` tier's role (`mcp_ro_second_profile`) gets SELECT on

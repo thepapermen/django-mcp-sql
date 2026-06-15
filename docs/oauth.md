@@ -14,10 +14,13 @@ responding to an incident.
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
 - Issuance gate at `/o/authorize/`: `is_active AND is_staff AND
-  is_mfa_enabled AND has_perm("mcp_sql.use_mcp_session")`.
+  is_mfa_enabled AND resolve_profile(user) binds exactly one profile`
+  (the profile gate reads the user's EXPLICIT permission assignments —
+  see [Profiles](architecture.md#profiles-access-tiers); 0 → denied,
+  >1 → denied as ambiguous).
 - Per-request re-validation: the same gate runs on every `/mcp/sql/`
-  request; revoked permission or removed MFA invalidates outstanding
-  tokens immediately.
+  request; a revoked profile assignment or removed MFA invalidates
+  outstanding tokens immediately.
 
 ## Discovery surface
 
@@ -97,7 +100,8 @@ Application named `mcp-sql-<urlsafe-token>`.
 ```
 
 Each `claude mcp add` creates one Application row. The rows live forever
-today (Phase 4 has periodic cleanup planned). Inspect:
+today — periodic cleanup of stale DCR clients is a known unimplemented gap
+(see [Roadmap / known gaps](#roadmap--known-gaps)). Inspect:
 
 ```sh
 python manage.py shell -c "
@@ -133,7 +137,8 @@ synthesized `client_id`
 is inert (no row), so it fails at `/o/authorize/` like any unknown client.
 A blocked operator's only signal is one `WARNING` at the threshold
 crossing; clear early with `cache.delete('mcp_sql:register:ip:<ip>')`.
-Periodic cleanup of stale dynamically-registered Applications is Phase 4.
+Periodic cleanup of stale dynamically-registered Applications is not yet
+implemented (see [Roadmap / known gaps](#roadmap--known-gaps)).
 See `views/registration.py`'s module docstring for the
 full threat-model analysis.
 
@@ -157,12 +162,20 @@ full threat-model analysis.
 
 ## Onboarding a user to the MCP cohort
 
-1. **Pre-flight**: the user must be `is_staff=True` and have MFA
-   configured (allauth TOTP). If not, sort that first via the user admin.
-2. **Add to `mcp_sql_users`**: in Django admin, open the user, attach the
-   `mcp_sql_users` group. The group carries `mcp_sql.use_mcp_session`.
-   (One-off permission attach via `user.user_permissions.add(...)`
-   also works but is not the recommended path.)
+1. **Pre-flight**: the user must be `is_staff=True` and satisfy your
+   configured `MCP_SQL["MFA_CHECKER"]` (MFA is opt-in — the default
+   `deny_unconfigured_mfa` denies everyone until you wire a real predicate,
+   e.g. `allauth.mfa.utils.is_mfa_enabled`). If not, sort that first via the
+   user admin.
+2. **Add to the profile group**: in Django admin, open the user, attach the
+   group for the access tier you're granting. Each `MCP_SQL["PROFILES"]`
+   entry has its own `GROUP_NAME` / `PERMISSION_CODENAME`; the in-package
+   `default` profile's group is `mcp_sql_users` (carrying
+   `mcp_sql.use_mcp_session`). A user must belong to **exactly one** profile
+   group — 0 → denied (`NO_PERM`), >1 → denied as ambiguous
+   (`AMBIGUOUS_PROFILE`). (One-off permission attach via
+   `user.user_permissions.add(...)` also works but is not the recommended
+   path.)
 3. **Register Claude Code as MCP client**: name the server after the
    environment so a developer connected to two envs at once does not
    conflate them. The recommended convention is `slugify(resource_name)`
@@ -283,7 +296,7 @@ Three paths by urgency:
 
 | Urgency | Action | Effect |
 |---|---|---|
-| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's `mcp-sql` Application tokens (`AccessToken.objects.filter(user=user, application__name="mcp-sql").delete()`) |
+| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose tokens — the canonical `mcp-sql` Application **and** every DCR-minted `mcp-sql-<token>` client (`Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
 | Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import AccessToken; AccessToken.objects.filter(user__email='alice@example.com').delete()"` | Outstanding tokens dropped in < 1 s; user can re-OAuth |
 | Operator, kick out | Remove from `mcp_sql_users` group (admin) | Outstanding tokens still exist in DB but `MCPOAuth2Authentication` re-checks the perm on every request and rejects. Combine with the token-delete shell snippet for a clean state. |
 
@@ -338,9 +351,10 @@ within 6 h.
 ### "Group membership changed and I want to confirm old tokens are dead"
 
 Group changes do not delete tokens. But the per-request
-`MCPOAuth2Authentication` rechecks `has_perm("mcp_sql.use_mcp_session")`
-on every call, so a user who lost group membership is locked out of
-`/mcp/sql/` at the next request without waiting for token expiry. If you
+`MCPOAuth2Authentication` re-runs `resolve_profile(user)` on every call —
+a user who lost their profile group (or landed in two) no longer resolves
+to exactly one profile and is locked out of `/mcp/sql/` at the next request
+without waiting for token expiry. If you
 also want the audit / `oauth2_provider_accesstoken` table to reflect
 reality, run the token-delete shell snippet.
 
@@ -429,29 +443,42 @@ volume.
   response, but `REFRESH_TOKEN_EXPIRE_SECONDS=0` sets its lifetime to
   zero — it cannot actually be used to refresh. Effective behavior is
   no-refresh; the field is cosmetic.
-- **Why no idle timeout?** Phase 3 defers this. The 6 h hard cap +
-  logout revocation + 16 h `SESSION_COOKIE_AGE` + per-request
-  session-existence check (see next item) + Phase 4 daily-volume Sentry
-  alerts already bound exposure. Revisit in Phase 4 if abuse patterns
+- **Why no idle timeout?** Out of scope. The 6 h hard cap + logout
+  revocation + the daily-volume Sentry alerts bound exposure for **every**
+  consumer. A consumer that enables the **opt-in** session-existence gate
+  (`MCP_SQL["SESSION_MODEL"]`, see next item) additionally caps token
+  usefulness at its own `SESSION_COOKIE_AGE`. Revisit if abuse patterns
   appear.
-- **Why does MCP stop working when my web session ends?** Every MCP
-  request re-checks that the user holds at least one live Django
-  session (`MCPOAuth2Authentication.authenticate`). This is the
-  *runtime* half of the design's "Option D session-trust" model:
-  issuance trusts a fresh login + MFA, and runtime trusts that the
-  same operator still has at least one live web session somewhere. If
-  the session expires naturally (16 h), an admin deletes it,
-  `clearsessions` cron sweeps an expired row, the operator clears
-  their browser cookies, or a server restart wipes session state, the
-  token immediately stops being honored even though it's not yet at
-  its 6 h hard cap. Recovery: log back in at the Django UI; the next
-  MCP call goes through. No re-OAuth needed if the AccessToken row is
-  still alive — the gate only checks "does any session for this user
-  exist", not "is this token tied to THE session that issued it".
-- **Why "session-trust" and not "fresh 2FA every authorize"?** The 8 h
-  Django session lifetime already requires login + MFA at the boundary,
-  so an active session is itself proof of recent-enough MFA — a separate
-  fresh-TOTP challenge at every issuance would be redundant.
+- **Why does MCP stop working when my web session ends?** Only if you
+  **opted in** to the runtime session-existence gate by setting
+  `MCP_SQL["SESSION_MODEL"]` to a session-with-user model. When it's set,
+  every MCP request re-checks that the user holds at least one live session
+  (`MCPOAuth2Authentication.authenticate`) — the *runtime* half of the
+  design's "Option D session-trust" model: issuance trusts a fresh login +
+  MFA, and runtime trusts that the same operator still has at least one live
+  web session somewhere. With the gate on, if the session expires naturally
+  (at your `SESSION_COOKIE_AGE`), an admin deletes it, `clearsessions`
+  sweeps an expired row, the operator clears their browser cookies, or a
+  server restart wipes session state, the token immediately stops being
+  honored even though it's not yet at its 6 h hard cap. Recovery: log back
+  in at the Django UI; the next MCP call goes through (no re-OAuth needed if
+  the AccessToken row is still alive — the gate only checks "does any
+  session for this user exist", not "is this token tied to THE session that
+  issued it"). **When `SESSION_MODEL` is unset (the default)** — stock
+  `django.contrib.sessions.Session` has no `user` FK, so the gate can't run
+  — the token lives until its 6 h cap or explicit logout, regardless of web
+  session state.
+- **Why "session-trust" and not "fresh 2FA every authorize"?** This rests on
+  two consumer-configured pieces. **MFA is opt-in**: `MCP_SQL["MFA_CHECKER"]`
+  defaults to `deny_unconfigured_mfa` (fail-closed — denies everyone until a
+  consumer wires a real predicate such as `allauth.mfa.utils.is_mfa_enabled`).
+  Once wired, and if the consumer's login flow performs MFA at session
+  establishment, the consumer's `SESSION_COOKIE_AGE` already requires
+  login + MFA at the boundary — so an active session is itself proof of
+  recent-enough MFA, and a separate fresh-TOTP challenge at every issuance
+  would be redundant. If your MFA is *not* tied to session establishment,
+  promote the gate to a `session["mfa_authenticated_at"]` freshness check
+  (see "Error-message verbosity" / threat-model notes).
   Promote the gate to require a `session["mfa_authenticated_at"]`
   freshness check if the threat model ever expands (e.g. whitelist
   grows to include PII tables, the user base grows beyond the
@@ -462,11 +489,15 @@ volume.
 `MCPOAuth2Authentication.authenticate` raises distinct
 `AuthenticationFailed` messages for each gate it fails:
 
-- `"Token was not issued by the mcp-sql Application."`
+- `"Token was not issued by an mcp-sql Application."`
 - `"Token does not carry the mcp:sql scope."`
 - `"User is not an active staff member."`
 - `"User does not have a verified TOTP device."`
-- `"User no longer holds the mcp_sql.use_mcp_session permission."`
+- `"User holds no MCP profile permission."` (resolves to no profile)
+- `"User is assigned to more than one MCP profile; access is denied …"`
+  (ambiguous — resolves to >1 profile)
+- `"No active web session — re-login at the Django UI to re-issue MCP
+  access."` (only when the opt-in `SESSION_MODEL` gate is enabled)
 
 These reach the MCP client (typically Claude Code) as the body of a 401
 response, and from there the user sees them. The verbosity is **deliberate**:
@@ -498,8 +529,8 @@ token against the MCP auth class (expected: `(user, token)` returned).
 
 ## Manual end-to-end smoke
 
-The following sequence verifies the full Phase 3 path against a running
-local deployment (substitute your own start command and hostname):
+The following sequence verifies the full OAuth + MCP transport path against
+a running local deployment (substitute your own start command and hostname):
 
 ```sh
 python manage.py createsuperuser
@@ -542,9 +573,13 @@ re-register via `claude mcp add`.
 
 - Token-table cleanup is **not** automatic beyond expiry. Operators may
   prune expired tokens periodically; the DB load is negligible until the
-  cohort grows substantially. Phase 4 may add a celery beat task.
-- If the `mcp_sql_users` group is deleted, every user loses MCP access.
-  Recreate via the data migration's reverse if needed:
+  cohort grows substantially. A scheduled prune task is a possible future
+  addition (see [Roadmap / known gaps](#roadmap--known-gaps)).
+- If a profile's group (the `default` profile's is `mcp_sql_users`) is
+  deleted, every user in that tier loses MCP access. The `post_migrate`
+  receiver in `mcp_sql.signals` re-provisions every profile's group +
+  permission on the next `migrate`; to recreate the `default` profile's
+  group by hand:
 
   ```python
   from django.contrib.auth.models import Group, Permission
@@ -558,3 +593,27 @@ re-register via `claude mcp add`.
   ```
 
 - Update this runbook if a new failure mode appears.
+
+## Roadmap / known gaps
+
+These are deliberately unimplemented today; each is bounded by an existing
+control so none is a live exposure:
+
+- **Periodic cleanup of stale DCR-minted Applications.** Every
+  `claude mcp add` mints one `mcp-sql-<token>` Application row, and nothing
+  prunes them. Bounded by: loopback-only redirect URIs + the issuance gate +
+  the silent per-IP registration block, so an accumulated row is inert
+  without a live MFA'd cohort user. A scheduled prune could be added if row
+  growth becomes operationally noticeable.
+- **Expired-token / audit-table retention.** Token rows past their 6 h
+  expiry and old `MCPQueryLog` / `MCPAuthRejectionLog` rows are not
+  auto-pruned. Negligible DB load until the cohort grows substantially.
+- **"Application bound to creating user" (full anti-phishing defense).** The
+  consent-screen asymmetry (see [DCR-minted clients require
+  consent](#dcr-minted-clients-require-consent)) converts the silent-GET
+  phishing attack into one needing the victim's active click; binding each
+  DCR client to its creator would close the gap fully, at the cost of a
+  schema change on `oauth2_provider_application`.
+- **Out of scope by design:** per-token / per-minute / concurrent rate
+  limits. The DB role + per-statement GUCs + the per-user volume tripwires
+  are the enforcement/alerting layers.

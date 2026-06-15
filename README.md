@@ -39,8 +39,9 @@ independent layers enforce it, so a bypass has to beat all four:
   with PKCE (RFC 7591/8414/9728 discovery); an unauthenticated client can't even
   open the door.
 
-> **Status**: beta (`0.1.0b2`). The public API and settings shape are
-> stabilizing, but may still shift before `1.0`.
+> **Status**: beta. The public API and settings shape are stabilizing, but
+> may still shift before `1.0`. The PyPI badge above shows the current
+> release.
 
 ## Quickstart — try it in 5 minutes
 
@@ -78,7 +79,7 @@ Three MCP tools mounted at `/mcp/sql/`:
 |---|---|
 | `list_tables()` | Returns the whitelisted db_tables for the surface (sorted). |
 | `describe_table(name)` | Returns column types / null / pk for a whitelisted table. |
-| `run_query(sql, limit=None)` | Validates + executes a single SELECT. Returns `{columns, rows, row_count, truncated, duration_ms, hint, rejection_reason, error, data_handling}`. `rows` (and `error`, when set) come back wrapped in a per-response random-UUID `<untrusted-data-…>` fence so DB content carrying a prompt-injection payload can't be read as agent instructions; `data_handling` explains the boundary. |
+| `run_query(sql, limit=None)` | Validates + executes a single SELECT. Returns `{columns, rows, row_count, truncated, duration_ms, hint, rejection_reason, error, data_handling}`. The `rows`/`error` fields come back inside a prompt-injection fence — see [Security model](#security-model--prompt-injection--untrusted-data). |
 
 Every call writes one append-only `MCPQueryLog` audit row. Every auth
 rejection writes one `MCPAuthRejectionLog` row (six resolved-user gates;
@@ -172,9 +173,22 @@ DATABASES = {
 DATABASE_ROUTERS = ["mcp_sql.db_router.McpSqlRouter"]
 
 MCP_SQL = {
-    "ALLOWED_MODELS": [
-        "auth.Permission",  # your real whitelist goes here
-    ],
+    # At least one access tier (profile) is REQUIRED — the package validates
+    # this at startup and refuses to boot without it. The `default` profile
+    # below reproduces the original single-tier behaviour; add more entries
+    # for multi-tier setups, each with its own unique ROLE /
+    # PERMISSION_CODENAME / GROUP_NAME. See docs/architecture.md "Profiles".
+    "PROFILES": {
+        "default": {
+            "ROLE": "mcp_readonly_role",  # NOLOGIN PG role entered via SET LOCAL ROLE
+            "PERMISSION_CODENAME": "use_mcp_session",  # binds a user to this tier
+            "GROUP_NAME": "mcp_sql_users",
+            "ALLOWED_MODELS": [
+                "auth.Permission",  # your real whitelist goes here
+            ],
+            # "SESSION_CONTEXT": "your_app.scoping.context",  # optional per-row hook
+        },
+    },
     "BAN_SELECT_STAR": True,
     "LIMITS": {"DEFAULT_LIMIT": 10, "HARD_LIMIT": 100, "BYTES_LIMIT": 256 * 1024},
     # Per-user volume tripwires: {decision: {window_seconds: threshold}}.
@@ -186,9 +200,13 @@ MCP_SQL = {
     },
     "BAD_TOKEN_IP_THRESHOLD": 100,
     "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
+    # MFA gate (fail-closed) — set this before onboarding anyone. The default
+    # `deny_unconfigured_mfa` returns False for EVERY user, so the whole MCP
+    # surface is locked out (the app logs a startup WARNING) until you wire a
+    # real check. django-allauth projects use:
+    # "MFA_CHECKER": "allauth.mfa.utils.is_mfa_enabled",
     # Optional overrides — see `mcp_sql/conf.py` DEFAULTS for the full list:
     # "RESOURCE_NAME": "My App",
-    # "MFA_CHECKER": "allauth.mfa.utils.is_mfa_enabled",
     # "SESSION_MODEL": "your_app.Session",  # opt-in runtime session-existence gate;
                                             # must be a session model with a `user` FK
                                             # (stock `django.contrib.sessions.Session`
