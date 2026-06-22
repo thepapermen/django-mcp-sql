@@ -18,8 +18,10 @@ a database login or the ability to write anything.
 > **In one line:** the self-hosted, Postgres-only safe-execution-and-access-control
 > layer that gives Django shops the part of [QueryBear](https://querybear.com) a
 > SaaS can't — an agent reading a precisely-scoped slice of your database, with
-> nothing (credentials, rows, or schema) ever leaving your infrastructure. Bring
-> your own SQL-writing agent. ([How it compares](#how-it-compares).)
+> your database credentials never leaving your infrastructure and the agent able
+> to reach only the slice you expose, never a login or the rest of your data.
+> Bring your own SQL-writing agent. ([How it compares](#how-it-compares) — and
+> [where your data actually goes](#where-your-data-actually-goes).)
 
 **It already runs in production**, mediating an LLM agent's database access
 inside a larger Django application — this package is an extraction of that
@@ -44,6 +46,25 @@ independent layers enforce it, so a bypass has to beat all four:
 - **Nothing reaches it unauthenticated.** The endpoint sits behind OAuth 2.1
   with PKCE (RFC 7591/8414/9728 discovery); an unauthenticated client can't even
   open the door.
+
+### Where your data actually goes
+
+**This package never ships your database anywhere.** Your Postgres credentials
+stay put — the agent authenticates to *you* over OAuth and never holds a
+database login — and anything you didn't whitelist stays invisible, enforced by
+a role that genuinely can't read it.
+
+What the agent *does* receive is the slice you chose to expose: the rows a query
+returns and the schema of the tables you allowed. Those bytes go wherever the
+agent runs. Point a cloud model like Claude at the endpoint and the rows it
+reads travel to that model's provider, exactly like any other prompt — and no
+library on the database side can change that.
+
+Want the queried slice to stay on your hardware too? Run a **local** agent
+against the same endpoint: the access-control and audit story is identical, and
+then nothing leaves at all. So the product doesn't keep your data *in* — it
+controls *which* rows an agent can ever reach, and logs every one that moves.
+Pick your agent accordingly.
 
 > **Status**: beta. The public API and settings shape are stabilizing, but
 > may still shift before `1.0`. The PyPI badge above shows the current
@@ -165,25 +186,19 @@ It isn't really a feature-by-feature contest — it's a fork in the road:
 
 | | Hosted NL→SQL service<br/>(e.g. QueryBear) | Reference / platform MCP server<br/>(e.g. Anthropic, Supabase, Neon) | `django-mcp-sql` |
 |---|---|---|---|
-| **Deployment** | Managed SaaS | Standalone or platform-bundled | Library inside your Django app |
 | **Writes the SQL?** | Yes — natural language → SQL | No — the agent writes it | No — the agent writes it |
-| **Data & credentials** | In the vendor's path | Wherever you run it | Never leave your infrastructure |
-| **Safety model** | Vendor-defined | Varies by implementation | Four independent layers (parser → role grants → sandbox → OAuth), by construction |
+| **Credentials** | Held by the vendor | You hold them | Never leave — the agent never gets a DB login |
+| **Your data** | Passes through the vendor's servers | Wherever you run it | Only the slice you expose leaves — to whatever agent you point at it |
+| **Safety model** | Vendor-defined | Varies by implementation | Four independent layers (parser → role grants → sandbox → OAuth) |
 | **Audit** | Vendor dashboard | Varies | Append-only tables in your own DB |
-| **Best when** | You want answers fast and SaaS is fine | You want a quick MCP bridge | You run Django + Postgres and the data can't leave the building |
-
-("Varies" is honest, not coy — these servers differ widely in how much
-enforcement, auth, and audit they bring, so we don't claim a blanket verdict.)
 
 Pick a hosted service if you want natural-language answers with the least
-setup. Pick this if you already run a Django + Postgres app, your data can't
-leave your perimeter, and you want access that's safe *by construction* and
-auditable line by line — not safe because you trusted a prompt or a vendor.
-
-And if you ever want **both** — natural-language querying *and* self-hosted,
-safe-by-construction execution — they compose rather than compete: a layer that
-turns English into SQL can submit that SQL through this endpoint instead of
-running it itself.
+setup. Pick this if you already run a Django + Postgres app and want access
+that's enforced by four independent layers and auditable line by line — not safe
+because you trusted a prompt or a vendor. And if your data genuinely can't leave
+your perimeter, pair it with a local agent (see [Where your data actually
+goes](#where-your-data-actually-goes)) so the queried slice stays on your
+hardware too.
 
 ## Installation
 
