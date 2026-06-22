@@ -197,17 +197,17 @@ It isn't really a feature-by-feature contest — it's a fork in the road:
 <tr>
 <th align="left">Writes the SQL?</th>
 <td>Yes — natural language → SQL</td>
-<td colspan="2">No — the agent writes it</td>
+<td colspan="2" align="center">No — the agent writes it</td>
 </tr>
 <tr>
 <th align="left">Credentials</th>
 <td>Held by the vendor</td>
-<td colspan="2">You hold them — agent never gets a DB login</td>
+<td colspan="2" align="center">You hold them — agent never gets a DB login</td>
 </tr>
 <tr>
 <th align="left">Your data</th>
 <td>Passes through the vendor's servers</td>
-<td colspan="2">Goes to whatever agent you point at it</td>
+<td colspan="2" align="center">Goes to whatever agent you point at it</td>
 </tr>
 <tr>
 <th align="left">Safety model</th>
