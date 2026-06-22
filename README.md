@@ -184,13 +184,45 @@ Django app you already operate.
 
 It isn't really a feature-by-feature contest — it's a fork in the road:
 
-| | Hosted NL→SQL service<br/>(e.g. QueryBear) | Reference / platform MCP server<br/>(e.g. Anthropic, Supabase, Neon) | `django-mcp-sql` |
-|---|---|---|---|
-| **Writes the SQL?** | Yes — natural language → SQL | No — the agent writes it | No — the agent writes it |
-| **Credentials** | Held by the vendor | You hold them | Never leave — the agent never gets a DB login |
-| **Your data** | Passes through the vendor's servers | Wherever you run it | Only the slice you expose leaves — to whatever agent you point at it |
-| **Safety model** | Vendor-defined | Varies by implementation | Four independent layers (parser → role grants → sandbox → OAuth) |
-| **Audit** | Vendor dashboard | Varies | Append-only tables in your own DB |
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Hosted NL→SQL service<br>(e.g. <a href="https://querybear.com">QueryBear</a>)</th>
+<th>Reference / platform MCP server<br>(e.g. Anthropic, Supabase, Neon)</th>
+<th><code>django-mcp-sql</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<th align="left">Writes the SQL?</th>
+<td>Yes — natural language → SQL</td>
+<td colspan="2">No — the agent writes it</td>
+</tr>
+<tr>
+<th align="left">Credentials</th>
+<td>Held by the vendor</td>
+<td colspan="2">You hold them — agent never gets a DB login</td>
+</tr>
+<tr>
+<th align="left">Your data</th>
+<td>Passes through the vendor's servers</td>
+<td colspan="2">Goes to whatever agent you point at it</td>
+</tr>
+<tr>
+<th align="left">Safety model</th>
+<td>Vendor-defined</td>
+<td>Varies by implementation</td>
+<td>Four independent layers (parser → role grants → sandbox → OAuth)</td>
+</tr>
+<tr>
+<th align="left">Audit</th>
+<td>Vendor dashboard</td>
+<td>Varies</td>
+<td>Append-only tables in your own DB</td>
+</tr>
+</tbody>
+</table>
 
 Pick a hosted service if you want natural-language answers with the least
 setup. Pick this if you already run a Django + Postgres app and want access
