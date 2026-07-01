@@ -224,9 +224,8 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    # "http" for loopback DCR clients (Claude Code). "https" is required by any
-    # "exact" cloud client (Claude — it rides DOT's stock redirect check);
-    # "prefix" clients (ChatGPT) enforce https in their own override.
+    # "http" for loopback DCR clients (Claude Code); "https" is required
+    # whenever CLOUD_CLIENTS is non-empty (the app refuses to boot otherwise).
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
 }
 

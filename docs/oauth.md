@@ -379,11 +379,10 @@ that public `https` origin (if a proxy terminates TLS, set
    idempotent, but a plain web-process restart does **not** provision it. If you
    added the entry without migrating, run `python manage.py migrate` (a no-op
    still fires the receiver).
-2. If any entry is `REDIRECT_MATCH: "exact"` (e.g. Claude), ensure `"https"` is
-   in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` — exact clients ride
-   DOT's stock redirect check, which enforces that list, so without `"https"`
-   the app refuses to boot. (`"prefix"` clients enforce `https` in their own
-   override and don't need it.)
+2. Ensure `"https"` is in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` —
+   whenever `CLOUD_CLIENTS` is non-empty the app **refuses to boot** without it
+   (cloud callbacks are `https`). DOT's default already includes `https`; you
+   only hit this if you narrowed the list (e.g. to `["http"]` for loopback DCR).
 3. In the provider's connector UI, add a custom MCP connector pointing at
    `https://<host>/mcp/sql/`, open its **Advanced / manual client_id** field,
    and paste the derived `client_id` (`mcp-sql-cloud.<NAME>`). Leave the client

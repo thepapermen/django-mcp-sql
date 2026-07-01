@@ -107,7 +107,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         neither widens nor weakens the loopback/exact paths.
 
         Why cloud clients need this + the exact-vs-prefix rationale:
-        `docs/oauth.md` → "Cloud clients (opt-in Category-B support)".
+        `docs/oauth.md` → "Cloud clients".
         """
         cloud = mcp_sql_settings.cloud_clients().get(client_id)
         if cloud is not None and cloud.redirect_match == "prefix":

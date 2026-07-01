@@ -90,7 +90,7 @@ class McpSqlSettings(TypedDict):
     APPLICATION_NAME_PREFIX: NotRequired[str]
     SCOPE: NotRequired[str]
     DB_ALIAS: NotRequired[str]
-    # Opt-in cloud (Category-B) clients. Empty / absent = feature off.
+    # Opt-in cloud clients. Empty / absent = feature off.
     CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
 
 
@@ -272,11 +272,11 @@ def _validate_cloud_redirect_uri(name: str, match: str, uri: str) -> None:
 
 def _validate_cloud_clients(clients: list[Mapping[str, Any]]) -> None:
     """Each CLOUD_CLIENTS entry: a unique slug NAME, REDIRECT_MATCH in
-    {"exact", "prefix"}, and a hardened https REDIRECT_URI. If any entry is
-    "exact", https must also be in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]
-    (see below). Empty list (the default) is a no-op — the feature is off. What
-    the setting enables and how the cloud login works: `docs/oauth.md` →
-    "Cloud clients (opt-in Category-B support)"."""
+    {"exact", "prefix"}, and a hardened https REDIRECT_URI. When CLOUD_CLIENTS is
+    non-empty, https must also be in
+    OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] (see below). Empty list (the
+    default) is a no-op — the feature is off. What the setting enables and how
+    the cloud login works: `docs/oauth.md` → "Cloud clients"."""
     seen: set[str] = set()
     for entry in clients:
         name = entry["NAME"]
@@ -300,23 +300,23 @@ def _validate_cloud_clients(clients: list[Mapping[str, Any]]) -> None:
             raise ImproperlyConfigured(msg)
         _validate_cloud_redirect_uri(name, match, entry["REDIRECT_URI"])
 
-    # An "exact" cloud client rides DOT's stock redirect validation, which
-    # enforces OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]. Its callback is
-    # https, so https MUST be in that allowlist or every exact-client login
-    # fails opaquely at /o/authorize/ (a "prefix" client bypasses this via the
-    # _redirect_under_prefix override, which enforces https itself). DOT's
-    # default is ["http", "https"], so this only bites a consumer who narrowed
-    # it (e.g. to ["http"] for loopback DCR) — catch it loudly at startup
-    # rather than silently at consent-redirect time.
-    if any(entry["REDIRECT_MATCH"] == "exact" for entry in clients):
+    # Every cloud client has an https callback, so if CLOUD_CLIENTS is non-empty
+    # https MUST be in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]. An
+    # "exact" client would else fail opaquely at /o/authorize/ (it rides DOT's
+    # stock redirect check, which enforces this list); a "prefix" client bypasses
+    # that check via the _redirect_under_prefix override, but https is required
+    # uniformly anyway so the config is self-consistent and a prefix-only setup
+    # can't silently break the day an exact client is added. DOT's default is
+    # ["http", "https"], so this only bites a consumer who narrowed it (e.g. to
+    # ["http"] for loopback DCR) — fail loudly at startup.
+    if clients:
         oauth_cfg = getattr(settings, "OAUTH2_PROVIDER", {})
         schemes = oauth_cfg.get("ALLOWED_REDIRECT_URI_SCHEMES", ["http", "https"])
         if "https" not in schemes:
             msg = (
-                "MCP_SQL.CLOUD_CLIENTS declares an 'exact' cloud client with an "
-                "https callback, but OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES']"
-                f" = {list(schemes)!r} does not include 'https' — exact-match "
-                "cloud logins would fail at /o/authorize/. Add 'https' to "
+                "MCP_SQL.CLOUD_CLIENTS is non-empty (cloud clients use https "
+                "callbacks), but OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'] "
+                f"= {list(schemes)!r} does not include 'https'. Add 'https' to "
                 "ALLOWED_REDIRECT_URI_SCHEMES."
             )
             raise ImproperlyConfigured(msg)

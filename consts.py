@@ -46,14 +46,14 @@ def is_mcp_application_name(name: str) -> bool:
     """
     if name == mcp_sql_settings.APPLICATION_NAME:
         return True
-    # Operator-declared cloud clients (opt-in Category-B). Recognition is
+    # Operator-declared cloud clients (opt-in). Recognition is
     # SETTINGS-GATED: a cloud client is recognised only while its entry is
     # present in MCP_SQL["CLOUD_CLIENTS"], so removing the entry de-recognises
     # its outstanding tokens at the very next request (fail-closed). The
     # derived client_id carries a "." after "cloud", so it can never match the
     # DCR suffix shape below — the two namespaces stay disjoint and removal is
     # absolute (a removed cloud id can't leak back in via the DCR branch).
-    # How cloud logins work: docs/oauth.md → "Cloud clients (opt-in Category-B)".
+    # How cloud logins work: docs/oauth.md → "Cloud clients".
     if name in mcp_sql_settings.cloud_clients():
         return True
     prefix = mcp_sql_settings.APPLICATION_NAME_PREFIX

@@ -1,4 +1,4 @@
-"""Opt-in cloud-client (Category-B) support.
+"""Opt-in cloud-client support.
 
 Covers the settings validation, the derived client_id, settings-gated
 recognition, the `post_migrate` provisioning receiver, the prefix
@@ -113,8 +113,9 @@ class TestCloudClientValidation:
             validate_mcp_sql_settings(_cfg(clients))
 
     def test_exact_client_requires_https_in_scheme_allowlist(self, settings):
-        # An "exact" client rides DOT's ALLOWED_REDIRECT_URI_SCHEMES; without
-        # https it would fail opaquely at /o/authorize/, so boot loudly instead.
+        # Any cloud client has an https callback; without https in the allowlist
+        # the app must refuse to boot (an exact client would else fail opaquely
+        # at /o/authorize/).
         settings.OAUTH2_PROVIDER = {
             **settings.OAUTH2_PROVIDER,
             "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],
@@ -122,14 +123,26 @@ class TestCloudClientValidation:
         with pytest.raises(ImproperlyConfigured, match="ALLOWED_REDIRECT_URI_SCHEMES"):
             validate_mcp_sql_settings(_cfg([CLAUDE]))
 
-    def test_prefix_only_config_unaffected_by_scheme_allowlist(self, settings):
-        # A "prefix" client bypasses DOT's allowlist (it enforces https itself),
-        # so an http-only allowlist is valid for a prefix-only config.
+    def test_prefix_only_config_also_requires_https(self, settings):
+        # Even a prefix-only config (whose redirect override bypasses DOT's
+        # allowlist at request time) must have https in the allowlist: the guard
+        # fires on ANY non-empty CLOUD_CLIENTS, so the config stays consistent
+        # and can't silently break the day an exact client is added.
         settings.OAUTH2_PROVIDER = {
             **settings.OAUTH2_PROVIDER,
             "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],
         }
-        validate_mcp_sql_settings(_cfg([CHATGPT]))  # no raise
+        with pytest.raises(ImproperlyConfigured, match="ALLOWED_REDIRECT_URI_SCHEMES"):
+            validate_mcp_sql_settings(_cfg([CHATGPT]))
+
+    def test_cloud_clients_boot_when_https_allowed(self, settings):
+        # Happy path: https present (DOT's default) → non-empty CLOUD_CLIENTS
+        # validates without raising.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
+        }
+        validate_mcp_sql_settings(_cfg([CLAUDE, CHATGPT]))  # no raise
 
 
 # --------------------------------------------------------------------------- #
