@@ -49,6 +49,14 @@ class TestEndpointRouting:
     def test_slashless_path_resolves_to_the_same_view(self):
         assert resolve("/mcp/sql").func is mcp_endpoint
 
+    def test_slashless_post_is_served_not_append_slash_500(self, db, client):
+        # The real symptom the alias guards: a POST to the slash-less path must
+        # reach the (auth-challenging) view and return 401, NOT 500 from
+        # APPEND_SLASH refusing to redirect a POST body. A slash-only route
+        # would raise RuntimeError -> 500 here.
+        resp = client.post("/mcp/sql", data="{}", content_type="application/json")
+        assert resp.status_code == 401
+
 
 class TestSharedAsgiLoop:
     """C1: the a2wsgi bridge must reuse one process-global event loop. a2wsgi

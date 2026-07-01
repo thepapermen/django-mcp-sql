@@ -320,6 +320,17 @@ Empty (the default) means the feature is **off** — the server stays
 loopback-only, exactly as before. This is an allowlist you curate: nothing is
 admitted that you did not name.
 
+> **The client ID to paste into the provider.** It is **derived and stable**,
+> not random: `<APPLICATION_NAME_PREFIX>cloud.<NAME>`. With the default prefix
+> that is **`mcp-sql-cloud.<NAME>`** — e.g. `{"NAME": "claude", …}` →
+> **`mcp-sql-cloud.claude`**. You never invent or look up a random secret; you
+> paste this string as the connector's *OAuth Client ID* and leave the secret
+> blank. Three ways to get it:
+> 1. **`migrate` logs it** — provisioning emits an INFO line per client:
+>    `MCP cloud client 'claude' provisioned — paste client_id 'mcp-sql-cloud.claude' …`.
+> 2. **From config** — `python manage.py shell -c "from mcp_sql.conf import mcp_sql_settings; print(list(mcp_sql_settings.cloud_clients()))"`.
+> 3. **From the DB** — `select client_id from oauth2_provider_application where client_id like 'mcp-sql-cloud.%';`.
+
 **What each entry does.** On `migrate`, a `post_migrate` receiver
 (`provision_mcp_cloud_clients`, mirroring `provision_mcp_profiles`)
 materializes one curated `Application` per entry: public / PKCE,

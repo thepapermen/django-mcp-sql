@@ -209,6 +209,18 @@ def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> N
                 "algorithm": "",
             },
         )
+        # Surface the value the operator must paste into the provider's
+        # connector, at the moment they run `migrate` — the derived client_id
+        # is otherwise easy to miss. (Also findable via `docs/oauth.md` and
+        # `mcp_sql_settings.cloud_clients()`.)
+        logger.info(
+            "MCP cloud client %r provisioned — paste client_id %r into your "
+            "provider's connector as the OAuth Client ID (leave the secret "
+            "blank); callback %s.",
+            client.name,
+            client.client_id,
+            client.redirect_uri,
+        )
 
 
 @receiver(post_migrate)

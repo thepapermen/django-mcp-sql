@@ -36,6 +36,12 @@ if _PUBLIC_ORIGIN:
     # The tunnel terminates TLS and forwards plain http to runserver; tell
     # Django the original scheme + host so the RFC 9728 / RFC 8414 discovery
     # documents and OAuth redirects come out as the public https URLs.
+    #
+    # SECURITY — demo only. Both settings below TRUST client-supplied headers
+    # (X-Forwarded-Proto / X-Forwarded-Host). That is safe ONLY behind a proxy
+    # that STRIPS then re-sets them (as the ngrok/cloudflared tunnel does here).
+    # Do NOT copy this to a directly-exposed origin: a client could spoof
+    # `X-Forwarded-Proto: https` to defeat SSL-redirect / secure-cookie logic.
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     USE_X_FORWARDED_HOST = True
 

@@ -260,6 +260,11 @@ DEFAULTS: dict[str, Any] = {
     #   REDIRECT_URI   — the exact callback ("exact") or the host+path prefix
     #                    ("prefix"). https only; validated at startup.
     #
+    # The client_id you paste into the provider's connector is DERIVED and
+    # stable: "<APPLICATION_NAME_PREFIX>cloud.<NAME>" (default prefix →
+    # "mcp-sql-cloud.<NAME>", e.g. "mcp-sql-cloud.claude"). `migrate` logs it,
+    # or read it from `mcp_sql_settings.cloud_clients()`.
+    #
     # See docs/oauth.md "Cloud clients". Recognition is settings-gated:
     # removing an entry denies its outstanding tokens at the next request.
     #

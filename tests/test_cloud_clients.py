@@ -112,6 +112,25 @@ class TestCloudClientValidation:
         with pytest.raises(ImproperlyConfigured):
             validate_mcp_sql_settings(_cfg(clients))
 
+    def test_exact_client_requires_https_in_scheme_allowlist(self, settings):
+        # An "exact" client rides DOT's ALLOWED_REDIRECT_URI_SCHEMES; without
+        # https it would fail opaquely at /o/authorize/, so boot loudly instead.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],
+        }
+        with pytest.raises(ImproperlyConfigured, match="ALLOWED_REDIRECT_URI_SCHEMES"):
+            validate_mcp_sql_settings(_cfg([CLAUDE]))
+
+    def test_prefix_only_config_unaffected_by_scheme_allowlist(self, settings):
+        # A "prefix" client bypasses DOT's allowlist (it enforces https itself),
+        # so an http-only allowlist is valid for a prefix-only config.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],
+        }
+        validate_mcp_sql_settings(_cfg([CHATGPT]))  # no raise
+
 
 # --------------------------------------------------------------------------- #
 # Derivation + settings-gated recognition                                     #
@@ -248,6 +267,31 @@ class TestValidateRedirectUriOverride:
             is False
         )
 
+    def test_exact_client_delegates_to_super_never_prefix_matching(
+        self, settings, monkeypatch
+    ):
+        # Load-bearing scoping: an "exact" cloud client must fall through to
+        # DOT's stock (exact) matching, NOT the prefix override. Dropping the
+        # `== "prefix"` guard would silently loosen exact clients — this pins it.
+        from oauth2_provider.oauth2_validators import OAuth2Validator
+
+        settings.MCP_SQL = _cfg([CLAUDE])  # REDIRECT_MATCH == "exact"
+        prefix_calls: list = []
+        monkeypatch.setattr(
+            "mcp_sql.oauth._redirect_under_prefix",
+            lambda *a, **k: prefix_calls.append(a) or True,
+        )
+        monkeypatch.setattr(
+            OAuth2Validator,
+            "validate_redirect_uri",
+            lambda self, *a, **k: "DELEGATED-TO-SUPER",
+        )
+        result = MCPOAuth2Validator().validate_redirect_uri(
+            CLAUDE_CLIENT_ID, CLAUDE["REDIRECT_URI"], request=None
+        )
+        assert result == "DELEGATED-TO-SUPER"  # rode DOT stock matching
+        assert prefix_calls == []  # the prefix override was never touched
+
 
 # --------------------------------------------------------------------------- #
 # Provisioning                                                                 #
@@ -277,6 +321,15 @@ class TestCloudProvisioning:
         _provision(settings, [CLAUDE])
         _provision(settings, [CLAUDE])
         assert Application.objects.filter(client_id=CLAUDE_CLIENT_ID).count() == 1
+
+    def test_provisioning_logs_the_client_id_to_paste(self, db, settings, caplog):
+        # Discoverability: `migrate` surfaces the derived client_id operators
+        # must paste into the provider connector.
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="mcp_sql.signals"):
+            _provision(settings, [CLAUDE])
+        assert CLAUDE_CLIENT_ID in caplog.text
 
     def test_redirect_change_syncs_on_reprovision(self, db, settings):
         from oauth2_provider.models import Application
