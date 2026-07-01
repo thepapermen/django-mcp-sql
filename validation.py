@@ -22,6 +22,8 @@ import re
 import sys
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import unquote
+from urllib.parse import urlparse
 
 if sys.version_info >= (3, 12):
     from typing import NotRequired
@@ -33,6 +35,7 @@ else:
 
     from typing_extensions import TypedDict
 
+from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 from pydantic import TypeAdapter
@@ -54,6 +57,15 @@ class ProfileEntry(TypedDict):
     # Optional dormant per-row-context hook: dotted path to
     # `callable(user, profile) -> Mapping[str, str] | None`. Default None.
     SESSION_CONTEXT: NotRequired[str | None]
+
+
+class CloudClientEntry(TypedDict):
+    """One `MCP_SQL["CLOUD_CLIENTS"]` entry. See `conf.CloudClient`."""
+
+    NAME: str
+    # "exact" | "prefix" — value-checked in `_validate_cloud_clients`.
+    REDIRECT_MATCH: str
+    REDIRECT_URI: str
 
 
 class McpSqlSettings(TypedDict):
@@ -78,6 +90,8 @@ class McpSqlSettings(TypedDict):
     APPLICATION_NAME_PREFIX: NotRequired[str]
     SCOPE: NotRequired[str]
     DB_ALIAS: NotRequired[str]
+    # Opt-in cloud clients. Empty / absent = feature off.
+    CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
 
 
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
@@ -213,6 +227,101 @@ def _validate_profiles(profiles: Mapping[str, Mapping[str, Any]]) -> None:
         _validate_profile_entry(name, entry)
 
 
+# A cloud client NAME is a slug; its derived client_id is
+# `<APPLICATION_NAME_PREFIX>cloud.<NAME>` (see `conf.MCPSQLSettings.cloud_clients`).
+# The `.` after "cloud" keeps that id provably disjoint from the DCR
+# `<prefix><22-urlsafe>` shape, so no NAME-length guard against the DCR shape
+# is needed here.
+_CLOUD_CLIENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_VALID_REDIRECT_MATCHES = frozenset({"exact", "prefix"})
+
+
+def _validate_cloud_redirect_uri(name: str, match: str, uri: str) -> None:
+    """A cloud client's REDIRECT_URI must be safe to admit as a non-loopback
+    OAuth callback. Rejects anything an attacker could weaponise if it reached
+    DOT's exact matching or the prefix override: non-https, a userinfo
+    component, a `*` wildcard, or a `..` traversal segment. A "prefix" entry
+    must additionally carry a non-root path AND end with `/` — so the runtime
+    match is anchored at a segment boundary and a sibling like `.../oauthEVIL`
+    cannot slip past `.../oauth`. Mirrors the care in
+    `views/registration.py::_is_loopback_redirect`."""
+    parsed = urlparse(uri)
+    problems: list[str] = []
+    if parsed.scheme != "https":
+        problems.append("use the https scheme")
+    if parsed.username or parsed.password:
+        problems.append("carry no userinfo component")
+    if not parsed.hostname:
+        problems.append("include a host")
+    if "*" in uri:
+        problems.append("contain no '*' wildcard")
+    if ".." in unquote(parsed.path).split("/"):
+        problems.append("contain no '..' path segment (literal or encoded)")
+    if match == "prefix" and parsed.path.strip("/") == "":
+        problems.append("include a non-root path for prefix matching")
+    if match == "prefix" and not parsed.path.endswith("/"):
+        problems.append("end with '/' for prefix matching (segment-anchored)")
+    if problems:
+        joined = "; ".join(problems)
+        msg = (
+            f"MCP_SQL.CLOUD_CLIENTS[{name!r}].REDIRECT_URI {uri!r} is invalid: "
+            f"must {joined}"
+        )
+        raise ImproperlyConfigured(msg)
+
+
+def _validate_cloud_clients(clients: list[Mapping[str, Any]]) -> None:
+    """Each CLOUD_CLIENTS entry: a unique slug NAME, REDIRECT_MATCH in
+    {"exact", "prefix"}, and a hardened https REDIRECT_URI. When CLOUD_CLIENTS is
+    non-empty, https must also be in
+    OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] (see below). Empty list (the
+    default) is a no-op — the feature is off. What the setting enables and how
+    the cloud login works: `docs/oauth.md` → "Cloud clients"."""
+    seen: set[str] = set()
+    for entry in clients:
+        name = entry["NAME"]
+        if not _CLOUD_CLIENT_NAME_RE.fullmatch(name):
+            msg = (
+                f"MCP_SQL.CLOUD_CLIENTS NAME {name!r} must be a slug: a "
+                f"lowercase letter followed by lowercase letters, digits, or "
+                f"hyphens"
+            )
+            raise ImproperlyConfigured(msg)
+        if name in seen:
+            msg = f"MCP_SQL.CLOUD_CLIENTS NAME {name!r} is used more than once"
+            raise ImproperlyConfigured(msg)
+        seen.add(name)
+        match = entry["REDIRECT_MATCH"]
+        if match not in _VALID_REDIRECT_MATCHES:
+            msg = (
+                f"MCP_SQL.CLOUD_CLIENTS[{name!r}].REDIRECT_MATCH {match!r} must "
+                f"be one of {sorted(_VALID_REDIRECT_MATCHES)}"
+            )
+            raise ImproperlyConfigured(msg)
+        _validate_cloud_redirect_uri(name, match, entry["REDIRECT_URI"])
+
+    # Every cloud client has an https callback, so if CLOUD_CLIENTS is non-empty
+    # https MUST be in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]. An
+    # "exact" client would else fail opaquely at /o/authorize/ (it rides DOT's
+    # stock redirect check, which enforces this list); a "prefix" client bypasses
+    # that check via the _redirect_under_prefix override, but https is required
+    # uniformly anyway so the config is self-consistent and a prefix-only setup
+    # can't silently break the day an exact client is added. DOT's default is
+    # ["http", "https"], so this only bites a consumer who narrowed it (e.g. to
+    # ["http"] for loopback DCR) — fail loudly at startup.
+    if clients:
+        oauth_cfg = getattr(settings, "OAUTH2_PROVIDER", {})
+        schemes = oauth_cfg.get("ALLOWED_REDIRECT_URI_SCHEMES", ["http", "https"])
+        if "https" not in schemes:
+            msg = (
+                "MCP_SQL.CLOUD_CLIENTS is non-empty (cloud clients use https "
+                "callbacks), but OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'] "
+                f"= {list(schemes)!r} does not include 'https'. Add 'https' to "
+                "ALLOWED_REDIRECT_URI_SCHEMES."
+            )
+            raise ImproperlyConfigured(msg)
+
+
 def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
     """Validate the `MCP_SQL` settings dict on startup.
 
@@ -262,3 +371,4 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
         raise ImproperlyConfigured(msg)
 
     _validate_profiles(cfg["PROFILES"])
+    _validate_cloud_clients(cfg.get("CLOUD_CLIENTS", []))

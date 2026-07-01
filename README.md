@@ -304,6 +304,20 @@ MCP_SQL = {
                                             # (stock `django.contrib.sessions.Session`
                                             # does NOT qualify — its absence of a `user`
                                             # column is why the default is `None`)
+    # Opt-in cloud MCP clients (Claude.ai, ChatGPT). Omitted / empty (default)
+    # = OFF, loopback only. Each entry provisions a public/PKCE `Application` at
+    # `migrate` and gives you a `mcp-sql-cloud.<NAME>` client_id to paste into
+    # the provider's connector (secret blank). Needs a public HTTPS origin and
+    # "https" in ALLOWED_REDIRECT_URI_SCHEMES below (or the app won't boot).
+    # See docs/oauth.md "Cloud clients".
+    # "CLOUD_CLIENTS": [
+    #     # Claude.ai / Claude Desktop — OAuth client ID is: mcp-sql-cloud.claude
+    #     {"NAME": "claude",  "REDIRECT_MATCH": "exact",
+    #      "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback"},
+    #     # ChatGPT / Codex — OAuth client ID is: mcp-sql-cloud.chatgpt
+    #     {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
+    #      "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
+    # ],
 }
 
 OAUTH2_PROVIDER = {
@@ -314,7 +328,9 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],   # RFC 8252 loopback
+    # "http" alone is fine loopback-only (the default); add "https" whenever
+    # CLOUD_CLIENTS is non-empty, or the app won't boot.
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],   # RFC 8252 loopback; add "https" for cloud clients
 }
 ```
 

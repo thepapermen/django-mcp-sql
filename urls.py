@@ -56,7 +56,13 @@ urlpatterns = [
     ),
     # MCP read-only SQL transport endpoint. Bearer-auth via
     # `MCPOAuth2Authentication`; CSRF is exempt via decorator on the view.
+    # `/mcp/sql/` is canonical (what `reverse()` + the RFC 9728 `resource`
+    # advertise); the slash-less alias below accepts clients that normalise the
+    # trailing slash off the connector URL (Claude.ai's web connector POSTs to
+    # `/mcp/sql`). Without it, `APPEND_SLASH` can't 301-redirect a POST (that
+    # would drop the body) and Django 500s instead of serving the transport.
     path("mcp/sql/", mcp_endpoint, name="mcp_sql_endpoint"),
+    path("mcp/sql", mcp_endpoint),
     # OAuth 2.0 discovery surface (RFC 9728 + RFC 8414). Path layout is
     # spec-mandated: RFC 9728 inserts `.well-known/oauth-protected-resource`
     # after the host, then appends the resource path (`/mcp/sql`); RFC 8414

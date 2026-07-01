@@ -398,6 +398,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 user=user,  # type: ignore[misc]
                 token_pk=str(token.pk),
                 application_name=token.application.name,
+                client_redirect=token.application.redirect_uris or "",
                 reason=reason,
                 error=error,
                 client_ip=request.META.get("REMOTE_ADDR"),

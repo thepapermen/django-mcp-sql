@@ -239,6 +239,7 @@ def _build_mcp_server(
     profile: "Profile",
     token_id: str,
     client_ip: str | None,
+    client_redirect: str = "",
 ) -> FastMCP:
     """Construct a FastMCP server with tools closed over the authenticated
     principal and its bound `profile` (access tier). Called per-request so
@@ -286,6 +287,7 @@ def _build_mcp_server(
             tool=ToolName.LIST_TABLES,
             token_id=token_id,
             client_ip=client_ip,
+            client_redirect=client_redirect,
         )
         return tables
 
@@ -318,6 +320,7 @@ def _build_mcp_server(
             tool=ToolName.DESCRIBE_TABLE,
             token_id=token_id,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             detail=f"describe_table({name!r})",
         )
         if name not in tables.values():
@@ -387,6 +390,7 @@ def _build_mcp_server(
             limit=limit,
             token_id=token_id,
             client_ip=client_ip,
+            client_redirect=client_redirect,
         )
         return fencing.fence_query_result(asdict(result))
 
@@ -482,6 +486,15 @@ def mcp_endpoint(request):
     user = request.user
     token = request.auth
     token_id = str(token.pk) if token is not None else ""
+    # The OAuth redirect_uri the token was issued against (the token's
+    # Application's registered `redirect_uris`) — recorded on the audit rows
+    # for cloud-provider attribution: the provider's true callback for an
+    # "exact" cloud client, the host+path prefix for a "prefix" one, the
+    # loopback URI for canonical / DCR clients. `token.application` is a
+    # non-null FK on every DOT AccessToken, so this is safe when a token is set.
+    client_redirect = (
+        (token.application.redirect_uris or "") if token is not None else ""
+    )
     # Behind a reverse proxy the consumer's real-IP middleware (if wired —
     # see docs/architecture.md "the per-IP throttle trusts YOUR deployment's
     # IP handling") has already rewritten `REMOTE_ADDR` to the derived
@@ -507,7 +520,11 @@ def mcp_endpoint(request):
         )
         raise RuntimeError(msg)
     server = _build_mcp_server(
-        user=user, profile=profile, token_id=token_id, client_ip=client_ip
+        user=user,
+        profile=profile,
+        token_id=token_id,
+        client_ip=client_ip,
+        client_redirect=client_redirect,
     )
     # a2wsgi's `ASGIMiddleware` is a WSGI application by construction, but its
     # stubbed `__call__` is not recognised as the `WSGIApplication` callable

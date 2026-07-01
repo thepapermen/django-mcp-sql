@@ -54,6 +54,33 @@ class Profile:
     session_context: Callable[..., Mapping[str, str] | None] | None = None
 
 
+@dataclass(frozen=True)
+class CloudClient:
+    """One operator-declared cloud MCP client (opt-in).
+
+    Built by `MCPSQLSettings.cloud_clients()` from each
+    `MCP_SQL["CLOUD_CLIENTS"]` entry. `client_id` is the derived, stable
+    Application name / client_id (`<APPLICATION_NAME_PREFIX>cloud.<name>`).
+    The `.` after "cloud" is structural: it keeps the id disjoint from the
+    DCR `<prefix><22 url-safe chars>` shape (a `.` is not in the
+    urlsafe-base64 alphabet), so recognition never leaks through the DCR
+    branch and removing the entry fully de-recognises it. `redirect_match`
+    is "exact" (one fixed provider callback, e.g. Claude.ai) or "prefix"
+    (per-instance callbacks under a fixed host+path, e.g. ChatGPT);
+    `redirect_uri` is that exact URL or that host+path prefix.
+
+    How the cloud login works end-to-end (provider onboarding, the consent +
+    6h re-consent flow, exact-vs-prefix redirect matching, and the governing
+    OAuth 2.1 / PKCE / MCP-authorization spec links): see `docs/oauth.md` →
+    "Cloud clients".
+    """
+
+    name: str
+    client_id: str
+    redirect_match: str
+    redirect_uri: str
+
+
 class ResolutionOutcome(Enum):
     """Non-binding results of `resolve_profile` — fail-closed, never guess."""
 
@@ -208,6 +235,18 @@ DEFAULTS: dict[str, Any] = {
             "ALLOWED_MODELS": [],
         },
     },
+    # === Cloud clients (opt-in) ===
+    #
+    # Operator-declared cloud MCP clients (Claude.ai, ChatGPT/Codex) that
+    # authenticate against a provider-hosted HTTPS callback instead of an
+    # RFC 8252 loopback address. Empty (default) = OFF; `/o/register` DCR stays
+    # loopback-only regardless. Each entry provisions a public/PKCE Application
+    # at `migrate` and yields a client_id to paste into the provider's connector
+    # (secret blank): "<APPLICATION_NAME_PREFIX>cloud.<NAME>" (default:
+    # "mcp-sql-cloud.<NAME>"; `migrate` logs it). NAME = slug; REDIRECT_MATCH =
+    # "exact" | "prefix"; REDIRECT_URI = the https callback or host+path prefix.
+    # Runbook (onboarding, prerequisites, matching): docs/oauth.md "Cloud clients".
+    "CLOUD_CLIENTS": [],
 }
 
 
@@ -235,6 +274,7 @@ class MCPSQLSettings:
     def __init__(self) -> None:
         self._cached: dict[str, Any] = {}
         self._profiles: dict[str, Profile] | None = None
+        self._cloud_clients: dict[str, CloudClient] | None = None
 
     def __getattr__(self, name: str) -> Any:
         # `__getattr__` is only called when the attribute is NOT already
@@ -263,6 +303,7 @@ class MCPSQLSettings:
         """
         self._cached.clear()
         self._profiles = None
+        self._cloud_clients = None
 
     def profiles(self) -> dict[str, Profile]:
         """Resolve `MCP_SQL["PROFILES"]` into `{name: Profile}`.
@@ -287,6 +328,34 @@ class MCPSQLSettings:
                 session_context=import_string(ctx) if ctx else None,
             )
         self._profiles = built
+        return built
+
+    def cloud_clients(self) -> dict[str, CloudClient]:
+        """Resolve `MCP_SQL["CLOUD_CLIENTS"]` into `{client_id: CloudClient}`.
+
+        Keyed by the derived `client_id` so recognition
+        (`consts.is_mcp_application_name`) and the redirect validator
+        (`oauth.MCPOAuth2Validator.validate_redirect_uri`) can look it up by
+        the client_id DOT presents. Cached until `reload()`, so
+        `@override_settings(MCP_SQL=...)` re-reads between tests. Empty (the
+        default) means the opt-in cloud-client feature is off.
+        """
+        if self._cloud_clients is not None:
+            return self._cloud_clients
+        prefix = self.APPLICATION_NAME_PREFIX
+        user_cfg = getattr(settings, "MCP_SQL", {})
+        raw = user_cfg.get("CLOUD_CLIENTS", DEFAULTS["CLOUD_CLIENTS"])
+        built: dict[str, CloudClient] = {}
+        for entry in raw:
+            name = entry["NAME"]
+            client_id = f"{prefix}cloud.{name}"
+            built[client_id] = CloudClient(
+                name=name,
+                client_id=client_id,
+                redirect_match=entry["REDIRECT_MATCH"],
+                redirect_uri=entry["REDIRECT_URI"],
+            )
+        self._cloud_clients = built
         return built
 
     def resolve_profile(self, user: Any) -> Profile | ResolutionOutcome:

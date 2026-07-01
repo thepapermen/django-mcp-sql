@@ -159,6 +159,70 @@ def provision_mcp_profiles(sender: AppConfig | None, **kwargs: object) -> None:
 
 
 @receiver(post_migrate)
+def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> None:
+    """Materialise one OAuth `Application` row per `MCP_SQL["CLOUD_CLIENTS"]`
+    entry (opt-in cloud-client support).
+
+    Full login flow + provider onboarding: `docs/oauth.md` → "Cloud clients".
+
+    Same config-derived, idempotent shape as `provision_mcp_profiles`:
+    settings is the source of truth; the row exists ONLY to satisfy DOT's
+    non-null `Grant` / `AccessToken` FK to `Application` (a client_id must
+    resolve to a real row before a code/token can be persisted). Reuses the
+    curated migration-0005 posture (public client, authorization-code, PKCE,
+    no secret) EXCEPT `skip_authorization=False`: a cloud client's non-loopback
+    redirect makes the consent screen load-bearing — it is what breaks the
+    silent-GET phishing chain the loopback rule otherwise prevents.
+
+    `update_or_create` keeps the row's stored `redirect_uris` in sync with
+    settings on every migrate. Rows for entries later REMOVED from settings are
+    deliberately NOT deleted here: recognition is settings-gated
+    (`consts.is_mcp_application_name` only accepts a cloud client while its
+    entry is present), so a removed client is denied at the next request
+    regardless of a lingering row, and logout revocation still covers it via
+    the `mcp-sql-` prefix. Empty CLOUD_CLIENTS (the default) is a no-op.
+
+    Fires under the same full-plan `migrate` assumption as
+    `provision_mcp_profiles` — `oauth2_provider`'s tables exist by the time
+    any `post_migrate` is emitted.
+    """
+    if sender is None or getattr(sender, "label", None) != "mcp_sql":
+        return
+    using = kwargs.get("using")
+    if using and using != "default":
+        return
+
+    from oauth2_provider.models import Application
+
+    for client in mcp_sql_settings.cloud_clients().values():
+        Application.objects.update_or_create(
+            client_id=client.client_id,
+            defaults={
+                "name": client.client_id,
+                "client_secret": "",
+                "client_type": Application.CLIENT_PUBLIC,
+                "authorization_grant_type": Application.GRANT_AUTHORIZATION_CODE,
+                # Consent required for cloud clients — see docstring.
+                "skip_authorization": False,
+                "redirect_uris": client.redirect_uri,
+                "algorithm": "",
+            },
+        )
+        # Surface the value the operator must paste into the provider's
+        # connector, at the moment they run `migrate` — the derived client_id
+        # is otherwise easy to miss. (Also findable via `docs/oauth.md` and
+        # `mcp_sql_settings.cloud_clients()`.)
+        logger.info(
+            "MCP cloud client %r provisioned — paste client_id %r into your "
+            "provider's connector as the OAuth Client ID (leave the secret "
+            "blank); callback %s.",
+            client.name,
+            client.client_id,
+            client.redirect_uri,
+        )
+
+
+@receiver(post_migrate)
 def audit_grants_drift_after_migrate(
     sender: AppConfig | None, **kwargs: object
 ) -> None:
