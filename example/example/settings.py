@@ -18,6 +18,27 @@ SECRET_KEY = "example-not-for-production"  # noqa: S105
 DEBUG = True
 ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 
+# Public HTTPS origin for testing CLOUD MCP clients (Claude.ai / ChatGPT).
+# Cloud clients authenticate against a provider-hosted callback and vault the
+# token in the provider's cloud, so the server must be reachable over public
+# HTTPS — put a tunnel (ngrok / cloudflared) in front and set
+# EXAMPLE_PUBLIC_ORIGIN to its URL (e.g. https://abc123.ngrok-free.app) before
+# `make runserver`. Loopback Claude Code needs none of this. See the package's
+# docs/oauth.md "Cloud clients (opt-in Category-B)".
+_PUBLIC_ORIGIN = os.environ.get("EXAMPLE_PUBLIC_ORIGIN")
+if _PUBLIC_ORIGIN:
+    from urllib.parse import urlparse as _urlparse
+
+    _public_host = _urlparse(_PUBLIC_ORIGIN).hostname
+    if _public_host:
+        ALLOWED_HOSTS.append(_public_host)
+    CSRF_TRUSTED_ORIGINS = [_PUBLIC_ORIGIN]
+    # The tunnel terminates TLS and forwards plain http to runserver; tell
+    # Django the original scheme + host so the RFC 9728 / RFC 8414 discovery
+    # documents and OAuth redirects come out as the public https URLs.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    USE_X_FORWARDED_HOST = True
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -159,6 +180,20 @@ MCP_SQL = {
     "BAD_TOKEN_IP_THRESHOLD": 100,
     "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     "RESOURCE_NAME": "MCP SQL Example",
+    # Opt-in cloud MCP clients (Category-B). Empty by default = feature off /
+    # loopback-only. Declaring "claude" here provisions a curated
+    # `mcp-sql-cloud.claude` Application (public/PKCE, consent required) whose
+    # client_id the operator pastes into Claude.ai's custom-connector "Advanced
+    # / manual client_id" field. Requires "https" in
+    # OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] below and a public HTTPS
+    # origin (EXAMPLE_PUBLIC_ORIGIN). See docs/oauth.md "Cloud clients".
+    "CLOUD_CLIENTS": [
+        {
+            "NAME": "claude",
+            "REDIRECT_MATCH": "exact",
+            "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback",
+        },
+    ],
     # Stock Django has no MFA. The package default (`deny_unconfigured_mfa`)
     # is fail-closed and would reject every user at the OAuth issuance gate,
     # so the demo wires a permissive checker. Production consumers point this
@@ -176,7 +211,9 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],
+    # "http" for loopback DCR clients (Claude Code); "https" for cloud clients
+    # whose provider-hosted callback is https (Claude.ai / ChatGPT).
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
 }
 
 # Cache backend — Redis if reachable, fall back to LocMem otherwise. The
