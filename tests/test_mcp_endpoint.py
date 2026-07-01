@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 from asgiref.sync import async_to_sync
 from django.test import override_settings
+from django.urls import resolve
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import fencing
@@ -18,6 +19,7 @@ from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
 from mcp_sql.views.mcp_endpoint import _build_mcp_server
 from mcp_sql.views.mcp_endpoint import _get_asgi_loop
 from mcp_sql.views.mcp_endpoint import _invoke_wsgi_app
+from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from rest_framework.test import APIClient
 
 _DEFAULT_PROFILE = Profile(
@@ -28,6 +30,24 @@ _DEFAULT_PROFILE = Profile(
     allowed_models=("auth.Permission",),
     session_context=None,
 )
+
+
+class TestEndpointRouting:
+    """The transport endpoint resolves with AND without the trailing slash.
+
+    Claude.ai's web connector normalises the slash off and POSTs to
+    `/mcp/sql`; `APPEND_SLASH` can't 301-redirect a POST (it would drop the
+    body), so a slash-only route would 500 mid-connect. Both paths must reach
+    the same view. `/mcp/sql/` stays canonical — it is the named route that
+    `reverse()` and the RFC 9728 `resource` advertise.
+    """
+
+    def test_trailing_slash_is_the_canonical_named_route(self):
+        assert reverse("mcp_sql_endpoint") == "/mcp/sql/"
+        assert resolve("/mcp/sql/").func is mcp_endpoint
+
+    def test_slashless_path_resolves_to_the_same_view(self):
+        assert resolve("/mcp/sql").func is mcp_endpoint
 
 
 class TestSharedAsgiLoop:
@@ -121,6 +141,7 @@ class TestBuildMcpServer:
                 "tool": ToolName.LIST_TABLES,
                 "token_id": "t1",
                 "client_ip": "127.0.0.1",
+                "client_redirect": "",
             }
         ]
 
@@ -175,7 +196,7 @@ class TestBuildMcpServer:
         captured: dict = {}
 
         def fake_run_query(  # noqa: PLR0913
-            *, user, profile, raw_sql, limit, token_id, client_ip
+            *, user, profile, raw_sql, limit, token_id, client_ip, client_redirect
         ):
             captured.update(
                 user=user,
@@ -184,6 +205,7 @@ class TestBuildMcpServer:
                 limit=limit,
                 token_id=token_id,
                 client_ip=client_ip,
+                client_redirect=client_redirect,
             )
             return QueryResult(row_count=0)
 
@@ -196,6 +218,7 @@ class TestBuildMcpServer:
             profile=_DEFAULT_PROFILE,
             token_id="tok-42",  # noqa: S106 — opaque DB id, not a credential
             client_ip="10.0.0.7",
+            client_redirect="https://claude.ai/api/mcp/auth_callback",
         )
         run_query = server._tool_manager.get_tool("run_query").fn
         # `run_query` is `async def` so the FastMCP SDK can `await` it from
@@ -215,6 +238,7 @@ class TestBuildMcpServer:
         assert captured["limit"] == 5
         assert captured["token_id"] == "tok-42"
         assert captured["client_ip"] == "10.0.0.7"
+        assert captured["client_redirect"] == "https://claude.ai/api/mcp/auth_callback"
 
 
 @pytest.mark.django_db

@@ -65,6 +65,17 @@ class MCPQueryLog(models.Model):
     truncated = models.BooleanField(default=False)
     result_bytes = models.PositiveIntegerField(null=True, blank=True)
     client_ip = models.GenericIPAddressField(null=True, blank=True)
+    # The OAuth redirect_uri the presenting token was issued against — i.e.
+    # WHERE the authorization code was delivered. For an "exact" cloud client
+    # this is the provider's true callback (the "auth url cannot lie" ground
+    # truth — validated + PKCE-bound at issuance, not an operator-set label);
+    # for a "prefix" cloud client it's the provider host+path prefix; for the
+    # canonical / loopback DCR clients it's the loopback URI. Blank on
+    # pre-existing rows (no data migration). Sourced from the token's
+    # `application.redirect_uris` in `views/mcp_endpoint.py`, where the token
+    # object is in hand, and threaded to the executor like `token_id`. How
+    # cloud logins produce this value: docs/oauth.md → "Cloud clients".
+    client_redirect = models.CharField(max_length=1024, blank=True, default="")
     error = models.TextField(blank=True, default="")
 
     class Meta:
@@ -164,6 +175,10 @@ class MCPAuthRejectionLog(models.Model):
     )
     token_pk = models.CharField(max_length=64, blank=True, default="")
     application_name = models.CharField(max_length=255, blank=True, default="")
+    # The token's Application `redirect_uris` at rejection time — the same
+    # attribution as `MCPQueryLog.client_redirect`. Blank when there is no
+    # token in hand (e.g. the SESSION_LOGOUT revocation rows).
+    client_redirect = models.CharField(max_length=1024, blank=True, default="")
     reason = models.CharField(max_length=64, choices=REASON_CHOICES)
     error = models.TextField(blank=True, default="")
     client_ip = models.GenericIPAddressField(null=True, blank=True)

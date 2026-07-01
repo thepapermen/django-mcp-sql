@@ -62,6 +62,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
     limit: int | None = None,
     token_id: str = "",
     client_ip: str | None = None,
+    client_redirect: str = "",
 ) -> QueryResult:
     """Validate, execute, and audit a single read-only SQL query.
 
@@ -69,8 +70,10 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
     bound access tier (its `ALLOWED_MODELS` become the table whitelist, its
     `role` is entered via `SET LOCAL ROLE`, its optional `SESSION_CONTEXT`
     hook sets per-row GUCs, and its name is recorded on the audit row).
-    `token_id` and `client_ip` are optional. `limit` is clamped to
-    `[DEFAULT_LIMIT, HARD_LIMIT]` from `MCP_SQL["LIMITS"]`.
+    `token_id`, `client_ip`, and `client_redirect` (the OAuth redirect_uri the
+    token was issued against, recorded for cloud-provider attribution) are
+    optional. `limit` is clamped to `[DEFAULT_LIMIT, HARD_LIMIT]` from
+    `MCP_SQL["LIMITS"]`.
     """
     started_at = timezone.now()
     db_alias = mcp_sql_settings.DB_ALIAS
@@ -83,6 +86,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -108,6 +112,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             error=exc.detail,
         )
         return QueryResult(
@@ -142,6 +147,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             truncated=False,
             result_bytes=0,
             client_ip=client_ip,
+            client_redirect=client_redirect,
         )
         return QueryResult(row_count=0, duration_ms=0)
     # LIMIT-injection re-serializes (and may copy) the AST. `parse_and_validate`
@@ -166,6 +172,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             normalized_sql=parsed.normalized_sql,
             started_at=started_at,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             error=msg,
         )
         return QueryResult(
@@ -189,6 +196,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -220,6 +228,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             wrapped_sql=wrapped_sql,
             started_at=started_at,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             exc=exc,
         )
     t0 = perf_counter_ns()
@@ -247,6 +256,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
             started_at=started_at,
             duration_ms=duration_ms,
             client_ip=client_ip,
+            client_redirect=client_redirect,
             error=str(exc),
         )
         return QueryResult(
@@ -286,6 +296,7 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
         truncated=truncated,
         result_bytes=result_bytes,
         client_ip=client_ip,
+        client_redirect=client_redirect,
     )
     return QueryResult(
         columns=columns,
@@ -304,6 +315,7 @@ def audit_tool_call(  # noqa: PLR0913
     tool: str,
     token_id: str = "",
     client_ip: str | None = None,
+    client_redirect: str = "",
     detail: str = "",
 ) -> None:
     """Write one `MCPQueryLog` row for a metadata tool call.
@@ -326,6 +338,7 @@ def audit_tool_call(  # noqa: PLR0913
         raw_sql=detail,
         started_at=timezone.now(),
         client_ip=client_ip,
+        client_redirect=client_redirect,
     )
 
 
@@ -339,6 +352,7 @@ def _hook_failure(  # noqa: PLR0913
     wrapped_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
+    client_redirect: str,
     exc: Exception,
 ) -> QueryResult:
     """Audit + structure a SESSION_CONTEXT-hook failure.
@@ -367,6 +381,7 @@ def _hook_failure(  # noqa: PLR0913
         wrapped_sql=wrapped_sql,
         started_at=started_at,
         client_ip=client_ip,
+        client_redirect=client_redirect,
         error=error,
     )
     return QueryResult(
@@ -384,6 +399,7 @@ def _audit_misconfig(  # noqa: PLR0913
     raw_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
+    client_redirect: str,
     error: str,
 ) -> None:
     """Write a `decision='rejected'` audit row for an operator-error path.
@@ -404,6 +420,7 @@ def _audit_misconfig(  # noqa: PLR0913
         raw_sql=raw_sql,
         started_at=started_at,
         client_ip=client_ip,
+        client_redirect=client_redirect,
         error=error,
     )
 
@@ -425,6 +442,7 @@ class AuditFields(TypedDict):
     raw_sql: str
     started_at: "datetime.datetime"
     client_ip: str | None
+    client_redirect: NotRequired[str]
     error: NotRequired[str]
     normalized_sql: NotRequired[str]
     wrapped_sql: NotRequired[str]
