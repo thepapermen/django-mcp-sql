@@ -7,6 +7,48 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b5 - 2026-07-01
+
+### Added
+
+- **Opt-in cloud MCP clients** (`MCP_SQL["CLOUD_CLIENTS"]`, empty default =
+  feature off / loopback-only). Admits operator-blessed cloud-brokered clients
+  (Claude.ai web/desktop/mobile/Cowork, ChatGPT/Codex-cloud) that authenticate
+  against a provider-hosted HTTPS callback and vault the token in the provider's
+  cloud — **without** relaxing the loopback-only `/o/register` (DCR) endpoint.
+  - Each entry yields a derived, stable `client_id` (`mcp-sql-cloud.<name>`,
+    logged at `migrate`) to paste into the provider's connector, secret left
+    blank. Recognition is settings-gated and fail-closed: removing an entry
+    denies its outstanding tokens at the next `/o/authorize/` and `/mcp/sql/`
+    request.
+  - Provisioning is a `post_migrate` receiver (`provision_mcp_cloud_clients`,
+    mirroring `provision_mcp_profiles`): one curated `Application` per entry
+    (public/PKCE, no secret, `skip_authorization=False`), create/update only,
+    never deleting.
+  - Redirect matching is per-entry `"exact"` (Claude — DOT stock matching) or
+    `"prefix"` (ChatGPT's per-instance callback — one hardened override:
+    https-only, exact host, port-normalised, no userinfo, no traversal,
+    segment-anchored prefix).
+  - New `client_redirect` audit column on `MCPQueryLog` /
+    `MCPAuthRejectionLog` (migration `0012`) records the **issued** redirect URI
+    (ground truth), so cloud-client activity stays attributable in the logs.
+  - No refresh tokens: the 6-hour re-consent applies to cloud clients too.
+  - Operator runbook: `docs/oauth.md` "Cloud clients".
+
+### Changed
+
+- A non-empty `MCP_SQL["CLOUD_CLIENTS"]` now requires `"https"` in
+  `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]`; the app raises
+  `ImproperlyConfigured` at startup otherwise (cloud callbacks are https). DOT's
+  default already allows https, so this only affects a consumer who narrowed the
+  list (e.g. to `["http"]` for loopback DCR). Empty `CLOUD_CLIENTS` (the
+  default) is unaffected.
+- The MCP transport endpoint is now routed at **both** `/mcp/sql/` (canonical —
+  what `reverse()` and the RFC 9728 `resource` advertise) and a slash-less
+  `/mcp/sql` alias, so a cloud connector that normalises the trailing slash off
+  and POSTs to `/mcp/sql` is served rather than triggering an `APPEND_SLASH`
+  500.
+
 ## 0.1.0b4 - 2026-06-15
 
 Documentation-only release (no code changes).
