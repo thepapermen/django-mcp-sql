@@ -161,10 +161,9 @@ def provision_mcp_profiles(sender: AppConfig | None, **kwargs: object) -> None:
 @receiver(post_migrate)
 def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> None:
     """Materialise one OAuth `Application` row per `MCP_SQL["CLOUD_CLIENTS"]`
-    entry (opt-in Category-B / cloud-client support).
+    entry (opt-in cloud-client support).
 
-    Full login flow + provider onboarding: `docs/oauth.md` → "Cloud clients
-    (opt-in Category-B support)".
+    Full login flow + provider onboarding: `docs/oauth.md` → "Cloud clients".
 
     Same config-derived, idempotent shape as `provision_mcp_profiles`:
     settings is the source of truth; the row exists ONLY to satisfy DOT's

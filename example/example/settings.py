@@ -24,7 +24,7 @@ ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 # HTTPS — put a tunnel (ngrok / cloudflared) in front and set
 # EXAMPLE_PUBLIC_ORIGIN to its URL (e.g. https://abc123.ngrok-free.app) before
 # `make runserver`. Loopback Claude Code needs none of this. See the package's
-# docs/oauth.md "Cloud clients (opt-in Category-B)".
+# docs/oauth.md "Cloud clients".
 _PUBLIC_ORIGIN = os.environ.get("EXAMPLE_PUBLIC_ORIGIN")
 if _PUBLIC_ORIGIN:
     from urllib.parse import urlparse as _urlparse
@@ -186,7 +186,7 @@ MCP_SQL = {
     "BAD_TOKEN_IP_THRESHOLD": 100,
     "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     "RESOURCE_NAME": "MCP SQL Example",
-    # Opt-in cloud MCP clients (Category-B). Empty by default = feature off /
+    # Opt-in cloud MCP clients (Claude.ai, ChatGPT). Empty by default = off /
     # loopback-only. Each entry provisions a curated public/PKCE Application
     # (consent required) whose derived client_id the operator pastes into the
     # provider's custom-connector "client_id" field (no secret). Requires
@@ -224,8 +224,9 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    # "http" for loopback DCR clients (Claude Code); "https" for cloud clients
-    # whose provider-hosted callback is https (Claude.ai / ChatGPT).
+    # "http" for loopback DCR clients (Claude Code). "https" is required by any
+    # "exact" cloud client (Claude — it rides DOT's stock redirect check);
+    # "prefix" clients (ChatGPT) enforce https in their own override.
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
 }
 

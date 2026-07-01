@@ -56,13 +56,13 @@ class Profile:
 
 @dataclass(frozen=True)
 class CloudClient:
-    """One operator-declared cloud MCP client (opt-in Category-B support).
+    """One operator-declared cloud MCP client (opt-in).
 
     Built by `MCPSQLSettings.cloud_clients()` from each
     `MCP_SQL["CLOUD_CLIENTS"]` entry. `client_id` is the derived, stable
     Application name / client_id (`<APPLICATION_NAME_PREFIX>cloud.<name>`).
-    The `.` after "cloud" is structural: it keeps the id provably disjoint
-    from the DCR `<prefix><22-char-urlsafe>` shape (a `.` is not in the
+    The `.` after "cloud" is structural: it keeps the id disjoint from the
+    DCR `<prefix><22 url-safe chars>` shape (a `.` is not in the
     urlsafe-base64 alphabet), so recognition never leaks through the DCR
     branch and removing the entry fully de-recognises it. `redirect_match`
     is "exact" (one fixed provider callback, e.g. Claude.ai) or "prefix"
@@ -72,7 +72,7 @@ class CloudClient:
     How the cloud login works end-to-end (provider onboarding, the consent +
     6h re-consent flow, exact-vs-prefix redirect matching, and the governing
     OAuth 2.1 / PKCE / MCP-authorization spec links): see `docs/oauth.md` →
-    "Cloud clients (opt-in Category-B support)".
+    "Cloud clients".
     """
 
     name: str
@@ -235,48 +235,17 @@ DEFAULTS: dict[str, Any] = {
             "ALLOWED_MODELS": [],
         },
     },
-    # === Cloud clients (opt-in Category-B support) ===
+    # === Cloud clients (opt-in) ===
     #
-    # Operator-declared cloud MCP clients (Claude.ai web/desktop/mobile/Cowork,
-    # ChatGPT / Codex-cloud, ...) that authenticate against a provider-hosted
-    # HTTPS callback instead of an RFC 8252 loopback address, and vault the
-    # resulting token in the provider's cloud. Empty list (the default) =
-    # feature OFF. The `/o/register` DCR endpoint stays loopback-only
-    # regardless — cloud clients ride settings-provisioned Application rows
-    # via a manually-configured client_id, never anonymous registration.
-    #
-    # Each entry:
-    #   NAME           — slug (lowercase letter, then letters/digits/hyphens).
-    #                    The Application is provisioned as
-    #                    "<APPLICATION_NAME_PREFIX>cloud.<NAME>" and THAT value
-    #                    is the client_id the operator pastes into the
-    #                    provider's manual-client_id config (secret left blank;
-    #                    these are public + PKCE clients).
-    #   REDIRECT_MATCH — "exact" (a single fixed provider callback, e.g.
-    #                    Claude.ai's https://claude.ai/api/mcp/auth_callback) or
-    #                    "prefix" (per-instance callbacks under a fixed
-    #                    host+path, e.g. ChatGPT's
-    #                    https://chatgpt.com/connector/oauth/).
-    #   REDIRECT_URI   — the exact callback ("exact") or the host+path prefix
-    #                    ("prefix"). https only; validated at startup.
-    #
-    # The client_id you paste into the provider's connector is DERIVED and
-    # stable: "<APPLICATION_NAME_PREFIX>cloud.<NAME>" (default prefix →
-    # "mcp-sql-cloud.<NAME>", e.g. "mcp-sql-cloud.claude"). `migrate` logs it,
-    # or read it from `mcp_sql_settings.cloud_clients()`.
-    #
-    # See docs/oauth.md "Cloud clients". Recognition is settings-gated:
-    # removing an entry denies its outstanding tokens at the next request.
-    #
-    # Example — copy into your settings' MCP_SQL and adapt (the in-package
-    # default below is the empty, feature-off list):
-    #
-    #   "CLOUD_CLIENTS": [
-    #       {"NAME": "claude", "REDIRECT_MATCH": "exact",
-    #        "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback"},  # noqa: ERA001
-    #       {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
-    #        "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},  # noqa: ERA001
-    #   ],
+    # Operator-declared cloud MCP clients (Claude.ai, ChatGPT/Codex) that
+    # authenticate against a provider-hosted HTTPS callback instead of an
+    # RFC 8252 loopback address. Empty (default) = OFF; `/o/register` DCR stays
+    # loopback-only regardless. Each entry provisions a public/PKCE Application
+    # at `migrate` and yields a client_id to paste into the provider's connector
+    # (secret blank): "<APPLICATION_NAME_PREFIX>cloud.<NAME>" (default:
+    # "mcp-sql-cloud.<NAME>"; `migrate` logs it). NAME = slug; REDIRECT_MATCH =
+    # "exact" | "prefix"; REDIRECT_URI = the https callback or host+path prefix.
+    # Runbook (onboarding, prerequisites, matching): docs/oauth.md "Cloud clients".
     "CLOUD_CLIENTS": [],
 }
 

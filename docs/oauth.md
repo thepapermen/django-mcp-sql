@@ -290,7 +290,7 @@ that requires the victim's active participation. Adding the explicit
 is deferred to a future follow-up — closes the gap fully at the cost
 of a schema change on `oauth2_provider_application`.
 
-## Cloud clients (opt-in Category-B support)
+## Cloud clients (opt-in)
 
 Everything above assumes a **loopback** client (Claude Code, a native
 desktop app with a local callback): it runs on the user's machine, receives
@@ -323,13 +323,11 @@ admitted that you did not name.
 > **The client ID to paste into the provider.** It is **derived and stable**,
 > not random: `<APPLICATION_NAME_PREFIX>cloud.<NAME>`. With the default prefix
 > that is **`mcp-sql-cloud.<NAME>`** — e.g. `{"NAME": "claude", …}` →
-> **`mcp-sql-cloud.claude`**. You never invent or look up a random secret; you
-> paste this string as the connector's *OAuth Client ID* and leave the secret
-> blank. Three ways to get it:
-> 1. **`migrate` logs it** — provisioning emits an INFO line per client:
->    `MCP cloud client 'claude' provisioned — paste client_id 'mcp-sql-cloud.claude' …`.
-> 2. **From config** — `python manage.py shell -c "from mcp_sql.conf import mcp_sql_settings; print(list(mcp_sql_settings.cloud_clients()))"`.
-> 3. **From the DB** — `select client_id from oauth2_provider_application where client_id like 'mcp-sql-cloud.%';`.
+> **`mcp-sql-cloud.claude`**. Paste this string as the connector's *OAuth Client
+> ID*; leave the secret blank. Three ways to read it back:
+> 1. **From config** — `python manage.py shell -c "from mcp_sql.conf import mcp_sql_settings; print(list(mcp_sql_settings.cloud_clients()))"`.
+> 2. **From the DB** — `select client_id from oauth2_provider_application where client_id like 'mcp-sql-cloud.%';`.
+> 3. **`migrate` logs it** (if your `LOGGING` surfaces INFO from `mcp_sql`) — an INFO line per client: `MCP cloud client 'claude' provisioned — paste client_id 'mcp-sql-cloud.claude' …`.
 
 **What each entry does.** On `migrate`, a `post_migrate` receiver
 (`provision_mcp_cloud_clients`, mirroring `provision_mcp_profiles`)
@@ -337,10 +335,10 @@ materializes one curated `Application` per entry: public / PKCE,
 `authorization_code`, **no secret**, and — unlike the canonical `mcp-sql` row
 but like every DCR client — `skip_authorization=False` (consent required; the
 redirect is off-device, so the same phishing surface that motivates DCR
-consent applies). The derived, stable `client_id` is `mcp-sql-cloud.<NAME>`
-(e.g. `mcp-sql-cloud.claude`). The `mcp-sql-` prefix means logout revocation
-already covers these tokens; the `.` after `cloud` keeps the id provably
-disjoint from DCR's `mcp-sql-<22-char>` shape.
+consent applies). The `mcp-sql-` prefix on the `client_id` means logout
+revocation already covers these tokens; the `.` after `cloud` keeps the id
+disjoint from DCR's `mcp-sql-<22 url-safe chars>` shape (a `.` is not in the
+url-safe-base64 alphabet).
 
 **Recognition is settings-gated (fail-closed).** A cloud client is accepted
 only while its entry is present in `CLOUD_CLIENTS`. Remove the entry (and
@@ -357,7 +355,7 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
   override.
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
-  — so no single exact URI can be pre-registered. One hardened override
+  — so no single exact URI can be pre-registered. One override
   (`MCPOAuth2Validator.validate_redirect_uri` → `_redirect_under_prefix`)
   accepts a redirect **iff** it is `https`, carries no userinfo, its host
   **exactly equals** the prefix host (never `endswith`, so
@@ -368,13 +366,29 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
 
 **Onboarding a cloud client (operator + user).**
 
-1. Add the entry to `CLOUD_CLIENTS` and `migrate` (or restart — the receiver
-   runs on `post_migrate`; provisioning is idempotent).
-2. In the provider's connector UI, add a custom MCP connector pointing at
+**Before you start.** Unlike a loopback client, a cloud client is driven by the
+*provider's* servers — they fetch your discovery documents and open the
+transport. Your server must therefore be reachable at a **public HTTPS URL**; a
+`localhost` dev server will not work. Put it behind a real deployment or a
+tunnel (ngrok / cloudflared), and make sure the discovery documents advertise
+that public `https` origin (if a proxy terminates TLS, set
+`SECURE_PROXY_SSL_HEADER` and `USE_X_FORWARDED_HOST` — see `example/settings.py`).
+
+1. Add the entry to `CLOUD_CLIENTS` and run `migrate`. Provisioning is a
+   `post_migrate` receiver — it runs on any deploy that migrates and is
+   idempotent, but a plain web-process restart does **not** provision it. If you
+   added the entry without migrating, run `python manage.py migrate` (a no-op
+   still fires the receiver).
+2. If any entry is `REDIRECT_MATCH: "exact"` (e.g. Claude), ensure `"https"` is
+   in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` — exact clients ride
+   DOT's stock redirect check, which enforces that list, so without `"https"`
+   the app refuses to boot. (`"prefix"` clients enforce `https` in their own
+   override and don't need it.)
+3. In the provider's connector UI, add a custom MCP connector pointing at
    `https://<host>/mcp/sql/`, open its **Advanced / manual client_id** field,
    and paste the derived `client_id` (`mcp-sql-cloud.<NAME>`). Leave the client
    secret **blank** (these are public/PKCE clients).
-3. The user connects: login + MFA + the one-click consent screen, then tool
+4. The user connects: login + MFA + the one-click consent screen, then tool
    calls work. As with loopback clients, **consent recurs every 6 h** — token
    TTL is 6 h and refresh tokens are disabled, so a cloud user re-consents each
    time the token expires. There is no "remember me"; this is deliberate (same
@@ -382,12 +396,15 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
    consent](#dcr-minted-clients-require-consent)).
 
 **Strongly recommended: a cloud-tolerant `SESSION_MODEL`.** A cloud client's
-token lives in the provider's cloud, reachable from any device the user is
-signed into there. If your consumer pins MCP sessions to a single
-device/session via `MCP_SQL["SESSION_MODEL"]`, prefer a session model that
-tolerates that multi-device reality so a legitimate cloud login is not
-spuriously rejected. This is a recommendation only — the package neither warns
-nor errors on the combination.
+token lives in the provider's cloud, and a tool call can arrive minutes after
+the user last touched a browser. If you set `MCP_SQL["SESSION_MODEL"]`, the
+runtime gate passes only while the user has an unexpired session row (it keys on
+*user*, not device, so multiple devices are already fine). The pitfall is a
+session model whose rows are torn down the moment the browser tab closes: a
+cloud tool-call arriving later then 401s despite a valid token. Prefer a session
+that outlives the originating tab, or leave `SESSION_MODEL` unset for
+cloud-heavy deployments. This is a recommendation only — the package neither
+warns nor errors on the combination.
 
 **Audit.** Both audit tables carry `client_redirect`: the **issued** redirect
 URI captured from the token's Application (ground truth — the auth URL cannot
@@ -764,7 +781,7 @@ control so none is a live exposure:
   needed. Deferred deliberately — its payoff is directory-scale onboarding we
   do not have, and it adds an SSRF-guarded outbound fetch on the auth path while
   still needing a row for DOT's non-null `Grant.application` FK. Today's
-  settings-declared [cloud clients](#cloud-clients-opt-in-category-b-support)
+  settings-declared [cloud clients](#cloud-clients-opt-in)
   cover the same clients with a curated allowlist and no new network egress; if
   CIMD lands natively in django-oauth-toolkit it becomes an additive
   recognition branch, not a rewrite.
