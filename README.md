@@ -304,6 +304,21 @@ MCP_SQL = {
                                             # (stock `django.contrib.sessions.Session`
                                             # does NOT qualify — its absence of a `user`
                                             # column is why the default is `None`)
+    # Opt-in cloud MCP clients (Category-B) — omitted / empty = OFF (loopback
+    # only, the default). Each entry provisions a curated public/PKCE
+    # `Application` at `migrate`; paste the DERIVED, stable client_id
+    # `mcp-sql-cloud.<NAME>` (also logged at `migrate`) into the provider's
+    # connector, secret left blank. An "exact" client also needs "https" in
+    # ALLOWED_REDIRECT_URI_SCHEMES below, and cloud clients need a public HTTPS
+    # origin. See docs/oauth.md "Cloud clients".
+    # "CLOUD_CLIENTS": [
+    #     # Claude.ai / Claude Desktop — OAuth client ID is: mcp-sql-cloud.claude
+    #     {"NAME": "claude",  "REDIRECT_MATCH": "exact",
+    #      "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback"},
+    #     # ChatGPT / Codex — OAuth client ID is: mcp-sql-cloud.chatgpt
+    #     {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
+    #      "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
+    # ],
 }
 
 OAUTH2_PROVIDER = {

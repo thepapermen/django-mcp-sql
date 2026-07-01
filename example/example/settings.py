@@ -187,17 +187,24 @@ MCP_SQL = {
     "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     "RESOURCE_NAME": "MCP SQL Example",
     # Opt-in cloud MCP clients (Category-B). Empty by default = feature off /
-    # loopback-only. Declaring "claude" here provisions a curated
-    # `mcp-sql-cloud.claude` Application (public/PKCE, consent required) whose
-    # client_id the operator pastes into Claude.ai's custom-connector "Advanced
-    # / manual client_id" field. Requires "https" in
-    # OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] below and a public HTTPS
-    # origin (EXAMPLE_PUBLIC_ORIGIN). See docs/oauth.md "Cloud clients".
+    # loopback-only. Each entry provisions a curated public/PKCE Application
+    # (consent required) whose derived client_id the operator pastes into the
+    # provider's custom-connector "client_id" field (no secret). Requires
+    # "https" in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] below and a
+    # public HTTPS origin (EXAMPLE_PUBLIC_ORIGIN). See docs/oauth.md
+    # "Cloud clients".
     "CLOUD_CLIENTS": [
+        # Claude.ai / Claude Desktop — OAuth client ID is: mcp-sql-cloud.claude
         {
             "NAME": "claude",
             "REDIRECT_MATCH": "exact",
             "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback",
+        },
+        # ChatGPT / Codex — OAuth client ID is: mcp-sql-cloud.chatgpt
+        {
+            "NAME": "chatgpt",
+            "REDIRECT_MATCH": "prefix",
+            "REDIRECT_URI": "https://chatgpt.com/connector/oauth/",
         },
     ],
     # Stock Django has no MFA. The package default (`deny_unconfigured_mfa`)
