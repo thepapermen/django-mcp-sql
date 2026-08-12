@@ -5,19 +5,43 @@
 {% comment %}
 Package default consent page. Layout-agnostic (extends DOT's bundled base);
 consumers re-theme by overriding `mcp_sql/authorize.html` in their own
-template dir. Shows `resource_name` (the configured MCP server display name,
-injected by `MCPAuthorizationView.render_to_response`) instead of DOT's
-opaque per-client `application.name`.
+template dir.
+
+Three values, all injected by `MCPAuthorizationView.render_to_response`:
+`resource_name` names what is being accessed (this MCP server);
+`client_label` names who is asking, and is present ONLY for clients whose
+name the operator configured — a self-registered client sends its own
+`client_name`, so showing that would let anyone label themselves; and
+`client_destination` is where the authorization code will be delivered,
+which oauthlib has already validated and is the fact an attacker cannot
+dress up. DOT's stock template shows `application.name`, which for a
+self-registered client is the opaque `mcp-sql-<token>` and for everyone else
+says nothing about the destination.
+
+Approving this form is what stops a phished authorization link from silently
+handing someone else's process a token, so the destination must stay visible
+in any re-theme.
 {% endcomment %}
 {% block content %}
   <div class="block-center">
     {% if not error %}
       <form id="authorizationForm" method="post">
-        <h3 class="block-center-heading">{% trans "Authorize" %} {{ resource_name|default:application.name }}?</h3>
+        <h3 class="block-center-heading">
+          {% if client_label %}
+            {% blocktrans %}Authorize {{ client_label }} to access {{ resource_name }}?{% endblocktrans %}
+          {% else %}
+            {% blocktrans %}Authorize this client to access {{ resource_name }}?{% endblocktrans %}
+          {% endif %}
+        </h3>
         {% csrf_token %}
         {% for field in form %}
           {% if field.is_hidden %}{{ field }}{% endif %}
         {% endfor %}
+        {% if client_destination %}
+          <p>
+            {% blocktrans %}Sign-in will be completed at <strong>{{ client_destination }}</strong>. Only continue if you started this from there.{% endblocktrans %}
+          </p>
+        {% endif %}
         <p>{% trans "Application requires the following permissions" %}</p>
         <ul>
           {% for scope in scopes_descriptions %}<li>{{ scope }}</li>{% endfor %}

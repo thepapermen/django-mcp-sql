@@ -65,16 +65,29 @@ class MCPQueryLog(models.Model):
     truncated = models.BooleanField(default=False)
     result_bytes = models.PositiveIntegerField(null=True, blank=True)
     client_ip = models.GenericIPAddressField(null=True, blank=True)
-    # The OAuth redirect_uri the presenting token was issued against — i.e.
-    # WHERE the authorization code was delivered. For an "exact" cloud client
-    # this is the provider's true callback (the "auth url cannot lie" ground
-    # truth — validated + PKCE-bound at issuance, not an operator-set label);
-    # for a "prefix" cloud client it's the provider host+path prefix; for the
-    # canonical / loopback DCR clients it's the loopback URI. Blank on
-    # pre-existing rows (no data migration). Sourced from the token's
-    # `application.redirect_uris` in `views/mcp_endpoint.py`, where the token
-    # object is in hand, and threaded to the executor like `token_id`. How
-    # cloud logins produce this value: docs/oauth.md → "Cloud clients".
+    # Which OAuth client presented the token. All three are sourced from the
+    # token's `Application` by `consts.identify_application` (in
+    # `views/mcp_endpoint.py`, where the token object is in hand) and threaded
+    # to the executor as one `ClientIdentity`, like `token_id`. Blank on
+    # pre-existing rows — no data migration.
+    #
+    # `application_name` is the client_id / Application name: `mcp-sql` for the
+    # curated client, `mcp-sql-<token>` for a self-registered one, and
+    # `mcp-sql-<kind>.<slug>` for a settings-declared one.
+    application_name = models.CharField(max_length=255, blank=True, default="")
+    # `clients.ClientKind` — curated | dcr | cloud | local. DERIVED, never
+    # declared: for a declared client it comes from its redirect scheme, which
+    # is why "was this a provider-hosted client or one on someone's laptop?"
+    # has an answer here at all. Blank means the Application classified as
+    # nothing (a rejection path — DOT resolved the token but the client is no
+    # longer part of the MCP surface).
+    client_kind = models.CharField(max_length=16, blank=True, default="")
+    # The presenting Application's REGISTERED `redirect_uris` — the
+    # space-joined set of callbacks that client may use, truncated to fit.
+    # NOT the single URI a given authorization actually delivered to: DOT does
+    # not persist that on `AccessToken`, so the registered set is the closest
+    # available attribution. For a one-callback client the distinction is
+    # moot; for a multi-callback one, read it as "one of these".
     client_redirect = models.CharField(max_length=1024, blank=True, default="")
     error = models.TextField(blank=True, default="")
 
@@ -175,9 +188,14 @@ class MCPAuthRejectionLog(models.Model):
     )
     token_pk = models.CharField(max_length=64, blank=True, default="")
     application_name = models.CharField(max_length=255, blank=True, default="")
-    # The token's Application `redirect_uris` at rejection time — the same
-    # attribution as `MCPQueryLog.client_redirect`. Blank when there is no
-    # token in hand (e.g. the SESSION_LOGOUT revocation rows).
+    # `clients.ClientKind` — the same derived classification as
+    # `MCPQueryLog.client_kind`, so "which clients are generating rejections?"
+    # slices the same way on both tables.
+    client_kind = models.CharField(max_length=16, blank=True, default="")
+    # The token's Application registered `redirect_uris` at rejection time —
+    # the same attribution (and truncation) as `MCPQueryLog.client_redirect`.
+    # Blank when there is no token in hand (e.g. the SESSION_LOGOUT revocation
+    # rows).
     client_redirect = models.CharField(max_length=1024, blank=True, default="")
     reason = models.CharField(max_length=64, choices=REASON_CHOICES)
     error = models.TextField(blank=True, default="")

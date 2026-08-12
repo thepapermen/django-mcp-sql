@@ -25,7 +25,8 @@ executor-misconfig row counts as a `rejected` query too, consistent with
 counting every rejected row; it is independently escalated via its own
 `logger.error`, so the extra increment is accepted noise, not a second
 signal.) The alert names the user — pk plus `get_username()` (the email for
-an email-keyed user model) —
+an email-keyed user model) — and the client that presented the token (its
+client_id plus derived `ClientKind`),
 so a responder can act without a DB lookup; this is appropriate because the
 MCP surface is staff-only (employees, not clients). It never includes the
 SQL text.
@@ -47,7 +48,12 @@ def _volume_key(decision: str, window: int, user_id: object) -> str:
 # model may key on an int, a UUID, or anything else, and this only ever `str()`s
 # it into a cache key — every type supports that, so `object` is the honest type.
 def record_query_volume(
-    *, user_id: object, decision: str, user_label: str = ""
+    *,
+    user_id: object,
+    decision: str,
+    user_label: str = "",
+    client_name: str = "",
+    client_kind: str = "",
 ) -> None:
     """Count one audited query toward this user's per-window volume counters.
 
@@ -62,8 +68,13 @@ def record_query_volume(
     break a query, so a Redis blip logs a sub-Sentry WARNING and returns.
 
     The counter keys on `user_id` (the stable pk); `user_label`
-    (`get_username()`) is carried only for the alert message so the Sentry
-    event names a person, not just a number.
+    (`get_username()`), `client_name`, and `client_kind` are carried only for
+    the alert message. They make the event answer "who, and through what" —
+    the same user hitting a threshold through Claude.ai and through a
+    self-registered client on their laptop are different incidents, and the
+    counter alone cannot tell them apart. Counting stays per (user, decision,
+    window): keying the counters on the client too would let a burst spread
+    across several clients slip under every threshold.
     """
     windows = mcp_sql_config()["VOLUME_ALERT_THRESHOLDS"].get(decision)
     if not windows:
@@ -83,11 +94,13 @@ def record_query_volume(
             continue
         if count == threshold:
             logger.error(
-                "MCP query-volume tripwire: user=%s (pk=%s) decision=%s reached "
-                "%d within a %ds window (threshold=%d) — alert only, the query "
-                "was not blocked.",
+                "MCP query-volume tripwire: user=%s (pk=%s) client=%s (%s) "
+                "decision=%s reached %d within a %ds window (threshold=%d) — "
+                "alert only, the query was not blocked.",
                 user_label or "?",
                 user_id,
+                client_name or "?",
+                client_kind or "?",
                 decision,
                 count,
                 window,

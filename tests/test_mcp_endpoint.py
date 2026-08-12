@@ -13,6 +13,9 @@ from django.urls import resolve
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import fencing
+from mcp_sql.clients import NO_CLIENT
+from mcp_sql.clients import ClientIdentity
+from mcp_sql.clients import ClientKind
 from mcp_sql.conf import Profile
 from mcp_sql.schemas import ToolName
 from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
@@ -29,6 +32,12 @@ _DEFAULT_PROFILE = Profile(
     group_name="mcp_sql_users",
     allowed_models=("auth.Permission",),
     session_context=None,
+)
+
+_CLAUDE_IDENTITY = ClientIdentity(
+    name="mcp-sql-cloud.claude",
+    kind=ClientKind.CLOUD,
+    redirect="https://claude.ai/api/mcp/auth_callback",
 )
 
 
@@ -149,7 +158,7 @@ class TestBuildMcpServer:
                 "tool": ToolName.LIST_TABLES,
                 "token_id": "t1",
                 "client_ip": "127.0.0.1",
-                "client_redirect": "",
+                "client": NO_CLIENT,
             }
         ]
 
@@ -204,7 +213,7 @@ class TestBuildMcpServer:
         captured: dict = {}
 
         def fake_run_query(  # noqa: PLR0913
-            *, user, profile, raw_sql, limit, token_id, client_ip, client_redirect
+            *, user, profile, raw_sql, limit, token_id, client_ip, client
         ):
             captured.update(
                 user=user,
@@ -213,7 +222,7 @@ class TestBuildMcpServer:
                 limit=limit,
                 token_id=token_id,
                 client_ip=client_ip,
-                client_redirect=client_redirect,
+                client=client,
             )
             return QueryResult(row_count=0)
 
@@ -226,7 +235,7 @@ class TestBuildMcpServer:
             profile=_DEFAULT_PROFILE,
             token_id="tok-42",  # noqa: S106 — opaque DB id, not a credential
             client_ip="10.0.0.7",
-            client_redirect="https://claude.ai/api/mcp/auth_callback",
+            client=_CLAUDE_IDENTITY,
         )
         run_query = server._tool_manager.get_tool("run_query").fn
         # `run_query` is `async def` so the FastMCP SDK can `await` it from
@@ -246,7 +255,7 @@ class TestBuildMcpServer:
         assert captured["limit"] == 5
         assert captured["token_id"] == "tok-42"
         assert captured["client_ip"] == "10.0.0.7"
-        assert captured["client_redirect"] == "https://claude.ai/api/mcp/auth_callback"
+        assert captured["client"] is _CLAUDE_IDENTITY
 
 
 @pytest.mark.django_db

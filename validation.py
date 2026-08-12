@@ -22,6 +22,7 @@ import re
 import sys
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import ParseResult
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
@@ -35,13 +36,30 @@ else:
 
     from typing_extensions import TypedDict
 
-from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
+from mcp_sql.clients import LOOPBACK_HOST
+from mcp_sql.clients import MATCH_EXACT
+from mcp_sql.clients import MATCH_PREFIX
+from mcp_sql.clients import VALID_MATCHES
+from mcp_sql.clients import ClientKind
+from mcp_sql.clients import build_clients
+from mcp_sql.clients import redirect_kind
+from mcp_sql.conf import merge_config
+from pydantic import ConfigDict
 from pydantic import TypeAdapter
+
+# `extra="forbid"` on every one of these shapes. A typo'd key would otherwise
+# be silently ignored and the default used in its place — the consumer sees
+# their setting having no effect, with nothing in the logs. It is also what
+# makes a removed/renamed key (see `_REMOVED_KEYS`) a loud boot failure
+# rather than a silent revert to the default.
+_FORBID_EXTRA = ConfigDict(extra="forbid")
 
 
 class McpSqlLimits(TypedDict):
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
     DEFAULT_LIMIT: int
     HARD_LIMIT: int
     BYTES_LIMIT: int
@@ -49,6 +67,8 @@ class McpSqlLimits(TypedDict):
 
 class ProfileEntry(TypedDict):
     """One `MCP_SQL["PROFILES"]` entry — an access tier. See `conf.Profile`."""
+
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
 
     ROLE: str
     PERMISSION_CODENAME: str
@@ -59,39 +79,74 @@ class ProfileEntry(TypedDict):
     SESSION_CONTEXT: NotRequired[str | None]
 
 
-class CloudClientEntry(TypedDict):
-    """One `MCP_SQL["CLOUD_CLIENTS"]` entry. See `conf.CloudClient`."""
+class RedirectRuleEntry(TypedDict):
+    """One rule in a client's `REDIRECTS`. See `clients.RedirectRule`."""
 
-    NAME: str
-    # "exact" | "prefix" — value-checked in `_validate_cloud_clients`.
-    REDIRECT_MATCH: str
-    REDIRECT_URI: str
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
+    # "exact" | "prefix" — value-checked in `_validate_clients`.
+    MATCH: str
+    URI: str
+
+
+class ClientEntry(TypedDict):
+    """One `MCP_SQL["CLIENTS"]` entry. See `clients.DeclaredClient`."""
+
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
+    REDIRECTS: list[RedirectRuleEntry]
+    # Consent-screen display name. Operator-authored — never taken from the
+    # client itself. Defaults to the entry's slug.
+    LABEL: NotRequired[str]
 
 
 class McpSqlSettings(TypedDict):
-    # Required: every consumer must declare these.
+    """The `MCP_SQL` dict, AFTER `conf.merge_config` overlays the defaults.
+
+    Every key is `NotRequired` because every key has an in-package default
+    (`conf.DEFAULTS`) — a consumer declares the subset they want to change,
+    or omits `MCP_SQL` entirely. The merged mapping validated here always
+    carries all of them.
+    """
+
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
     # One entry per access tier; keys are profile names (e.g. "default").
-    PROFILES: dict[str, ProfileEntry]
-    BAN_SELECT_STAR: bool
-    LIMITS: McpSqlLimits
+    PROFILES: NotRequired[dict[str, ProfileEntry]]
+    BAN_SELECT_STAR: NotRequired[bool]
+    LIMITS: NotRequired[McpSqlLimits]
     # `{decision: {window_seconds: threshold}}` — per-user volume tripwires.
     # `decision` keys mirror `MCPQueryLog.DECISION_*` ("allowed"/"rejected");
     # the value-level checks below enforce that closed set.
-    VOLUME_ALERT_THRESHOLDS: dict[str, dict[int, int]]
-    BAD_TOKEN_IP_THRESHOLD: int
-    BAD_TOKEN_IP_WINDOW_SECONDS: int
-    # Optional: have in-package defaults in `mcp_sql.conf.DEFAULTS`.
-    # Consumers override any subset. (Per-profile ROLE / PERMISSION_CODENAME /
-    # GROUP_NAME / ALLOWED_MODELS live inside PROFILES, not here.)
+    VOLUME_ALERT_THRESHOLDS: NotRequired[dict[str, dict[int, int]]]
+    BAD_TOKEN_IP_THRESHOLD: NotRequired[int]
+    BAD_TOKEN_IP_WINDOW_SECONDS: NotRequired[int]
     RESOURCE_NAME: NotRequired[str]
     MFA_CHECKER: NotRequired[str]
-    SESSION_MODEL: NotRequired[str]
+    # `None` (the default) disables the runtime session-existence gate.
+    SESSION_MODEL: NotRequired[str | None]
     APPLICATION_NAME: NotRequired[str]
     APPLICATION_NAME_PREFIX: NotRequired[str]
     SCOPE: NotRequired[str]
     DB_ALIAS: NotRequired[str]
-    # Opt-in cloud clients. Empty / absent = feature off.
-    CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
+    # Declared (non-DCR) clients, keyed by slug. `{}` turns them all off.
+    CLIENTS: NotRequired[dict[str, ClientEntry]]
+
+
+# Keys that existed in an earlier release and are gone. Checked by name so the
+# upgrade error says what to do, instead of pydantic's generic "extra inputs
+# are not permitted". Worth the special case: silently ignoring a stale
+# CLOUD_CLIENTS would empty CLIENTS, de-recognise that consumer's cloud
+# clients, and start rejecting their live tokens at the next request.
+_REMOVED_KEYS = {
+    "CLOUD_CLIENTS": (
+        "renamed to CLIENTS and reshaped: a dict keyed by slug, each entry "
+        "carrying a REDIRECTS list of {'MATCH': 'exact'|'prefix', 'URI': ...} "
+        "rules instead of the singular REDIRECT_MATCH/REDIRECT_URI pair. "
+        "CLIENTS now ships ON by default (claude, chatgpt, cursor) — set "
+        "CLIENTS to {} to run loopback-only. See docs/oauth.md → 'Clients'."
+    ),
+}
 
 
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
@@ -227,116 +282,211 @@ def _validate_profiles(profiles: Mapping[str, Mapping[str, Any]]) -> None:
         _validate_profile_entry(name, entry)
 
 
-# A cloud client NAME is a slug; its derived client_id is
-# `<APPLICATION_NAME_PREFIX>cloud.<NAME>` (see `conf.MCPSQLSettings.cloud_clients`).
-# The `.` after "cloud" keeps that id provably disjoint from the DCR
-# `<prefix><22-urlsafe>` shape, so no NAME-length guard against the DCR shape
+# A client slug; its derived client_id is
+# `<APPLICATION_NAME_PREFIX><kind>.<slug>` (see `clients.build_clients`). The
+# `.` after the kind keeps that id provably disjoint from the DCR
+# `<prefix><22-urlsafe>` shape, so no slug-length guard against the DCR shape
 # is needed here.
-_CLOUD_CLIENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-_VALID_REDIRECT_MATCHES = frozenset({"exact", "prefix"})
+_CLIENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
-def _validate_cloud_redirect_uri(name: str, match: str, uri: str) -> None:
-    """A cloud client's REDIRECT_URI must be safe to admit as a non-loopback
-    OAuth callback. Rejects anything an attacker could weaponise if it reached
-    DOT's exact matching or the prefix override: non-https, a userinfo
-    component, a `*` wildcard, or a `..` traversal segment. A "prefix" entry
-    must additionally carry a non-root path AND end with `/` — so the runtime
-    match is anchored at a segment boundary and a sibling like `.../oauthEVIL`
-    cannot slip past `.../oauth`. Mirrors the care in
-    `views/registration.py::_is_loopback_redirect`."""
+def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
+    """A declared client's redirect URI must be safe to admit as a fixed,
+    non-DCR OAuth callback.
+
+    Two admissible shapes, and `clients.redirect_kind` decides which one this
+    is (that classification also picks the client's namespace, so the checks
+    below are what keeps each namespace's promise):
+
+    * **https** — the provider-hosted shape. Rejects anything an attacker
+      could weaponise if it reached DOT's exact matching or the prefix
+      override: a userinfo component, a `*` wildcard, a `..` traversal
+      segment. A "prefix" entry must additionally carry a non-root path AND
+      end with `/`, so the runtime match is anchored at a segment boundary and
+      a sibling like `.../oauthEVIL` cannot slip past `.../oauth`.
+    * **http on `localhost`** — the machine-local shape, for a client that
+      pins a fixed loopback port and cannot use DCR (Cursor's static
+      `mcp.json` path). "exact" only: prefix-matching a loopback URI would
+      admit ANY path on that port. The port must be explicit, because
+      `http://localhost/cb` silently means port 80 and an operator writing
+      this always has a specific port in mind. `127.0.0.1` / `::1` are
+      refused by `redirect_kind` itself — DOT port-wildcards those two
+      literals, which would quietly widen an exact rule into "any port on the
+      user's machine".
+
+    Mirrors the care in `views/registration.py::_is_loopback_redirect`.
+    """
+    kind = redirect_kind(uri)
+    if kind is None:
+        msg = (
+            f"MCP_SQL.CLIENTS[{name!r}] redirect URI {uri!r} is invalid: must be "
+            f"either an https callback or an "
+            f"http://{LOOPBACK_HOST}:<port>/<path> loopback one. A custom "
+            f"scheme (e.g. 'cursor://') is not supported — admitting one would "
+            f"require widening OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'], "
+            f"which relaxes redirect handling for every OAuth client in the "
+            f"project, not just this one"
+        )
+        raise ImproperlyConfigured(msg)
+
     parsed = urlparse(uri)
-    problems: list[str] = []
-    if parsed.scheme != "https":
-        problems.append("use the https scheme")
-    if parsed.username or parsed.password:
-        problems.append("carry no userinfo component")
-    if not parsed.hostname:
-        problems.append("include a host")
-    if "*" in uri:
-        problems.append("contain no '*' wildcard")
-    if ".." in unquote(parsed.path).split("/"):
-        problems.append("contain no '..' path segment (literal or encoded)")
-    if match == "prefix" and parsed.path.strip("/") == "":
-        problems.append("include a non-root path for prefix matching")
-    if match == "prefix" and not parsed.path.endswith("/"):
-        problems.append("end with '/' for prefix matching (segment-anchored)")
+    problems = [
+        *_universal_redirect_problems(uri, parsed),
+        *(_prefix_problems(kind, parsed) if match == MATCH_PREFIX else ()),
+        *(_loopback_problems(parsed) if kind is ClientKind.LOCAL else ()),
+    ]
     if problems:
         joined = "; ".join(problems)
         msg = (
-            f"MCP_SQL.CLOUD_CLIENTS[{name!r}].REDIRECT_URI {uri!r} is invalid: "
-            f"must {joined}"
+            f"MCP_SQL.CLIENTS[{name!r}] redirect URI {uri!r} is invalid: must {joined}"
         )
         raise ImproperlyConfigured(msg)
 
 
-def _validate_cloud_clients(clients: list[Mapping[str, Any]]) -> None:
-    """Each CLOUD_CLIENTS entry: a unique slug NAME, REDIRECT_MATCH in
-    {"exact", "prefix"}, and a hardened https REDIRECT_URI. When CLOUD_CLIENTS is
-    non-empty, https must also be in
-    OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] (see below). Empty list (the
-    default) is a no-op — the feature is off. What the setting enables and how
-    the cloud login works: `docs/oauth.md` → "Cloud clients"."""
-    seen: set[str] = set()
-    for entry in clients:
-        name = entry["NAME"]
-        if not _CLOUD_CLIENT_NAME_RE.fullmatch(name):
+def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
+    """Checks that hold for every declared redirect URI, whatever its kind."""
+    problems: list[str] = []
+    if parsed.username or parsed.password:
+        problems.append("carry no userinfo component")
+    if "*" in uri:
+        problems.append("contain no '*' wildcard")
+    if ".." in unquote(parsed.path).split("/"):
+        problems.append("contain no '..' path segment (literal or encoded)")
+    return problems
+
+
+def _prefix_problems(kind: ClientKind, parsed: ParseResult) -> list[str]:
+    """Extra checks for a `MATCH: "prefix"` rule."""
+    problems: list[str] = []
+    if kind is ClientKind.LOCAL:
+        problems.append(
+            f"use MATCH '{MATCH_EXACT}' — prefix matching a loopback URI would "
+            f"admit any path on that port"
+        )
+    if parsed.path.strip("/") == "":
+        problems.append("include a non-root path for prefix matching")
+    elif not parsed.path.endswith("/"):
+        problems.append("end with '/' for prefix matching (segment-anchored)")
+    return problems
+
+
+def _loopback_problems(parsed: ParseResult) -> list[str]:
+    """Extra checks for a loopback (`local`-kind) rule."""
+    problems: list[str] = []
+    if parsed.port is None:
+        problems.append("state an explicit port")
+    if parsed.path.strip("/") == "":
+        problems.append("include a non-root path")
+    return problems
+
+
+def _validate_redirect_schemes(kinds: set[ClientKind]) -> None:
+    """Whatever schemes the declared clients need must be allowed by DOT.
+
+    `ALLOWED_REDIRECT_URI_SCHEMES` is enforced by DOT when it issues the 302,
+    so a mismatch fails opaquely at `/o/authorize/` — long after the operator
+    could connect it to their config. Check it at boot instead. (A "prefix"
+    client bypasses DOT's stock check via the `_redirect_under_prefix`
+    override, but the requirement is applied uniformly anyway, so a
+    prefix-only setup can't silently break the day an exact client is added.)
+
+    Read through DOT's OWN accessor rather than off `settings.OAUTH2_PROVIDER`
+    with a hardcoded fallback. `oauth2_settings` applies DOT's defaults, so
+    this checks the value DOT will actually enforce — and it stays right if
+    DOT ever changes that default, where a re-declared fallback here would
+    silently start disagreeing with the code doing the enforcing.
+
+    DOT's default is `["http", "https"]`, which already covers every shape
+    this package admits, so a consumer never needs to declare the setting at
+    all. This only bites one who narrowed it.
+    """
+    from oauth2_provider.settings import oauth2_settings
+
+    required = {
+        "https": ClientKind.CLOUD in kinds,
+        "http": ClientKind.LOCAL in kinds,
+    }
+    schemes = oauth2_settings.ALLOWED_REDIRECT_URI_SCHEMES
+    for scheme, needed in required.items():
+        if needed and scheme not in schemes:
             msg = (
-                f"MCP_SQL.CLOUD_CLIENTS NAME {name!r} must be a slug: a "
-                f"lowercase letter followed by lowercase letters, digits, or "
-                f"hyphens"
+                f"MCP_SQL.CLIENTS declares a {scheme} callback, but "
+                f"OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'] = "
+                f"{list(schemes)!r} does not include {scheme!r}. Add it, or "
+                f"drop those clients from MCP_SQL.CLIENTS. Note that this "
+                f"setting is install-global: it relaxes redirect handling for "
+                f"every OAuth application in the project. DOT's own default "
+                f"({['http', 'https']!r}) already covers both, so the simplest "
+                f"fix is usually to stop declaring the key."
             )
             raise ImproperlyConfigured(msg)
-        if name in seen:
-            msg = f"MCP_SQL.CLOUD_CLIENTS NAME {name!r} is used more than once"
-            raise ImproperlyConfigured(msg)
-        seen.add(name)
-        match = entry["REDIRECT_MATCH"]
-        if match not in _VALID_REDIRECT_MATCHES:
+
+
+def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> None:
+    """Each CLIENTS entry: a slug key, MATCH in {"exact", "prefix"}, a
+    hardened redirect URI per rule, and a single consistent redirect scheme
+    across the entry (enforced by `clients.build_clients`, which derives the
+    kind). Then the scheme guard above. `{}` is a no-op — DCR and the curated
+    Application still work, the surface is just loopback-only. What this
+    setting enables end-to-end: `docs/oauth.md` → "Clients"."""
+    for name, entry in clients.items():
+        if not _CLIENT_NAME_RE.fullmatch(name):
             msg = (
-                f"MCP_SQL.CLOUD_CLIENTS[{name!r}].REDIRECT_MATCH {match!r} must "
-                f"be one of {sorted(_VALID_REDIRECT_MATCHES)}"
+                f"MCP_SQL.CLIENTS key {name!r} must be a slug: a lowercase "
+                f"letter followed by lowercase letters, digits, or hyphens"
             )
             raise ImproperlyConfigured(msg)
-        _validate_cloud_redirect_uri(name, match, entry["REDIRECT_URI"])
+        for rule in entry.get("REDIRECTS") or ():
+            match = rule["MATCH"]
+            if match not in VALID_MATCHES:
+                msg = (
+                    f"MCP_SQL.CLIENTS[{name!r}] MATCH {match!r} must be one of "
+                    f"{sorted(VALID_MATCHES)}"
+                )
+                raise ImproperlyConfigured(msg)
+            _validate_redirect_uri(name, match, rule["URI"])
 
-    # Every cloud client has an https callback, so if CLOUD_CLIENTS is non-empty
-    # https MUST be in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]. An
-    # "exact" client would else fail opaquely at /o/authorize/ (it rides DOT's
-    # stock redirect check, which enforces this list); a "prefix" client bypasses
-    # that check via the _redirect_under_prefix override, but https is required
-    # uniformly anyway so the config is self-consistent and a prefix-only setup
-    # can't silently break the day an exact client is added. DOT's default is
-    # ["http", "https"], so this only bites a consumer who narrowed it (e.g. to
-    # ["http"] for loopback DCR) — fail loudly at startup.
-    if clients:
-        oauth_cfg = getattr(settings, "OAUTH2_PROVIDER", {})
-        schemes = oauth_cfg.get("ALLOWED_REDIRECT_URI_SCHEMES", ["http", "https"])
-        if "https" not in schemes:
-            msg = (
-                "MCP_SQL.CLOUD_CLIENTS is non-empty (cloud clients use https "
-                "callbacks), but OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'] "
-                f"= {list(schemes)!r} does not include 'https'. Add 'https' to "
-                "ALLOWED_REDIRECT_URI_SCHEMES."
-            )
-            raise ImproperlyConfigured(msg)
+    # Runs the SAME normaliser the accessor uses at runtime, so a shape the
+    # validator blesses is exactly the shape `conf.MCPSQLSettings.clients()`
+    # will build. Also where the missing/empty-REDIRECTS and mixed-scheme
+    # rejections happen.
+    try:
+        built = build_clients(clients, prefix)
+    except ValueError as exc:
+        msg = f"Invalid MCP_SQL.CLIENTS: {exc}"
+        raise ImproperlyConfigured(msg) from exc
+
+    _validate_redirect_schemes({client.kind for client in built.values()})
 
 
-def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
-    """Validate the `MCP_SQL` settings dict on startup.
+def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
+    """Validate the consumer's `MCP_SQL` dict on startup.
 
-    - Pydantic TypeAdapter enforces the TypedDict shape (required keys
-      present and typed, optional keys typed when present).
+    `declared` is what the consumer actually wrote — any subset of the keys,
+    or `{}`. It is merged over `conf.DEFAULTS` first, so what gets validated
+    is the config the package will really run, and the shipped defaults are
+    themselves checked on every boot.
+
+    - Removed keys are named explicitly, then the Pydantic TypeAdapter
+      enforces the TypedDict shape (types, and no unknown keys anywhere).
     - Numeric values must be positive; `DEFAULT_LIMIT` must not exceed
       `HARD_LIMIT`.
     - Each profile in `PROFILES` has non-empty unique ROLE /
       PERMISSION_CODENAME / GROUP_NAME and `app_label.ModelName`-shaped
       `ALLOWED_MODELS`; model resolution is deferred to runtime.
+    - Each entry in `CLIENTS` normalises through the same builder the
+      runtime accessor uses, and the redirect schemes it needs are allowed.
 
     Raises `ImproperlyConfigured` on any violation so Django startup
     halts with a single, focused error rather than a cascade of
     AttributeErrors at first read.
     """
+    for key, guidance in _REMOVED_KEYS.items():
+        if key in declared:
+            msg = f"MCP_SQL.{key} is no longer supported — {guidance}"
+            raise ImproperlyConfigured(msg)
+
+    cfg = merge_config(declared)
     try:
         TypeAdapter(McpSqlSettings).validate_python(cfg)
     except Exception as e:
@@ -371,4 +521,4 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
         raise ImproperlyConfigured(msg)
 
     _validate_profiles(cfg["PROFILES"])
-    _validate_cloud_clients(cfg.get("CLOUD_CLIENTS", []))
+    _validate_clients(cfg["CLIENTS"], cfg["APPLICATION_NAME_PREFIX"])

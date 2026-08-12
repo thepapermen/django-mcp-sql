@@ -14,10 +14,18 @@ class McpSqlConfig(AppConfig):
 
     @staticmethod
     def validate_settings():
+        """Validate whatever the consumer declared — including nothing.
+
+        Every `MCP_SQL` key carries an in-package default, so an absent
+        setting is a valid (if useless: no readable tables, no MFA checker)
+        configuration rather than a boot error. `validate_mcp_sql_settings`
+        merges over the defaults before checking, so the shipped defaults are
+        re-validated on every boot too.
+        """
         from django.conf import settings
         from mcp_sql.validation import validate_mcp_sql_settings
 
-        validate_mcp_sql_settings(settings.MCP_SQL)
+        validate_mcp_sql_settings(getattr(settings, "MCP_SQL", {}))
 
     @staticmethod
     def warn_if_mfa_unconfigured():

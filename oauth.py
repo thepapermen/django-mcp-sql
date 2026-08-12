@@ -15,7 +15,7 @@ from oauth2_provider.oauth2_validators import OAuth2Validator
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     """True iff `redirect_uri` is a safe https URL sitting under `prefix`.
 
-    Used only for "prefix" cloud clients (ChatGPT / Codex-cloud), whose
+    Used only for `MATCH: "prefix"` rules (ChatGPT / Codex-cloud), whose
     callback is per-instance — `https://chatgpt.com/connector/oauth/{id}` —
     and so cannot be pre-registered as an exact URI. The match is deliberately
     strict, hardened against the classic redirect-allowlist bypasses so the
@@ -31,7 +31,7 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
       (`%2e%2e`, `%252e%252e`, ...) — above the prefix path,
     - path must start with the prefix path, anchored at a `/` segment boundary
       so a sibling like `.../oauthEVIL` cannot slip past a bare prefix (also
-      enforced at config time by `validation._validate_cloud_redirect_uri`).
+      enforced at config time by `validation._validate_redirect_uri`).
 
     Mirrors the care in `views/registration.py::_is_loopback_redirect`.
     """
@@ -83,7 +83,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         `request.client`. We let it do that, then verify the resulting
         Application is a recognised mcp-sql shape via `is_mcp_application_name`:
         the curated `mcp-sql` row, a dynamically-registered `mcp-sql-<token>`
-        row, OR a settings-declared `mcp-sql-cloud.<name>` cloud client. An
+        row, OR a settings-declared `mcp-sql-{cloud,local}.<slug>` client. An
         Application whose name matches none of these (e.g. some unrelated OAuth
         client added later) is rejected here.
         """
@@ -96,23 +96,31 @@ class MCPOAuth2Validator(OAuth2Validator):
         return app is not None and is_mcp_application_name(app.name)
 
     def validate_redirect_uri(self, client_id, redirect_uri, request, *args, **kwargs):
-        """Admit a "prefix" cloud client's per-instance callback.
+        """Admit a declared client's per-instance ("prefix") callback.
 
-        For a settings-declared cloud client whose `REDIRECT_MATCH` is
-        "prefix" (ChatGPT / Codex-cloud), accept any redirect under the
-        allowlisted host+path prefix via `_redirect_under_prefix`. EVERY other
-        client — "exact" cloud clients, the canonical `mcp-sql` row, and every
-        loopback DCR client — falls through to DOT's stock exact matching
-        against the Application's stored `redirect_uris`, so this override
-        neither widens nor weakens the loopback/exact paths.
+        For a settings-declared client carrying `MATCH: "prefix"` rules
+        (ChatGPT / Codex-cloud, whose callback is per-instance), accept a
+        redirect sitting under one of the allowlisted host+path prefixes via
+        `_redirect_under_prefix`.
 
-        Why cloud clients need this + the exact-vs-prefix rationale:
-        `docs/oauth.md` → "Cloud clients".
+        The `or super()` fallthrough is load-bearing, not defensive: a client
+        may carry BOTH prefix and exact rules, and its exact callbacks are
+        matched by DOT against the Application's stored `redirect_uris`, not
+        here. Returning the prefix result on its own would reject them.
+
+        EVERY other client — declared clients with only exact rules, the
+        canonical `mcp-sql` row, and every loopback DCR client — reaches only
+        the `super()` call, so this override neither widens nor weakens the
+        loopback/exact paths.
+
+        Why declared clients need this + the exact-vs-prefix rationale:
+        `docs/oauth.md` → "Clients".
         """
-        cloud = mcp_sql_settings.cloud_clients().get(client_id)
-        if cloud is not None and cloud.redirect_match == "prefix":
-            return _redirect_under_prefix(redirect_uri, cloud.redirect_uri)
-        return super().validate_redirect_uri(
+        declared = mcp_sql_settings.clients().get(client_id)
+        prefixes = declared.prefixes if declared is not None else ()
+        return any(
+            _redirect_under_prefix(redirect_uri, prefix) for prefix in prefixes
+        ) or super().validate_redirect_uri(
             client_id, redirect_uri, request, *args, **kwargs
         )
 

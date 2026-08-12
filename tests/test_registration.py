@@ -164,6 +164,86 @@ class TestDynamicClientRegistrationValidation:
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"] == "invalid_redirect_uri"
 
+    def test_non_loopback_uris_are_filtered_not_fatal(self, client, db):
+        # RFC 7591 §3.2.1: register the subset we support and echo what was
+        # registered. Real clients present more than they will use — Cursor's
+        # IDE sends its loopback callback alongside a hosted https one and a
+        # `cursor://` deeplink — and refusing the whole request would lock them
+        # out of DCR entirely.
+        from oauth2_provider.models import Application
+
+        response = _post(
+            client,
+            {
+                "redirect_uris": [
+                    "http://localhost:8787/callback",
+                    "https://www.cursor.com/agents/mcp/oauth/callback",
+                    "cursor://anysphere.cursor-mcp/oauth/callback",
+                ]
+            },
+        )
+        assert response.status_code == HTTPStatus.CREATED, response.content
+        body = response.json()
+        assert body["redirect_uris"] == ["http://localhost:8787/callback"]
+        # And nothing non-loopback reached the stored Application.
+        app = Application.objects.get(client_id=body["client_id"])
+        assert app.redirect_uris == "http://localhost:8787/callback"
+
+    def test_all_non_loopback_uris_still_rejected(self, client):
+        # Filtering must not become "accept anything": an empty subset is a
+        # refusal, exactly as before.
+        response = _post(
+            client,
+            {
+                "redirect_uris": [
+                    "https://www.cursor.com/agents/mcp/oauth/callback",
+                    "cursor://anysphere.cursor-mcp/oauth/callback",
+                ]
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+
+    def test_duplicate_loopback_uris_are_collapsed(self, client, db):
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/cb", "http://localhost:8787/cb"]},
+        )
+        assert response.status_code == HTTPStatus.CREATED, response.content
+        assert response.json()["redirect_uris"] == ["http://localhost:8787/cb"]
+
+    def test_non_string_client_name_rejected(self, client):
+        # It is echoed in the 201 and written to the registration log line, so
+        # it must be a bounded string before it reaches either.
+        response = _post(
+            client,
+            {
+                "redirect_uris": ["http://localhost:8787/cb"],
+                "client_name": {"nested": "object"},
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_client_metadata"
+
+    def test_absurdly_long_client_name_rejected(self, client):
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/cb"], "client_name": "A" * 5000},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_client_metadata"
+
+    def test_absurd_redirect_uri_count_rejected(self, client):
+        # Whatever survives the filter is stored verbatim on the Application,
+        # so an anonymous caller must not be able to persist an unbounded
+        # string.
+        response = _post(
+            client,
+            {"redirect_uris": [f"http://localhost:{9000 + i}/cb" for i in range(11)]},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+
     def test_localhost_accepted_for_industry_compatibility(self, client):
         # RFC 8252 §7.3 says "SHOULD NOT" localhost — but Anthropic's MCP SDK,
         # Google's native-app OAuth, GitHub's, etc. all use http://localhost.

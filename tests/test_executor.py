@@ -43,6 +43,7 @@ from unittest.mock import patch
 import pytest
 from django.db import DatabaseError
 from mcp_sql.conf import Profile
+from mcp_sql.conf import mcp_sql_config
 from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import _cap_cell
 from mcp_sql.executor import _cap_rows
@@ -149,18 +150,33 @@ class TestClassifyDbError:
         assert _classify_db_error(exc) == OutcomeReason.EXECUTION_ERROR
 
 
+def _set_limits(settings, **overrides):
+    """Declare `MCP_SQL["LIMITS"]` for one test.
+
+    A declared key replaces its in-package default WHOLESALE — there is no
+    per-member merge — so a test tweaking one bound must restate all three.
+    Rebinding `settings.MCP_SQL` (rather than mutating it in place) is also
+    what fires `setting_changed`, flushing the accessor's cache; an in-place
+    poke would leak into every later test in the process.
+    """
+    settings.MCP_SQL = {
+        **settings.MCP_SQL,
+        "LIMITS": {**mcp_sql_config()["LIMITS"], **overrides},
+    }
+
+
 class TestCapRows:
     """Row/byte cap contracts. Total cap comes from MCP_SQL[LIMITS][BYTES_LIMIT]."""
 
     def test_under_cap_returns_all_rows(self, settings):
-        settings.MCP_SQL["LIMITS"]["BYTES_LIMIT"] = 10_000
+        _set_limits(settings, BYTES_LIMIT=10_000)
         rows, total, trunc = _cap_rows([(1, "a"), (2, "b"), (3, "c")])
         assert len(rows) == 3
         assert trunc is False
         assert total > 0
 
     def test_over_cap_truncates(self, settings):
-        settings.MCP_SQL["LIMITS"]["BYTES_LIMIT"] = 200
+        _set_limits(settings, BYTES_LIMIT=200)
         big = "A" * 100  # already JSON-safe; ~100 bytes per row
         rows, total, trunc = _cap_rows([(i, big) for i in range(20)])
         assert trunc is True
@@ -172,13 +188,13 @@ class TestCapRows:
         # Even a single huge row that exceeds BYTES_LIMIT lands; truncation
         # only applies from the *second* row onward. Otherwise the agent
         # would see "rows=0 truncated=true" with no hint of what happened.
-        settings.MCP_SQL["LIMITS"]["BYTES_LIMIT"] = 50
+        _set_limits(settings, BYTES_LIMIT=50)
         rows, _total, trunc = _cap_rows([("A" * 1000,)])
         assert len(rows) == 1
         assert trunc is False
 
     def test_decimal_and_datetime_serialise_in_byte_count(self, settings):
-        settings.MCP_SQL["LIMITS"]["BYTES_LIMIT"] = 10_000
+        _set_limits(settings, BYTES_LIMIT=10_000)
         when = datetime.datetime(2026, 5, 11, tzinfo=datetime.UTC)
         rows, total, _trunc = _cap_rows([(1, Decimal("3.14"), when)])
         assert len(rows) == 1
@@ -525,7 +541,7 @@ class TestExecutorLimitClamp:
         """User-supplied SQL LIMIT cannot exceed HARD_LIMIT. The clamp is
         the security invariant; tests pin that user-friendliness (honor
         smaller LIMITs) doesn't accidentally open a hole upward."""
-        settings.MCP_SQL["LIMITS"]["HARD_LIMIT"] = 100
+        _set_limits(settings, HARD_LIMIT=100)
         user = UserFactory()
         mock_cursor = _stub_readonly_connections(monkeypatch)
         mock_cursor.description = [MagicMock(name="id")]
@@ -574,8 +590,7 @@ class TestExecutorLimitClamp:
         binding constraint (no user limit anywhere), `truncated=True`
         still fires. This is the hint's *correct* use: "we capped you;
         consider COUNT/GROUP BY"."""
-        settings.MCP_SQL["LIMITS"]["DEFAULT_LIMIT"] = 10
-        settings.MCP_SQL["LIMITS"]["HARD_LIMIT"] = 100
+        _set_limits(settings, DEFAULT_LIMIT=10, HARD_LIMIT=100)
         user = UserFactory()
         mock_cursor = _stub_readonly_connections(monkeypatch)
         mock_cursor.description = [MagicMock(name="id")]

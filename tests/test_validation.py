@@ -146,11 +146,30 @@ class TestTopLevelInvariants:
     the per-profile checks: TypedDict shape, LIMITS, VOLUME_ALERT_THRESHOLDS,
     and the BAD_TOKEN_IP_* tripwire knobs."""
 
-    def test_malformed_shape_rejected(self):
-        # A missing required top-level key fails the pydantic TypeAdapter,
-        # which `validate_mcp_sql_settings` wraps as ImproperlyConfigured.
+    def test_omitted_key_falls_back_to_the_default(self):
+        # Every key has an in-package default, so declaring a subset is valid —
+        # that is the whole point of `conf.DEFAULTS`.
         cfg = copy.deepcopy(VALID)
         del cfg["BAN_SELECT_STAR"]
+        validate_mcp_sql_settings(cfg)  # no raise
+
+    def test_empty_settings_are_valid(self):
+        validate_mcp_sql_settings({})  # no raise
+
+    def test_wrong_type_rejected(self):
+        # A declared key still has to be the right type; the pydantic
+        # TypeAdapter catches it and `validate_mcp_sql_settings` wraps it.
+        cfg = copy.deepcopy(VALID)
+        cfg["LIMITS"] = "generous"
+        with pytest.raises(ImproperlyConfigured, match="Invalid MCP_SQL settings"):
+            validate_mcp_sql_settings(cfg)
+
+    def test_unknown_key_rejected(self):
+        # `extra="forbid"`: a typo'd key would otherwise be ignored and the
+        # default used in its place, with nothing in the logs to explain why
+        # the setting had no effect.
+        cfg = copy.deepcopy(VALID)
+        cfg["BAN_SELECT_STARS"] = True
         with pytest.raises(ImproperlyConfigured, match="Invalid MCP_SQL settings"):
             validate_mcp_sql_settings(cfg)
 

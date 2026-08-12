@@ -37,6 +37,7 @@ from mcp_sql import throttle
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import identify_application
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
@@ -394,11 +395,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             # so reports the supertype as incompatible. The package genuinely
             # accepts any user model, so the plugin's check is stricter than
             # the contract — suppress just this kwarg.
+            client = identify_application(token.application)
             MCPAuthRejectionLog.objects.create(
                 user=user,  # type: ignore[misc]
                 token_pk=str(token.pk),
-                application_name=token.application.name,
-                client_redirect=token.application.redirect_uris or "",
+                application_name=client.name,
+                client_kind=client.kind,
+                client_redirect=client.redirect,
                 reason=reason,
                 error=error,
                 client_ip=request.META.get("REMOTE_ADDR"),

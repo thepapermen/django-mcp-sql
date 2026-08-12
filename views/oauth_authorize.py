@@ -4,6 +4,8 @@
 full design rationale."""
 
 from typing import TYPE_CHECKING
+from typing import Any
+from urllib.parse import urlparse
 
 from django.core.exceptions import PermissionDenied
 from mcp_sql.conf import ResolutionOutcome
@@ -32,18 +34,71 @@ class MCPAuthorizationView(AuthorizationView):
         # OAuth errors bounce back to the client, success carries the auth
         # code, login / `prompt=none` 302), and a failed issuance gate
         # raises `PermissionDenied` rendered by the consumer's 403 page —
-        # none of those render here. So injecting `resource_name` here
-        # reaches every page this view itself shows.
+        # none of those render here. So injecting here reaches every page
+        # this view itself shows.
         #
-        # DOT's default consent template shows `application.name`, which
-        # for every dynamically-registered (RFC 7591) client is the opaque
-        # `mcp-sql-<token>` — meaningless to the human approving the grant.
-        # `RESOURCE_NAME` is the same identity advertised in the RFC 9728
-        # discovery metadata and shown by the MCP client. `setdefault`
-        # leaves a preset value (and the error branch, which ignores it)
-        # untouched.
+        # `RESOURCE_NAME` names the thing being accessed — the same identity
+        # advertised in the RFC 9728 discovery metadata and shown by the MCP
+        # client. `setdefault` leaves a preset value (and the error branch,
+        # which ignores it) untouched.
         context.setdefault("resource_name", mcp_sql_settings.RESOURCE_NAME)
+        context.setdefault("client_label", self._client_label(context))
+        context.setdefault("client_destination", self._client_destination(context))
         return super().render_to_response(context, **response_kwargs)
+
+    @staticmethod
+    def _client_label(context: dict[str, Any]) -> str:
+        """Trusted display name for the client requesting authorization.
+
+        Only ever operator-authored or package-derived. A declared client
+        contributes its `MCP_SQL["CLIENTS"][...]["LABEL"]`; the curated
+        Application contributes its configured name. A DCR client gets NO
+        label: the `client_name` it sent at registration is attacker-chosen
+        free text, and rendering it here would let anyone put "Claude Code"
+        (or the name of an internal tool) above the Authorize button. Its
+        callback address, shown separately, is the honest identifier.
+        """
+        application = context.get("application")
+        if application is None:
+            return ""
+        declared = mcp_sql_settings.clients().get(application.name)
+        if declared is not None:
+            return declared.label
+        curated: str = mcp_sql_settings.APPLICATION_NAME
+        if application.name == curated:
+            return curated
+        return ""
+
+    @staticmethod
+    def _client_destination(context: dict[str, Any]) -> str:
+        """Where the authorization code will actually be delivered.
+
+        The one fact on this page an attacker cannot dress up: oauthlib has
+        already validated this `redirect_uri` against the Application, and the
+        code is going there. `scheme://host[:port]` — enough to tell
+        `https://claude.ai` from `http://localhost:8787` from someone else's
+        machine, without a long path pushing the useful part off a narrow
+        screen.
+
+        Rebuilt from the parsed parts rather than sliced out of the raw
+        string, so a userinfo component can never reach the page: no
+        registrable redirect URI may carry one (`validation` and
+        `registration._is_loopback_redirect` both refuse it), but
+        `https://claude.ai@evil.example/` rendering as "https://claude.ai…"
+        is precisely the misreading this line exists to prevent.
+
+        Blank if the URI is unparseable or hostless; the template then shows
+        nothing rather than a half-rendered address that could mislead.
+        """
+        redirect_uri = context.get("redirect_uri") or ""
+        try:
+            parsed = urlparse(redirect_uri)
+            host, port = parsed.hostname, parsed.port
+        except ValueError:
+            return ""
+        if not parsed.scheme or not host:
+            return ""
+        return f"{parsed.scheme}://{host}" + (f":{port}" if port else "")
 
     def dispatch(self, request, *args, **kwargs):
         if request.user.is_authenticated:

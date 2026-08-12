@@ -7,6 +7,125 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.2.0b1 - 2026-08-11
+
+The multi-client release: declared clients ship ON, Cursor is supported, every
+`MCP_SQL` key has a default, and every audit row now names the client that
+made the request.
+
+### Breaking
+
+All of these fail loudly at startup — none of them can be missed silently, and
+none require any client to reconnect (client_ids are unchanged, provisioning
+never deletes rows, and tokens are 6-hour anyway).
+
+- **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
+  of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
+  `REDIRECT_MATCH` / `REDIRECT_URI` pair to a **`REDIRECTS` list** of
+  `{"MATCH": "exact"|"prefix", "URI": ...}` rules (so one provider is one
+  client_id even when it calls back from several shapes). Optional `LABEL` sets
+  the consent-screen display name. Declaring the old key raises
+  `ImproperlyConfigured` naming the replacement — it is not silently ignored,
+  because ignoring it would empty `CLIENTS`, de-recognise the consumer's
+  declared clients, and start rejecting their live tokens.
+
+  ```python
+  # before                                     # after
+  "CLOUD_CLIENTS": [                           "CLIENTS": {
+      {"NAME": "claude",                           "claude": {
+       "REDIRECT_MATCH": "exact",                      "LABEL": "Claude.ai",
+       "REDIRECT_URI": "https://…/cb"},                "REDIRECTS": [
+  ]                                                        {"MATCH": "exact", "URI": "https://…/cb"}],
+                                                   },
+                                               }
+  ```
+
+- **Unknown `MCP_SQL` keys are now rejected** (`extra="forbid"`, at every
+  nesting level). A typo'd key used to be ignored, leaving the default in place
+  with nothing in the logs to explain why the setting had no effect.
+- **`"https"` in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` is now
+  required by default**, because the shipped clients use https callbacks. DOT's
+  own default includes it; this only affects a consumer who narrowed the list
+  (e.g. to `["http"]`). Add `"https"`, or set `"CLIENTS": {}`.
+
+### Added
+
+- **Every `MCP_SQL` key now has an in-package default** — declare only what you
+  change, or omit `MCP_SQL` entirely. One merge rule, applied identically by
+  the settings accessor and by `conf.merged_config()`: a declared key replaces
+  its default **wholesale**, never member-by-member. In practice a real
+  deployment sets two things: each profile's `ALLOWED_MODELS` (default: empty,
+  so nothing is readable) and `MFA_CHECKER` (default: denies everyone). Both
+  defaults are useless-but-safe on purpose.
+- **Declared clients ship ON**: `claude`, `chatgpt`, and `cursor` (its hosted
+  web / Cursor Agents surface). They are inert until an operator pastes a
+  client_id into the provider's connector AND a user passes the login, MFA,
+  profile, and consent gates. `"CLIENTS": {}` runs loopback-only.
+- **Cursor support.** The hosted surface rides the shipped `cursor` entry; the
+  desktop app and CLI need no configuration, because Cursor performs RFC 7591
+  dynamic registration automatically and `/o/register` now accepts their
+  request (see below). They therefore get their own `mcp-sql-<token>` identity,
+  distinct in the audit trail from the hosted agents. The legacy
+  `cursor://` deeplink is deliberately unsupported — admitting a custom scheme
+  means widening `ALLOWED_REDIRECT_URI_SCHEMES`, which is install-global.
+- **A `local` client kind** for a client that pins a fixed loopback port and
+  cannot use DCR (Cursor's static `mcp.json` path). Held to narrower rules than
+  an https entry: `localhost` only (never `127.0.0.1` / `::1`, which DOT
+  port-wildcards), explicit port, non-root path, `MATCH: "exact"`. Documented,
+  not shipped — see `docs/oauth.md` → "Clients".
+- **Client attribution on every audit row.** `MCPQueryLog` gains
+  `application_name` and `client_kind`; `MCPAuthRejectionLog` gains
+  `client_kind` (migration `0013`). `client_kind` is one of `curated` / `dcr` /
+  `cloud` / `local` and is **derived, never declared** — for a declared client
+  it comes from its redirect scheme, so it cannot drift from what the client
+  is. The query-volume tripwire names the client too.
+- **`manage.py mcp_sql_clients`** prints each declared client's client_id and
+  callbacks — the values to paste into a provider connector, without scrolling
+  through `migrate` output.
+
+### Changed
+
+- **A declared client's client_id namespace is derived from its redirect
+  scheme**: all-https → `mcp-sql-cloud.<slug>` (unchanged from 0.1.0b5),
+  all-loopback → `mcp-sql-local.<slug>`, and an entry mixing the two refuses to
+  boot. One client_id must never span a provider-hosted and a machine-local
+  surface, or `client_kind` on an audit row would be a guess.
+- **`/o/register` registers the loopback SUBSET** of a request's
+  `redirect_uris` and echoes back what it registered (RFC 7591 §3.2.1), instead
+  of refusing any request containing a non-loopback URI. This is what lets
+  Cursor register at all — it may present a hosted https callback and the
+  `cursor://` deeplink alongside its loopback one. Nothing non-loopback is ever
+  stored, an empty subset is still a refusal, duplicates collapse, and the list
+  is capped at 10. The declared (unverified) `client_name` is now logged at INFO
+  beside the minted client_id; it is still never persisted.
+- **The consent screen now says who is asking and where the code will go.** It
+  showed "Authorize MCP SQL?" for every client — naming the resource, never the
+  requester or the destination — which left nothing to check on the screen that
+  exists to break phished authorization links. It now shows the declared
+  client's operator-authored `LABEL` and, for every client, the destination
+  (`scheme://host[:port]`, rebuilt from the validated `redirect_uri`'s parsed
+  parts so a userinfo component cannot render). A self-registered client gets
+  no label: its `client_name` is attacker-chosen free text.
+- Provisioning now names orphaned declared-client `Application` rows in a
+  WARNING. It still never deletes them — that would cascade live tokens in the
+  middle of a `migrate`.
+
+### Fixed
+
+- **`validate_redirect_uri` rejected the exact callbacks of any client that
+  also had a prefix rule.** It returned the prefix verdict instead of falling
+  through to DOT's stock exact matching. Unreachable in 0.1.0b5 (one rule per
+  entry); reachable the moment a client carries both.
+- **Over-long `redirect_uris` silently discarded audit rows.** Both writers
+  passed the Application's registered list straight into a 1024-char column; an
+  overflow raised `DataError`, which the best-effort audit wrappers swallow —
+  losing the row entirely. It is now truncated at the single point where the
+  client identity is built.
+- `MCPQueryLog.client_redirect` was documented as the redirect the token "was
+  issued against … the auth url cannot lie". It is the Application's
+  **registered** `redirect_uris` — DOT does not persist which redirect a given
+  authorization used. Read it as "one of these". The docstring now says so.
+
 ## 0.1.0b5 - 2026-07-01
 
 ### Added

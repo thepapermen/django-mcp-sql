@@ -38,3 +38,18 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
 - **Curated-view migrations** live in the OWNING app, use
   `CREATE OR REPLACE VIEW` forward SQL (column-additive) and carry
   `state_operations=[CreateModel(..., managed=False)]`.
+- **A declared client's kind and client_id namespace are DERIVED from its
+  redirect scheme** (`clients.derive_kind`): all-https → `cloud`, all-loopback
+  → `local`, mixed → boot error. Never let an entry carry both, and never let
+  `client_kind` be declared — that is what keeps one client_id from spanning a
+  provider-hosted and a machine-local surface, and what makes the audit
+  trail's `client_kind` trustworthy.
+- **Every `MCP_SQL` key has a default and a declared key replaces its default
+  WHOLESALE** — no per-member merge, `extra="forbid"` at every level. Adding a
+  key means adding it to `conf.DEFAULTS` *and* `validation.McpSqlSettings`;
+  removing one means adding it to `validation._REMOVED_KEYS` so the upgrade
+  fails loudly instead of reverting to a default.
+- **`clients.py` is settings-free** (takes the prefix as an argument), which
+  is what lets `conf.py`, `validation.py`, and `consts.py` all import it
+  without a cycle. Redirect *safety* rules live in `validation.py`; `clients.py`
+  only classifies.

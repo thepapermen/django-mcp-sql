@@ -290,69 +290,89 @@ that requires the victim's active participation. Adding the explicit
 is deferred to a future follow-up — closes the gap fully at the cost
 of a schema change on `oauth2_provider_application`.
 
-## Cloud clients (opt-in)
+## Clients
 
-Everything above assumes a **loopback** client (Claude Code, a native
-desktop app with a local callback): it runs on the user's machine, receives
-the auth code at `http://127.0.0.1:<port>`, and vaults the token locally.
-That is the only shape `/o/register` (DCR) will mint, and it stays that way.
+Four kinds of client can hold an `mcp:sql` token, and every audit row records
+which one did:
 
-**Cloud-brokered** MCP clients are different. Claude.ai (web / desktop /
-mobile / Cowork) and ChatGPT / Codex-cloud complete the OAuth dance against a
+| Kind | `client_id` | How it gets registered | Consent |
+|---|---|---|---|
+| `curated` | `mcp-sql` | migration 0005, by the operator | skipped |
+| `dcr` | `mcp-sql-<22 chars>` | anonymous RFC 7591 self-registration at `/o/register`, loopback callbacks only | forced |
+| `cloud` | `mcp-sql-cloud.<slug>` | `MCP_SQL["CLIENTS"]`, https callback | forced |
+| `local` | `mcp-sql-local.<slug>` | `MCP_SQL["CLIENTS"]`, `http://localhost:<port>` callback | forced |
+
+**The kind is derived, never declared.** A `CLIENTS` entry whose redirect
+rules are all `https` lands in the `cloud` namespace; all-loopback lands in
+`local`; an entry that mixes the two **refuses to boot**. That rule exists so
+one `client_id` can never serve both a provider-hosted and a machine-local
+surface — if it could, `client_kind` on an audit row would be a guess, and
+"was that query from a hosted agent or from someone's laptop?" would have no
+answer. Two surfaces means two entries, two client_ids, two audit identities.
+
+### Declared clients
+
+Cloud-brokered MCP clients complete the OAuth dance against a
 **provider-hosted HTTPS callback** and store the token in the provider's
-cloud, not on the user's device. The loopback rule rejects them by
-construction. To admit *specific, operator-blessed* cloud clients — **without**
-loosening `/o/register` — declare them in `MCP_SQL["CLOUD_CLIENTS"]`:
+cloud, not on the user's device — the RFC 8252 loopback rule that governs
+`/o/register` rejects them by construction. `MCP_SQL["CLIENTS"]` is the
+allowlist that admits *specific, operator-blessed* ones **without** loosening
+`/o/register`. Three ship by default:
 
 ```python
 MCP_SQL = {
     # ... your other settings ...
-    "CLOUD_CLIENTS": [
-        {"NAME": "claude",  "REDIRECT_MATCH": "exact",
-         "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback"},
-        {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
-         "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
-    ],
+    "CLIENTS": {
+        "claude": {"LABEL": "Claude.ai", "REDIRECTS": [
+            {"MATCH": "exact", "URI": "https://claude.ai/api/mcp/auth_callback"}]},
+        "chatgpt": {"LABEL": "ChatGPT", "REDIRECTS": [
+            {"MATCH": "prefix", "URI": "https://chatgpt.com/connector/oauth/"}]},
+        "cursor": {"LABEL": "Cursor", "REDIRECTS": [
+            {"MATCH": "exact",
+             "URI": "https://www.cursor.com/agents/mcp/oauth/callback"}]},
+    },
 }
 ```
 
-Empty (the default) means the feature is **off** — the server stays
-loopback-only, exactly as before. This is an allowlist you curate: nothing is
-admitted that you did not name.
+Shipping them ON costs nothing until someone uses one: each is an
+`Application` row that no one can authorize against without logging in,
+passing the MFA and profile gates, and clicking through a consent screen —
+and the provider side needs the operator to paste a client_id before it can
+connect at all. **To turn them off**, declare a smaller `CLIENTS` (a declared
+key replaces its default wholesale) — `"CLIENTS": {}` runs loopback-only.
 
 > **The client ID to paste into the provider.** It is **derived and stable**,
-> not random: `<APPLICATION_NAME_PREFIX>cloud.<NAME>`. With the default prefix
-> that is **`mcp-sql-cloud.<NAME>`** — e.g. `{"NAME": "claude", …}` →
-> **`mcp-sql-cloud.claude`**. Paste this string as the connector's *OAuth Client
-> ID*; leave the secret blank. Three ways to read it back:
-> 1. **From config** — `python manage.py shell -c "from mcp_sql.conf import mcp_sql_settings; print(list(mcp_sql_settings.cloud_clients()))"`.
-> 2. **From the DB** — `select client_id from oauth2_provider_application where client_id like 'mcp-sql-cloud.%';`.
-> 3. **`migrate` logs it** (if your `LOGGING` surfaces INFO from `mcp_sql`) — an INFO line per client: `MCP cloud client 'claude' provisioned — paste client_id 'mcp-sql-cloud.claude' …`.
+> not random: `<APPLICATION_NAME_PREFIX><kind>.<slug>` — e.g. the `claude`
+> entry above yields **`mcp-sql-cloud.claude`**. Paste it as the connector's
+> *OAuth Client ID* and leave the secret blank. Read them all back with
+> **`python manage.py mcp_sql_clients`**, which prints each client_id next to
+> its callbacks. (`migrate` logs the same lines, if your `LOGGING` surfaces
+> INFO from `mcp_sql`.)
 
 **What each entry does.** On `migrate`, a `post_migrate` receiver
-(`provision_mcp_cloud_clients`, mirroring `provision_mcp_profiles`)
-materializes one curated `Application` per entry: public / PKCE,
-`authorization_code`, **no secret**, and — unlike the canonical `mcp-sql` row
-but like every DCR client — `skip_authorization=False` (consent required; the
-redirect is off-device, so the same phishing surface that motivates DCR
-consent applies). The `mcp-sql-` prefix on the `client_id` means logout
-revocation already covers these tokens; the `.` after `cloud` keeps the id
-disjoint from DCR's `mcp-sql-<22 url-safe chars>` shape (a `.` is not in the
-url-safe-base64 alphabet).
+(`provision_mcp_clients`, mirroring `provision_mcp_profiles`) materializes one
+curated `Application` per entry: public / PKCE, `authorization_code`, **no
+secret**, every rule's URI in `redirect_uris`, and — unlike the canonical
+`mcp-sql` row but like every DCR client — `skip_authorization=False` (consent
+required; the callback is fixed and shared, so the same phishing surface that
+motivates DCR consent applies). The `mcp-sql-` prefix on the `client_id` means
+logout revocation already covers these tokens; the `.` after the kind keeps
+the id disjoint from DCR's `mcp-sql-<22 url-safe chars>` shape (a `.` is not
+in the url-safe-base64 alphabet).
 
-**Recognition is settings-gated (fail-closed).** A cloud client is accepted
-only while its entry is present in `CLOUD_CLIENTS`. Remove the entry (and
-redeploy) and the same `client_id` is denied at the very next `/o/authorize/`
-**and** `/mcp/sql/` request — outstanding tokens included — even though its
-`Application` row still exists (provisioning never deletes rows).
-De-authorizing a cloud client is a settings edit, not DB surgery.
+**Recognition is settings-gated (fail-closed).** A declared client is accepted
+only while its entry is present in `CLIENTS`. Remove the entry (and redeploy)
+and the same `client_id` is denied at the very next `/o/authorize/` **and**
+`/mcp/sql/` request — outstanding tokens included — even though its
+`Application` row still exists. Provisioning never deletes rows (that would
+cascade live tokens mid-`migrate`); it names orphaned ones in a WARNING so you
+can clean up deliberately. De-authorizing a client is a settings edit, not DB
+surgery.
 
 **Exact vs. prefix redirect matching.**
 
-- `"exact"` (Claude): one fixed callback serves every surface (web / desktop /
-  mobile / Cowork) — `https://claude.ai/api/mcp/auth_callback`. DOT's native
-  exact match against the provisioned `redirect_uris` handles it; there is no
-  override.
+- `"exact"` (Claude, Cursor): a fixed callback. DOT's native exact match
+  against the provisioned `redirect_uris` handles it; there is no override.
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
@@ -360,11 +380,67 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
   accepts a redirect **iff** it is `https`, carries no userinfo, its host
   **exactly equals** the prefix host (never `endswith`, so
   `chatgpt.com.evil.com` is rejected), its port matches, it has no `..`
-  segment, and its path starts with the allowlisted prefix path. Every other
-  client — exact cloud clients, the canonical row, every loopback DCR client —
-  falls through to DOT's stock exact matching, untouched.
+  segment, and its path starts with the allowlisted prefix path — anchored at
+  a `/` boundary, so `.../oauthEVIL` cannot pass as `.../oauth`. A client may
+  carry both kinds of rule; its exact callbacks still ride DOT's stock
+  matching. Every other client — clients with no prefix rules, the canonical
+  row, every loopback DCR client — falls through to that stock matching,
+  untouched.
 
-**Onboarding a cloud client (operator + user).**
+### Cursor: three surfaces, two paths
+
+Cursor is the case that motivates the derived-namespace rule, so it is worth
+spelling out. It uses **fixed** redirect URLs, one per surface:
+
+| Surface | Callback | How it reaches us |
+|---|---|---|
+| Web + Cursor Agents | `https://www.cursor.com/agents/mcp/oauth/callback` | the shipped `cursor` entry |
+| Desktop app | `http://localhost:8787/callback` | DCR at `/o/register` |
+| CLI | `http://localhost:8787/callback` | DCR at `/o/register` |
+
+Cursor performs DCR automatically, so **the desktop app and CLI need no
+configuration here** — they self-register and get their own
+`mcp-sql-<token>` identity, distinct in the audit trail from the hosted
+agents. `/o/register` registers the loopback subset of whatever a client
+presents and echoes back what it registered (RFC 7591 §3.2.1), which is what
+lets Cursor register at all: it may present the hosted https callback and the
+legacy `cursor://anysphere.cursor-mcp/oauth/callback` deeplink alongside the
+loopback one.
+
+**We do not support the `cursor://` deeplink.** Admitting a custom scheme
+means adding it to `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]`, which is
+install-global — it would relax redirect handling for every OAuth application
+in your project to accommodate one client's fallback path. Current Cursor
+builds use the loopback callback; if a build falls back to the deeplink, that
+authorization fails against this server.
+
+**If you need the static-credentials path** (Cursor's `mcp.json` `auth`
+block, where the operator pins a `CLIENT_ID` instead of letting Cursor
+register), declare the desktop surface as its **own entry** rather than adding
+a second URI to `cursor`:
+
+```python
+"CLIENTS": {
+    # ... claude, chatgpt, cursor ...
+    "cursor-desktop": {"LABEL": "Cursor Desktop", "REDIRECTS": [
+        {"MATCH": "exact", "URI": "http://localhost:8787/callback"}]},
+},
+```
+
+That yields `mcp-sql-local.cursor-desktop`, classified `local`, and it needs
+`"http"` in `ALLOWED_REDIRECT_URI_SCHEMES`. Note that **port 8787 is
+hardcoded in Cursor today and there is an open request to make it dynamic**
+(per RFC 8252, a loopback client may use any port) — an exact rule pinned to
+8787 breaks the day that lands, whereas the DCR path above keeps working
+untouched. Prefer DCR; treat this entry as a stopgap.
+
+Loopback entries are held to narrower rules than https ones: `localhost` only
+(never `127.0.0.1` / `::1`, which DOT port-wildcards — that would silently
+widen an exact rule into "any port on the user's machine"), an explicit port,
+a non-root path, and `MATCH: "exact"` (prefix-matching a loopback URI would
+admit any path on that port).
+
+### Onboarding a declared client (operator + user)
 
 **Before you start.** Unlike a loopback client, a cloud client is driven by the
 *provider's* servers — they fetch your discovery documents and open the
@@ -374,22 +450,21 @@ tunnel (ngrok / cloudflared), and make sure the discovery documents advertise
 that public `https` origin (if a proxy terminates TLS, set
 `SECURE_PROXY_SSL_HEADER` and `USE_X_FORWARDED_HOST` — see `example/settings.py`).
 
-1. Add the entry to `CLOUD_CLIENTS` and run `migrate`. Provisioning is a
-   `post_migrate` receiver — it runs on any deploy that migrates and is
-   idempotent, but a plain web-process restart does **not** provision it. If you
-   added the entry without migrating, run `python manage.py migrate` (a no-op
-   still fires the receiver).
+1. Run `migrate`. Provisioning is a `post_migrate` receiver — it runs on any
+   deploy that migrates and is idempotent, but a plain web-process restart does
+   **not** provision it. If you added an entry without migrating, run
+   `python manage.py migrate` (a no-op run still fires the receiver).
 2. Ensure `"https"` is in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` —
-   whenever `CLOUD_CLIENTS` is non-empty the app **refuses to boot** without it
-   (cloud callbacks are `https`). DOT's default already includes `https`; you
-   only hit this if you narrowed the list (e.g. to `["http"]` for loopback DCR).
+   with any https client declared the app **refuses to boot** without it. DOT's
+   default already includes `https`; you only hit this if you narrowed the list
+   (e.g. to `["http"]` for loopback DCR).
 3. In the provider's connector UI, add a custom MCP connector pointing at
    `https://<host>/mcp/sql/`, open its **Advanced / manual client_id** field,
-   and paste the derived `client_id` (`mcp-sql-cloud.<NAME>`). Leave the client
-   secret **blank** (these are public/PKCE clients).
+   and paste the derived `client_id`. Leave the client secret **blank** (these
+   are public/PKCE clients).
 4. The user connects: login + MFA + the one-click consent screen, then tool
    calls work. As with loopback clients, **consent recurs every 6 h** — token
-   TTL is 6 h and refresh tokens are disabled, so a cloud user re-consents each
+   TTL is 6 h and refresh tokens are disabled, so the user re-consents each
    time the token expires. There is no "remember me"; this is deliberate (same
    rationale as [DCR-minted clients require
    consent](#dcr-minted-clients-require-consent)).
@@ -405,12 +480,29 @@ that outlives the originating tab, or leave `SESSION_MODEL` unset for
 cloud-heavy deployments. This is a recommendation only — the package neither
 warns nor errors on the combination.
 
-**Audit.** Both audit tables carry `client_redirect`: the **issued** redirect
-URI captured from the token's Application (ground truth — the auth URL cannot
-lie), not the operator-set label. For an exact client it is the true callback;
-for a prefix client it is the provisioned host+prefix. Both queries
-(`MCPQueryLog`) and rejections (`MCPAuthRejectionLog`) record it, so a cloud
-client's activity stays attributable in the logs.
+**The consent screen names the client.** It shows the operator-authored
+`LABEL` for a declared client and, for every client, the **destination** the
+authorization code will be delivered to (`scheme://host[:port]`, taken from
+the validated `redirect_uri`). A self-registered DCR client gets no label: the
+`client_name` it sent at registration is attacker-chosen free text, so
+rendering it would let anyone label themselves "Claude Code". Its callback
+address is its only identifier, which is the honest one — that address is
+where the code actually goes. If you re-theme `mcp_sql/authorize.html`, keep
+the destination line: it is what makes a phished authorization link
+recognisable.
+
+**Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three
+attribution columns: `application_name` (the client_id), `client_kind` (the
+derived `curated` / `dcr` / `cloud` / `local`), and `client_redirect` — the
+Application's **registered** `redirect_uris`, truncated to the column width.
+Read `client_redirect` as "one of these", not "this one": DOT does not persist
+which redirect a given authorization used, so the registered set is the
+closest attribution available at request time. `client_kind` is blank when the
+Application classifies as nothing, which is the de-recognised case (DOT
+resolved the token; the client is no longer part of the MCP surface). The
+query-volume tripwire names the client too, so the same user hitting a
+threshold through Claude.ai and through a self-registered client on their
+laptop reads as two incidents rather than one.
 
 **Troubleshooting — "your account was authorized, but … returned an error
 when connecting".** If the OAuth dance succeeds (you logged in + consented)
@@ -429,26 +521,31 @@ still reaches the view. (Pinned by `tests/test_mcp_endpoint.py::TestEndpointRout
 **References** (this section is the how-it-works runbook the implementation
 docstrings point back to):
 
-- Code: `mcp_sql/conf.py` (`CloudClient` / `cloud_clients()`),
-  `mcp_sql/signals.py` (`provision_mcp_cloud_clients`), `mcp_sql/oauth.py`
+- Code: `mcp_sql/clients.py` (the taxonomy — kinds, `DeclaredClient`,
+  namespace derivation, `ClientIdentity`), `mcp_sql/conf.py` (`clients()`),
+  `mcp_sql/signals.py` (`provision_mcp_clients`), `mcp_sql/oauth.py`
   (`MCPOAuth2Validator.validate_redirect_uri` / `_redirect_under_prefix`),
-  `mcp_sql/consts.py` (settings-gated recognition), `mcp_sql/validation.py`
-  (`_validate_cloud_clients`).
-- Provider setup — paste the derived `mcp-sql-cloud.<name>` client_id (no
-  secret): **Claude.ai** → Settings → Connectors → *Add custom connector* →
-  Advanced → *OAuth Client ID*; **ChatGPT** → Settings → Connectors → *Create*
-  (advanced OAuth). Provider callbacks: Claude
-  `https://claude.ai/api/mcp/auth_callback` (one, unified across web/desktop/
-  mobile/Cowork), ChatGPT `https://chatgpt.com/connector/oauth/{id}`
-  (per-instance — the reason ChatGPT needs `REDIRECT_MATCH: "prefix"`).
+  `mcp_sql/consts.py` (settings-gated recognition + classification),
+  `mcp_sql/validation.py` (`_validate_clients`).
+- Provider setup — paste the derived client_id (no secret): **Claude.ai** →
+  Settings → Connectors → *Add custom connector* → Advanced → *OAuth Client
+  ID*; **ChatGPT** → Settings → Connectors → *Create* (advanced OAuth);
+  **Cursor** → `mcp.json` `auth.CLIENT_ID` (only needed for the hosted-agent
+  surface; the desktop app and CLI use DCR).
+- Provider callbacks: Claude `https://claude.ai/api/mcp/auth_callback` (one,
+  unified across web/desktop/mobile/Cowork), ChatGPT
+  `https://chatgpt.com/connector/oauth/{id}` (per-instance — the reason
+  ChatGPT needs `MATCH: "prefix"`), Cursor
+  [`https://www.cursor.com/agents/mcp/oauth/callback` and
+  `http://localhost:8787/callback`](https://cursor.com/docs/context/mcp).
 - MCP authorization model: <https://modelcontextprotocol.io/specification> (the
   Authorization section — OAuth 2.1 + PKCE + protected-resource discovery).
 - Governing specs: PKCE — [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636);
   protected-resource metadata — [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728);
   AS metadata — [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414); native-app /
-  loopback redirects (the DCR path this feature deliberately leaves untouched) —
-  [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252); dynamic client
-  registration — [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591).
+  loopback redirects — [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252);
+  dynamic client registration — [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591).
+
 
 ## Revoking access
 
@@ -780,7 +877,7 @@ control so none is a live exposure:
   needed. Deferred deliberately — its payoff is directory-scale onboarding we
   do not have, and it adds an SSRF-guarded outbound fetch on the auth path while
   still needing a row for DOT's non-null `Grant.application` FK. Today's
-  settings-declared [cloud clients](#cloud-clients-opt-in)
+  settings-declared [clients](#clients)
   cover the same clients with a curated allowlist and no new network egress; if
   CIMD lands natively in django-oauth-toolkit it becomes an additive
   recognition branch, not a rewrite.

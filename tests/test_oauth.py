@@ -433,6 +433,8 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert MCPAuthorizationView.template_name == "mcp_sql/authorize.html"
 
     def test_render_to_response_injects_resource_name(self, monkeypatch):
+        from types import SimpleNamespace
+
         from mcp_sql.conf import mcp_sql_settings
         from oauth2_provider.views import AuthorizationView
 
@@ -442,8 +444,94 @@ class TestMCPAuthorizationViewConsentTemplate:
             "render_to_response",
             lambda self, context, **kw: captured.update(context) or "ok",
         )
-        MCPAuthorizationView().render_to_response({"application": object()})
+        MCPAuthorizationView().render_to_response(
+            {"application": SimpleNamespace(name="mcp-sql-" + "a" * 22)}
+        )
         assert captured["resource_name"] == mcp_sql_settings.RESOURCE_NAME
+
+    def test_self_registered_client_gets_no_label(self, monkeypatch):
+        """A dynamically-registered client's `client_name` is attacker-chosen
+        free text, so the consent page must not present a label for it — the
+        destination line is its only identifier."""
+        from types import SimpleNamespace
+
+        from oauth2_provider.views import AuthorizationView
+
+        captured = {}
+        monkeypatch.setattr(
+            AuthorizationView,
+            "render_to_response",
+            lambda self, context, **kw: captured.update(context) or "ok",
+        )
+        MCPAuthorizationView().render_to_response(
+            {
+                "application": SimpleNamespace(name="mcp-sql-" + "a" * 22),
+                "redirect_uri": "http://127.0.0.1:53682/callback",
+            }
+        )
+        assert captured["client_label"] == ""
+        assert captured["client_destination"] == "http://127.0.0.1:53682"
+
+    def test_declared_client_shows_its_operator_authored_label(
+        self, settings, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from oauth2_provider.views import AuthorizationView
+
+        captured = {}
+        monkeypatch.setattr(
+            AuthorizationView,
+            "render_to_response",
+            lambda self, context, **kw: captured.update(context) or "ok",
+        )
+        MCPAuthorizationView().render_to_response(
+            {
+                "application": SimpleNamespace(name="mcp-sql-cloud.claude"),
+                "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+            }
+        )
+        assert captured["client_label"] == "Claude.ai"
+        assert captured["client_destination"] == "https://claude.ai"
+
+    def test_template_renders_the_destination_and_escapes_it(self):
+        """The rendered page must actually carry the destination — the whole
+        point of the screen — and must escape everything it interpolates."""
+        from django.template.loader import render_to_string
+
+        html = render_to_string(
+            MCPAuthorizationView.template_name,
+            {
+                "resource_name": "MCP SQL",
+                "client_label": "<script>alert(1)</script>",
+                "client_destination": "https://claude.ai",
+                "scopes_descriptions": ["Read-only SQL"],
+                "form": "",
+            },
+        )
+        assert "https://claude.ai" in html
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_destination_never_renders_a_userinfo_component(self, monkeypatch):
+        """`https://claude.ai@evil.example/` must not read as "claude.ai"."""
+        from types import SimpleNamespace
+
+        from oauth2_provider.views import AuthorizationView
+
+        captured = {}
+        monkeypatch.setattr(
+            AuthorizationView,
+            "render_to_response",
+            lambda self, context, **kw: captured.update(context) or "ok",
+        )
+        MCPAuthorizationView().render_to_response(
+            {
+                "application": SimpleNamespace(name="mcp-sql"),
+                "redirect_uri": "https://claude.ai@evil.example/cb",
+            }
+        )
+        assert captured["client_destination"] == "https://evil.example"
 
     def test_render_to_response_does_not_clobber_preset_resource_name(
         self, monkeypatch

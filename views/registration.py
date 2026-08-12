@@ -1,13 +1,17 @@
 """RFC 7591 dynamic client registration at `/o/register`. Anonymous
 JSON POST mints an `mcp-sql-<token>` Application with
 `skip_authorization=False` (so the client hits the consent screen,
-preventing silent-consent token theft) and a loopback-only
-`redirect_uri`. See `docs/architecture.md` "OAuth surface" + the
-`docs/oauth.md` runbook for the full security posture."""
+preventing silent-consent token theft) and loopback-only
+`redirect_uris` — the request's non-loopback URIs are filtered out and the
+registered subset echoed back, per RFC 7591 §3.2.1. See
+`docs/architecture.md` "OAuth surface" + the `docs/oauth.md` runbook for the
+full security posture."""
 
 import json
+import logging
 import secrets
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import urlparse
 
 from django.http import HttpRequest
@@ -21,6 +25,8 @@ from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from oauth2_provider.models import Application
 
+logger = logging.getLogger(__name__)
+
 # RFC 8252 §7.3 specifies `127.0.0.1` and `[::1]` as the loopback hostnames
 # and "SHOULD NOT" `localhost`. In practice Anthropic's MCP SDK, Google's
 # native-app OAuth, GitHub's, etc. all use `http://localhost:<port>`, and
@@ -30,6 +36,18 @@ from oauth2_provider.models import Application
 # than break interop on a SHOULD that the broader OAuth ecosystem
 # universally ignores.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Upper bound on the redirect_uris an anonymous caller may submit. Whatever
+# survives the loopback filter is stored verbatim on the Application, so
+# without a cap one request could persist an arbitrarily long string. Real
+# clients send one to three (Cursor's IDE presents the most, at three).
+_MAX_REDIRECT_URIS = 10
+
+# Upper bound on the client's self-declared name. It is echoed in the 201 and
+# written to the registration log line, so it is caller-controlled text on two
+# output paths; the log uses `%r`, which escapes newlines, so a long name is
+# the remaining concern rather than a forged log line.
+_MAX_CLIENT_NAME = 200
 
 
 def _error(
@@ -86,6 +104,40 @@ def _registration_response(
     )
 
 
+def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
+    """The non-redirect half of RFC 7591 client metadata: grant / response
+    types and the client-authentication method. Returns an error response, or
+    None when the request is acceptable.
+
+    The client may request a SUPERSET of what we actually support (Anthropic's
+    MCP SDK sends `authorization_code` + `refresh_token`, for example). Per RFC
+    7591 §3.2.1 the server registers the subset it supports and echoes the
+    registered values back, so the client learns what we allow. We require
+    `authorization_code` + `code` to be *present* in the request, so a client
+    asking for ONLY `client_credentials` — i.e. not the OAuth 2.1 native-app
+    pattern — is refused outright rather than silently downgraded.
+    """
+    if "authorization_code" not in body.get("grant_types", ["authorization_code"]):
+        return _error(
+            "invalid_client_metadata",
+            "grant_types must include 'authorization_code'",
+        )
+    if "code" not in body.get("response_types", ["code"]):
+        return _error(
+            "invalid_client_metadata",
+            "response_types must include 'code'",
+        )
+    # Public client only. We don't accept confidential-client schemes
+    # because we don't issue client_secrets. The default `"none"` for
+    # native apps is what every MCP SDK sends.
+    if body.get("token_endpoint_auth_method", "none") != "none":
+        return _error(
+            "invalid_client_metadata",
+            "Only token_endpoint_auth_method='none' is supported (public client)",
+        )
+    return None
+
+
 @csrf_exempt
 @require_POST
 def register_client(request):  # noqa: PLR0911 — each validation produces a distinct RFC 7591 error code; consolidating would obscure the spec mapping.
@@ -98,52 +150,56 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     if not isinstance(body, dict):
         return _error("invalid_client_metadata", "Request body must be a JSON object")
 
-    redirect_uris = body.get("redirect_uris")
-    if not isinstance(redirect_uris, list) or not redirect_uris:
+    requested_uris = body.get("redirect_uris")
+    if not isinstance(requested_uris, list) or not requested_uris:
         return _error(
             "invalid_redirect_uri",
             "redirect_uris must be a non-empty array of URI strings",
         )
-    for uri in redirect_uris:
-        if not isinstance(uri, str) or not _is_loopback_redirect(uri):
-            return _error(
-                "invalid_redirect_uri",
-                f"redirect_uri {uri!r} is not a loopback URI "
-                "(must be http://127.0.0.1, http://[::1], or http://localhost "
-                "with an optional port and path)",
-            )
+    if len(requested_uris) > _MAX_REDIRECT_URIS:
+        return _error(
+            "invalid_redirect_uri",
+            f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
+        )
+    # Register the loopback SUBSET rather than refusing the whole request.
+    # RFC 7591 §3.2.1 already has us registering the subset of requested
+    # metadata we support and echoing back what we actually registered, and
+    # real clients send more than they will use: Cursor's IDE/CLI may present
+    # its loopback callback alongside a hosted `https://…/callback` and the
+    # legacy `cursor://…` deeplink, none of which we can admit. Rejecting the
+    # request outright would lock those clients out of DCR entirely; taking
+    # the loopback URIs and echoing only those tells the client exactly what
+    # it may use. Nothing is widened — a non-loopback URI is still never
+    # registered, and a client that sends none at all is still refused.
+    redirect_uris = list(
+        dict.fromkeys(
+            uri
+            for uri in requested_uris
+            if isinstance(uri, str) and _is_loopback_redirect(uri)
+        )
+    )
+    if not redirect_uris:
+        return _error(
+            "invalid_redirect_uri",
+            "none of the requested redirect_uris is a loopback URI "
+            "(must be http://127.0.0.1, http://[::1], or http://localhost "
+            "with an optional port and path)",
+        )
 
-    # The client may request a superset of what we actually support
-    # (Anthropic's MCP SDK sends `authorization_code` + `refresh_token`,
-    # for example). Per RFC 7591 §3.2.1 the server registers the subset
-    # it supports and echoes the registered values in the response — the
-    # client reads the response and learns what we actually allow.
-    # We require `authorization_code` + `code` to be present in the
-    # request so a client asking for ONLY `client_credentials` (i.e.
-    # not the OAuth 2.1 native-app pattern) is refused outright.
-    requested_grant_types = body.get("grant_types", ["authorization_code"])
-    if "authorization_code" not in requested_grant_types:
-        return _error(
-            "invalid_client_metadata",
-            "grant_types must include 'authorization_code'",
-        )
-    requested_response_types = body.get("response_types", ["code"])
-    if "code" not in requested_response_types:
-        return _error(
-            "invalid_client_metadata",
-            "response_types must include 'code'",
-        )
-    # Public client only. We don't accept confidential-client schemes
-    # because we don't issue client_secrets. The default `"none"` for
-    # native apps is what every MCP SDK sends.
-    token_endpoint_auth_method = body.get("token_endpoint_auth_method", "none")
-    if token_endpoint_auth_method != "none":  # noqa: S105 — "none" is the RFC 7591 §2 enum value for "public client, no client_secret", not a credential.
-        return _error(
-            "invalid_client_metadata",
-            "Only token_endpoint_auth_method='none' is supported (public client)",
-        )
+    metadata_error = _client_metadata_error(body)
+    if metadata_error is not None:
+        return metadata_error
 
     client_name = body.get("client_name") or "Unnamed MCP client"
+    if not isinstance(client_name, str) or len(client_name) > _MAX_CLIENT_NAME:
+        # Bounded and typed before it is echoed in the 201 or written to the
+        # log line below. The body cap is 64 KiB, so an unbounded name would
+        # otherwise put ~64 KiB of caller-chosen text into both — and a
+        # non-string (a nested object) would be reflected verbatim.
+        return _error(
+            "invalid_client_metadata",
+            f"client_name must be a string of at most {_MAX_CLIENT_NAME} characters",
+        )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).
     client_id = f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
@@ -200,6 +256,27 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         scope="register",
         window=cfg["BAD_TOKEN_IP_WINDOW_SECONDS"],
         threshold=threshold,
+    )
+    # The only record of who claimed to be registering. `client_name` is
+    # UNVERIFIED — anyone may POST here and pick any string — so it is logged
+    # and never persisted: `Application.name` holds the minted client_id
+    # because that field is the recognition predicate
+    # (`consts.classify_application_name`), and a caller who could write it
+    # could name themselves into the MCP surface. Audit rows likewise carry
+    # the client_id, not this. It is still worth logging: correlating "a
+    # client calling itself X registered from this IP" with a later audit row
+    # is exactly the triage question, as long as the string is read as a
+    # claim rather than an identity.
+    logger.info(
+        "MCP dynamic client registration: client_id %r for unverified "
+        "client_name %r from %s; registered %d of %d requested redirect_uris "
+        "(%s).",
+        client_id,
+        client_name,
+        ip,
+        len(redirect_uris),
+        len(requested_uris),
+        ", ".join(redirect_uris),
     )
 
     return _registration_response(request, client_id, client_name, redirect_uris)
