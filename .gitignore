@@ -21,3 +21,8 @@ htmlcov/
 .mypy-pkg/
 # Local scratch (throwaway DBs, mypy sandboxes, ad-hoc notes).
 .tmp/
+# Machine-local Claude Code settings, including the `.tmp.<pid>.<hash>` files
+# the CLI writes next to them while saving. Contributor-local permission
+# choices, never project content.
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*

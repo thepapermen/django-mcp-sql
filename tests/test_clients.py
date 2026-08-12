@@ -15,15 +15,20 @@ weakened — it must not be.
 import logging
 import secrets
 from datetime import timedelta
+from io import StringIO
 
 import pytest
 from django.apps import apps as django_apps
 from django.conf import settings as django_settings
 from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
 from django.utils import timezone
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.clients import REDIRECT_MAX_LENGTH
 from mcp_sql.clients import ClientKind
+from mcp_sql.clients import RedirectRule
+from mcp_sql.clients import derive_kind
+from mcp_sql.clients import redirect_rules
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import classify_application_name
 from mcp_sql.consts import identify_application
@@ -344,6 +349,46 @@ class TestClientValidation:
         validate_mcp_sql_settings(
             _cfg({"claude": CLAUDE, "cursor-desktop": CURSOR_DESKTOP})
         )  # no raise
+
+
+class TestBuilderGuardsStandAlone:
+    """`clients.build_clients` re-checks what `validation` already rejected.
+
+    In a booted process these branches are unreachable: `_validate_clients`
+    runs first and produces the richer operator-facing message. They are the
+    backstop for the paths that skip boot validation — `@override_settings` in
+    a test, a `settings.MCP_SQL` assignment at runtime — where the accessor
+    would otherwise build a nonsense client rather than failing. Exercised
+    directly, since by construction nothing else can reach them.
+    """
+
+    def test_unsupported_scheme_raises(self):
+        rules = (RedirectRule(match="exact", uri="ftp://x/cb"),)
+        with pytest.raises(ValueError, match="neither an https callback"):
+            derive_kind("x", rules)
+
+    def test_mixed_schemes_raise(self):
+        rules = (
+            RedirectRule(match="exact", uri="https://x.example/cb"),
+            RedirectRule(match="exact", uri="http://localhost:8787/cb"),
+        )
+        with pytest.raises(ValueError, match="mixes https and loopback"):
+            derive_kind("x", rules)
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param({"REDIRECTS": [{"URI": CLAUDE_URI}]}, id="missing-match"),
+            pytest.param({"REDIRECTS": ["not-a-mapping"]}, id="rule-not-a-mapping"),
+        ],
+    )
+    def test_malformed_rule_raises(self, entry):
+        with pytest.raises(ValueError, match="needs a MATCH and a URI"):
+            redirect_rules("x", entry)
+
+    def test_missing_redirects_raises(self):
+        with pytest.raises(ValueError, match="non-empty REDIRECTS list"):
+            redirect_rules("x", {"LABEL": "no rules"})
 
 
 # --------------------------------------------------------------------------- #
@@ -758,6 +803,41 @@ class TestLogoutRevocation:
         assert not AccessToken.objects.filter(pk=token.pk).exists()
 
 
+class TestClientsCommand:
+    """`manage.py mcp_sql_clients` — the operator's copy-paste source for a
+    provider connector's OAuth Client ID."""
+
+    def _run(self, settings, clients):
+        settings.MCP_SQL = _cfg(clients)
+        out = StringIO()
+        call_command("mcp_sql_clients", stdout=out)
+        return out.getvalue()
+
+    def test_prints_every_client_with_its_callbacks(self, settings):
+        output = self._run(settings, {"claude": CLAUDE, "chatgpt": CHATGPT})
+        # The client_id is the whole point — it is what gets pasted.
+        assert CLAUDE_ID in output
+        assert CHATGPT_ID in output
+        assert CLAUDE_URI in output
+        assert f"{CHATGPT_PREFIX} (prefix)" in output
+        assert "Claude.ai" in output  # the operator-authored label
+        assert "cloud" in output  # the derived kind
+        # No secret is ever issued for these; say so rather than leaving the
+        # operator to guess what to put in the provider's secret field.
+        assert "leave blank" in output
+
+    def test_local_client_reports_its_derived_kind(self, settings):
+        output = self._run(settings, {"cursor-desktop": CURSOR_DESKTOP})
+        assert CURSOR_DESKTOP_ID in output
+        assert "local" in output
+
+    def test_empty_clients_explains_the_surface_is_loopback_only(self, settings):
+        output = self._run(settings, {})
+        assert "empty" in output
+        assert "/o/register" in output
+        assert "mcp-sql-cloud" not in output
+
+
 class TestClientIdentity:
     def test_registered_redirect_is_truncated_to_the_column_width(self, db, settings):
         # An Application with many registered URIs would otherwise overflow the
@@ -792,6 +872,12 @@ class TestClientIdentity:
         identity = identify_application(app)
         assert len(identity.redirect) == REDIRECT_MAX_LENGTH
         assert identity.kind == ClientKind.CLOUD
+
+    def test_no_application_yields_the_blank_identity(self):
+        # The "no token in hand" case (e.g. the logout-driven revocation rows),
+        # matching the models' blank defaults.
+        identity = identify_application(None)
+        assert (identity.name, identity.kind, identity.redirect) == ("", "", "")
 
     def test_unrecognised_application_gets_a_blank_kind(self, settings):
         from types import SimpleNamespace

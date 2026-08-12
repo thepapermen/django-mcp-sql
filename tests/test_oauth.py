@@ -513,6 +513,35 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert "<script>" not in html
         assert "&lt;script&gt;" in html
 
+    @pytest.mark.parametrize(
+        "redirect_uri",
+        [
+            pytest.param("http://localhost:notaport/cb", id="malformed-port"),
+            pytest.param("not a url at all", id="unparseable"),
+            pytest.param("", id="absent"),
+        ],
+    )
+    def test_unusable_redirect_renders_no_destination(self, monkeypatch, redirect_uri):
+        """Blank beats a half-rendered address: showing part of an address the
+        user cannot act on is worse than showing none."""
+        from types import SimpleNamespace
+
+        from oauth2_provider.views import AuthorizationView
+
+        captured = {}
+        monkeypatch.setattr(
+            AuthorizationView,
+            "render_to_response",
+            lambda self, context, **kw: captured.update(context) or "ok",
+        )
+        MCPAuthorizationView().render_to_response(
+            {
+                "application": SimpleNamespace(name="mcp-sql"),
+                "redirect_uri": redirect_uri,
+            }
+        )
+        assert captured["client_destination"] == ""
+
     def test_destination_never_renders_a_userinfo_component(self, monkeypatch):
         """`https://claude.ai@evil.example/` must not read as "claude.ai"."""
         from types import SimpleNamespace
