@@ -7,7 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
-## 0.2.0b1 - 2026-08-11
+## 0.2.0b1
 
 The multi-client release: declared clients ship ON, Cursor is supported, every
 `MCP_SQL` key has a default, and every audit row now names the client that
@@ -288,6 +288,12 @@ precisely because it is the one that does **not** announce itself.
   logout yields no usable MCP token after it (DOT 3.4.1: `invalid_grant`;
   DOT 3.2.0: a token with an empty scope, which the `mcp:sql` check refuses).
   Predates the multi-client work.
+- **A declared redirect URI with an empty userinfo passed boot validation.**
+  The check refused a non-empty user or password, but `https://@claude.ai/cb`
+  (or `http://@localhost:8787/cb`) parses with username `""` and slipped
+  through. Any `@` in the authority of a declared redirect URI — cloud and
+  local alike — is now a boot error; an `@` in the path or query is
+  unaffected.
 - **The consent screen corrupted IPv6 destinations.** `urlparse().hostname`
   strips the brackets, so `http://[::1]:8787/cb` rendered as
   `http://::1:8787` — and `::1` is an accepted DCR loopback host. An explicit
