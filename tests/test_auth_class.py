@@ -15,6 +15,9 @@ from http import HTTPStatus
 
 import pytest
 from django.core.cache import cache
+from django.test.client import BOUNDARY
+from django.test.client import MULTIPART_CONTENT
+from django.test.client import encode_multipart
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql.auth import MCP_REQUEST_BODY_MAX_BYTES
@@ -825,6 +828,62 @@ class TestBearerTokenOnlyInHeader:
         # The test client's default content type for a dict is multipart.
         response = client.post(
             url, data={"access_token": mcp_access_token.token}, **_ACCEPT
+        )
+        self._assert_refused(response, token_lookups)
+
+    def test_header_plus_form_body_token_is_refused(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        # oauthlib ignores a body token once a header is present, so only the
+        # guard can enforce "refused even beside a valid header" here.
+        response = client.post(
+            url,
+            data=f"access_token={mcp_access_token.token}",
+            content_type="application/x-www-form-urlencoded",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            **_ACCEPT,
+        )
+        self._assert_refused(response, token_lookups)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            (method, encoding)
+            for method in ("GET", "DELETE", "OPTIONS", "PUT")
+            for encoding in ("urlencoded", "multipart")
+        ],
+        ids=lambda case: "-".join(case),
+    )
+    def test_form_body_token_is_refused_on_every_method(
+        self, client, url, mcp_access_token, token_lookups, case
+    ):
+        method, encoding = case
+        # DOT reads the body through DRF's `Request.POST`, which parses a form
+        # body whatever the method (Django's own `request.POST` is POST-only).
+        # `Accept: application/json` only: were the token accepted, a GET would
+        # get a 406 here instead of opening the MCP stream.
+        if encoding == "urlencoded":
+            body = f"access_token={mcp_access_token.token}"
+            content_type = "application/x-www-form-urlencoded"
+        else:
+            body = encode_multipart(BOUNDARY, {"access_token": mcp_access_token.token})
+            content_type = MULTIPART_CONTENT
+        response = client.generic(
+            method,
+            url,
+            data=body,
+            content_type=content_type,
+            HTTP_ACCEPT="application/json",
+        )
+        self._assert_refused(response, token_lookups)
+
+    def test_bogus_form_body_token_is_400_not_401(self, client, url, token_lookups):
+        response = client.generic(
+            "DELETE",
+            url,
+            data="access_token=not-a-token",
+            content_type="application/x-www-form-urlencoded",
+            HTTP_ACCEPT="application/json",
         )
         self._assert_refused(response, token_lookups)
 

@@ -25,12 +25,17 @@ is `logger.exception`-logged but does not mask the underlying
 """
 
 import logging
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 from django.apps import apps
+from django.conf import settings
 from django.core.cache import cache
+from django.core.files.uploadhandler import load_handler
 from django.db import DatabaseError
 from django.http import HttpRequest
+from django.http import QueryDict
+from django.http.multipartparser import MultiPartParser
 from django.http.multipartparser import MultiPartParserError
 from django.urls import reverse
 from django.utils import timezone
@@ -133,21 +138,35 @@ def _carries_token_outside_header(django_request: HttpRequest) -> bool:
 
     oauthlib (and so DOT) accepts a bearer token from either place when there is
     no `Authorization` header (RFC 6750 §2.2/§2.3); this endpoint accepts the
-    header only. Read through Django's own parsers, not DRF's, so the answer
-    doesn't depend on the consumer's `DEFAULT_PARSER_CLASSES`; and only for
-    form media types, so the JSON-RPC body is never parsed here. The raw body
-    is already cached by then, so parsing it cannot starve the MCP bridge. A
-    form body Django cannot parse is treated as carrying no token: DOT could
-    not read one from it either.
+    header only. The body is parsed here from the cached raw bytes, for form
+    media types only and on EVERY method: DOT reads the token through DRF's
+    `Request.POST`, which runs the form parsers whatever the method, whereas
+    Django's own `request.POST` is filled for POST alone — so checking that
+    would miss a form-body token on GET / DELETE / OPTIONS / PUT. The JSON-RPC
+    body is never parsed here, the bytes stay cached for the MCP bridge, and
+    the multipart parse uses fresh upload handlers so it leaves the request's
+    own untouched. A form body that cannot be parsed counts as carrying no
+    token: DRF's parsers, and so DOT, could not read one from it either.
     """
     if _TOKEN_PARAM in django_request.GET:
         return True
     if not is_form_media_type(django_request.content_type or ""):
         return False
-    try:
-        return _TOKEN_PARAM in django_request.POST
-    except MultiPartParserError:
-        return False
+    body = django_request.body
+    fields: QueryDict
+    if django_request.content_type == "application/x-www-form-urlencoded":
+        fields = QueryDict(body, encoding=django_request.encoding)
+    else:  # multipart/form-data
+        handlers = [
+            load_handler(path, django_request) for path in settings.FILE_UPLOAD_HANDLERS
+        ]
+        try:
+            fields, _files = MultiPartParser(
+                django_request.META, BytesIO(body), handlers, django_request.encoding
+            ).parse()
+        except MultiPartParserError:
+            return False
+    return _TOKEN_PARAM in fields
 
 
 class MCPOAuth2Authentication(OAuth2Authentication):

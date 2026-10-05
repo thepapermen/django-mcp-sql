@@ -538,8 +538,11 @@ The load-bearing invariants and footguns, grouped by layer:
   even next to a valid header — right after the body cap and BEFORE the
   bad-token throttle and any token lookup, so a URL token is never validated
   and the answer is the same for a valid and a bogus one. The form check
-  reads Django's own `request.POST`, only for form media types, after the
-  raw body is cached: the JSON-RPC body is never parsed there and the MCP
+  parses the cached raw body itself, for form media types only, on EVERY
+  method: DOT reads the token through DRF's `Request.POST`, which parses a
+  form body whatever the method, while Django's own `request.POST` is filled
+  for POST alone — reading that would miss a form-body token on GET /
+  DELETE / OPTIONS / PUT. The JSON-RPC body is never parsed there and the MCP
   bridge still gets the bytes. Like the 413 cap it is malformed transport:
   no `MCPAuthRejectionLog` row, no throttle count. This is what keeps the RFC
   9728 `bearer_methods_supported: ["header"]` honest; pinned by
