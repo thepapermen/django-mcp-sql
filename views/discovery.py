@@ -23,9 +23,10 @@ def _issuer(request: HttpRequest) -> str:
     plenty else (admin, API, the MCP transport itself).
 
     RFC 8414 §2 requires the issuer to be an https URL except for
-    loopback / development; `_absolute` is what enforces that, and every
-    other URL in both discovery documents now goes through the same helper
-    so the whole surface agrees on one origin.
+    loopback / development; `consts.absolute_url` is what enforces that, and
+    every other URL in both discovery documents (and the 401 challenge's
+    `resource_metadata` pointer) goes through the same helper so the whole
+    surface agrees on one origin.
     """
     return absolute_url(request, "/o")
 
@@ -36,19 +37,26 @@ def _resource_identifier(request: HttpRequest) -> str:
     RFC 9728 §3.3 requires the returned `resource` to be *identical* to the
     resource identifier the client inserted the well-known suffix into, and
     says the document "MUST NOT be used" on mismatch. Clients disagree on
-    trailing-slash normalisation — Cursor strips it off the connector URL
-    before building the metadata path and then enforces §3.3 (it aborts the
-    dance after consent, before the token exchange); Claude Code strips it
-    too but does not enforce; Claude.ai's web connector strips it off the
-    transport POST instead. Advertising one fixed spelling therefore breaks
-    whichever half of the ecosystem normalises the other way.
+    trailing-slash normalisation — Cursor Desktop requests the slash-less
+    metadata path and then enforces §3.3 (it aborts the dance after consent,
+    before the token exchange); Claude Code requests the same path but does
+    not enforce; Claude.ai's web connector strips the slash off the transport
+    POST instead. Advertising one fixed spelling therefore breaks whichever
+    half of the ecosystem normalises the other way.
 
     So `urls.py` serves this document at BOTH `.../mcp/sql` and
-    `.../mcp/sql/`, and we echo whichever spelling was used. Every client's
-    §3.3 check passes, and both spellings already route to the same transport
-    view, so the audience a client derives from this value reaches the same
-    endpoint either way. Nothing here is attacker-controlled: `request.path`
-    can only be one of the two literal routes Django matched.
+    `.../mcp/sql/`, and we echo whichever spelling was used. That satisfies
+    both clauses of §3.3: a client that built the metadata URL from its own
+    identifier gets that identifier back, and a client that followed the 401
+    `resource_metadata` pointer gets the URL it sent the request to, because
+    `auth.MCPOAuth2Authentication.authenticate_header` picks the pointer's
+    spelling from the request path. (A client that requests `/mcp/sql/` but
+    then builds a slash-less metadata URL on its own — or vice versa — is
+    comparing two different identifiers, and no single document can satisfy
+    it.) Both spellings route to the same transport view, so the audience a
+    client derives from this value reaches the same endpoint either way.
+    Nothing here is attacker-controlled: `request.path` can only be one of the
+    two literal routes Django matched.
     """
     canonical = absolute_url(request, reverse("mcp_sql_endpoint"))
     if request.path.endswith("/"):

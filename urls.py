@@ -58,11 +58,13 @@ urlpatterns = [
     ),
     # MCP read-only SQL transport endpoint. Bearer-auth via
     # `MCPOAuth2Authentication`; CSRF is exempt via decorator on the view.
-    # `/mcp/sql/` is canonical (what `reverse()` + the RFC 9728 `resource`
-    # advertise); the slash-less alias below accepts clients that normalise the
-    # trailing slash off the connector URL (Claude.ai's web connector POSTs to
-    # `/mcp/sql`). Without it, `APPEND_SLASH` can't 301-redirect a POST (that
-    # would drop the body) and Django 500s instead of serving the transport.
+    # `/mcp/sql/` is canonical (named — what `reverse()` builds from; the RFC
+    # 9728 `resource` echoes whichever spelling the client used, see the
+    # discovery routes below); the slash-less alias accepts clients that
+    # normalise the trailing slash off the connector URL (Claude.ai's web
+    # connector POSTs to `/mcp/sql`). Without it, `APPEND_SLASH` can't
+    # 301-redirect a POST (that would drop the body) and Django 500s instead
+    # of serving the transport.
     path("mcp/sql/", mcp_endpoint, name="mcp_sql_endpoint"),
     path("mcp/sql", mcp_endpoint),
     # OAuth 2.0 discovery surface (RFC 9728 + RFC 8414). Path layout is
@@ -76,10 +78,11 @@ urlpatterns = [
     # and RFC 9728 §3.3 makes that disagreement fatal: the `resource` value
     # must equal the identifier the client built the metadata URL from, or the
     # client MUST discard the document. The view echoes whichever spelling was
-    # used (`discovery._resource_identifier`). The named route stays the
-    # slash-less one — it is what `authenticate_header` advertises in the 401
-    # `resource_metadata` parameter, and what every client observed so far
-    # actually requests.
+    # used (`discovery._resource_identifier`). The named route is the
+    # slash-less one; `authenticate_header` reverses it and appends the slash
+    # when the request that drew the 401 had one, so the `resource_metadata`
+    # pointer always leads to the document whose `resource` equals the URL the
+    # client requested (RFC 9728 §3.3's second clause).
     path(
         ".well-known/oauth-protected-resource/mcp/sql",
         protected_resource_metadata,

@@ -156,7 +156,8 @@ class TestResourceIdentifierMatchesMetadataPath:
     the advertised identifier 404'd, so no client could retrieve the document
     the spec-correct way either.
 
-    Both spellings are now served and the identifier echoes the one used.
+    Both spellings are now served and the identifier echoes the one used, and
+    the 401 challenge points at the spelling that matches the request.
     """
 
     PRM = "/.well-known/oauth-protected-resource/mcp/sql"
@@ -199,6 +200,29 @@ class TestResourceIdentifierMatchesMetadataPath:
         resource_path = urlparse(body["resource"]).path
         response = APIClient().post(resource_path, {}, format="json")
         assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+    @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
+    @pytest.mark.parametrize("transport", ["/mcp/sql/", "/mcp/sql"])
+    def test_challenge_pointer_leads_back_to_the_requested_url(
+        self, transport, debug, scheme, settings
+    ):
+        """§3.3's SECOND clause: metadata reached through the 401's
+        `resource_metadata` pointer MUST carry a `resource` identical to the
+        URL the client sent its request to.
+
+        The pointer used to be the slash-less document unconditionally, so a
+        client that requested the documented `https://<host>/mcp/sql/` was
+        handed `resource=https://<host>/mcp/sql` — a mismatch it must discard.
+        Asserted end to end the way a client walks it: draw the 401, follow
+        the pointer, compare.
+        """
+        settings.DEBUG = debug
+        challenge = APIClient().post(transport, {}, format="json")["WWW-Authenticate"]
+        pointer = challenge.split('resource_metadata="', 1)[1].rstrip('"')
+        slash = "/" if transport.endswith("/") else ""
+        assert pointer == f"{scheme}://testserver{self.PRM}{slash}"
+        body = APIClient().get(urlparse(pointer).path).json()
+        assert body["resource"] == f"{scheme}://testserver{transport}"
 
     @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
     def test_every_advertised_url_shares_one_origin(self, debug, scheme, settings):

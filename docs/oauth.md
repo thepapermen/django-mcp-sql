@@ -35,10 +35,12 @@ discovery surface comprises two anonymous-GET endpoints plus the
 | `/.well-known/oauth-protected-resource/mcp/sql` (and `…/mcp/sql/`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. Served under **both** spellings of the resource path — see below. |
 | `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
 
-The `/mcp/sql/` 401 response advertises the RFC 9728 URL:
+The `/mcp/sql/` 401 response advertises the RFC 9728 URL (a request to the
+slash-less `/mcp/sql` gets the slash-less `…/oauth-protected-resource/mcp/sql`
+instead — see "Trailing slashes in the resource identifier" below):
 
 ```
-WWW-Authenticate: Bearer realm="api", resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp/sql"
+WWW-Authenticate: Bearer realm="api", resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp/sql/"
 ```
 
 A compliant MCP client follows this chain end to end without any
@@ -47,7 +49,7 @@ out-of-band configuration:
 ```
 1. POST <host>/mcp/sql/
    → 401, WWW-Authenticate: Bearer realm="api", resource_metadata="<PRM>"
-2. GET  <PRM>      (i.e. <host>/.well-known/oauth-protected-resource/mcp/sql)
+2. GET  <PRM>      (i.e. <host>/.well-known/oauth-protected-resource/mcp/sql/)
    → 200, JSON document, authorization_servers=["<issuer>"]
 3. GET  <issuer>/.well-known/oauth-authorization-server  (path-suffixed per
    RFC 8414 §3.1: actually <host>/.well-known/oauth-authorization-server/o)
@@ -77,12 +79,24 @@ document is served at **both** `…/oauth-protected-resource/mcp/sql` and
 spelling was requested. Both spellings also route to the transport, so the
 audience a client derives either way reaches the same endpoint.
 
-Observed client behaviour:
+§3.3 has a second clause for a client that found the document through the
+401's `resource_metadata` pointer rather than by building the URL itself: the
+`resource` must then equal the URL the client sent its request to. So the
+pointer follows the request — a 401 drawn by `/mcp/sql/` points at
+`…/oauth-protected-resource/mcp/sql/`, one drawn by `/mcp/sql` at
+`…/oauth-protected-resource/mcp/sql` — and either way the document it leads to
+names the URL that was requested. Pinned by
+`test_discovery.TestResourceIdentifierMatchesMetadataPath::test_challenge_pointer_leads_back_to_the_requested_url`.
+
+Observed client behaviour (recorded while the 401 pointer was still always the
+slash-less URL, so "requests the slash-less path" cannot be told apart from
+"follows the pointer"):
 
 | Client | Metadata path it requests | Enforces §3.3? |
 |---|---|---|
-| Cursor Desktop / CLI | strips the trailing slash | **yes** — aborts after consent, before the token exchange |
-| Claude Code | strips the trailing slash | no |
+| Cursor Desktop | the slash-less one | **yes** — aborts after consent, before the token exchange |
+| Cursor CLI | the slash-less one | no — ignored the mismatch |
+| Claude Code | the slash-less one | no |
 | Claude.ai web connector | not directly observed | no — it connects fine to a deployment with the mismatch |
 
 (Claude.ai separately strips the trailing slash off the *transport* POST, which

@@ -153,13 +153,22 @@ precisely because it is the one that does **not** announce itself.
   so no client could retrieve the document the spec-correct way.
 
   The document is now served under **both** spellings of the resource path and
-  `resource` echoes the one requested, so every client's §3.3 check passes
-  regardless of how it normalises. Both spellings already routed to the
+  `resource` echoes the one requested, and the 401 challenge's
+  `resource_metadata` pointer follows the spelling of the request that drew it
+  (`/mcp/sql/` → `…/oauth-protected-resource/mcp/sql/`, `/mcp/sql` →
+  `…/oauth-protected-resource/mcp/sql`). That covers both clauses of §3.3: a
+  client that builds the metadata URL from its own identifier gets that
+  identifier back, and one that follows the 401 pointer gets back the URL it
+  sent the request to. What it cannot cover is a client that requests one
+  spelling and then compares against the other — no single document satisfies
+  that (the MCP Python SDK's `check_resource_allowed` normalises the slash, so
+  it is lenient here either way). Both spellings already routed to the
   transport, so the derived audience reaches the same endpoint either way.
-  Backwards-compatible: no advertised value that previously worked stops
-  working, the named route (and therefore the `resource_metadata` URL in the
-  401 challenge) is unchanged, and nothing server-side validates `resource`,
-  so no live token is affected.
+  The pointer's path changes only for requests to `/mcp/sql/`; a client whose
+  request URL is slash-less — which is what the original Cursor Desktop failure
+  implies — is pointed exactly where it was (its scheme is covered by the next
+  entry). The pointer change was not re-tested against a live client. Nothing
+  server-side validates `resource`, so no live token is affected.
 - **Both discovery documents now agree on one origin.** The scheme is the
   other half of the same identifier: `resource` and the four AS endpoint URLs
   were composed with `request.build_absolute_uri`, which trusts

@@ -117,18 +117,29 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # Without it the client receives a clean 401 but has nowhere to
         # discover the authorization endpoint and the flow stalls.
         # Built per request so the value is correct behind any reverse proxy
-        # / hostname, and through `discovery._absolute` so this URL carries
+        # / hostname, and through `consts.absolute_url` so this URL carries
         # the SAME hardened scheme as the documents it points at. It is the
         # bootstrap pointer for the whole dance, so a plain
         # `build_absolute_uri` here would reintroduce, on the one URL that
-        # starts discovery, both problems `_absolute` exists to prevent: a
+        # starts discovery, both problems `absolute_url` exists to prevent: a
         # client deriving its RFC 9728 resource identifier from an `http`
         # challenge is handed an `https` `resource` and must discard the
         # document per §3.3, and the pointer itself would be plaintext for an
         # on-path attacker to answer with a forged `authorization_servers`.
-        metadata_url = absolute_url(
-            request, reverse("mcp_sql_protected_resource_metadata")
-        )
+        #
+        # The pointer also follows the trailing-slash spelling of the URL the
+        # client actually requested. RFC 9728 §3.3's second clause: metadata
+        # reached through this `resource_metadata` parameter MUST carry a
+        # `resource` identical to the URL the client sent the request to. The
+        # document echoes the spelling of its own path
+        # (`discovery._resource_identifier`), so a `/mcp/sql/` request pointed
+        # at the slash-less document would be handed `…/mcp/sql` — a mismatch
+        # the client must discard. `request.path` is one of the two literal
+        # transport routes Django matched, never free text.
+        metadata_path = reverse("mcp_sql_protected_resource_metadata")
+        if request.path.endswith("/"):
+            metadata_path += "/"
+        metadata_url = absolute_url(request, metadata_path)
         return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 
     def authenticate(self, request):  # noqa: C901, PLR0912 — linear defense-in-depth chain reads better than extracted helpers
