@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b7
+
 ### Added
 
 - **Django 6.1 and Python 3.14 support.** The Django cap is widened to
