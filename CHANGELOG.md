@@ -7,6 +7,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Security
+
+- **`/o/register` could register an off-machine redirect URI (affects
+  0.1.0b5 and earlier).** The anonymous dynamic-client-registration endpoint
+  validated each submitted redirect URI with `urlparse` (scheme `http`, no
+  userinfo, loopback host) but stored the list as one space-joined string,
+  which django-oauth-toolkit splits again on any `str.split()` whitespace
+  when matching. A single submitted URI with embedded whitespace (space, tab,
+  CR/LF, or a less obvious separator such as NBSP or U+2028) therefore passed
+  the loopback check yet was stored as two or more redirects, one of which
+  could name any host. An attacker could mint such a client without
+  credentials; turning it into a stolen token still required a logged-in
+  user who passes the issuance gate (staff + MFA + MCP profile) to approve
+  the attacker's authorization link on the consent screen, after which the
+  code went to the attacker's host and was exchangeable with the attacker's
+  own PKCE verifier.
+  - Registration now refuses any URI that `str.split()` would break apart
+    (deliberately DOT's own operation), any non-printable or non-ASCII
+    character, and any URI whose authority or port does not parse — each a
+    normal 400 `invalid_redirect_uri` with no `Application` row created.
+    Previously a malformed authority (e.g. an unterminated IPv6 literal), a
+    NUL or a lone surrogate raised an uncaught 500, and a non-numeric or
+    out-of-range port was stored, leaving a client that could never complete
+    a flow (and, for some such URIs, an uncaught 500 at `/o/authorize/`).
+  - Rows already registered by an affected release are not deleted.
+    `MCPOAuth2Validator.validate_redirect_uri` now re-applies the same
+    loopback check to the requested redirect of every client that is not a
+    declared cloud client, so a smuggled entry is refused at
+    `/o/authorize/` after upgrading. `docs/oauth.md` has a shell snippet
+    that lists such rows for review and deletion.
+  - Behaviour change for the canonical `mcp-sql` row as well: it can no
+    longer be redirected off-machine even if an operator edited its stored
+    `redirect_uris` to a non-loopback URI (the documented posture was
+    already loopback-only).
+
 ## 0.1.0b5 - 2026-07-01
 
 ### Added

@@ -6,8 +6,10 @@ Three things are pinned here:
    `Application` row with the curated public-client / PKCE-required
    posture and returns the RFC 7591 §3.2.1 response shape.
 2. Validation: malformed JSON, non-loopback redirect URIs, https on
-   loopback, and unsupported grant/response/auth-method values all return
-   RFC 7591 §3.2.2 error responses with the right `error` code.
+   loopback, whitespace-smuggled / malformed / non-ASCII redirect URIs, and
+   unsupported grant/response/auth-method values all return RFC 7591
+   §3.2.2 error responses with the right `error` code — never a 500, and
+   never a persisted row.
 3. End-to-end: a dynamically-registered client can complete the full
    OAuth flow (authorize gate + token exchange) and the resulting bearer
    token satisfies `MCPOAuth2Authentication`. This is the integration
@@ -16,6 +18,10 @@ Three things are pinned here:
    regression that broke the prefix-based `Application` recognition in
    `MCPOAuth2Validator` / `MCPOAuth2Authentication` would still pass the
    isolated unit tests.
+4. Defense in depth at `/o/authorize/`: a DCR row that ALREADY stores a
+   smuggled off-machine redirect (minted before the registration check
+   existed) cannot be redirected to it — `MCPOAuth2Validator` re-applies
+   the loopback predicate to the requested URI.
 """
 
 import base64
@@ -24,6 +30,7 @@ import json
 import secrets
 from datetime import timedelta
 from http import HTTPStatus
+from urllib.parse import urlencode
 
 import pytest
 from django.test import RequestFactory
@@ -117,6 +124,25 @@ class TestDynamicClientRegistrationHappyPath:
         """
         assert mcp_app.skip_authorization is True
 
+    def test_stored_redirect_uris_are_exactly_the_submitted_ones(self, client):
+        # Pin what DOT will actually match against: it re-splits the stored
+        # string with `str.split()`, so the round-trip must give back exactly
+        # the submitted list — no extra entry, and nothing off-machine allowed.
+        clean = "http://127.0.0.1:3456/cb"
+        response = _post(client, {"redirect_uris": [clean]})
+        assert response.status_code == HTTPStatus.CREATED, response.content
+        app = Application.objects.get(client_id=response.json()["client_id"])
+        assert app.redirect_uris.split() == [clean]
+        assert app.redirect_uri_allowed(clean) is True
+        assert app.redirect_uri_allowed("http://evil.example/steal") is False
+
+    def test_multiple_clean_redirect_uris_round_trip(self, client):
+        uris = ["http://127.0.0.1:3456/cb", "http://localhost:3456/cb"]
+        response = _post(client, {"redirect_uris": uris})
+        assert response.status_code == HTTPStatus.CREATED, response.content
+        app = Application.objects.get(client_id=response.json()["client_id"])
+        assert app.redirect_uris.split() == uris
+
     def test_omitted_client_name_gets_placeholder(self, client):
         response = _post(client, {"redirect_uris": ["http://127.0.0.1:9999"]})
         assert response.json()["client_name"] == "Unnamed MCP client"
@@ -192,6 +218,112 @@ class TestDynamicClientRegistrationValidation:
             response = _post(client, {"redirect_uris": [uri]})
             assert response.status_code == HTTPStatus.BAD_REQUEST, uri
             assert response.json()["error"] == "invalid_redirect_uri"
+
+    @pytest.mark.parametrize(
+        "separator",
+        [
+            " ",
+            "\t",
+            "\n",
+            "\r",
+            "\x0b",  # vertical tab
+            "\x0c",  # form feed
+            "\x1c",  # file separator
+            "\x85",  # next line (NEL)
+            "\xa0",  # no-break space
+            "\u2028",  # line separator
+            "\u3000",  # ideographic space
+        ],
+        ids=["space", "tab", "lf", "cr", "vt", "ff", "fs", "nel", "nbsp", "ls", "ideo"],
+    )
+    def test_whitespace_smuggled_redirect_rejected(self, client, separator):
+        # DOT stores an Application's redirect URIs as one whitespace-joined
+        # string and matches with `str.split()`. A single submitted URI with
+        # embedded `str.split()` whitespace would register a SECOND, off-machine
+        # redirect, while `urlparse` still reports the loopback host — so only
+        # the explicit split check stops it.
+        smuggled = f"http://127.0.0.1:3456/cb{separator}http://evil.example/steal"
+        # Guard the parameter itself: each case must be a real smuggle under
+        # DOT's parsing, or this test would pass without exercising the hole.
+        assert smuggled.split() == [
+            "http://127.0.0.1:3456/cb",
+            "http://evil.example/steal",
+        ]
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [smuggled]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
+
+    def test_smuggled_uri_anywhere_in_list_refuses_whole_request(self, client):
+        # All-or-nothing: one bad entry refuses the registration outright,
+        # rather than registering the clean entries and dropping the bad one.
+        before = Application.objects.count()
+        response = _post(
+            client,
+            {
+                "redirect_uris": [
+                    "http://127.0.0.1:3456/cb",
+                    "http://127.0.0.1:3456/cb2 http://evil.example/steal",
+                ]
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://[::1/cb",  # unterminated IPv6 literal: `urlparse` raises
+            "http://::1]/cb",  # stray closing bracket: `urlparse` raises
+            # A netloc character that becomes `#` under NFKC: `urlparse` raises.
+            "http://localhost\uff03@evil.example/cb",
+        ],
+    )
+    def test_malformed_authority_rejected_not_500(self, client, uri):
+        # The default `client` re-raises view exceptions, so a regression to
+        # an uncaught ValueError fails here loudly rather than as a status.
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [uri]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://localhost:abc/cb",
+            "http://localhost:99999/cb",
+            "http://127.0.0.1:-1/cb",
+        ],
+    )
+    def test_unparseable_port_rejected(self, client, uri):
+        # Previously stored as-is; DOT's `.port` access then raised at
+        # `/o/authorize/`. Refused at registration so it never reaches DOT.
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [uri]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://127.0.0.1:3456/cb\x00",  # NUL: PostgreSQL refuses it on INSERT
+            "\x01http://127.0.0.1:3456/cb",  # leading C0: `urlsplit` strips it
+            "http://127.0.0.1:3456/cb\x7f",  # DEL
+            "http://127.0.0.1:3456/cb\ud800",  # lone surrogate: not encodable
+            "http://127.0.0.1:3456/caf\u00e9",  # non-ASCII: not an RFC 3986 URI
+        ],
+        ids=["nul", "leading-c0", "del", "lone-surrogate", "non-ascii"],
+    )
+    def test_non_printable_or_non_ascii_rejected(self, client, uri):
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [uri]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
 
     def test_grant_types_missing_authorization_code_rejected(self, client):
         response = _post(
@@ -374,6 +506,85 @@ class TestRegisteredClientCompletesOAuthFlow:
             AccessToken.objects.filter(user=mcp_user, application=dynamic_app).count()
             == 0
         )
+
+
+@pytest.mark.django_db
+class TestPreFixSmuggledRowInertAtAuthorize:
+    """A DCR row minted before the registration check existed may already
+    store a smuggled off-machine redirect. `MCPOAuth2Validator` re-applies the
+    loopback predicate to the requested URI at `/o/authorize/`, so such a row
+    can never deliver a code off-machine even if the operator never finds and
+    deletes it."""
+
+    LOOPBACK = "http://127.0.0.1:3456/cb"
+    EVIL = "http://evil.example/steal"
+
+    @pytest.fixture
+    def legacy_app(self, db):
+        # Exactly what a <= 0.1.0b5 `/o/register` stored for a single submitted
+        # `LOOPBACK + " " + EVIL` URI: DOT reads it back as TWO redirects.
+        client_id = (
+            f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
+        )
+        app = Application.objects.create(
+            name=client_id,
+            client_id=client_id,
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=False,
+            redirect_uris=f"{self.LOOPBACK} {self.EVIL}",
+            algorithm="",
+        )
+        # Precondition: DOT's own matching WOULD allow the off-machine URI.
+        assert app.redirect_uri_allowed(self.EVIL) is True
+        return app
+
+    def _params(self, app, redirect_uri) -> dict:
+        return {
+            "client_id": app.client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "xyz",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+
+    def test_consent_screen_refused_for_smuggled_redirect(
+        self, client, mcp_user, mcp_mfa_on, legacy_app
+    ):
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize") + "?" + urlencode(self._params(legacy_app, self.EVIL))
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+
+    def test_consent_approval_never_redirects_off_machine(
+        self, client, mcp_user, mcp_mfa_on, legacy_app
+    ):
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"),
+            data={**self._params(legacy_app, self.EVIL), "allow": "Authorize"},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+        assert not Grant.objects.filter(application=legacy_app).exists()
+
+    def test_loopback_redirect_on_the_same_row_still_works(
+        self, client, mcp_user, mcp_mfa_on, legacy_app
+    ):
+        # Positive control: the guard refuses the off-machine entry, not the row.
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"),
+            data={**self._params(legacy_app, self.LOOPBACK), "allow": "Authorize"},
+        )
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        assert response["Location"].startswith(self.LOOPBACK + "?")
+        assert Grant.objects.filter(application=legacy_app).exists()
 
 
 @pytest.mark.django_db

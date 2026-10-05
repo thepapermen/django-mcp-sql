@@ -1,9 +1,10 @@
 """RFC 7591 dynamic client registration at `/o/register`. Anonymous
 JSON POST mints an `mcp-sql-<token>` Application with
 `skip_authorization=False` (so the client hits the consent screen,
-preventing silent-consent token theft) and a loopback-only
-`redirect_uri`. See `docs/architecture.md` "OAuth surface" + the
-`docs/oauth.md` runbook for the full security posture."""
+preventing silent-consent token theft) and loopback-only
+`redirect_uris` (`_is_loopback_redirect`, which `oauth.MCPOAuth2Validator`
+re-applies at `/o/authorize/`). See `docs/architecture.md` "OAuth
+surface" + the `docs/oauth.md` runbook for the full security posture."""
 
 import json
 import secrets
@@ -43,7 +44,34 @@ def _error(
 
 
 def _is_loopback_redirect(uri: str) -> bool:
-    parsed = urlparse(uri)
+    if uri.split() != [uri]:
+        # The Application stores its redirect URIs as ONE whitespace-joined
+        # string, and DOT reads them back with `redirect_uris.split()`. A
+        # single submitted URI containing any `str.split()` whitespace —
+        # not only space/tab/CR/LF, but also e.g. `\x0b`, `\x1c`, NBSP,
+        # U+2028 — would therefore be stored as TWO OR MORE registered
+        # redirects, while `urlparse` below only ever sees the first
+        # (loopback) host: an off-machine redirect smuggled past the check.
+        # Deliberately the SAME operation DOT performs, so the two can't drift.
+        return False
+    if not uri.isascii() or not uri.isprintable():
+        # RFC 3986 URIs are printable ASCII. Anything else is either rewritten
+        # before parsing (`urlsplit` silently strips leading C0 controls, so
+        # the string we validated is not the one we would store) or rejected
+        # by the database on INSERT (NUL, lone surrogates — an uncaught 500).
+        # Refuse the whole class rather than enumerate the harmful characters.
+        return False
+    try:
+        parsed = urlparse(uri)
+        # `.port` is parsed lazily and raises on a non-numeric or out-of-range
+        # port (`:abc`, `:99999`). DOT reads it when matching at
+        # `/o/authorize/`, so a URI it cannot parse must never be stored.
+        _ = parsed.port
+    except ValueError:
+        # Malformed authority (`http://[::1/cb`, an unparseable port, a netloc
+        # that changes under NFKC): a client error, answered with the normal
+        # 400 rather than an uncaught 500.
+        return False
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False

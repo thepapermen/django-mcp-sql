@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
@@ -96,15 +97,23 @@ class MCPOAuth2Validator(OAuth2Validator):
         return app is not None and is_mcp_application_name(app.name)
 
     def validate_redirect_uri(self, client_id, redirect_uri, request, *args, **kwargs):
-        """Admit a "prefix" cloud client's per-instance callback.
+        """Admit a "prefix" cloud client's per-instance callback; hold every
+        non-cloud client to a loopback redirect.
 
         For a settings-declared cloud client whose `REDIRECT_MATCH` is
         "prefix" (ChatGPT / Codex-cloud), accept any redirect under the
-        allowlisted host+path prefix via `_redirect_under_prefix`. EVERY other
-        client — "exact" cloud clients, the canonical `mcp-sql` row, and every
-        loopback DCR client — falls through to DOT's stock exact matching
-        against the Application's stored `redirect_uris`, so this override
-        neither widens nor weakens the loopback/exact paths.
+        allowlisted host+path prefix via `_redirect_under_prefix`. "Exact"
+        cloud clients fall through to DOT's stock exact matching against the
+        Application's stored `redirect_uris`.
+
+        EVERY other client — the canonical `mcp-sql` row and every DCR client
+        — must ALSO pass `_is_loopback_redirect` (the `/o/register` predicate)
+        on the requested URI before DOT's matching runs. Only declared cloud
+        clients may redirect off-machine; DOT's matching alone trusts whatever
+        the row stores, and a DCR row minted by <= 0.1.0b5 can store an
+        off-machine redirect smuggled through whitespace (see
+        `_is_loopback_redirect`). This re-check makes such a row inert here
+        without needing the operator to find and delete it first.
 
         Why cloud clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Cloud clients".
@@ -112,6 +121,8 @@ class MCPOAuth2Validator(OAuth2Validator):
         cloud = mcp_sql_settings.cloud_clients().get(client_id)
         if cloud is not None and cloud.redirect_match == "prefix":
             return _redirect_under_prefix(redirect_uri, cloud.redirect_uri)
+        if cloud is None and not _is_loopback_redirect(redirect_uri):
+            return False
         return super().validate_redirect_uri(
             client_id, redirect_uri, request, *args, **kwargs
         )

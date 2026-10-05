@@ -111,6 +111,27 @@ for a in Application.objects.filter(name__startswith='mcp-sql').order_by('-creat
 "
 ```
 
+Releases up to and including 0.1.0b5 could store a DCR row whose
+`redirect_uris` holds an off-machine entry smuggled in through whitespace
+(see `CHANGELOG.md`). Since the fix such an entry is refused at
+`/o/authorize/`, but the rows are not deleted automatically. List DCR rows
+holding any entry the current registration check would refuse (print-only;
+review before deleting):
+
+```sh
+python manage.py shell -c "
+from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.views.registration import _is_loopback_redirect
+from oauth2_provider.models import Application
+qs = Application.objects.filter(
+    name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
+).exclude(name__in=list(mcp_sql_settings.cloud_clients()))
+for a in qs:
+    if not all(_is_loopback_redirect(u) for u in a.redirect_uris.split()):
+        print(a.created, a.client_id, '->', repr(a.redirect_uris))
+"
+```
+
 Manual registration probe (no auth, no client tooling):
 
 ```sh
@@ -122,7 +143,10 @@ curl -s -X POST https://<host>/o/register \
 
 **Security**: the structural mitigations are the loopback-only
 `redirect_uris` restriction (a rogue registered client can only redirect to
-its own machine — useless for cross-machine token theft) and the
+its own machine — useless for cross-machine token theft; enforced at
+registration and re-checked on the requested redirect at `/o/authorize/`,
+see the "DOT stores redirect URIs whitespace-joined" entry in
+`docs/architecture.md`) and the
 `/o/authorize/` issuance gate (real user with is_staff + MFA + perm
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same
@@ -360,9 +384,12 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
   accepts a redirect **iff** it is `https`, carries no userinfo, its host
   **exactly equals** the prefix host (never `endswith`, so
   `chatgpt.com.evil.com` is rejected), its port matches, it has no `..`
-  segment, and its path starts with the allowlisted prefix path. Every other
-  client — exact cloud clients, the canonical row, every loopback DCR client —
-  falls through to DOT's stock exact matching, untouched.
+  segment, and its path starts with the allowlisted prefix path. Exact cloud
+  clients fall through to DOT's stock exact matching, untouched. The canonical
+  row and every loopback DCR client also fall through to it, but only after the
+  requested redirect passes the `/o/register` loopback predicate
+  (`_is_loopback_redirect`) — so a non-cloud client can never be redirected
+  off-machine, whatever its row stores.
 
 **Onboarding a cloud client (operator + user).**
 
