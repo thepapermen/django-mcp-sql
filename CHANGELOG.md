@@ -114,22 +114,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   malformed transport, like the 413 body cap).
   - **Behaviour change:** a client sending its token anywhere but the
     `Authorization` header is now refused.
-- **Raised the `django-oauth-toolkit` floor to `>=3.4` (was `>=3.2`).**
-  Releases before 3.4.0 redirect an unauthenticated `prompt=none`
-  authorization request to whatever `redirect_uri` it names, with an
-  `error=login_required` but never a code, before any validation — and so
-  before any of this package's redirect checks (DOT #1719, fixed upstream in
-  3.4.0). With the new floor that request is validated first, like any
-  other: an unregistered `redirect_uri` gets an error page instead of a
-  redirect, while a registered one (a loopback URI, or a declared cloud
-  client's `https` callback) still receives the specified
-  `error=login_required`, never a code. A new test pins this for the
-  canonical client.
+- **Raised the `django-oauth-toolkit` floor to `>=3.4.1` (was `>=3.2`)**,
+  for two upstream fixes that sit below any of this package's checks:
+  - Releases before 3.4.0 redirect an unauthenticated `prompt=none`
+    authorization request to whatever `redirect_uri` it names, with an
+    `error=login_required` but never a code, before any validation (DOT
+    #1719). Now that request is validated first, like any other: an
+    unregistered `redirect_uri` gets an error page instead of a redirect,
+    while a registered one (a loopback URI, or a declared cloud client's
+    `https` callback) still receives the specified `error=login_required`,
+    never a code. A new test pins this for the canonical client.
+  - Releases before 3.4.1 match redirect URIs loosely. Against a
+    registered `https://claude.ai/api/mcp/auth_callback`, DOT 3.4.0's
+    matcher accepts the same host with userinfo, extra query parameters, a
+    fragment or `;params` added. oauthlib's own absolute-URI check stops the
+    userinfo and fragment forms first, but the extra-query and `;params`
+    forms reached the consent page end to end (verified on 3.4.0), so an
+    authorization code could be delivered to the registered host with
+    attacker-chosen parameters. 3.4.1 matches exactly, per RFC 9700 §2.1.
+    This is the matcher behind declared "exact" cloud clients; a new test
+    pins all four forms being refused at `/o/authorize/` for one.
   - **Action required** for a consumer pinning django-oauth-toolkit below
-    3.4 (e.g. `==3.2.0`): bump it. 3.4.0 still supports Django 4.2 and
+    3.4.1 (e.g. `==3.2.0`): bump it. 3.4.1 still supports Django 4.2 and
     requires `oauthlib>=3.3.0` (unchanged from 3.2.0). Django 4.2 remains
     supported; CI's minimum-versions job now pins
-    `django-oauth-toolkit==3.4`.
+    `django-oauth-toolkit==3.4.1`.
 
 ### Changed
 

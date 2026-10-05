@@ -237,15 +237,14 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         `ACCESS_TOKEN_EXPIRE_SECONDS` is meant to be the re-consent interval.
         DOT does not give that on its own: with the documented
-        `REFRESH_TOKEN_EXPIRE_SECONDS=0` a refresh token has no age limit
-        (DOT 3.4.0, like 3.2/3.3 before it, checks no age at refresh time;
-        3.4.1 adds only an idle window from the access token's expiry, which
-        `0` disables), so a refresh token minted by any release up to and
-        including 0.1.0b5 renewed access indefinitely without the user. This
-        is the hook oauthlib's refresh
-        grant calls after client authentication, so returning `False` also
-        covers refresh tokens already stored. `save_bearer_token` stops new
-        ones from being minted.
+        `REFRESH_TOKEN_EXPIRE_SECONDS=0` a refresh token has no age limit (DOT
+        3.4.1, the floor, measures only an idle window from the access token's
+        expiry, which `0` disables; earlier releases checked no age at refresh
+        time at all), so a refresh token minted by any release up to and
+        including 0.1.0b5 renewed access indefinitely without the user. This is
+        the hook oauthlib's refresh grant calls after client authentication, so
+        returning `False` also covers refresh tokens already stored.
+        `save_bearer_token` stops new ones from being minted.
 
         Install-wide, like `validate_scopes` (which already refuses every
         scope but `mcp:sql`): this class is the install's

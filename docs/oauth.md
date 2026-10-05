@@ -153,9 +153,10 @@ curl -s -X POST https://<host>/o/register \
 its own machine — useless for cross-machine token theft; enforced at
 registration and re-checked on the requested redirect at `/o/authorize/`,
 see the "DOT stores redirect URIs whitespace-joined" entry in
-`docs/architecture.md`; the `django-oauth-toolkit>=3.4` floor also keeps out
-DOT releases that redirected an unauthenticated `prompt=none` request to the
-supplied `redirect_uri` before any of this ran, DOT #1719) and the
+`docs/architecture.md`; the `django-oauth-toolkit>=3.4.1` floor also keeps
+out DOT releases that redirected an unauthenticated `prompt=none` request to
+the supplied `redirect_uri` before any of this ran, DOT #1719, and ones whose
+redirect matching was not exact) and the
 `/o/authorize/` issuance gate (real user with is_staff + MFA + perm
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same

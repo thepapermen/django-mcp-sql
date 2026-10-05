@@ -29,7 +29,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
   validator refuses refresh grants and mints none). Audience
   binding is implicit: the binding is achieved via the single `mcp:sql`
   scope plus the auth class being mounted only on `/mcp/sql/` (no explicit
-  `aud` claim). DOT 3.4 (the floor) ships RFC 8707 resource-indicator
+  `aud` claim). DOT 3.4+ (3.4.1 is the floor) ships RFC 8707 resource-indicator
   support (DOT #1626), but the package does not use it yet — adopting it is
   the revisit point. See
   `docs/oauth.md` for the operational profile.
@@ -341,7 +341,7 @@ column-level grants scattered in tooling state.
 - **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
 - **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` rows (scoped via `application__name__startswith="mcp-sql"`, covering the curated Application, every dynamically-registered client, and every settings-declared `mcp-sql-cloud.<name>` client).
 - **Cloud clients (opt-in)**: `MCP_SQL["CLOUD_CLIENTS"]` (empty default → off) admits operator-blessed cloud-brokered clients (Claude.ai web/desktop/mobile/Cowork, ChatGPT/Codex-cloud) that vault the token in the provider's cloud behind an `https` callback. Each entry provisions one curated `Application` (`mcp-sql-cloud.<name>`, public/PKCE, no secret, `skip_authorization=False`) via the `post_migrate` receiver `provision_mcp_cloud_clients` (mirrors `provision_mcp_profiles`; create/update only — never deletes, recognition is what gates). Redirect matching is per-entry `"exact"` (DOT stock) or `"prefix"` (one override). No refresh tokens: cloud users re-consent every 6 h like everyone else. CIMD (Client ID Metadata Documents) is deferred — see `docs/oauth.md` → "Roadmap". Full onboarding + the `SESSION_MODEL` recommendation: `docs/oauth.md` → "Cloud clients".
-- **Audience binding**: implicit. Binding is achieved via the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. DOT 3.4 (the floor) ships RFC 8707 Resource Indicators support (DOT #1626); the package does not use it yet (no `resource` / `aud` check), and adopting it is the revisit point.
+- **Audience binding**: implicit. Binding is achieved via the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. DOT 3.4+ (3.4.1 is the floor) ships RFC 8707 Resource Indicators support (DOT #1626); the package does not use it yet (no `resource` / `aud` check), and adopting it is the revisit point.
 
 ## Naming map
 

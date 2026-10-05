@@ -257,6 +257,60 @@ class TestRedirectUnderPrefix:
         assert _redirect_under_prefix(f"{bare}/inst-42", bare) is True
 
 
+@pytest.mark.django_db
+class TestExactCloudClientMatchedExactly:
+    """An "exact" cloud client rides DOT's own matching, which is exact only
+    from django-oauth-toolkit 3.4.1 (the floor; RFC 9700 §2.1). DOT 3.4.0's
+    matcher still accepted the registered host with userinfo, extra query
+    parameters, a fragment or `;params` added; oauthlib's absolute-URI check
+    stops the userinfo and fragment forms first, but on 3.4.0 the extra-query
+    and `;params` forms reached the consent page (and then the code redirect)."""
+
+    @staticmethod
+    def _authorize(client, redirect_uri):
+        from urllib.parse import urlencode
+
+        from django.urls import reverse
+
+        params = {
+            "client_id": CLAUDE_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        return client.get(reverse("authorize") + "?" + urlencode(params))
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "https://attacker@claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
+            "https://claude.ai/api/mcp/auth_callback#frag",
+            "https://claude.ai/api/mcp/auth_callback;p=1",
+        ],
+        ids=["userinfo", "extra-query", "fragment", "path-params"],
+    )
+    def test_near_miss_of_the_registered_callback_is_refused(
+        self, client, settings, mcp_user, mcp_mfa_on, variant
+    ):
+        _provision(settings, [CLAUDE])
+        client.force_login(mcp_user)
+        response = self._authorize(client, variant)
+        assert response.status_code == 400, response.content
+        assert "Location" not in response
+
+    def test_registered_callback_gets_the_consent_page(
+        self, client, settings, mcp_user, mcp_mfa_on
+    ):
+        _provision(settings, [CLAUDE])
+        client.force_login(mcp_user)
+        response = self._authorize(client, CLAUDE["REDIRECT_URI"])
+        assert response.status_code == 200, response.content
+
+
 class TestValidateRedirectUriOverride:
     def test_prefix_client_admits_under_prefix(self, settings):
         settings.MCP_SQL = _cfg([CHATGPT])

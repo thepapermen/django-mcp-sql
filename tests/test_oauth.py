@@ -276,7 +276,7 @@ class TestMCPAuthorizationViewRouting:
         """DOT before 3.4.0 answered an anonymous `prompt=none` request with a
         302 to whatever `redirect_uri` it named — before validating the client
         or the URI (DOT #1719), so before any check of this package. The
-        `django-oauth-toolkit>=3.4` floor exists for this: the request is now
+        `django-oauth-toolkit>=3.4.1` floor keeps this out: the request is now
         validated first, and an off-machine URI gets an error page.
         """
         params = {

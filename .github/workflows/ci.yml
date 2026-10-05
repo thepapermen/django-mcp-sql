@@ -139,7 +139,7 @@ jobs:
           cat > /tmp/min-constraints.txt <<'EOF'
           django==4.2.*
           djangorestframework==3.14
-          django-oauth-toolkit==3.4
+          django-oauth-toolkit==3.4.1
           sqlglot==30.7
           mcp==1.28.1
           a2wsgi==1.10

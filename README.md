@@ -387,9 +387,9 @@ DRF:
 
 | Django  | Python      | DRF (supported) | django-oauth-toolkit |
 |---------|-------------|-----------------|----------------------|
-| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.4                  |
-| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.4                  |
-| 6.0     | 3.12, 3.13  | 3.17            | 3.4                  |
+| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.4.1+               |
+| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.4.1+               |
+| 6.0     | 3.12, 3.13  | 3.17            | 3.4.1+               |
 
 - The DRF floor is **3.14** — the lowest we support, i.e. what a legacy
   Django 4.2 app is likely already pinning. Each Django line has its own DRF
@@ -401,8 +401,10 @@ DRF:
   the ragged Python columns.
 - `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
   Django-version-coupled within their declared ranges. django-oauth-toolkit
-  is floored at **3.4** on every row: earlier releases have an
-  unauthenticated open redirect at `/o/authorize/` (DOT #1719).
+  is floored at **3.4.1** on every row: earlier releases have an
+  unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed in
+  3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
+  §2.1).
 
 ### Dropping into an existing app with an older pinned DRF
 
