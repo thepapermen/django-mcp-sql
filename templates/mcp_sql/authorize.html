@@ -13,14 +13,17 @@ Three values, all injected by `MCPAuthorizationView.render_to_response`:
 name the operator configured — a self-registered client sends its own
 `client_name`, so showing that would let anyone label themselves; and
 `client_destination` is where the authorization code will be delivered,
-which oauthlib has already validated and is the fact an attacker cannot
-dress up. DOT's stock template shows `application.name`, which for a
-self-registered client is the opaque `mcp-sql-<token>` and for everyone else
-says nothing about the destination.
+which oauthlib has already validated. It names a provider or a machine, not
+whose account there: a shared provider callback (Claude.ai, every ChatGPT
+connector) renders identically for an attacker's own connector. DOT's stock
+template shows `application.name`, which for a self-registered client is the
+opaque `mcp-sql-<token>` and for everyone else says nothing about the
+destination.
 
-Approving this form is what stops a phished authorization link from silently
-handing someone else's process a token, so the destination must stay visible
-in any re-theme.
+Approving this form is an explicit, CSRF-protected POST, so a phished
+authorization link cannot complete silently; the check the user can actually
+make is the "Only continue if you started this from there" instruction. Keep
+both it and the destination visible in any re-theme.
 {% endcomment %}
 {% block content %}
   <div class="block-center">

@@ -73,12 +73,15 @@ class MCPAuthorizationView(AuthorizationView):
     def _client_destination(context: dict[str, Any]) -> str:
         """Where the authorization code will actually be delivered.
 
-        The one fact on this page an attacker cannot dress up: oauthlib has
+        The one fact on this page the requester does not author: oauthlib has
         already validated this `redirect_uri` against the Application, and the
         code is going there. `scheme://host[:port]` — enough to tell
         `https://claude.ai` from `http://localhost:8787` from someone else's
         machine, without a long path pushing the useful part off a narrow
-        screen.
+        screen. It names the provider or machine, NOT whose account there: a
+        shared provider callback (Claude.ai's, or any ChatGPT connector's)
+        renders the same for an attacker's own connector, so the template's
+        "Only continue if you started this from there" is the real check.
 
         Rebuilt from the parsed parts rather than sliced out of the raw
         string, so a userinfo component can never reach the page: no

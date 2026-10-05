@@ -566,9 +566,27 @@ the validated `redirect_uri`). A self-registered DCR client gets no label: the
 `client_name` it sent at registration is attacker-chosen free text, so
 rendering it would let anyone label themselves "Claude Code". Its callback
 address is its only identifier, which is the honest one — that address is
-where the code actually goes. If you re-theme `mcp_sql/authorize.html`, keep
-the destination line: it is what makes a phished authorization link
-recognisable.
+where the code actually goes.
+
+Be clear about what the destination line can and cannot tell a user. It names
+the **provider or machine** the code goes to (`https://claude.ai`,
+`https://chatgpt.com`, `http://localhost:8787`) — never **whose account** at
+that provider. Claude.ai's callback is one URL shared by every Claude.ai
+account, and every ChatGPT connector's `/connector/oauth/<id>` callback renders
+as `https://chatgpt.com`. So an attacker who adds their own connector against
+your server, starts the flow and sends the resulting authorization link to a
+staff user produces a page that looks exactly like a legitimate one; if the
+user approves, the code lands in the attacker's provider account (the
+shared-callback phishing surface noted under "What each entry does"). Showing
+the connector id would not help — the user cannot tell theirs from an
+attacker's. The page's real defence is its instruction, **"Only continue if
+you started this from there"**: approving is an explicit, CSRF-protected POST,
+and an approval the user did not initiate *is* the attack. Behind it, every
+request re-runs the issuance gate (active staff, MFA, one profile) and is
+audited under the user with the client's id and kind, a token lives only as
+long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config), and
+logging out revokes every MCP token the user holds. If you re-theme
+`mcp_sql/authorize.html`, keep both the destination and that instruction.
 
 **Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three
 attribution columns: `application_name` (the client_id), `client_kind` (the

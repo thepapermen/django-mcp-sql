@@ -83,10 +83,14 @@ precisely because it is the one that does **not** announce itself.
   three `Application` rows bound to `claude.ai` / `chatgpt.com` / `cursor.com`
   callbacks at the next `migrate`, with no error and no prompt. The derived
   client_ids are guessable (`mcp-sql-cloud.claude`), so what stands between a
-  phished authorization link and a token is now the issuance gate (staff + MFA
-  + profile) and the consent screen — no longer RFC 8252 loopback delivery.
-  That is the whole point of the consent-screen rework in this release, but an
-  operator who deliberately chose loopback-only should know the posture moved.
+  phished authorization link and a token is now a cohort user (staff + MFA +
+  profile — the issuance gate limits who can be a victim, not whether the
+  link works) declining the consent screen — no longer RFC 8252 loopback
+  delivery. Under loopback-only, a phished code still landed on the victim's
+  own machine; with a shared provider callback, an attacker who adds their own
+  connector receives it in their own provider account, and the consent page
+  looks the same either way (see "Changed" below). An operator who
+  deliberately chose loopback-only should know the posture moved.
   Set `"CLIENTS": {}` to keep the old behaviour, or name just the clients you
   want. Provisioning logs each client at INFO on every `migrate`.
 
@@ -153,7 +157,11 @@ precisely because it is the one that does **not** announce itself.
   client's operator-authored `LABEL` and, for every client, the destination
   (`scheme://host[:port]`, rebuilt from the validated `redirect_uri`'s parsed
   parts so a userinfo component cannot render). A self-registered client gets
-  no label: its `client_name` is attacker-chosen free text.
+  no label: its `client_name` is attacker-chosen free text. The destination
+  names the provider or machine, not whose account there — a shared callback
+  (Claude.ai's, every ChatGPT connector's) renders identically for an
+  attacker's own connector — so the screen's real check is its "Only continue
+  if you started this from there" line.
 - The `"prefix"` redirect matcher also refuses a backslash anywhere in the
   (percent-decoded) path, since a browser reads `\` as `/` in an https URL and
   `..\` is traversal by another spelling. Hardening rather than a reachable
