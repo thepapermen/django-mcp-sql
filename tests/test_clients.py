@@ -1110,3 +1110,63 @@ class TestReviewFindings:
         }
         with pytest.raises(ImproperlyConfigured, match="/o/register"):
             validate_mcp_sql_settings({"CLIENTS": {}})
+
+
+def _dot_has_localhost_loopback() -> bool:
+    from oauth2_provider.settings import DEFAULTS
+
+    return "ALLOW_LOCALHOST_LOOPBACK" in DEFAULTS
+
+
+@pytest.mark.django_db
+@pytest.mark.skipif(
+    not _dot_has_localhost_loopback(),
+    reason="OAUTH2_PROVIDER['ALLOW_LOCALHOST_LOOPBACK'] exists from DOT 3.4",
+)
+class TestLocalhostLoopbackFlag:
+    """DOT >= 3.4's `ALLOW_LOCALHOST_LOOPBACK=True` port-wildcards a
+    registered `http://localhost` callback — the exact widening a declared
+    `local` client's rules exist to forbid (`clients.LOOPBACK_HOST`)."""
+
+    @staticmethod
+    def _flag(settings, *, on):
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ALLOW_LOCALHOST_LOOPBACK": on,
+        }
+
+    def test_the_flag_really_widens_an_exact_localhost_rule(self, settings):
+        # The premise, pinned through DOT's own matcher, so this class goes
+        # red (rather than silently guarding nothing) if DOT ever changes what
+        # the flag means.
+        from oauth2_provider.models import Application
+
+        app = Application(redirect_uris=CURSOR_DESKTOP["REDIRECTS"][0]["URI"])
+        self._flag(settings, on=False)
+        assert not app.redirect_uri_allowed("http://localhost:9999/callback")
+        self._flag(settings, on=True)
+        assert app.redirect_uri_allowed("http://localhost:9999/callback")
+
+    def test_refused_when_a_local_client_is_declared(self, settings):
+        self._flag(settings, on=True)
+        with pytest.raises(ImproperlyConfigured, match="ALLOW_LOCALHOST_LOOPBACK"):
+            validate_mcp_sql_settings(_cfg({"cursor-desktop": CURSOR_DESKTOP}))
+
+    @pytest.mark.parametrize(
+        "clients",
+        [
+            pytest.param(None, id="shipped-defaults"),
+            pytest.param({}, id="no-clients"),
+        ],
+    )
+    def test_left_alone_without_a_local_client(self, settings, clients):
+        # Install-global, and it changes nothing else this package promises:
+        # DCR and the curated Application already live with any-port loopback
+        # via 127.0.0.1 / ::1. Vetoing it here would only break a consumer's
+        # unrelated OAuth config.
+        self._flag(settings, on=True)
+        validate_mcp_sql_settings({} if clients is None else _cfg(clients))
+
+    def test_off_is_fine_with_a_local_client(self, settings):
+        self._flag(settings, on=False)
+        validate_mcp_sql_settings(_cfg({"cursor-desktop": CURSOR_DESKTOP}))

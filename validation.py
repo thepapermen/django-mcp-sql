@@ -554,13 +554,53 @@ def _validate_redirect_schemes(kinds: set[ClientKind]) -> None:
             raise ImproperlyConfigured(msg)
 
 
+def _validate_localhost_loopback(kinds: set[ClientKind]) -> None:
+    """A declared `local` client's exact rule must stay exact.
+
+    DOT >= 3.4's `ALLOW_LOCALHOST_LOOPBACK=True` extends the RFC 8252 any-port
+    treatment DOT already gives `127.0.0.1` / `::1` to `localhost`
+    (`oauth2_provider.models.check_redirect_to_uri_allowed`). `localhost` is
+    the ONLY host a `local` entry may use precisely because DOT did not
+    port-wildcard it (`clients.LOOPBACK_HOST`), so with the flag on, a declared
+    `http://localhost:8787/callback` silently admits every port on the user's
+    machine — the widening the `local` rules exist to forbid, with nothing at
+    boot or in the logs to say so.
+
+    "Feature on -> require the safe setting": refused whenever a `local` client
+    is declared, and only then. The flag is install-global, and it changes
+    nothing else this package promises — DCR clients and the curated
+    Application already live with any-port loopback through `127.0.0.1` /
+    `::1`, and with the flag on a DCR `localhost` callback merely joins them —
+    so refusing it unconditionally would veto a consumer's unrelated OAuth
+    config for no gain. `getattr` with a default because the setting does not
+    exist before DOT 3.4, whose settings object raises `AttributeError` for an
+    unknown name.
+    """
+    from oauth2_provider.settings import oauth2_settings
+
+    if ClientKind.LOCAL in kinds and getattr(
+        oauth2_settings, "ALLOW_LOCALHOST_LOOPBACK", False
+    ):
+        msg = (
+            f"MCP_SQL.CLIENTS declares a '{ClientKind.LOCAL}' (loopback) client, "
+            f"but OAUTH2_PROVIDER['ALLOW_LOCALHOST_LOOPBACK'] is True. DOT then "
+            f"matches a registered http://{LOOPBACK_HOST} callback on ANY port, "
+            f"silently widening the declared client's exact "
+            f"http://{LOOPBACK_HOST}:<port>/<path> rule into 'any port on the "
+            f"user's machine'. Set ALLOW_LOCALHOST_LOOPBACK to False, or drop "
+            f"the '{ClientKind.LOCAL}' entries from MCP_SQL.CLIENTS (clients that "
+            f"can self-register via /o/register need no entry)."
+        )
+        raise ImproperlyConfigured(msg)
+
+
 def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> None:
     """Each CLIENTS entry: a slug key, MATCH in {"exact", "prefix"}, a
     hardened redirect URI per rule, and a single consistent redirect scheme
     across the entry (enforced by `clients.build_clients`, which derives the
-    kind). Then the scheme guard above. `{}` is a no-op — DCR and the curated
-    Application still work, the surface is just loopback-only. What this
-    setting enables end-to-end: `docs/oauth.md` → "Clients"."""
+    kind). Then the two DOT-settings guards above. `{}` is a no-op — DCR and
+    the curated Application still work, the surface is just loopback-only.
+    What this setting enables end-to-end: `docs/oauth.md` → "Clients"."""
     for name, entry in clients.items():
         if not _CLIENT_NAME_RE.fullmatch(name):
             msg = (
@@ -588,7 +628,9 @@ def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> 
         msg = f"Invalid MCP_SQL.CLIENTS: {exc}"
         raise ImproperlyConfigured(msg) from exc
 
-    _validate_redirect_schemes({client.kind for client in built.values()})
+    kinds = {client.kind for client in built.values()}
+    _validate_redirect_schemes(kinds)
+    _validate_localhost_loopback(kinds)
 
 
 def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:

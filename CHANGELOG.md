@@ -59,6 +59,21 @@ precisely because it is the one that does **not** announce itself.
   running `["https"]` today will not start until they add `"http"`; DOT's own
   default has both, so most consumers never declared the key at all.
 
+  **Known conflict with DOT ≥ 3.4's opt-in RFC 9700 gate.** DOT 3.4 added
+  `OAUTH2_PROVIDER["COMPLIANT_BCP_RFC9700_REDIRECT_URI_SCHEME"]`. It changes no
+  runtime behaviour — it only sets the severity of the `manage.py check
+  --deploy` finding for `"http"` in `ALLOWED_REDIRECT_URI_SCHEMES`: warning
+  `oauth2_provider.W008` while the gate is `False` (DOT's default, so every
+  deployment of this package sees that warning under `--deploy`), error
+  `oauth2_provider.E003` once it is `True`. Since this package will not boot
+  without `"http"`, no configuration satisfies both with the gate on:
+  `check --deploy` fails on E003. The `http` entry is what RFC 8252 loopback
+  callbacks need, and DOT's own hint for E003 says to keep it if you support
+  them. Either leave the gate off, or turn it on and add
+  `"oauth2_provider.E003"` to `SILENCED_SYSTEM_CHECKS` (Django silences errors
+  as well as warnings; checked against DOT 3.4.1). DOT says the gate defaults
+  flip to `True` in its 4.0; this package caps DOT at `<4`.
+
 - **Declared clients now ship ON.** `CLOUD_CLIENTS` defaulted to `[]`; `CLIENTS`
   defaults to `claude`, `chatgpt` and `cursor`. A consumer who declared the old
   key hits the `ImproperlyConfigured` above and makes a deliberate choice — but
@@ -97,8 +112,12 @@ precisely because it is the one that does **not** announce itself.
 - **A `local` client kind** for a client that pins a fixed loopback port and
   cannot use DCR (Cursor's static `mcp.json` path). Held to narrower rules than
   an https entry: `localhost` only (never `127.0.0.1` / `::1`, which DOT
-  port-wildcards), explicit port, non-root path, `MATCH: "exact"`. Documented,
-  not shipped — see `docs/oauth.md` → "Clients".
+  port-wildcards), explicit port, non-root path, `MATCH: "exact"`. While one is
+  declared, boot also refuses DOT ≥ 3.4's
+  `OAUTH2_PROVIDER["ALLOW_LOCALHOST_LOOPBACK"] = True`, which would
+  port-wildcard `localhost` too and silently turn the exact rule into "any port
+  on the user's machine". Documented, not shipped — see `docs/oauth.md` →
+  "Clients".
 - **Client attribution on every audit row.** `MCPQueryLog` gains
   `application_name` and `client_kind`; `MCPAuthRejectionLog` gains
   `client_kind` (migration `0013`). `client_kind` is one of `curated` / `dcr` /

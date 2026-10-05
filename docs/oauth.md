@@ -477,13 +477,34 @@ hardcoded in Cursor today and there is an open request to make it dynamic**
 8787 breaks the day that lands, whereas the DCR path above keeps working
 untouched. Prefer DCR; treat this entry as a stopgap.
 
-Note that `"http"` in `ALLOWED_REDIRECT_URI_SCHEMES` is required **unconditionally**, not because of this entry: `/o/register` is always mounted and only mints http loopback callbacks, so the package refuses to boot without it regardless of which clients you declare.
+Note that `"http"` in `ALLOWED_REDIRECT_URI_SCHEMES` is required
+**unconditionally**, not because of this entry: `/o/register` is always
+mounted and only mints http loopback callbacks, so the package refuses to boot
+without it regardless of which clients you declare.
+
+That puts it at odds with DOT ≥ 3.4's opt-in
+`OAUTH2_PROVIDER["COMPLIANT_BCP_RFC9700_REDIRECT_URI_SCHEME"]`. The gate has
+no runtime effect; it decides how `manage.py check --deploy` reports `"http"`
+in the scheme list — warning `oauth2_provider.W008` while it is `False` (the
+default, so you will see that warning under `--deploy`), error
+`oauth2_provider.E003` when `True`. With the gate on, no configuration passes
+both that check and this package's boot validation. Leave the gate off, or
+turn it on and add `"oauth2_provider.E003"` to `SILENCED_SYSTEM_CHECKS` —
+Django silences errors as well as warnings. (DOT's own hint for E003 says to
+keep `http` if you support RFC 8252 loopback callbacks, which this package
+does.)
 
 Loopback entries are held to narrower rules than https ones: `localhost` only
 (never `127.0.0.1` / `::1`, which DOT port-wildcards — that would silently
 widen an exact rule into "any port on the user's machine"), an explicit port,
 a non-root path, and `MATCH: "exact"` (prefix-matching a loopback URI would
-admit any path on that port).
+admit any path on that port). While a `local` entry is declared, the package
+also refuses to boot with DOT ≥ 3.4's
+`OAUTH2_PROVIDER["ALLOW_LOCALHOST_LOOPBACK"] = True`: that flag port-wildcards
+`localhost` the way DOT already treats `127.0.0.1` / `::1`, which would turn
+the exact rule into "any port on the user's machine". Without a `local` entry
+the flag is left alone — DCR and the curated Application already accept any
+port on the loopback IPs, so it changes nothing this package promises.
 
 https entries carry a host rule of their own: the host must be an **ASCII DNS
 name** (an internationalised domain in its punycode `xn--` form), never an IP

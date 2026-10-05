@@ -56,7 +56,9 @@ VALID_MATCHES = frozenset({MATCH_EXACT, MATCH_PREFIX})
 # are rejected BY NAME: DOT's `redirect_to_uri_allowed()` treats those two
 # literals as port-wildcarded (any port matches a registered one), which would
 # silently widen a declared exact rule into "any port on the user's machine".
-# `localhost` gets no such treatment, so an exact rule stays exact.
+# `localhost` gets no such treatment, so an exact rule stays exact — unless
+# DOT >= 3.4's `ALLOW_LOCALHOST_LOOPBACK` is on, which is why boot validation
+# refuses that flag while a `local` client is declared.
 LOOPBACK_HOST = "localhost"
 
 # Mirrors `MCPQueryLog.client_redirect` / `MCPAuthRejectionLog.client_redirect`
