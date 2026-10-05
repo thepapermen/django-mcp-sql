@@ -463,8 +463,17 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
 def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
     """Checks that hold for every declared redirect URI, whatever its kind."""
     problems: list[str] = []
-    if parsed.username or parsed.password:
-        problems.append("carry no userinfo component")
+    if "@" in parsed.netloc:
+        # Any `@` in the authority, not just a non-empty user or password:
+        # `https://@claude.ai/cb` parses with username "" and so passed a
+        # `username or password` test, yet it is still a userinfo component —
+        # and DOT >= 3.4's matcher refuses a registered URI carrying one, so
+        # the entry would boot clean and then never match. No real callback
+        # has one; refuse the whole class.
+        problems.append(
+            "carry no userinfo component (no '@' in the authority, not even "
+            "an empty one)"
+        )
     if "*" in uri:
         problems.append("contain no '*' wildcard")
     if uri.split() != [uri]:

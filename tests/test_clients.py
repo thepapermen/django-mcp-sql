@@ -1112,6 +1112,41 @@ class TestReviewFindings:
             {"CLIENTS": {"provider": {"REDIRECTS": [{"MATCH": "exact", "URI": uri}]}}}
         )
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            # Any `@` in the authority, cloud and local alike — including an
+            # EMPTY userinfo, which `urlparse` reports as username "" and so
+            # slipped past a "non-empty username or password" test.
+            pytest.param("https://@claude.ai/cb", id="cloud-empty-userinfo"),
+            pytest.param("https://user@claude.ai/cb", id="cloud-user"),
+            pytest.param("https://:pw@claude.ai/cb", id="cloud-password-only"),
+            pytest.param("https://@chatgpt.com/connector/oauth/", id="cloud-prefix"),
+            pytest.param("http://@localhost:8787/cb", id="local-empty-userinfo"),
+            pytest.param("http://user@localhost:8787/cb", id="local-user"),
+            pytest.param("http://:pw@localhost:8787/cb", id="local-password-only"),
+        ],
+    )
+    def test_declared_redirect_may_not_carry_any_userinfo(self, uri):
+        match = "prefix" if uri.endswith("/oauth/") else "exact"
+        cfg = {"x": {"REDIRECTS": [{"MATCH": match, "URI": uri}]}}
+        with pytest.raises(ImproperlyConfigured, match="userinfo"):
+            validate_mcp_sql_settings({"CLIENTS": cfg})
+
+    def test_an_at_sign_outside_the_authority_is_fine(self):
+        # Only the authority is userinfo; `@` in a path or query is not.
+        validate_mcp_sql_settings(
+            {
+                "CLIENTS": {
+                    "x": {
+                        "REDIRECTS": [
+                            {"MATCH": "exact", "URI": "https://p.example/cb/@me?a=@"}
+                        ]
+                    }
+                }
+            }
+        )
+
     def test_declared_redirect_may_not_carry_whitespace(self):
         # Declared clients are stored with the same `" ".join(...)` that DOT
         # later splits, so embedded whitespace would register a second,
