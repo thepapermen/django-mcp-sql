@@ -114,6 +114,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   malformed transport, like the 413 body cap).
   - **Behaviour change:** a client sending its token anywhere but the
     `Authorization` header is now refused.
+- **The "prefix" cloud-client redirect matcher accepted near-miss callbacks
+  (affects 0.1.0b5, which introduced cloud clients).** `_redirect_under_prefix`
+  checked the scheme, host, port and path exactly but ignored query strings,
+  fragments and `;params`, and refused only a non-empty userinfo. Past
+  oauthlib's own URI check, an extra query string (or a bare `?`), `;params`,
+  or an empty `:@` userinfo on the provider's host reached the consent page
+  end to end, so an authorization code could be delivered to the provider's
+  callback with attacker-chosen parameters (the RFC 9700 §4.1 concern); the
+  host itself was always checked exactly. The matcher now refuses any `@` in
+  the authority, any query or fragment (even a bare `?` / `#`, tested on the
+  raw string) and any `;params` (it uses `urlsplit`, which keeps them in the
+  path) — the same exactness DOT 3.4.1 applies to "exact" clients.
 - **Raised the `django-oauth-toolkit` floor to `>=3.4.1` (was `>=3.2`)**,
   for two upstream fixes that sit below any of this package's checks:
   - Releases before 3.4.0 redirect an unauthenticated `prompt=none`

@@ -5,7 +5,7 @@ full picture (consent-screen asymmetry, audience-binding policy, prefix
 semantics)."""
 
 from urllib.parse import unquote
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
@@ -25,7 +25,13 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     relaxation stays bounded to the provider's own origin:
 
     - scheme MUST be https (no downgrade),
-    - no userinfo component (`https://chatgpt.com@evil.com/...`),
+    - no `@` anywhere in the authority — no userinfo component at all, not even
+      an empty one (`https://chatgpt.com@evil.com/...`, `https://@chatgpt.com/`),
+    - no query, fragment or `;params` — not even a bare trailing `?` / `#`, which
+      parse to an empty `.query` / `.fragment`, so the raw string is tested.
+      The callback is a plain path, and DOT 3.4.1+ matches an exact URI the same
+      way (RFC 9700 §2.1). `urlsplit` (not `urlparse`) keeps `;params` in the
+      path, where they are refused,
     - host must EXACTLY equal the prefix host (not `endswith`, so
       `chatgpt.com.evil.com` is rejected), and port must match with only a
       MISSING port normalised to the https default (an explicit `:443` equals
@@ -39,8 +45,8 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     Mirrors the care in `views/registration.py::_is_loopback_redirect`.
     """
     try:
-        got = urlparse(redirect_uri)
-        want = urlparse(prefix)
+        got = urlsplit(redirect_uri)
+        want = urlsplit(prefix)
         got_port, want_port = got.port, want.port
     except ValueError:
         # Malformed authority (e.g. a non-numeric port) — reject, fail-closed.
@@ -66,8 +72,10 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     want_port = 443 if want_port is None else want_port
     return (
         got.scheme == "https"  # no downgrade
-        and not got.username  # no userinfo smuggling ...
-        and not got.password  # ... in either field
+        and "@" not in got.netloc  # no userinfo, not even an empty one
+        and "?" not in redirect_uri  # no query, not even a bare `?` ...
+        and "#" not in redirect_uri  # ... nor a fragment / bare `#`
+        and ";" not in got.path  # no `;params`
         and bool(got.hostname)
         and got.hostname == want.hostname  # exact host, never `endswith`
         and got_port == want_port  # exact port (:443 == implicit https)

@@ -391,10 +391,12 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
   (`MCPOAuth2Validator.validate_redirect_uri` → `_redirect_under_prefix`)
-  accepts a redirect **iff** it is `https`, carries no userinfo, its host
-  **exactly equals** the prefix host (never `endswith`, so
-  `chatgpt.com.evil.com` is rejected), its port matches, it has no `..`
-  segment, and its path starts with the allowlisted prefix path. Exact cloud
+  accepts a redirect **iff** it is `https`, has no `@` anywhere in its
+  authority (no userinfo, not even an empty one), carries no query, fragment
+  or `;params` (not even a bare `?` / `#`), its host **exactly equals** the
+  prefix host (never `endswith`, so `chatgpt.com.evil.com` is rejected), its
+  port matches, it has no `..` segment, and its path starts with the
+  allowlisted prefix path. Exact cloud
   clients fall through to DOT's stock exact matching, untouched. The canonical
   row and every loopback DCR client also fall through to it, but only after the
   requested redirect passes the `/o/register` loopback predicate

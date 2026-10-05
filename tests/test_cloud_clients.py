@@ -241,6 +241,20 @@ class TestRedirectUnderPrefix:
             pytest.param(
                 "https://chatgpt.com:notaport/connector/oauth/x", id="malformed-port"
             ),
+            # Strict: no `@` in the authority at all, no query / fragment (not
+            # even a bare `?` / `#`), no `;params`.
+            pytest.param("https://@chatgpt.com/connector/oauth/x", id="empty-userinfo"),
+            pytest.param(
+                "https://:@chatgpt.com/connector/oauth/x", id="empty-userinfo-colon"
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x?next=https://evil.example",
+                id="query",
+            ),
+            pytest.param("https://chatgpt.com/connector/oauth/x?", id="bare-query"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#frag", id="fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#", id="bare-fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x;p=1", id="path-params"),
         ],
     )
     def test_rejects_bypass_attempts(self, uri):
