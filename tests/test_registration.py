@@ -20,8 +20,9 @@ Three things are pinned here:
    isolated unit tests.
 4. Defense in depth at `/o/authorize/`: a DCR row that ALREADY stores a
    smuggled off-machine redirect (minted before the registration check
-   existed) cannot be redirected to it — `MCPOAuth2Validator` re-applies
-   the loopback predicate to the requested URI.
+   existed), or a canonical row edited to one, cannot be redirected to it —
+   `MCPOAuth2Validator` re-applies the loopback predicate to the requested
+   URI — while legitimate loopback redirects keep working.
 """
 
 import base64
@@ -509,12 +510,14 @@ class TestRegisteredClientCompletesOAuthFlow:
 
 
 @pytest.mark.django_db
-class TestPreFixSmuggledRowInertAtAuthorize:
+class TestAuthorizeLoopbackRecheck:
     """A DCR row minted before the registration check existed may already
     store a smuggled off-machine redirect. `MCPOAuth2Validator` re-applies the
-    loopback predicate to the requested URI at `/o/authorize/`, so such a row
-    can never deliver a code off-machine even if the operator never finds and
-    deletes it."""
+    loopback predicate to the requested URI at `/o/authorize/` for every
+    client that is not a declared cloud client, so such an entry can never
+    receive a code even if the operator never finds and deletes the row. Its
+    loopback entries, and the canonical row's port-wildcarded loopback
+    redirect, keep working."""
 
     LOOPBACK = "http://127.0.0.1:3456/cb"
     EVIL = "http://evil.example/steal"
@@ -585,6 +588,70 @@ class TestPreFixSmuggledRowInertAtAuthorize:
         assert response.status_code == HTTPStatus.FOUND, response.content
         assert response["Location"].startswith(self.LOOPBACK + "?")
         assert Grant.objects.filter(application=legacy_app).exists()
+
+    def test_legacy_unparseable_port_row_is_a_400_not_a_500(
+        self, client, mcp_user, mcp_mfa_on
+    ):
+        # A <= 0.1.0b5 row could store a garbage port. DOT parses every stored
+        # candidate's port (`localhost` is not port-wildcarded) while matching
+        # a request for a DIFFERENT, valid loopback URI — a ValueError that
+        # must surface as the normal refusal, not an uncaught 500.
+        client_id = (
+            f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
+        )
+        app = Application.objects.create(
+            name=client_id,
+            client_id=client_id,
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=False,
+            redirect_uris="http://localhost:99999/cb",
+            algorithm="",
+        )
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize")
+            + "?"
+            + urlencode(self._params(app, "http://localhost:3456/cb"))
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+
+    @pytest.mark.parametrize("send_redirect_uri", [True, False])
+    def test_canonical_row_edited_off_machine_is_refused(
+        self, client, mcp_user, mcp_mfa_on, mcp_app, send_redirect_uri
+    ):
+        # The canonical row skips consent, so a stored off-machine redirect
+        # would be a silent code delivery. With `redirect_uri` omitted oauthlib
+        # resolves the stored default WITHOUT calling `validate_redirect_uri`;
+        # DOT then re-validates it when creating the response. Pin both paths.
+        mcp_app.redirect_uris = "https://evil.example/cb"
+        mcp_app.save()
+        params = self._params(mcp_app, "https://evil.example/cb")
+        if not send_redirect_uri:
+            del params["redirect_uri"]
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+        assert not Grant.objects.filter(application=mcp_app).exists()
+
+    def test_canonical_loopback_port_wildcard_still_redirects(
+        self, client, mcp_user, mcp_mfa_on, mcp_app
+    ):
+        # Positive control for the canonical row: it stores bare
+        # `http://127.0.0.1` and DOT port-wildcards loopback IPs, so a request
+        # for an ephemeral port must still pass the re-check and 302 with a code.
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize")
+            + "?"
+            + urlencode(self._params(mcp_app, "http://127.0.0.1:9999"))
+        )
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        assert response["Location"].startswith("http://127.0.0.1:9999?")
+        assert "code=" in response["Location"]
 
 
 @pytest.mark.django_db

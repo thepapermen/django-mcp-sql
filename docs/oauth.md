@@ -114,18 +114,22 @@ for a in Application.objects.filter(name__startswith='mcp-sql').order_by('-creat
 Releases up to and including 0.1.0b5 could store a DCR row whose
 `redirect_uris` holds an off-machine entry smuggled in through whitespace
 (see `CHANGELOG.md`). Since the fix such an entry is refused at
-`/o/authorize/`, but the rows are not deleted automatically. List DCR rows
-holding any entry the current registration check would refuse (print-only;
-review before deleting):
+`/o/authorize/`, but the rows are not deleted automatically. List the
+canonical and DCR rows holding any entry the current registration check
+would refuse (print-only; review before deleting). Cloud-client rows
+(`mcp-sql-cloud.<name>`, including ones whose entry was since removed from
+settings) are skipped — an `https` callback is expected there:
 
 ```sh
 python manage.py shell -c "
+from django.db.models import Q
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
+prefix = mcp_sql_settings.APPLICATION_NAME_PREFIX
 qs = Application.objects.filter(
-    name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
-).exclude(name__in=list(mcp_sql_settings.cloud_clients()))
+    Q(name=mcp_sql_settings.APPLICATION_NAME) | Q(name__startswith=prefix)
+).exclude(name__startswith=prefix + 'cloud.')
 for a in qs:
     if not all(_is_loopback_redirect(u) for u in a.redirect_uris.split()):
         print(a.created, a.client_id, '->', repr(a.redirect_uris))

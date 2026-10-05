@@ -727,10 +727,11 @@ The load-bearing invariants and footguns, grouped by layer:
   replace it with a regex or a narrower character list. Releases up to and
   including 0.1.0b5 lacked it, so `MCPOAuth2Validator.validate_redirect_uri`
   also re-applies `_is_loopback_redirect` to the *requested* redirect of
-  every non-cloud client — a row minted before the fix is inert at
-  `/o/authorize/` without the operator having to find it. Pinned by
-  `test_registration.py::TestDynamicClientRegistrationValidation` and
-  `::TestPreFixSmuggledRowInertAtAuthorize`.
+  every non-cloud client — the off-machine entry of a row minted before the
+  fix is refused at `/o/authorize/` without the operator having to find the
+  row (its loopback entries still authorize, like any DCR client's). Pinned
+  by `test_registration.py::TestDynamicClientRegistrationValidation` and
+  `::TestAuthorizeLoopbackRecheck`.
 ### Curated-view migrations
 
 - **Curated-view migrations have two mandatory invariants** that any new

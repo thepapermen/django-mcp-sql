@@ -35,8 +35,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `MCPOAuth2Validator.validate_redirect_uri` now re-applies the same
     loopback check to the requested redirect of every client that is not a
     declared cloud client, so a smuggled entry is refused at
-    `/o/authorize/` after upgrading. `docs/oauth.md` has a shell snippet
-    that lists such rows for review and deletion.
+    `/o/authorize/` after upgrading (the row's loopback entries keep
+    working), and a stored unparseable port is refused instead of raising
+    a 500. `docs/oauth.md` has a shell snippet that lists such rows for
+    review and deletion.
   - Behaviour change for the canonical `mcp-sql` row as well: it can no
     longer be redirected off-machine even if an operator edited its stored
     `redirect_uris` to a non-loopback URI (the documented posture was

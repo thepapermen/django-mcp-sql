@@ -112,8 +112,14 @@ class MCPOAuth2Validator(OAuth2Validator):
         clients may redirect off-machine; DOT's matching alone trusts whatever
         the row stores, and a DCR row minted by <= 0.1.0b5 can store an
         off-machine redirect smuggled through whitespace (see
-        `_is_loopback_redirect`). This re-check makes such a row inert here
-        without needing the operator to find and delete it first.
+        `_is_loopback_redirect`). This re-check refuses such an entry here
+        without needing the operator to find and delete the row first (its
+        loopback entries keep working, like any DCR client's).
+
+        A ValueError from DOT's matching is a refusal, not a 500: such a row
+        can also store an unparseable port (`http://localhost:99999/cb`), and
+        DOT parses every stored candidate's port while matching a request
+        for a different, valid one.
 
         Why cloud clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Cloud clients".
@@ -123,9 +129,12 @@ class MCPOAuth2Validator(OAuth2Validator):
             return _redirect_under_prefix(redirect_uri, cloud.redirect_uri)
         if cloud is None and not _is_loopback_redirect(redirect_uri):
             return False
-        return super().validate_redirect_uri(
-            client_id, redirect_uri, request, *args, **kwargs
-        )
+        try:
+            return super().validate_redirect_uri(
+                client_id, redirect_uri, request, *args, **kwargs
+            )
+        except ValueError:
+            return False
 
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
         """Reject any token request that asks for scopes other than `mcp:sql`."""
