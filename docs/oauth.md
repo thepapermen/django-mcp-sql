@@ -579,8 +579,12 @@ account, and every ChatGPT connector's `/connector/oauth/<id>` callback renders
 as `https://chatgpt.com`. So an attacker who adds their own connector against
 your server, starts the flow and sends the resulting authorization link to a
 staff user produces a page that looks exactly like a legitimate one; if the
-user approves, the code lands in the attacker's provider account (the
-shared-callback phishing surface noted under "What each entry does"). Showing
+user approves, their browser is sent to the shared callback with a code bound
+to the attacker's PKCE challenge and carrying the attacker's `state` (the
+shared-callback phishing surface noted under "What each entry does"). Whether
+the provider then completes that callback for the attacker's connector is the
+provider's behaviour, outside this server, and was not tested — assume it
+might. Showing
 the connector id would not help — the user cannot tell theirs from an
 attacker's. The page's real defence is its instruction, **"Only continue if
 you started this from there"**: approving is an explicit, CSRF-protected POST,
@@ -589,8 +593,8 @@ visit, including for a client the user has already authorized:
 `MCPAuthorizationView` pins DOT's `approval_prompt` to `force`, because on
 `auto` DOT would skip the page and issue a code on a plain GET to anyone
 holding a live token for that (shared) Application. Behind the page: every
-`/mcp/sql/` request re-runs the issuance gate (active staff, MFA, one
-profile); every tool call, and every gate denial for a token that resolved to
+`/mcp/sql/` request whose bearer token resolves to a user re-runs the issuance
+gate (active staff, MFA, one profile); every tool call, and every gate denial for a token that resolved to
 a user, is audited under that user with the client's id and kind (the MCP
 handshake itself — `initialize`, `tools/list` — is not); a token lives only as
 long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
@@ -741,10 +745,17 @@ minted (see [Revoking access](#revoking-access)).
 
 The volume tripwire fires when a user crosses an hourly/daily allowed- or
 rejected-query threshold (`MCP_SQL["VOLUME_ALERT_THRESHOLDS"]`). It is an
-ALERT only — the query was not blocked. Open the [usage summary](#auditing-usage)
-to see the user's recent volume, then either revoke their tokens if the
-activity looks abusive, or raise the threshold if it is legitimate heavy use
-(MCP agents are greedy; the defaults are deliberately generous).
+ALERT only — the query was not blocked. The `client=` in the alert is only the
+client whose query crossed the per-user threshold, and a declared `cloud`
+client_id (`mcp-sql-cloud.claude`, …) is one Application shared by every
+account at that provider — a connector the user approved from a phished link
+looks exactly like their own. So "Alice uses Claude.ai" does not explain the
+alert by itself. Open the [usage summary](#auditing-usage) and the user's
+`MCPQueryLog` rows (per-client breakdown, `client_ip`, the SQL) and **ask the
+user** whether the volume is theirs. If it is not, or you cannot tell, revoke
+their MCP tokens (logging them out does it) before anything else; raise the
+threshold only for activity the user confirms as legitimate heavy use (MCP
+agents are greedy; the defaults are deliberately generous).
 
 ## Auditing usage
 

@@ -120,13 +120,17 @@ class MCPAuthorizationView(AuthorizationView):
         # the user already holds an unexpired token for the same Application.
         # A declared client is ONE Application shared by every account at the
         # provider (`mcp-sql-cloud.claude`), so a staff user who connected
-        # Claude.ai would hand a code — with the attacker's `state` and PKCE
-        # challenge — to an attacker's own connector just by opening a link
-        # carrying `approval_prompt=auto`. `skip_authorization=False` is
+        # Claude.ai would be redirected, no page shown, to the shared callback
+        # with a code bound to an attacker's PKCE challenge and `state` just
+        # by opening a link carrying `approval_prompt=auto` (what the provider
+        # does with it next is outside this server). `skip_authorization=False` is
         # supposed to make consent an explicit POST every time; this keeps it
         # so. The curated `skip_authorization=True` row is unaffected (DOT
         # checks that flag first). The parameter is DOT-specific and no MCP
-        # client is known to send it, so nothing legitimate loses anything.
+        # client is known to send it; what the pin does take away, on
+        # purpose, is a consumer-wide `REQUEST_APPROVAL_PROMPT = "auto"` for
+        # this view — same-client re-authorization before the token expires
+        # now shows the consent page too.
         query = request.GET.copy()
         query["approval_prompt"] = "force"  # replaces every value, if repeated
         request.GET = query

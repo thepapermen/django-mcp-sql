@@ -87,9 +87,11 @@ precisely because it is the one that does **not** announce itself.
   profile — the issuance gate limits who can be a victim, not whether the
   link works) declining the consent screen — no longer RFC 8252 loopback
   delivery. Under loopback-only, a phished code still landed on the victim's
-  own machine; with a shared provider callback, an attacker who adds their own
-  connector receives it in their own provider account, and the consent page
-  looks the same either way (see "Changed" below). An operator who
+  own machine; with a shared provider callback, the victim's browser is sent
+  to the provider carrying a `state` the attacker's own connector minted, and
+  the consent page looks the same either way (see "Changed" below). Whether
+  the provider then completes that callback for the attacker's connector is
+  provider behaviour this server does not control and that was not tested. An operator who
   deliberately chose loopback-only should know the posture moved.
   Set `"CLIENTS": {}` to keep the old behaviour, or name just the clients you
   want. Provisioning logs each client at INFO on every `migrate`.
@@ -257,9 +259,10 @@ precisely because it is the one that does **not** announce itself.
   on a plain GET — no page, no POST — whenever the user already holds an
   unexpired token for the same Application. `skip_authorization=False` did not
   prevent it. A declared client is one Application shared by every account at
-  its provider, so a staff user who had connected Claude.ai would hand a code,
-  carrying the attacker's `state` and PKCE challenge, to an attacker's own
-  connector just by opening a crafted link. Reproduced against DOT 3.4.1 (302
+  its provider, so a staff user who had connected Claude.ai had their browser
+  sent straight to the shared callback with a code bound to the attacker's
+  PKCE challenge and carrying the attacker's `state`, just by opening a
+  crafted link. Reproduced against DOT 3.4.1 (302
   to the callback with the code). `MCPAuthorizationView` now pins
   `approval_prompt` to `force` for every request, so consent is an explicit
   POST every time; the curated `skip_authorization=True` Application is

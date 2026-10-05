@@ -20,10 +20,13 @@ template shows `application.name`, which for a self-registered client is the
 opaque `mcp-sql-<token>` and for everyone else says nothing about the
 destination.
 
-Approving this form is an explicit, CSRF-protected POST, so a phished
-authorization link cannot complete silently; the check the user can actually
-make is the "Only continue if you started this from there" instruction. Keep
-both it and the destination visible in any re-theme.
+Approving this form is an explicit, CSRF-protected POST, and
+`MCPAuthorizationView.dispatch` pins DOT's `approval_prompt` to "force" (on
+"auto" DOT would skip this page for a user who already holds a live token for
+the Application), so a phished authorization link cannot complete silently;
+the check the user can actually make is the "Only continue if you started
+this from there" instruction. Keep both it and the destination visible in
+any re-theme.
 {% endcomment %}
 {% block content %}
   <div class="block-center">
