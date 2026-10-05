@@ -69,6 +69,12 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
         and got.hostname == want.hostname  # exact host, never `endswith`
         and got_port == want_port  # exact port (:443 == implicit https)
         and ".." not in decoded_path.split("/")  # no traversal (literal/encoded)
+        # ...and no backslash, which a browser's WHATWG parser treats as `/`
+        # in an https URL, so `..\` would be traversal by another spelling.
+        # oauthlib's absolute-URI check and Django's `iri_to_uri` (`\` ->
+        # `%5C`) each already stop it upstream; refused here as well so the
+        # path anchor does not depend on either.
+        and "\\" not in decoded_path
         and got.path.startswith(want_path)  # under the allowlisted path
     )
 

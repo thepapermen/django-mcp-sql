@@ -357,14 +357,23 @@ _DNS_HOSTNAME_RE = re.compile(
     r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.?"
 )
 
-# Final labels that mean "this machine" by convention: the RFC 6761 reserved
-# `localhost` (and so every `*.localhost`), and the `localdomain` /
-# `localdomain4` / `localdomain6` pseudo-TLDs of the stock `/etc/hosts`
+# Special-use suffixes that never resolve in public DNS — only on the user's
+# own machine or network — so no provider's callback can live under one: the
+# RFC 6761 reserved `localhost`, RFC 6762 mDNS `local` (which includes the
+# machine's own `<hostname>.local`), RFC 8375 `home.arpa`, ICANN's private-use
+# `internal`, and the `localdomain*` pseudo-TLDs of the stock `/etc/hosts`
 # loopback aliases (`localhost.localdomain`, `localhost4.localdomain4`, …).
 # The single-label aliases (`localhost4`, `ip6-localhost`, the machine's own
-# hostname) are caught by the fully-qualified-name rule instead, so this is a
-# short closed set rather than a list of every distro's aliases.
-_LOOPBACK_TLDS = frozenset({"localhost", "localdomain", "localdomain4", "localdomain6"})
+# hostname) are caught by the fully-qualified-name rule instead.
+_LOCAL_SCOPE_SUFFIXES = (
+    "localhost",
+    "local",
+    "home.arpa",
+    "internal",
+    "localdomain",
+    "localdomain4",
+    "localdomain6",
+)
 
 
 def _is_ipv4_literal(host: str) -> bool:
@@ -404,8 +413,9 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
     `::1`. A provider's
     callback is always a fully-qualified ASCII DNS name, so require exactly
     that: refuse every IP literal outright, loopback or not; refuse the
-    "this machine" pseudo-TLDs (`*.localhost`, `*.localdomain`, …); and
-    refuse every single-label name, which can only resolve somewhere local —
+    special-use suffixes that only resolve locally (`*.localhost`, `*.local`,
+    `*.home.arpa`, `*.internal`, `*.localdomain`, …); and refuse every
+    single-label name, which can only resolve somewhere local —
     that one rule covers `localhost4`, `ip6-localhost` and the machine's own
     hostname, where a list of distro aliases kept missing entries. What a
     syntactic check cannot see is a public DNS name that happens to resolve
@@ -429,14 +439,16 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
             "name, and a literal (including shorthand such as '127.1' or '0') "
             "is how a loopback address is disguised"
         ]
-    if host.rsplit(".", 1)[-1] in _LOOPBACK_TLDS:
+    if any(host == sfx or host.endswith(f".{sfx}") for sfx in _LOCAL_SCOPE_SUFFIXES):
         return [
-            "not point https at a loopback name — kind is derived from the "
-            "scheme, so this would be namespaced and audited as a hosted "
+            "not point https at a local-scope name (under "
+            + ", ".join(f"'.{sfx}'" for sfx in _LOCAL_SCOPE_SUFFIXES)
+            + ") — those never resolve in public DNS, and kind is derived from "
+            "the scheme, so this would be namespaced and audited as a hosted "
             f"'{ClientKind.CLOUD}' client while the browser following the "
-            "redirect delivers the code to the end user's own machine; use an "
-            f"http://{LOOPBACK_HOST}:<port>/<path> loopback entry (or let the "
-            "client self-register via /o/register) instead"
+            "redirect delivers the code to the end user's own machine or "
+            f"network; use an http://{LOOPBACK_HOST}:<port>/<path> loopback "
+            "entry (or let the client self-register via /o/register) instead"
         ]
     if "." not in host:
         return [

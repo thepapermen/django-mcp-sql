@@ -152,6 +152,12 @@ precisely because it is the one that does **not** announce itself.
   (`scheme://host[:port]`, rebuilt from the validated `redirect_uri`'s parsed
   parts so a userinfo component cannot render). A self-registered client gets
   no label: its `client_name` is attacker-chosen free text.
+- The `"prefix"` redirect matcher also refuses a backslash anywhere in the
+  (percent-decoded) path, since a browser reads `\` as `/` in an https URL and
+  `..\` is traversal by another spelling. Hardening rather than a reachable
+  fix: oauthlib's absolute-URI check already rejects such a `redirect_uri`, and
+  Django's `iri_to_uri` would encode it to `%5C` in the `Location` anyway — it
+  is refused so the path anchor depends on neither.
 - Provisioning now names orphaned declared-client `Application` rows in a
   WARNING. It still never deletes them — that would cascade live tokens in the
   middle of a `migrate`.
@@ -219,8 +225,10 @@ precisely because it is the one that does **not** announce itself.
   or IPv4, including the resolver's shorthand forms (`127.1`, `0x7f.1`, `0`) —
   is never **single-label** (`localhost4`, `ip6-localhost`, a machine's own
   hostname: such names resolve only through `/etc/hosts` or a search domain),
-  and never sits under the `localhost` or `localdomain*` pseudo-TLDs
-  (`app.localhost`, `localhost.localdomain`, `localhost4.localdomain4`). It is
+  and never sits under a special-use suffix that only resolves locally
+  (`.localhost`, mDNS `.local` — which includes the machine's own
+  `<hostname>.local` — `.home.arpa`, `.internal`, and the `localdomain*`
+  pseudo-TLDs of `localhost.localdomain` / `localhost4.localdomain4`). It is
   an allow-shape rather than a loopback detector because the detector kept
   missing spellings: percent-encoded and fullwidth hosts, `0.0.0.0`,
   `*.localhost`, and — on Python 3.12.3, whose `ipaddress` does not call them

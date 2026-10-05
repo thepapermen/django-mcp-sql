@@ -240,9 +240,10 @@ DEFAULTS: dict[str, Any] = {
     #
     # These ship ON. A declared key replaces its default wholesale, so
     # `"CLIENTS": {}` turns them all off and a smaller dict keeps only what
-    # it names. Non-empty CLIENTS requires "https" in
-    # OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] (DOT's own default
-    # includes it). Runbook: docs/oauth.md → "Clients".
+    # it names. OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] must contain
+    # "http" always (/o/register mints RFC 8252 loopback callbacks) and
+    # "https" while any https client is declared; DOT's own default has both.
+    # Runbook: docs/oauth.md → "Clients".
     "CLIENTS": {
         "claude": {
             "LABEL": "Claude.ai",

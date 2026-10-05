@@ -494,6 +494,16 @@ class TestRedirectUnderPrefix:
                 "https://chatgpt.com/connector/oauth/%252e%252e/admin",
                 id="double-encoded-traversal",
             ),
+            # A browser treats `\` as `/` in an https URL, so these are
+            # traversal by another spelling (raw, then percent-encoded).
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/..\\..\\evil",
+                id="backslash-traversal",
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/..%5c..%5cevil",
+                id="encoded-backslash-traversal",
+            ),
             pytest.param(
                 "https://chatgpt.com:8443/connector/oauth/x", id="port-mismatch"
             ),
@@ -987,15 +997,19 @@ class TestReviewFindings:
     @pytest.mark.parametrize(
         ("host", "reason"),
         [
-            # The names that mean "this machine": RFC 6761 `localhost`, its
-            # FQDN root form and reserved subdomains, and the `localdomain*`
-            # pseudo-TLDs of the stock /etc/hosts aliases.
-            ("localhost", "loopback name"),
-            ("localhost.", "loopback name"),
-            ("app.localhost", "loopback name"),
-            ("localhost.localdomain", "loopback name"),
-            ("localhost4.localdomain4", "loopback name"),
-            ("localhost6.localdomain6", "loopback name"),
+            # Special-use suffixes that only ever resolve locally: RFC 6761
+            # `localhost` (and its FQDN root form and subdomains), RFC 6762
+            # mDNS `.local`, RFC 8375 `.home.arpa`, ICANN's `.internal`, and the
+            # `localdomain*` pseudo-TLDs of the stock /etc/hosts aliases.
+            ("localhost", "local-scope name"),
+            ("localhost.", "local-scope name"),
+            ("app.localhost", "local-scope name"),
+            ("laptop.local", "local-scope name"),
+            ("printer.home.arpa", "local-scope name"),
+            ("svc.corp.internal", "local-scope name"),
+            ("localhost.localdomain", "local-scope name"),
+            ("localhost4.localdomain4", "local-scope name"),
+            ("localhost6.localdomain6", "local-scope name"),
             # Every single-label name — it can only resolve through /etc/hosts
             # or a search domain. This is what catches the distro aliases a
             # hand-written list missed (Fedora's `localhost4`, found by the
@@ -1051,7 +1065,7 @@ class TestReviewFindings:
         (percent-encoding, fullwidth forms, `0`, `*.localhost`, and on Python
         3.12.3 IPv4-mapped IPv6), so the rule is an allow-shape: a
         fully-qualified ASCII DNS name, no IP literal of any kind, not under a
-        "this machine" pseudo-TLD.
+        special-use suffix that only resolves locally.
         """
         with pytest.raises(ImproperlyConfigured, match=reason):
             validate_mcp_sql_settings({"CLIENTS": self._https_client(host)})
@@ -1084,6 +1098,8 @@ class TestReviewFindings:
             # (`urlparse` lowercases it).
             "https://xn--bcher-kva.example/cb",
             "https://localhost.evil.example/cb",
+            "https://local.example/cb",
+            "https://home.arpa.example/cb",
             "https://127.example/cb",
             "https://p.example:8443/cb",
             "https://claude.ai./cb",

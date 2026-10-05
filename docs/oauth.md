@@ -423,7 +423,8 @@ surgery.
   accepts a redirect **iff** it is `https`, carries no userinfo, its host
   **exactly equals** the prefix host (never `endswith`, so
   `chatgpt.com.evil.com` is rejected), its port matches, it has no `..`
-  segment, and its path starts with the allowlisted prefix path — anchored at
+  segment and no backslash (which a browser reads as `/`, so `..\` is
+  traversal too), and its path starts with the allowlisted prefix path — anchored at
   a `/` boundary, so `.../oauthEVIL` cannot pass as `.../oauth`. A client may
   carry both kinds of rule; its exact callbacks still ride DOT's stock
   matching. Every other client — clients with no prefix rules, the canonical
@@ -510,8 +511,8 @@ https entries carry a host rule of their own: the host must be a
 **fully-qualified ASCII DNS name** (an internationalised domain in its
 punycode `xn--` form) — never an IP literal of any kind, never a single-label
 name (`localhost4`, a machine's own hostname: those resolve only locally), and
-never under the `localhost` / `localdomain*` pseudo-TLDs (`app.localhost`,
-`localhost.localdomain`). The kind is derived from the scheme, so an https
+never under a special-use suffix that only resolves locally (`.localhost`,
+`.local`, `.home.arpa`, `.internal`, `.localdomain*`). The kind is derived from the scheme, so an https
 callback that actually pointed at the user's machine would be namespaced and
 audited as provider-hosted; refusing every non-DNS host is simpler, and harder
 to get wrong, than recognising every spelling of loopback. (A public DNS name
