@@ -51,6 +51,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     redirect carrying an error, never a code; fixed upstream in 3.4.0,
     DOT #1719). The declared `django-oauth-toolkit>=3.2` range still admits
     those releases.
+- **Refresh tokens renewed access indefinitely (affects 0.1.0b5 and
+  earlier).** The docs said refresh tokens were disabled by
+  `REFRESH_TOKEN_EXPIRE_SECONDS=0`, but django-oauth-toolkit reads `0` as
+  "no age limit": `/o/token/` issued a `refresh_token` alongside every
+  access token and honoured it on `grant_type=refresh_token` (verified on
+  DOT 3.2.0 and 3.4.1). A client could therefore keep renewing its access
+  token without the user ever re-consenting.
+  `MCPOAuth2Validator.validate_refresh_token` now refuses every refresh
+  grant with `invalid_grant`, including refresh tokens already stored, and
+  `save_bearer_token` no longer mints them: the `/o/token/` response has no
+  `refresh_token` field and no `RefreshToken` row is created. Existing
+  `RefreshToken` rows are left in place and are inert.
+  - **Behaviour change:** a client that relied on refresh now re-authorizes
+    every `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the documented settings),
+    with the consent screen for DCR and cloud clients — the interval the
+    docs always described.
+- **PKCE was not S256-only, and could be switched off (affects 0.1.0b5 and
+  earlier).** The validator's S256-only check
+  (`validate_code_challenge_method`) is not a hook oauthlib or DOT ever
+  calls, so `/o/authorize/` accepted `code_challenge_method=plain`, and an
+  omitted method (which oauthlib treats as `plain`), although the discovery
+  document advertises `S256` only. With `plain` the challenge in the
+  authorization URL is the verifier itself, so anyone who observes that
+  request can redeem an intercepted code. A consumer's
+  `PKCE_REQUIRED=False` also turned PKCE off altogether.
+  `MCPOAuth2Validator.is_pkce_required` now requires PKCE on every
+  authorization regardless of `PKCE_REQUIRED` and refuses any method but
+  `S256` with `invalid_request` — redirected, like any non-fatal authorize
+  error, to the already-validated redirect URI — on the authorize GET and
+  on the consent POST. `get_code_challenge_method` refuses to exchange a
+  stored non-S256 grant (`invalid_grant`). The dead override is removed.
+  - **Behaviour change:** a client that sends `plain`, or no
+    `code_challenge_method`, is now refused at `/o/authorize/`.
+- Both policies are install-wide: the validator is the DOT install's
+  `OAUTH2_VALIDATOR_CLASS` (which already refuses any scope but `mcp:sql`),
+  so they apply to every client of that install.
 
 ### Changed
 

@@ -1,7 +1,8 @@
 """Custom DOT validator pinned to mcp-sql Applications + the single
-`mcp:sql` scope. S256-only PKCE enforcement lives here too. See
-`docs/architecture.md` "OAuth surface" for the full picture
-(consent-screen asymmetry, audience-binding policy, prefix semantics)."""
+`mcp:sql` scope. Mandatory S256-only PKCE and the no-refresh-token policy
+are enforced here too. See `docs/architecture.md` "OAuth surface" for the
+full picture (consent-screen asymmetry, audience-binding policy, prefix
+semantics)."""
 
 from urllib.parse import unquote
 from urllib.parse import urlparse
@@ -11,6 +12,7 @@ from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
 from oauth2_provider.oauth2_validators import OAuth2Validator
+from oauthlib.oauth2.rfc6749.errors import InvalidRequestError
 
 
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
@@ -172,15 +174,91 @@ class MCPOAuth2Validator(OAuth2Validator):
             client_id, scopes, client, request, *args, **kwargs
         )
 
-    def validate_code_challenge_method(self, request, code_challenge_method):
-        """Accept only `S256`; reject `plain` (and any other method).
+    def is_pkce_required(self, client_id, request):
+        """Require PKCE on every authorization, with `S256` as its method.
 
-        oauthlib accepts both `S256` and `plain` at runtime by default. The
-        OAUTH2_PROVIDER comment in `settings/base.py` flags this as a known
-        gap — `plain` PKCE is equivalent to no PKCE if the verifier ever
-        leaks, which gives a weaker guarantee than `S256` for negligible
-        client-side cost. The RFC 8414 discovery doc advertises only
-        `S256`; this validator ensures the server actually enforces what
-        the discovery doc promises.
+        Two jobs, both here because this is the hook that fits:
+
+        - Return `True` whatever `OAUTH2_PROVIDER["PKCE_REQUIRED"]` says.
+          Every MCP client is public (no secret), so PKCE is the only thing
+          binding an authorization code to the client that asked for it; a
+          consumer setting must not be able to switch it off. (oauthlib
+          compares the result with `is True`, so it must be the literal.)
+        - Refuse any method but `S256`. oauthlib calls no "validate the
+          method" hook: it defaults an omitted `code_challenge_method` to
+          `plain` and accepts `plain` (RFC 7636 §4.3), and DOT's own refusal
+          of `plain` is off by default. oauthlib's
+          `validate_authorization_request` calls this AFTER the fatal
+          client_id / redirect_uri checks — so the `InvalidRequestError`
+          raised here goes back as a normal error redirect to an
+          already-validated URI — and BEFORE it applies that default, so an
+          omitted method is still visible as `None`. (The other hook in that
+          window, `validate_response_type`, can only answer
+          `unauthorized_client`.) It runs on the authorize GET and again when
+          the consent POST (or `skip_authorization`) creates the response.
+
+        oauthlib also calls this at `/o/token/`, but only for a grant with no
+        stored challenge, which is refused either way: normally the token
+        request has no `code_challenge`, so this returns `True` and oauthlib
+        answers `invalid_grant` ("Challenge not found"); a stray
+        `code_challenge` there makes it an `invalid_request` instead.
         """
-        return code_challenge_method == "S256"
+        if (
+            request.code_challenge is not None
+            and request.code_challenge_method != "S256"
+        ):
+            raise InvalidRequestError(
+                description='code_challenge_method must be "S256".',
+                request=request,
+            )
+        return True
+
+    def get_code_challenge_method(self, code, request):
+        """Token-time backstop: only an `S256` grant can be exchanged.
+
+        A Grant stored with any other method — `plain`, explicit or
+        defaulted from an omitted method, as every release up to and
+        including 0.1.0b5 minted on request — must not be redeemable even
+        though `is_pkce_required` now stops new ones. Returning `None` makes
+        oauthlib refuse the exchange with `invalid_grant` ("Challenge method
+        not found").
+        """
+        method = super().get_code_challenge_method(code, request)
+        return method if method == "S256" else None
+
+    def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
+        """Refuse every refresh grant (`invalid_grant`), whatever the token.
+
+        `ACCESS_TOKEN_EXPIRE_SECONDS` is meant to be the re-consent interval.
+        DOT does not give that on its own: with the documented
+        `REFRESH_TOKEN_EXPIRE_SECONDS=0` a refresh token has no age limit
+        (DOT 3.4 measures only an idle window from the access token's expiry,
+        which `0` disables; DOT 3.2/3.3 check nothing), so a refresh token
+        minted by any release up to and including 0.1.0b5 renewed access
+        indefinitely without the user. This is the hook oauthlib's refresh
+        grant calls after client authentication, so returning `False` also
+        covers refresh tokens already stored. `save_bearer_token` stops new
+        ones from being minted.
+
+        Install-wide, like `validate_scopes` (which already refuses every
+        scope but `mcp:sql`): this class is the install's
+        `OAUTH2_VALIDATOR_CLASS`, so no client of this DOT install can refresh.
+        """
+        return False
+
+    def save_bearer_token(self, token, request, *args, **kwargs):
+        """Never mint a refresh token.
+
+        oauthlib builds the token dict, hands it to `save_token` (whose
+        oauthlib default calls this method), then serialises that SAME dict
+        as the `/o/token/` body.
+        Dropping `refresh_token` before DOT stores the token therefore removes
+        both the `RefreshToken` row (DOT creates one only when the key is
+        present) and the response field. Clients then re-authorize when the
+        access token expires instead of trying a refresh that
+        `validate_refresh_token` refuses. A custom `OAUTH2_SERVER_CLASS` could
+        stop oauthlib generating it in the first place, but that setting
+        belongs to the consumer.
+        """
+        token.pop("refresh_token", None)
+        return super().save_bearer_token(token, request, *args, **kwargs)

@@ -325,8 +325,12 @@ OAUTH2_PROVIDER = {
     "SCOPES": {"mcp:sql": "Read-only SQL surface for MCP agents"},
     "DEFAULT_SCOPES": ["mcp:sql"],
     "ACCESS_TOKEN_EXPIRE_SECONDS": 6 * 3600,
+    # Moot for MCP: MCPOAuth2Validator mints no refresh tokens and refuses
+    # every refresh grant, so ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent
+    # interval. (On its own, DOT reads 0 as "no age limit".)
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
+    # MCPOAuth2Validator requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
     # "http" alone is fine loopback-only (the default); add "https" whenever
     # CLOUD_CLIENTS is non-empty, or the app won't boot.

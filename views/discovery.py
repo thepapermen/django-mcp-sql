@@ -80,7 +80,10 @@ def authorization_server_metadata(request):
 
     `code_challenge_methods_supported: ["S256"]` is the canonical
     advertisement of the S256-only PKCE posture; the matching enforcement
-    lives in `oauth.py::MCPOAuth2Validator.validate_code_challenge_method`.
+    lives in `oauth.py::MCPOAuth2Validator.is_pkce_required` (authorize)
+    and `.get_code_challenge_method` (token). `grant_types_supported` lists
+    only `authorization_code`: the validator refuses refresh grants and mints
+    no refresh tokens.
     `token_endpoint_auth_methods_supported: ["none"]` reflects the
     public-client setup (no client_secret); same posture applies to the
     revocation endpoint per RFC 8414 §2.

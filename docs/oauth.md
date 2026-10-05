@@ -9,7 +9,8 @@ responding to an incident.
 ## Architecture in five lines
 
 - Single OAuth Application `mcp-sql`; single scope `mcp:sql`; PKCE
-  required; `authorization_code` grant only.
+  required, `S256` only (enforced by `MCPOAuth2Validator` whatever
+  `PKCE_REQUIRED` says); `authorization_code` grant only.
 - Token lifetime: 6 h access, no refresh tokens, 60 s authorization code.
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
@@ -242,7 +243,7 @@ full threat-model analysis.
    point.
 
    **The consent click recurs every 6 h** for the same user. Token TTL
-   is 6 h and refresh tokens are disabled (see "Token lifetime / freshness
+   is 6 h and there are no refresh tokens (see "Token lifetime / freshness
    FAQ"), so Claude Code re-OAuths whenever the token expires; DOT's
    default consent template has no "remember my choice" mechanism, so
    the user sees the page each time. This is deliberate: see
@@ -426,7 +427,7 @@ that public `https` origin (if a proxy terminates TLS, set
    secret **blank** (these are public/PKCE clients).
 4. The user connects: login + MFA + the one-click consent screen, then tool
    calls work. As with loopback clients, **consent recurs every 6 h** — token
-   TTL is 6 h and refresh tokens are disabled, so a cloud user re-consents each
+   TTL is 6 h and there are no refresh tokens, so a cloud user re-consents each
    time the token expires. There is no "remember me"; this is deliberate (same
    rationale as [DCR-minted clients require
    consent](#dcr-minted-clients-require-consent)).
@@ -632,14 +633,20 @@ volume.
 
 - **Why 6 h?** Bounded blast radius on a leaked token; comfortably spans
   a typical workday so users don't re-OAuth mid-session.
-- **Why no refresh tokens?** Adds lifecycle complexity not worth it for
-  internal use. Users re-OAuth silently (the session-trust gate at
-  `/o/authorize/` runs without re-prompting MFA so long as the Django
-  session is still valid) every 6 h, mediated by Claude Code. Technical
-  note: DOT 3.2.0 still emits a `refresh_token` field in the `/o/token/`
-  response, but `REFRESH_TOKEN_EXPIRE_SECONDS=0` sets its lifetime to
-  zero — it cannot actually be used to refresh. Effective behavior is
-  no-refresh; the field is cosmetic.
+- **Why no refresh tokens?** They would make the 6 h access-token TTL
+  meaningless as a re-consent interval: a refresh token keeps renewing
+  access without the user. Users instead re-OAuth every 6 h (the
+  session-trust gate at `/o/authorize/` runs without re-prompting MFA so
+  long as the Django session is still valid; DCR and cloud clients show the
+  consent screen each time), mediated by the client. Enforcement is in
+  `MCPOAuth2Validator`: `save_bearer_token` drops the `refresh_token` field
+  before DOT stores the token (so `/o/token/` returns none and no
+  `RefreshToken` row is created), and `validate_refresh_token` refuses every
+  `grant_type=refresh_token` request with `invalid_grant` — including refresh
+  tokens minted by releases up to and including 0.1.0b5, which did emit them.
+  `REFRESH_TOKEN_EXPIRE_SECONDS` is not what disables refresh: DOT reads `0`
+  as *no age limit*, and on those releases such a token renewed access
+  indefinitely.
 - **Why no idle timeout?** Out of scope. The 6 h hard cap + logout
   revocation + the daily-volume Sentry alerts bound exposure for **every**
   consumer. A consumer that enables the **opt-in** session-existence gate
