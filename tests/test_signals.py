@@ -160,13 +160,16 @@ class TestRevokeMcpTokensOnLogout:
                 sender=type(user), request=_logout_request(), user=user
             )
 
+        from mcp_sql.models import MCPAuthRejectionLog
+
         grants = get_grant_model().objects
         assert set(grants.filter(user=user)) == {non_mcp}
         assert set(grants.filter(user=bystander)) == {theirs}
-        # Counted, and logged/audited even with no access token to delete.
-        assert "Revoked 0 MCP token(s) and 2 pending authorization code(s)" in (
-            caplog.text
-        )
+        # Counted, and logged AND audited even with no access token to delete.
+        summary = "Revoked 0 MCP token(s) and 2 pending authorization code(s)"
+        assert summary in caplog.text
+        assert summary in MCPAuthRejectionLog.objects.get(user=user).error
+        assert not MCPAuthRejectionLog.objects.filter(user=bystander).exists()
 
     def test_logout_without_tokens_is_silent(
         self, mcp_app, caplog, django_capture_on_commit_callbacks
@@ -180,7 +183,8 @@ class TestRevokeMcpTokensOnLogout:
                 sender=type(user), request=_logout_request(), user=user
             )
 
-        # `signals.py` logs (and writes an audit row) only when `deleted > 0`.
+        # `signals.py` logs (and writes an audit row) only when it deleted a
+        # token or a pending code.
         assert "Revoked" not in caplog.text
 
     def test_logout_writes_session_logout_audit_row(
@@ -421,6 +425,41 @@ class TestSignalDatabaseErrorResilience:
             )
         assert "Failed to revoke pending MCP authorization codes" in caplog.text
         assert not AccessToken.objects.filter(user=user).exists()
+
+    def test_token_delete_db_error_still_audits_the_codes_it_revoked(
+        self, monkeypatch, caplog, mcp_app
+    ):
+        # Codes go first; if the token delete then fails, what logout DID
+        # revoke must still reach the audit trail, marked as partial.
+        from django.db import DatabaseError
+        from mcp_sql.models import MCPAuthRejectionLog
+        from mcp_sql.signals import _revoke_and_audit_on_logout
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+
+        user = UserFactory()
+        Grant.objects.create(
+            user=user,
+            code="c_" + secrets.token_urlsafe(16),
+            application=mcp_app,
+            expires=timezone.now() + timedelta(minutes=1),
+            redirect_uri="http://127.0.0.1:9999",
+            scope="mcp:sql",
+        )
+        monkeypatch.setattr(
+            AccessToken,
+            "objects",
+            _mgr(filter_delete_side_effect=DatabaseError("tokens down")),
+        )
+        with caplog.at_level(logging.INFO):
+            _revoke_and_audit_on_logout(
+                user=user, client_ip=None, logged_out_at=timezone.now()
+            )
+        assert not Grant.objects.filter(user=user).exists()
+        assert "Failed to revoke MCP tokens on logout" in caplog.text
+        row = MCPAuthRejectionLog.objects.get(user=user)
+        assert "Revoked 1 pending MCP authorization code(s)" in row.error
+        assert "FAILED" in row.error
 
     def test_audit_write_db_error_is_swallowed(self, monkeypatch, caplog):
         import mcp_sql.signals as signals_mod

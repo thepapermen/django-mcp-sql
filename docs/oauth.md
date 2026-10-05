@@ -604,12 +604,14 @@ volume tripwire; a token lives only as
 long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
 logging out deletes both the user's MCP access tokens and their pending MCP
 authorization codes, so a code approved a moment ago — say, on a link the user
-now realises they did not start — cannot be exchanged afterwards. Two things
-it does not reach: an exchange already in progress at that instant, and
-refresh-token rows, which are not deleted but cannot yield a usable MCP token
-after logout (DOT ≥ 3.4 rejects a refresh token whose access token is gone; on
-DOT 3.2/3.3 the refresh succeeds but the new token carries no scope, which the
-`mcp:sql` check refuses — verified on DOT 3.2.0 and 3.4.1). If you re-theme
+now realises they did not start — cannot be exchanged afterwards. Not reached:
+a code or refresh exchange already in progress at that instant. Refresh-token
+rows are not deleted; tested with `REFRESH_TOKEN_EXPIRE_SECONDS=0`, a refresh
+token obtained before logout yields no usable MCP token after it — DOT 3.4.1
+answers `invalid_grant` (its access token is gone), and DOT 3.2.0 still mints
+a token but with an empty scope (read from the deleted access token), which
+the `mcp:sql` check refuses (pinned by
+`test_oauth.py::TestLogoutKillsPendingCode`). If you re-theme
 `mcp_sql/authorize.html`, keep both the destination and that instruction.
 
 **Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three
@@ -677,8 +679,8 @@ Three paths by urgency:
 
 | Urgency | Action | Effect |
 |---|---|---|
-| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose tokens — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-cloud.<name>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
-| Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import AccessToken; AccessToken.objects.filter(user__email='alice@example.com').delete()"` | Outstanding tokens dropped in < 1 s; user can re-OAuth |
+| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's pending authorization codes and then their access tokens for every MCP-purpose Application — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-{cloud,local}.<slug>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
+| Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import get_access_token_model, get_grant_model; u='alice@example.com'; get_grant_model().objects.filter(user__email=u).delete(); get_access_token_model().objects.filter(user__email=u).delete()"` | Pending codes and outstanding tokens dropped in < 1 s (codes first, so a just-approved code cannot be exchanged afterwards; this snippet covers every OAuth Application the user holds, not only MCP's); user can re-OAuth |
 | Operator, kick out | Remove from `mcp_sql_users` group (admin) | Outstanding tokens still exist in DB but `MCPOAuth2Authentication` re-checks the perm on every request and rejects. Combine with the token-delete shell snippet for a clean state. |
 
 The 6 h hard cap on `access_token` lifetime is the worst-case fallback:

@@ -697,16 +697,13 @@ class TestLogoutKillsPendingCode:
     CALLBACK = "https://claude.ai/api/mcp/auth_callback"
     CLIENT_ID = "mcp-sql-cloud.claude"  # the shipped declared client
 
-    def test_code_issued_before_logout_cannot_be_exchanged_after(
-        self, client, mcp_user, mcp_mfa_on, django_capture_on_commit_callbacks
-    ):
+    def _consent_code(self, client, mcp_user):
+        """A real consent POST with S256 PKCE -> (code, verifier)."""
         import base64
         import hashlib
         import secrets
         from urllib.parse import parse_qs
         from urllib.parse import urlparse
-
-        from oauth2_provider.models import AccessToken
 
         verifier = secrets.token_urlsafe(64)
         challenge = (
@@ -733,12 +730,10 @@ class TestLogoutKillsPendingCode:
         assert f"{location.scheme}://{location.netloc}{location.path}" == (
             self.CALLBACK
         )
-        code = parse_qs(location.query)["code"][0]
+        return parse_qs(location.query)["code"][0], verifier
 
-        with django_capture_on_commit_callbacks(execute=True):
-            client.logout()
-
-        exchange = client.post(
+    def _exchange(self, client, code, verifier):
+        return client.post(
             reverse("token"),
             data={
                 "grant_type": "authorization_code",
@@ -748,9 +743,70 @@ class TestLogoutKillsPendingCode:
                 "code_verifier": verifier,
             },
         )
+
+    def test_code_issued_before_logout_cannot_be_exchanged_after(
+        self, client, mcp_user, mcp_mfa_on, django_capture_on_commit_callbacks
+    ):
+        from oauth2_provider.models import AccessToken
+
+        code, verifier = self._consent_code(client, mcp_user)
+        with django_capture_on_commit_callbacks(execute=True):
+            client.logout()
+
+        exchange = self._exchange(client, code, verifier)
         assert exchange.status_code == HTTPStatus.BAD_REQUEST, exchange.content
         assert exchange.json()["error"] == "invalid_grant"
         assert not AccessToken.objects.filter(user=mcp_user).exists()
+
+    def test_refresh_token_from_before_logout_yields_no_usable_token(
+        self,
+        client,
+        mcp_user,
+        mcp_mfa_on,
+        mcp_session_factory,
+        django_capture_on_commit_callbacks,
+    ):
+        """Logout leaves refresh-token rows in place; pin that none of them
+        can be turned into a usable MCP bearer afterwards, on any DOT version
+        the suite runs (with the suite's `REFRESH_TOKEN_EXPIRE_SECONDS=0`).
+
+        DOT >= 3.4 refuses a refresh token whose access token is gone. DOT
+        3.2/3.3 honour it but read the new token's scope from the deleted
+        access token, so it carries none — and the `mcp:sql` check refuses it.
+        """
+        from mcp_sql.auth import MCPOAuth2Authentication
+        from oauth2_provider.models import AccessToken
+        from rest_framework.exceptions import AuthenticationFailed
+        from rest_framework.test import APIRequestFactory
+
+        code, verifier = self._consent_code(client, mcp_user)
+        refresh_token = self._exchange(client, code, verifier).json()["refresh_token"]
+        with django_capture_on_commit_callbacks(execute=True):
+            client.logout()
+
+        refreshed = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.CLIENT_ID,
+            },
+        )
+        if refreshed.status_code != HTTPStatus.OK:  # DOT >= 3.4
+            assert refreshed.status_code == HTTPStatus.BAD_REQUEST
+            assert refreshed.json()["error"] == "invalid_grant"
+            return
+        # DOT 3.2/3.3: a token is minted, but without the scope.
+        new = AccessToken.objects.get(token=refreshed.json()["access_token"])
+        assert "mcp:sql" not in new.scope.split()
+        # Rule out the session gate as the reason it is refused: give the user
+        # a live web session elsewhere.
+        mcp_session_factory(user=mcp_user)
+        bearer = APIRequestFactory().post(
+            "/mcp/sql/", HTTP_AUTHORIZATION=f"Bearer {new.token}"
+        )
+        with pytest.raises(AuthenticationFailed, match="mcp:sql"):
+            MCPOAuth2Authentication().authenticate(bearer)
 
 
 class TestOauthAdminUnregistered:
