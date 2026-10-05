@@ -44,6 +44,7 @@ classifiers = [
     "Framework :: Django :: 4.2",
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Operating System :: OS Independent",
@@ -51,28 +52,36 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    # Spans the 4.2 LTS, 5.2 LTS, and 6.0 lines (matches the
+    # Spans the 4.2 LTS, 5.2 LTS, 6.0, and 6.1 lines (matches the
     # Framework :: Django classifiers and the README compatibility matrix).
     # The package's own surface is Django-version-agnostic — no 5.x/6.x-only
     # APIs — so the supported range is bounded only by the dependencies. Cap
-    # <6.1: 6.1 is unreleased/untested, widen per-line after CI proves it.
-    "django>=4.2,<6.1",
+    # <6.2: 6.2 is unreleased/untested, widen per-line after CI proves it.
+    "django>=4.2,<6.2",
     # Stable DRF surface only (auth-class subclass, @api_view, permissions).
     # Floor 3.14 is the LOWEST DRF we support — the version a legacy Django 4.2
     # app is likely already pinning. Support is a staircase, not a rectangle:
     # DRF gained each Django line in a later release (4.2 works from 3.14
-    # empirically / 3.15 officially, 5.x from 3.15, 6.0 from 3.17), and a
-    # single floor cannot encode "DRF must track Django". We floor LOW so the
-    # package installs into an existing 4.2+DRF-3.14 stack without forcing an
-    # upgrade; a greenfield install resolves newest-first and gets 3.17 on any
-    # Django anyway. The one pairing this floor cannot exclude — DRF 3.14 with
-    # Django >=5.0 — is broken, but static metadata can't express the
-    # exclusion and pip never auto-resolves it; the README matrix + CI legs
-    # document the combinations that are actually supported.
+    # empirically / 3.15 officially, 5.x from 3.15, 6.0 from 3.17, 6.1 from
+    # 3.18), and a single floor cannot encode "DRF must track Django". We
+    # floor LOW so the package installs into an existing 4.2+DRF-3.14 stack
+    # without forcing an upgrade; a greenfield install resolves newest-first
+    # and gets the newest DRF its Django allows anyway (3.18 on 5.2+; 3.17 on
+    # 4.2, since DRF 3.18 requires Django >=5.2). Two pairings this floor
+    # cannot exclude are broken: DRF 3.14 with Django >=5.0, and DRF <=3.17
+    # with Django 6.1 (`rest_framework.views` imports
+    # `django.utils.cache.cc_delim_re`, removed in 6.1 — an ImportError at
+    # URLconf load). A DRF floor that depends on the installed Django is not
+    # expressible in static metadata (PEP 508 markers can't see another
+    # package's version), and DRF <=3.17 declares `django>=4.2` uncapped, so
+    # pip won't stop an existing DRF pin from meeting a Django 6.1 upgrade (a
+    # greenfield resolve never picks either pair). The README matrix + CI
+    # legs document the combinations that are actually supported.
     "djangorestframework>=3.14,<4",
     # DOT 3.x semantics are load-bearing: loopback port-wildcarding,
     # validator hooks, skip_authorization flow; RFC 8707 audience binding is
@@ -128,9 +137,11 @@ test = [
 # Static type-checking stack (`make typecheck` / CI's `typecheck` job).
 # `[compatible-mypy]` lets each stubs package pin the mypy range it was
 # tested against, so the three resolve as a matched set rather than fighting
-# over the mypy version. django-stubs floored at 6 because only 6.x knows the
-# full Django 4.2–6.0 span the package supports (5.x predates the 6.0 stubs).
-# This is a dev-only gate that resolves the newest stubs and runs against one
+# over the mypy version. django-stubs floored at 6 because 5.x predates the
+# Django 6.0 stubs. Deliberately not raised to 6.1 for Django 6.1: the package
+# uses no 6.1-only API, and newest-resolve picks the 6.1 stubs anyway
+# (djangorestframework-stubs 3.18 requires django-stubs>=6.1). This is a
+# dev-only gate that resolves the newest stubs and runs against one
 # representative Django line (5.2); the package's annotations are
 # Django/DRF-version-agnostic, so it does not re-validate every supported
 # Django × DRF pair (those are exercised by the runtime test matrix instead).

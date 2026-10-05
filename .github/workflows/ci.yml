@@ -15,22 +15,30 @@ jobs:
     strategy:
       fail-fast: false
       # Ragged Django × Python matrix (each leg resolves the NEWEST in-range
-      # DRF/DOT/allauth for its Django line, so the 6.0 legs pull DRF 3.17).
+      # DRF/DOT/allauth for its Django line: DRF 3.17 on 4.2, 3.18 on 5.2+).
       # The columns are ragged because the interpreters differ per Django:
-      # 6.0 dropped Python 3.11, and 4.2 never supported 3.13.
+      # 6.0 dropped Python 3.11, 4.2 never supported 3.13, and 3.14 runs on
+      # 6.0/6.1 only. Each leg names its PostgreSQL major — an `include`-only
+      # matrix has no defaults, so an omitted key would be empty: 14 (the
+      # floor for Django <=6.0) except Django 6.1, which refuses 14 at connect
+      # (floor 15); the 6.0 × 3.14 leg also runs 15 so 6.0 sees both majors.
       matrix:
         include:
-          - { python-version: "3.11", django: "4.2" }
-          - { python-version: "3.12", django: "4.2" }
-          - { python-version: "3.11", django: "5.2" }
-          - { python-version: "3.12", django: "5.2" }
-          - { python-version: "3.13", django: "5.2" }
-          - { python-version: "3.12", django: "6.0" }
-          - { python-version: "3.13", django: "6.0" }
+          - { python-version: "3.11", django: "4.2", postgres: "14" }
+          - { python-version: "3.12", django: "4.2", postgres: "14" }
+          - { python-version: "3.11", django: "5.2", postgres: "14" }
+          - { python-version: "3.12", django: "5.2", postgres: "14" }
+          - { python-version: "3.13", django: "5.2", postgres: "14" }
+          - { python-version: "3.12", django: "6.0", postgres: "14" }
+          - { python-version: "3.13", django: "6.0", postgres: "14" }
+          - { python-version: "3.14", django: "6.0", postgres: "15" }
+          - { python-version: "3.12", django: "6.1", postgres: "15" }
+          - { python-version: "3.13", django: "6.1", postgres: "15" }
+          - { python-version: "3.14", django: "6.1", postgres: "15" }
     services:
       postgres:
-        # The documented PostgreSQL floor (README "Compatibility").
-        image: postgres:14
+        # Per-leg PostgreSQL major (README "Compatibility" floors; see above).
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -159,7 +167,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:14
+        # Django is unpinned here, so newest-resolve picks the newest in-range
+        # line (6.1), which refuses PostgreSQL 14 — raise this to the newest
+        # line's floor whenever the Django cap is widened.
+        image: postgres:15
         env:
           POSTGRES_PASSWORD: postgres
         ports:
