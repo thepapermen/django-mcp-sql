@@ -52,10 +52,12 @@ class AuthRejectionReason(StrEnum):
     # once at ASSIGNMENT time (`signals.py`), not per request.
     AMBIGUOUS_PROFILE = "ambiguous_profile"
     NO_SESSION = "no_session"
-    # Not a denial: the `user_logged_out` signal revoked the user's MCP
-    # tokens. Recorded here alongside the gate denials so the audit table
-    # carries a complete access-ending timeline — see
-    # `signals.revoke_mcp_tokens_on_logout`.
+    # Not a denial: the `user_logged_out` signal's revocation of the user's
+    # MCP access tokens and pending authorization codes. The row records the
+    # attempt; its `error` text carries the outcome — the counts revoked, and
+    # FAILED for a delete that raised (a codes-only or failed revocation is
+    # recorded too). Kept alongside the gate denials so the audit table carries
+    # a complete access-ending timeline — see `signals.revoke_mcp_tokens_on_logout`.
     SESSION_LOGOUT = "session_logout"
 
 
