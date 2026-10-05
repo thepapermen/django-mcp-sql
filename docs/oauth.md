@@ -81,8 +81,10 @@ and refuses to authenticate against an AS that doesn't. The AS metadata
 exposes `/o/register` at this slot; the view at
 `views/registration.py` accepts anonymous JSON POST,
 validates that every `redirect_uris` entry is an RFC 8252 §7.3 loopback URI
-(`127.0.0.1` or `[::1]`, http only), and creates a public-client
-Application named `mcp-sql-<urlsafe-token>`.
+(`127.0.0.1`, `[::1]` or `localhost`, http only, no userinfo, no whitespace,
+printable ASCII), and creates a public-client Application named
+`mcp-sql-<urlsafe-token>` that shows the consent screen
+(`skip_authorization=False`).
 
 **What Claude Code does on first `claude mcp add` + tool use**:
 
@@ -92,7 +94,7 @@ Application named `mcp-sql-<urlsafe-token>`.
 3. claude POSTs to /o/register with its loopback redirect_uri
    ← 201 with a fresh client_id
 4. claude redirects the browser to /o/authorize/?client_id=<fresh>&...
-5. user completes login + MFA + (skipped consent)
+5. user completes login + MFA + consent (DCR clients always show it)
 6. /o/authorize/ → 302 to claude's loopback callback with ?code=...
 7. claude POSTs code + code_verifier to /o/token/ with the fresh client_id
    ← 200 with bearer
@@ -392,8 +394,9 @@ De-authorizing a cloud client is a settings edit, not DB surgery.
   clients fall through to DOT's stock exact matching, untouched. The canonical
   row and every loopback DCR client also fall through to it, but only after the
   requested redirect passes the `/o/register` loopback predicate
-  (`_is_loopback_redirect`) — so a non-cloud client can never be redirected
-  off-machine, whatever its row stores.
+  (`_is_loopback_redirect`); their stored default (used when a request omits
+  `redirect_uri`) is held to the same predicate. So for a non-cloud client, the
+  validator refuses a non-loopback redirect whether it was requested or stored.
 
 **Onboarding a cloud client (operator + user).**
 

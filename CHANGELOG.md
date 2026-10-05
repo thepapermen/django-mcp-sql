@@ -32,17 +32,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     out-of-range port was stored, leaving a client that could never complete
     a flow (and, for some such URIs, an uncaught 500 at `/o/authorize/`).
   - Rows already registered by an affected release are not deleted.
-    `MCPOAuth2Validator.validate_redirect_uri` now re-applies the same
-    loopback check to the requested redirect of every client that is not a
-    declared cloud client, so a smuggled entry is refused at
-    `/o/authorize/` after upgrading (the row's loopback entries keep
-    working), and a stored unparseable port is refused instead of raising
-    a 500. `docs/oauth.md` has a shell snippet that lists such rows for
-    review and deletion.
-  - Behaviour change for the canonical `mcp-sql` row as well: it can no
-    longer be redirected off-machine even if an operator edited its stored
-    `redirect_uris` to a non-loopback URI (the documented posture was
-    already loopback-only).
+    `MCPOAuth2Validator` now re-applies the same loopback check at
+    `/o/authorize/` to the requested redirect, and to the stored default
+    used when a request omits one, of every client that is not a declared
+    cloud client. A smuggled entry is therefore refused after upgrading (the
+    row's loopback entries keep working), and a stored unparseable port is
+    refused instead of raising a 500. `docs/oauth.md` has a shell snippet
+    that lists such rows for review and deletion.
+  - Behaviour change for the canonical `mcp-sql` row as well: a
+    non-loopback redirect, requested or stored, is now refused for it too,
+    even if an operator edited its `redirect_uris` (the documented posture
+    was already loopback-only).
+  - Not covered by this fix: on django-oauth-toolkit older than 3.4.0, DOT
+    itself redirects an unauthenticated `prompt=none` authorization request
+    to the supplied `redirect_uri` before any validation runs (an open
+    redirect carrying an error, never a code; fixed upstream in 3.4.0,
+    DOT #1719). The declared `django-oauth-toolkit>=3.2` range still admits
+    those releases.
 
 ### Changed
 

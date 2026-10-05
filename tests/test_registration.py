@@ -241,8 +241,11 @@ class TestDynamicClientRegistrationValidation:
         # DOT stores an Application's redirect URIs as one whitespace-joined
         # string and matches with `str.split()`. A single submitted URI with
         # embedded `str.split()` whitespace would register a SECOND, off-machine
-        # redirect, while `urlparse` still reports the loopback host — so only
-        # the explicit split check stops it.
+        # redirect, while `urlparse` still reports the loopback host. ASCII
+        # space is the only separator here that the printable-ASCII rule would
+        # let through, so it is the case that pins the split check; the others
+        # are refused by both checks (the charset rule is pinned on its own by
+        # `test_non_printable_or_non_ascii_rejected`).
         smuggled = f"http://127.0.0.1:3456/cb{separator}http://evil.example/steal"
         # Guard the parameter itself: each case must be a real smuggle under
         # DOT's parsing, or this test would pass without exercising the hole.
@@ -637,6 +640,33 @@ class TestAuthorizeLoopbackRecheck:
         assert "Location" not in response
         assert not Grant.objects.filter(application=mcp_app).exists()
 
+    @pytest.mark.parametrize(
+        "broken",
+        [{"response_type": None}, {"scope": "not-a-scope"}],
+        ids=["no-response-type", "bad-scope"],
+    )
+    def test_off_machine_stored_default_gets_no_error_redirect(
+        self, client, mcp_user, mcp_mfa_on, mcp_app, broken
+    ):
+        # With `redirect_uri` omitted, oauthlib resolves the stored default
+        # without calling `validate_redirect_uri`, and a later NON-fatal error
+        # is 302'd to that default — off-machine, though carrying no code.
+        # `get_default_redirect_uri` drops a non-loopback default for a
+        # non-cloud client, so oauthlib fails fatally instead: no redirect.
+        mcp_app.redirect_uris = "https://evil.example/cb"
+        mcp_app.save()
+        params = self._params(mcp_app, "unused")
+        del params["redirect_uri"]
+        for key, value in broken.items():
+            if value is None:
+                del params[key]
+            else:
+                params[key] = value
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+
     def test_canonical_loopback_port_wildcard_still_redirects(
         self, client, mcp_user, mcp_mfa_on, mcp_app
     ):
@@ -651,6 +681,19 @@ class TestAuthorizeLoopbackRecheck:
         )
         assert response.status_code == HTTPStatus.FOUND, response.content
         assert response["Location"].startswith("http://127.0.0.1:9999?")
+        assert "code=" in response["Location"]
+
+    def test_canonical_loopback_default_still_used_when_omitted(
+        self, client, mcp_user, mcp_mfa_on, mcp_app
+    ):
+        # Positive control for `get_default_redirect_uri`: a loopback stored
+        # default must still be used when the request omits `redirect_uri`.
+        params = self._params(mcp_app, "unused")
+        del params["redirect_uri"]
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        assert response["Location"].startswith("http://127.0.0.1?")
         assert "code=" in response["Location"]
 
 

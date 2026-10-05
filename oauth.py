@@ -121,6 +121,10 @@ class MCPOAuth2Validator(OAuth2Validator):
         DOT parses every stored candidate's port while matching a request
         for a different, valid one.
 
+        The stored default used when a request omits `redirect_uri` never
+        reaches this method — `get_default_redirect_uri` below holds it to the
+        same rule.
+
         Why cloud clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Cloud clients".
         """
@@ -135,6 +139,27 @@ class MCPOAuth2Validator(OAuth2Validator):
             )
         except ValueError:
             return False
+
+    def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
+        """Hold a non-cloud client's stored default redirect to loopback.
+
+        When a request omits `redirect_uri`, oauthlib resolves the stored
+        default WITHOUT calling `validate_redirect_uri`, and a later non-fatal
+        error (missing `response_type`, a bad scope, ...) is then 302'd to it.
+        So a non-cloud row whose single stored redirect fails the loopback
+        predicate (e.g. a canonical row hand-edited to an off-machine URI)
+        would still send an error redirect there. Dropping such a default
+        makes oauthlib raise its fatal `MissingRedirectURIError` instead —
+        error page, no redirect. Declared cloud clients keep DOT's default.
+        """
+        uri = super().get_default_redirect_uri(client_id, request, *args, **kwargs)
+        if (
+            uri
+            and mcp_sql_settings.cloud_clients().get(client_id) is None
+            and not _is_loopback_redirect(uri)
+        ):
+            return None
+        return uri
 
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
         """Reject any token request that asks for scopes other than `mcp:sql`."""
