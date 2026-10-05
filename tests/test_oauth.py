@@ -766,16 +766,18 @@ class TestLogoutKillsPendingCode:
         mcp_session_factory,
         django_capture_on_commit_callbacks,
     ):
-        """Logout leaves refresh-token rows in place; pin that none of them
-        can be turned into a usable MCP bearer afterwards, on any DOT version
-        the suite runs (with the suite's `REFRESH_TOKEN_EXPIRE_SECONDS=0`).
+        """Logout leaves refresh-token rows in place; pin what each DOT line
+        then does with one (under the suite's `REFRESH_TOKEN_EXPIRE_SECONDS=0`).
 
-        DOT >= 3.4 refuses a refresh token whose access token is gone. DOT
-        3.2/3.3 honour it but read the new token's scope from the deleted
-        access token, so it carries none — and the `mcp:sql` check refuses it.
+        Branches on the INSTALLED DOT version, not on the response, so a DOT
+        that changed behaviour fails here instead of slipping into the other
+        branch. CI runs DOT 3.2 (floor job) and the newest 3.x (3.4.x today).
         """
+        from importlib.metadata import version
+
         from mcp_sql.auth import MCPOAuth2Authentication
         from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import RefreshToken
         from rest_framework.exceptions import AuthenticationFailed
         from rest_framework.test import APIRequestFactory
 
@@ -783,6 +785,8 @@ class TestLogoutKillsPendingCode:
         refresh_token = self._exchange(client, code, verifier).json()["refresh_token"]
         with django_capture_on_commit_callbacks(execute=True):
             client.logout()
+        # Logout deletes access tokens and pending codes, not refresh tokens.
+        assert RefreshToken.objects.filter(user=mcp_user).exists()
 
         refreshed = client.post(
             reverse("token"),
@@ -792,15 +796,19 @@ class TestLogoutKillsPendingCode:
                 "client_id": self.CLIENT_ID,
             },
         )
-        if refreshed.status_code != HTTPStatus.OK:  # DOT >= 3.4
-            assert refreshed.status_code == HTTPStatus.BAD_REQUEST
+        dot = tuple(int(p) for p in version("django-oauth-toolkit").split(".")[:2])
+        if dot >= (3, 4):
+            # Refuses a refresh token whose access token is gone.
+            assert refreshed.status_code == HTTPStatus.BAD_REQUEST, refreshed.content
             assert refreshed.json()["error"] == "invalid_grant"
             return
-        # DOT 3.2/3.3: a token is minted, but without the scope.
+        # DOT < 3.4 (3.2 is the tested floor): a token IS minted, but its scope
+        # is read from the deleted access token, so it carries none...
+        assert refreshed.status_code == HTTPStatus.OK, refreshed.content
         new = AccessToken.objects.get(token=refreshed.json()["access_token"])
-        assert "mcp:sql" not in new.scope.split()
-        # Rule out the session gate as the reason it is refused: give the user
-        # a live web session elsewhere.
+        assert new.scope == ""
+        # ...and the `mcp:sql` check refuses it. A live web session elsewhere
+        # rules out the session gate as the reason.
         mcp_session_factory(user=mcp_user)
         bearer = APIRequestFactory().post(
             "/mcp/sql/", HTTP_AUTHORIZATION=f"Bearer {new.token}"

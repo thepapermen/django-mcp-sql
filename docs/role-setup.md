@@ -25,7 +25,7 @@ deployments have just the in-package `default` profile and its
 | End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected" |
 | Executor smoke (full pipeline) | With a whitelisted table | `python manage.py mcp_sql_smoke --run-query "SELECT id FROM auth_permission LIMIT 5"` | `QueryResult` printed, audit row created |
 | Add user to MCP cohort | Onboarding / role change | Admin: add user to the profile's group (`default` profile's is `mcp_sql_users`) | user resolves to exactly one profile (`resolve_profile`) |
-| Revoke a user's MCP tokens | Incident / off-boarding | `AccessToken.objects.filter(user=user).delete()` (or user logs out) | `AccessToken.objects.filter(user=user).count() == 0` |
+| Revoke a user's MCP tokens | Incident / off-boarding | Pending codes first, then tokens: `get_grant_model().objects.filter(user=user).delete(); get_access_token_model().objects.filter(user=user).delete()` (both from `oauth2_provider.models`; see `oauth.md` → "Revoking access"), or the user logs out, which does the same for MCP Applications | `get_grant_model().objects.filter(user=user).count() == 0` and `get_access_token_model().objects.filter(user=user).count() == 0` |
 | Register Claude Code as MCP client | Once per developer per env | `claude mcp add --transport http <slug-of-RESOURCE_NAME> https://<host>/mcp/sql/` (e.g. `local-my-app`, `stage-my-app`, `my-app`) | First `claude` chat invokes a tool from this surface |
 
 OAuth-specific incident playbooks live in

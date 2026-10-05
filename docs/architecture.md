@@ -738,7 +738,8 @@ The load-bearing invariants and footguns, grouped by layer:
   before logout yields no usable MCP token after it — DOT 3.4.1 answers
   `invalid_grant`, DOT 3.2.0 mints a token with an empty scope (read from the
   deleted access token) that the `mcp:sql` check refuses (pinned by the same
-  test class, which runs on both).
+  test class, which branches on the installed DOT version; CI runs the 3.2
+  floor and the newest 3.x).
 - **Trailing dash on `APPLICATION_NAME_PREFIX` is structural, and the DCR
   suffix shape is checked.** Without the dash `startswith("mcp-sql")` would
   match BOTH the canonical `mcp-sql` row AND every DCR-minted

@@ -281,8 +281,8 @@ precisely because it is the one that does **not** announce itself.
   MCP access tokens, through one shared Application predicate so the two can
   never disagree (the existing name test: exactly `APPLICATION_NAME`, or
   starting with `APPLICATION_NAME_PREFIX`); rows of other Applications are
-  untouched, and the logout audit row counts both — including when the token
-  delete fails after the codes went. Not reached: a code or refresh exchange
+  untouched, and the logout audit row counts both — and says FAILED for
+  whichever delete raised, rather than reporting it as zero. Not reached: a code or refresh exchange
   already in progress at that instant. Refresh-token rows are still not
   deleted; tested with `REFRESH_TOKEN_EXPIRE_SECONDS=0`, one obtained before
   logout yields no usable MCP token after it (DOT 3.4.1: `invalid_grant`;

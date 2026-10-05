@@ -99,7 +99,7 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
     # would otherwise be exchanged afterwards for a fresh token that this
     # function had no chance to delete. Codes before tokens also narrows the
     # in-flight case: an exchange that has not yet loaded its grant fails.
-    codes = 0
+    codes, codes_failed = 0, False
     try:
         codes, _ = get_grant_model().objects.filter(mcp_apps, user=user).delete()
     except DatabaseError:
@@ -107,26 +107,37 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
             "Failed to revoke pending MCP authorization codes on logout for user %s",
             user.pk,
         )
-    token_delete_failed = False
+        codes_failed = True
+    deleted, tokens_failed = 0, False
     try:
         deleted, _ = (
             get_access_token_model().objects.filter(mcp_apps, user=user).delete()
         )
     except DatabaseError:
         logger.exception("Failed to revoke MCP tokens on logout for user %s", user.pk)
-        deleted, token_delete_failed = 0, True
-    if not (deleted or codes):
+        tokens_failed = True
+    if not (deleted or codes or codes_failed or tokens_failed):
         return
-    # Codes already deleted are still recorded when the token delete failed —
-    # the audit trail must show what logout did revoke, and that it was partial.
-    summary = (
-        f"Revoked {codes} pending MCP authorization code(s) on logout; deleting "
-        f"the MCP access tokens FAILED"
-        if token_delete_failed
-        else f"Revoked {deleted} MCP token(s) and {codes} pending authorization "
-        f"code(s) on logout"
-    )
-    logger.info("%s for user %s", summary, user.pk)
+    # A failed delete is recorded as FAILED, never as "0": `QuerySet.delete()`
+    # is atomic, so a raised error means those rows are all still there — the
+    # audit trail must say what logout did revoke and what it could not.
+    revoked, failed = [], []
+    if tokens_failed:
+        failed.append("MCP tokens")
+    else:
+        revoked.append(f"{deleted} MCP token(s)")
+    if codes_failed:
+        failed.append("pending authorization codes")
+    else:
+        revoked.append(f"{codes} pending authorization code(s)")
+    parts = []
+    if revoked:
+        parts.append(f"Revoked {' and '.join(revoked)} on logout")
+    if failed:
+        parts.append(f"deleting the {' and the '.join(failed)} FAILED")
+    summary = "; ".join(parts)
+    log = logger.warning if failed else logger.info
+    log("%s (user %s)", summary, user.pk)
     # Record the revocation in the access-ending audit table alongside the
     # per-request gate denials, so the timeline of why a user lost MCP
     # access is complete.
@@ -142,9 +153,9 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
         )
     except DatabaseError:
         logger.exception(
-            "Revoked MCP tokens on logout for user %s but failed to write the "
-            "audit row",
+            "Logout revocation for user %s (%s), but failed to write the audit row",
             user.pk,
+            summary,
         )
 
 
