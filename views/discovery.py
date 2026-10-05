@@ -50,11 +50,11 @@ def _cors(response: JsonResponse) -> JsonResponse:
 def protected_resource_metadata(request):
     """RFC 9728 Protected Resource Metadata for the MCP SQL surface.
 
-    `bearer_methods_supported: ["header"]` reflects DOT 3.2.0's behavior:
-    `oauth2_provider.contrib.rest_framework.OAuth2Authentication` only
-    reads bearer tokens from the `Authorization` header. We don't add a
-    body/query rejection path because DOT doesn't have a body/query
-    acceptance path to override.
+    `bearer_methods_supported: ["header"]` is backed by our own refusal, not
+    by DOT: oauthlib (and so DOT) would also take an `access_token` from the
+    query string or a form body, so `MCPOAuth2Authentication` answers any
+    request carrying that parameter with a 400 `invalid_request` before any
+    token lookup (`auth.py::_carries_token_outside_header`).
     """
     return _cors(
         JsonResponse(

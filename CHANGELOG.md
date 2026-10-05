@@ -91,6 +91,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - Both policies are install-wide: the validator is the DOT install's
   `OAUTH2_VALIDATOR_CLASS` (which already refuses any scope but `mcp:sql`),
   so they apply to every client of that install.
+- **`/mcp/sql/` accepted a bearer token in the URL query string (affects
+  every release up to and including 0.1.0b5).** oauthlib, and so DOT, falls
+  back to an `access_token` request parameter when there is no
+  `Authorization` header, so `/mcp/sql/?access_token=<token>` authenticated
+  like the header (verified on DOT 3.2.0, 3.4.0 and 3.4.1), and a form-body
+  token passed authentication too — although the RFC 9728 metadata
+  advertised `bearer_methods_supported: ["header"]`. A token in a URL ends up
+  in proxy and access logs and in `Referer` headers. RFC 6750 §2.3 and §5.3
+  advise against sending bearer tokens in URLs, OAuth 2.1 (the draft the MCP
+  specification builds on) drops the query-parameter method entirely, and
+  the MCP authorization specification requires clients to use the
+  `Authorization` header and says access tokens MUST NOT be included in the
+  URI query string.
+  `MCPOAuth2Authentication` now refuses any request to `/mcp/sql/` (with or
+  without the trailing slash) that carries an `access_token` query parameter
+  or a form-body `access_token` — even alongside a valid header — with 400
+  `invalid_request` (RFC 6750 §3.1) and the usual `WWW-Authenticate`
+  challenge, now including `error="invalid_request"`. The check runs before
+  any token lookup, so a URL token is never validated. Nothing is written
+  to `MCPAuthRejectionLog` and the bad-token throttle is not counted (it is
+  malformed transport, like the 413 body cap).
+  - **Behaviour change:** a client sending its token anywhere but the
+    `Authorization` header is now refused.
 - **Raised the `django-oauth-toolkit` floor to `>=3.4` (was `>=3.2`).**
   Releases before 3.4.0 redirect an unauthenticated `prompt=none`
   authorization request to whatever `redirect_uri` it names, with an

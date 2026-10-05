@@ -88,7 +88,9 @@ class TestProtectedResourceMetadata:
         response = self._get()
         body = response.json()
         assert body["scopes_supported"] == ["mcp:sql"]
-        # DOT 3.2.0 only accepts header bearers by default.
+        # Header only — enforced by MCPOAuth2Authentication's own refusal of an
+        # `access_token` query/form parameter (DOT alone would accept both);
+        # pinned in test_auth_class.py::TestBearerTokenOnlyInHeader.
         assert body["bearer_methods_supported"] == ["header"]
 
     def test_no_auth_required(self):

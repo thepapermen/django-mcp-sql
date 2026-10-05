@@ -33,7 +33,7 @@ discovery surface comprises two anonymous-GET endpoints plus the
 
 | URL | RFC | What it says |
 |---|---|---|
-| `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. |
+| `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]` (enforced: a request carrying an `access_token` query or form parameter gets 400 `invalid_request`). |
 | `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
 
 The `/mcp/sql/` 401 response advertises the RFC 9728 URL:
