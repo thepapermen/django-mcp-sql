@@ -80,9 +80,9 @@ dependencies = [
     # sit below any hook of ours: before 3.4.0 an unauthenticated
     # `prompt=none` authorization request is redirected to whatever
     # `redirect_uri` it names before validation (an open redirect, DOT
-    # #1719); before 3.4.1 redirect URIs match loosely — userinfo, extra
-    # query parameters, a fragment or `;params` on a registered host still
-    # match — and 3.4.1 makes matching exact (RFC 9700 §2.1). 3.4.1 still
+    # #1719); before 3.4.1 redirect URIs match loosely — extra query
+    # parameters, `;params` or a userinfo on a registered host still match —
+    # and 3.4.1 makes matching exact (RFC 9700 §2.1). 3.4.1 still
     # supports Django 4.2 (`django>=4.2`) and needs `oauthlib>=3.3.0`.
     # (3.4 also ships RFC 8707 resource indicators; the package does not use
     # them — audience binding stays implicit, see docs/architecture.md.)

@@ -195,26 +195,20 @@ class MCPOAuth2Authentication(OAuth2Authentication):
 
     def authenticate(self, request):  # noqa: C901, PLR0912, PLR0915 — linear defense-in-depth chain reads better than extracted helpers
         # DOT's parent class calls `oauthlib_core.verify_request`, which
-        # extracts the body via `request.POST.items()`. For application/json
-        # request bodies (the MCP wire protocol's content type), DRF's
-        # JSONParser consumes the body stream as a side effect, leaving the
-        # downstream `request.body` access in `_invoke_wsgi_app` raising
+        # extracts the body via DRF's `request.POST`; that runs DRF's parsers
+        # (JSON for the MCP wire protocol, and the default form / multipart
+        # parsers on ANY method), consuming the body stream, so the
+        # downstream `request.body` access in `_invoke_wsgi_app` would raise
         # `RawPostDataException`. Force-cache the raw bytes on the underlying
-        # Django HttpRequest BEFORE super() runs so the MCP view can still
-        # re-seed `wsgi.input` from `request.body`. Gated to body-carrying
-        # JSON requests: this auth class is mounted ONLY on `/mcp/sql/`,
-        # which is JSON-RPC and rejects non-JSON content types via DRF's
-        # parser negotiation — so the JSON gate is exhaustive for paths
-        # that can actually reach the bridge, and the explicit method
-        # whitelist keeps GET/HEAD from flipping `_read_started=True` for
-        # free.
+        # Django HttpRequest BEFORE super() runs — always, whatever the method
+        # or content type — so the MCP view can still re-seed `wsgi.input`
+        # from `request.body`, and so `_carries_token_outside_header` can
+        # parse a form body from the cached bytes.
         django_request = getattr(request, "_request", request)
         _enforce_body_size_cap(django_request)
-        # `/mcp/sql/` is JSON-RPC POST only (DRF parser negotiation rejects
-        # non-JSON content types upstream of this code), so we always have
-        # a body to materialise. The `hasattr` guard makes the force-cache
-        # idempotent — DRF body negotiation re-runs would otherwise raise
-        # `RawPostDataException` when the bridged WSGI worker re-reads.
+        # The `hasattr` guard makes the force-cache idempotent — a re-run
+        # would otherwise raise `RawPostDataException` when the bridged WSGI
+        # worker re-reads.
         if not hasattr(django_request, "_body"):
             _ = django_request.body
 

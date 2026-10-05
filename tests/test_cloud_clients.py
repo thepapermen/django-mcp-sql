@@ -255,6 +255,14 @@ class TestRedirectUnderPrefix:
             pytest.param("https://chatgpt.com/connector/oauth/x#frag", id="fragment"),
             pytest.param("https://chatgpt.com/connector/oauth/x#", id="bare-fragment"),
             pytest.param("https://chatgpt.com/connector/oauth/x;p=1", id="path-params"),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%3bnext=https://evil.example",
+                id="encoded-path-params",
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%253Bp=1",
+                id="double-encoded-path-params",
+            ),
         ],
     )
     def test_rejects_bypass_attempts(self, uri):
@@ -276,9 +284,11 @@ class TestExactCloudClientMatchedExactly:
     """An "exact" cloud client rides DOT's own matching, which is exact only
     from django-oauth-toolkit 3.4.1 (the floor; RFC 9700 §2.1). DOT 3.4.0's
     matcher still accepted the registered host with userinfo, extra query
-    parameters, a fragment or `;params` added; oauthlib's absolute-URI check
-    stops the userinfo and fragment forms first, but on 3.4.0 the extra-query
-    and `;params` forms reached the consent page (and then the code redirect)."""
+    parameters, a fragment or `;params` added. oauthlib's absolute-URI check
+    stops fragments and any userinfo longer than one character first (its
+    userinfo rule matches a single character), but on 3.4.0 a one-character
+    userinfo, the extra-query and the `;params` forms reached the consent page
+    (and then the code redirect)."""
 
     @staticmethod
     def _authorize(client, redirect_uri):
@@ -301,11 +311,12 @@ class TestExactCloudClientMatchedExactly:
         "variant",
         [
             "https://attacker@claude.ai/api/mcp/auth_callback",
+            "https://a@claude.ai/api/mcp/auth_callback",
             "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
             "https://claude.ai/api/mcp/auth_callback#frag",
             "https://claude.ai/api/mcp/auth_callback;p=1",
         ],
-        ids=["userinfo", "extra-query", "fragment", "path-params"],
+        ids=["userinfo", "one-char-userinfo", "extra-query", "fragment", "path-params"],
     )
     def test_near_miss_of_the_registered_callback_is_refused(
         self, client, settings, mcp_user, mcp_mfa_on, variant

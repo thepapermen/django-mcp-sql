@@ -31,7 +31,8 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
       parse to an empty `.query` / `.fragment`, so the raw string is tested.
       The callback is a plain path, and DOT 3.4.1+ matches an exact URI the same
       way (RFC 9700 §2.1). `urlsplit` (not `urlparse`) keeps `;params` in the
-      path, where they are refused,
+      path, where they are refused — also percent-encoded (`%3b`), since the
+      check runs on the decoded path,
     - host must EXACTLY equal the prefix host (not `endswith`, so
       `chatgpt.com.evil.com` is rejected), and port must match with only a
       MISSING port normalised to the https default (an explicit `:443` equals
@@ -75,7 +76,7 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
         and "@" not in got.netloc  # no userinfo, not even an empty one
         and "?" not in redirect_uri  # no query, not even a bare `?` ...
         and "#" not in redirect_uri  # ... nor a fragment / bare `#`
-        and ";" not in got.path  # no `;params`
+        and ";" not in decoded_path  # no `;params`, raw or percent-encoded
         and bool(got.hostname)
         and got.hostname == want.hostname  # exact host, never `endswith`
         and got_port == want_port  # exact port (:443 == implicit https)

@@ -120,14 +120,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (affects 0.1.0b5, which introduced cloud clients).** `_redirect_under_prefix`
   checked the scheme, host, port and path exactly but ignored query strings,
   fragments and `;params`, and refused only a non-empty userinfo. Past
-  oauthlib's own URI check, an extra query string (or a bare `?`), `;params`,
-  or an empty `:@` userinfo on the provider's host reached the consent page
-  end to end, so an authorization code could be delivered to the provider's
-  callback with attacker-chosen parameters (the RFC 9700 §4.1 concern); the
-  host itself was always checked exactly. The matcher now refuses any `@` in
-  the authority, any query or fragment (even a bare `?` / `#`, tested on the
-  raw string) and any `;params` (it uses `urlsplit`, which keeps them in the
-  path) — the same exactness DOT 3.4.1 applies to "exact" clients.
+  oauthlib's own URI check, an extra query string (or a bare `?`), `;params`
+  (raw or percent-encoded), or an empty `:@` userinfo on the provider's host
+  reached the consent page end to end, so an authorization code could be
+  delivered to the provider's callback with attacker-chosen parameters (the
+  RFC 9700 §4.1 concern); the host itself was always checked exactly. The
+  matcher now refuses any `@` in the authority, any query or fragment (even a
+  bare `?` / `#`, tested on the raw string) and any `;params`, raw or
+  percent-encoded (it uses `urlsplit`, which keeps them in the path, and
+  checks the decoded path) — the same userinfo / query / fragment /
+  `;params` refusals DOT 3.4.1 applies to "exact" clients (the port check
+  keeps its deliberate `:443` normalisation).
 - **Raised the `django-oauth-toolkit` floor to `>=3.4.1` (was `>=3.2`)**,
   for two upstream fixes that sit below any of this package's checks:
   - Releases before 3.4.0 redirect an unauthenticated `prompt=none`
@@ -141,13 +144,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   - Releases before 3.4.1 match redirect URIs loosely. Against a
     registered `https://claude.ai/api/mcp/auth_callback`, DOT 3.4.0's
     matcher accepts the same host with userinfo, extra query parameters, a
-    fragment or `;params` added. oauthlib's own absolute-URI check stops the
-    userinfo and fragment forms first, but the extra-query and `;params`
-    forms reached the consent page end to end (verified on 3.4.0), so an
-    authorization code could be delivered to the registered host with
-    attacker-chosen parameters. 3.4.1 matches exactly, per RFC 9700 §2.1.
-    This is the matcher behind declared "exact" cloud clients; a new test
-    pins all four forms being refused at `/o/authorize/` for one.
+    fragment or `;params` added. oauthlib's own absolute-URI check stops
+    fragments and any userinfo longer than one character first (its userinfo
+    rule matches a single character), but a one-character userinfo, the
+    extra-query and the `;params` forms reached the consent page end to end
+    (verified on 3.4.0), so an authorization code could be delivered to the
+    registered host with attacker-chosen parameters. 3.4.1 matches exactly,
+    per RFC 9700 §2.1. This is the matcher behind declared "exact" cloud
+    clients; a new test pins these forms being refused at `/o/authorize/`
+    for one.
   - **Action required** for a consumer pinning django-oauth-toolkit below
     3.4.1 (e.g. `==3.2.0`): bump it. 3.4.1 still supports Django 4.2 and
     requires `oauthlib>=3.3.0` (unchanged from 3.2.0). Django 4.2 remains
