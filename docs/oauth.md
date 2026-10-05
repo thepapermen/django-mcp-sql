@@ -602,10 +602,14 @@ when the Application no longer classifies); a *successful* handshake
 (`initialize`, `tools/list`) writes no row and does not count toward the
 volume tripwire; a token lives only as
 long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
-logging out deletes the MCP access tokens the user holds at that moment — not
-an authorization code issued moments before and not yet exchanged
-(`AUTHORIZATION_CODE_EXPIRE_SECONDS`, 60 s in the recommended config), whose
-token is minted after the logout and survives it. If you re-theme
+logging out deletes both the user's MCP access tokens and their pending MCP
+authorization codes, so a code approved a moment ago — say, on a link the user
+now realises they did not start — cannot be exchanged afterwards. Two things
+it does not reach: an exchange already in progress at that instant, and
+refresh-token rows, which are not deleted but cannot yield a usable MCP token
+after logout (DOT ≥ 3.4 rejects a refresh token whose access token is gone; on
+DOT 3.2/3.3 the refresh succeeds but the new token carries no scope, which the
+`mcp:sql` check refuses — verified on DOT 3.2.0 and 3.4.1). If you re-theme
 `mcp_sql/authorize.html`, keep both the destination and that instruction.
 
 **Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three

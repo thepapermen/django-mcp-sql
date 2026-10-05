@@ -271,6 +271,20 @@ precisely because it is the one that does **not** announce itself.
   shipping ON makes it reachable by default. Whether a given provider then
   completes a callback it receives in another user's browser is outside this
   server and was not tested.
+- **Logout now also revokes pending authorization codes.** The `user_logged_out`
+  receiver deleted the user's MCP access tokens but not their DOT `Grant`
+  rows, so a code issued just before logout — a consent approved a moment
+  ago, or a phished approval the user logs out to undo — could still be
+  exchanged at `/o/token/` afterwards for a fresh token nothing had deleted
+  (reproduced end to end: consent, logout, exchange → 200 with a new access
+  token). Logout now deletes the user's pending MCP codes first, then their
+  MCP access tokens, through one shared Application predicate so the two can
+  never disagree; codes and tokens of non-MCP Applications are untouched, and
+  the logout audit row counts both. Not reached: an exchange already in
+  progress at that instant. Refresh-token rows are still not deleted, but
+  after logout none yields a usable MCP token (DOT ≥ 3.4 rejects an orphaned
+  refresh token; DOT 3.2/3.3 mint a scope-less token the `mcp:sql` check
+  refuses — verified on 3.2.0 and 3.4.1). Predates the multi-client work.
 - **The consent screen corrupted IPv6 destinations.** `urlparse().hostname`
   strips the brackets, so `http://[::1]:8787/cb` rendered as
   `http://::1:8787` — and `::1` is an accepted DCR loopback host. An explicit

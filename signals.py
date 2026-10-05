@@ -65,33 +65,64 @@ def revoke_mcp_tokens_on_logout(
     )
 
 
-def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
-    """Best-effort post-commit MCP token revocation + a forensic audit row.
+def _mcp_application_q() -> Q:
+    """Rows (tokens, grants) whose `application` is part of the MCP surface.
 
-    Runs after the logout transaction commits. Both the delete and the
-    audit write are wrapped so a DB blip is logged (Sentry via
+    Matches BOTH the curated `mcp-sql` Application (exact name) AND every
+    `mcp-sql-` Application — DCR-minted `mcp-sql-<token>` and settings-declared
+    `mcp-sql-{cloud,local}.<slug>`. The prefix carries a trailing dash, so a
+    `startswith` on it does NOT match the canonical name — that's why the
+    Q-OR is required. One helper so the access-token and the pending-code
+    deletes can never disagree about which Applications are MCP's.
+    """
+    return Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
+        application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
+    )
+
+
+def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
+    """Best-effort post-commit MCP revocation + a forensic audit row.
+
+    Deletes the user's pending MCP authorization codes (DOT `Grant` rows) and
+    their MCP access tokens. Runs after the logout transaction commits. Each
+    delete and the audit write are wrapped so a DB blip is logged (Sentry via
     `logger.exception`) rather than surfacing as a 500 on an already-
     completed logout.
     """
     # Lazy import keeps `apps.ready()` import-graph small.
-    from oauth2_provider.models import AccessToken
+    from oauth2_provider.models import get_access_token_model
+    from oauth2_provider.models import get_grant_model
 
-    # Match BOTH the curated `mcp-sql` Application (exact name) AND every
-    # DCR-minted `mcp-sql-<token>` Application (prefix). The prefix carries
-    # a trailing dash, so a `startswith` on it does NOT match the canonical
-    # name — that's why the Q-OR is required here.
+    mcp_apps = _mcp_application_q()
+    # Pending codes FIRST. A code issued just before logout (consent approved
+    # a moment ago, or a phished approval the user is now trying to undo)
+    # would otherwise be exchanged afterwards for a fresh token that this
+    # function had no chance to delete. Codes before tokens also narrows the
+    # in-flight case: an exchange that has not yet loaded its grant fails.
+    codes = 0
     try:
-        deleted, _ = AccessToken.objects.filter(
-            Q(application__name=mcp_sql_settings.APPLICATION_NAME)
-            | Q(application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX),
-            user=user,
-        ).delete()
+        codes, _ = get_grant_model().objects.filter(mcp_apps, user=user).delete()
+    except DatabaseError:
+        logger.exception(
+            "Failed to revoke pending MCP authorization codes on logout for user %s",
+            user.pk,
+        )
+    try:
+        deleted, _ = (
+            get_access_token_model().objects.filter(mcp_apps, user=user).delete()
+        )
     except DatabaseError:
         logger.exception("Failed to revoke MCP tokens on logout for user %s", user.pk)
         return
-    if not deleted:
+    if not (deleted or codes):
         return
-    logger.info("Revoked %d MCP token(s) on logout for user %s", deleted, user.pk)
+    logger.info(
+        "Revoked %d MCP token(s) and %d pending authorization code(s) on logout "
+        "for user %s",
+        deleted,
+        codes,
+        user.pk,
+    )
     # Record the revocation in the access-ending audit table alongside the
     # per-request gate denials, so the timeline of why a user lost MCP
     # access is complete.
@@ -101,7 +132,10 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
             token_pk="",
             application_name="",
             reason=AuthRejectionReason.SESSION_LOGOUT,
-            error=f"Revoked {deleted} MCP token(s) on logout",
+            error=(
+                f"Revoked {deleted} MCP token(s) and {codes} pending "
+                f"authorization code(s) on logout"
+            ),
             client_ip=client_ip,
             started_at=logged_out_at,
         )

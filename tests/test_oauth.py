@@ -682,6 +682,77 @@ class TestApprovalPromptCannotSkipConsent:
         assert "Location" not in response
 
 
+@pytest.mark.django_db
+class TestLogoutKillsPendingCode:
+    """Logout must also revoke an authorization code not yet exchanged.
+
+    Logout deletes the user's MCP access tokens, but a code issued just
+    before it (a consent approved a moment ago — or a phished approval the
+    user is now trying to undo) used to survive and be exchanged afterwards
+    for a fresh token that nothing had deleted. Walked end to end: a real
+    consent POST at `/o/authorize/` with S256 PKCE, a real logout, then the
+    exchange.
+    """
+
+    CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+    CLIENT_ID = "mcp-sql-cloud.claude"  # the shipped declared client
+
+    def test_code_issued_before_logout_cannot_be_exchanged_after(
+        self, client, mcp_user, mcp_mfa_on, django_capture_on_commit_callbacks
+    ):
+        import base64
+        import hashlib
+        import secrets
+        from urllib.parse import parse_qs
+        from urllib.parse import urlparse
+
+        from oauth2_provider.models import AccessToken
+
+        verifier = secrets.token_urlsafe(64)
+        challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        client.force_login(mcp_user)
+        consent = client.post(
+            reverse("authorize"),
+            data={
+                "client_id": self.CLIENT_ID,
+                "redirect_uri": self.CALLBACK,
+                "response_type": "code",
+                "scope": "mcp:sql",
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "allow": "Authorize",
+            },
+        )
+        assert consent.status_code == HTTPStatus.FOUND, consent.content
+        location = urlparse(consent["Location"])
+        assert f"{location.scheme}://{location.netloc}{location.path}" == (
+            self.CALLBACK
+        )
+        code = parse_qs(location.query)["code"][0]
+
+        with django_capture_on_commit_callbacks(execute=True):
+            client.logout()
+
+        exchange = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": self.CALLBACK,
+                "client_id": self.CLIENT_ID,
+                "code_verifier": verifier,
+            },
+        )
+        assert exchange.status_code == HTTPStatus.BAD_REQUEST, exchange.content
+        assert exchange.json()["error"] == "invalid_grant"
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
+
+
 class TestOauthAdminUnregistered:
     """DOT ModelAdmin classes must not be reachable via Django admin.
 

@@ -114,6 +114,60 @@ class TestRevokeMcpTokensOnLogout:
         assert AccessToken.objects.filter(user=user, application=mcp_app).count() == 0
         assert AccessToken.objects.filter(user=user, application=other_app).count() == 1
 
+    @staticmethod
+    def _mint_grant(user, application):
+        from oauth2_provider.models import get_grant_model
+
+        return get_grant_model().objects.create(
+            user=user,
+            code="code_" + secrets.token_urlsafe(16),
+            application=application,
+            expires=timezone.now() + timedelta(minutes=1),
+            redirect_uri="http://127.0.0.1:9999",
+            scope="mcp:sql",
+            code_challenge="x" * 43,
+            code_challenge_method="S256",
+        )
+
+    def test_logout_deletes_pending_mcp_codes_and_spares_the_rest(
+        self, mcp_app, caplog, django_capture_on_commit_callbacks
+    ):
+        """Pending codes go with the tokens — for the MCP Applications only,
+        and only the logging-out user's. Same predicate as the token delete."""
+        from oauth2_provider.models import Application
+        from oauth2_provider.models import get_grant_model
+
+        other_app = Application.objects.create(
+            name="other-app",
+            client_id="other",
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="http://127.0.0.1",
+        )
+        declared = Application.objects.get(client_id="mcp-sql-cloud.claude")
+        user, bystander = UserFactory(), UserFactory()
+        self._mint_grant(user, mcp_app)  # curated
+        self._mint_grant(user, declared)  # declared (`mcp-sql-` prefix)
+        non_mcp = self._mint_grant(user, other_app)
+        theirs = self._mint_grant(bystander, mcp_app)
+
+        with (
+            caplog.at_level(logging.INFO, logger="mcp_sql.signals"),
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            user_logged_out.send(
+                sender=type(user), request=_logout_request(), user=user
+            )
+
+        grants = get_grant_model().objects
+        assert set(grants.filter(user=user)) == {non_mcp}
+        assert set(grants.filter(user=bystander)) == {theirs}
+        # Counted, and logged/audited even with no access token to delete.
+        assert "Revoked 0 MCP token(s) and 2 pending authorization code(s)" in (
+            caplog.text
+        )
+
     def test_logout_without_tokens_is_silent(
         self, mcp_app, caplog, django_capture_on_commit_callbacks
     ):
@@ -339,6 +393,34 @@ class TestSignalDatabaseErrorResilience:
                 user=user, client_ip="1.2.3.4", logged_out_at=timezone.now()
             )
         assert "Failed to revoke MCP tokens on logout" in caplog.text
+
+    def test_grant_delete_db_error_still_revokes_tokens(
+        self, monkeypatch, caplog, mcp_app
+    ):
+        # A failed pending-code delete is logged and must not stop the token
+        # delete — the tokens are the primary revocation.
+        from django.db import DatabaseError
+        from mcp_sql.signals import _revoke_and_audit_on_logout
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+
+        user = UserFactory()
+        AccessToken.objects.create(
+            user=user,
+            token="t_" + secrets.token_urlsafe(16),
+            application=mcp_app,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+        monkeypatch.setattr(
+            Grant, "objects", _mgr(filter_delete_side_effect=DatabaseError("boom"))
+        )
+        with caplog.at_level(logging.ERROR):
+            _revoke_and_audit_on_logout(
+                user=user, client_ip=None, logged_out_at=timezone.now()
+            )
+        assert "Failed to revoke pending MCP authorization codes" in caplog.text
+        assert not AccessToken.objects.filter(user=user).exists()
 
     def test_audit_write_db_error_is_swallowed(self, monkeypatch, caplog):
         import mcp_sql.signals as signals_mod
