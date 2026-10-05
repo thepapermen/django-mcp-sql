@@ -334,8 +334,10 @@ OAUTH2_PROVIDER = {
     # admits (RFC 8252 loopback and the declared clients' https callbacks).
     # It is install-global — it governs redirect handling for every OAuth
     # application in your project — so narrowing it is a decision to make on
-    # purpose, not by pasting. If you do narrow it and drop "https" while any
-    # https client is declared, the app refuses to boot and says so.
+    # purpose, not by pasting. If you do narrow it, the app refuses to boot
+    # (and says why) unless it keeps "http" — always, because /o/register
+    # mints RFC 8252 loopback callbacks — and "https" while any https client
+    # is declared.
 }
 ```
 

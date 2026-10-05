@@ -406,8 +406,8 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
     spellings lost every time it was tried: percent-encoding, fullwidth and
     ideographic-dot forms, `0` / `0.0.0.0`, `*.localhost`, and IPv4-mapped
     IPv6 (which `ipaddress` on older Pythons, 3.12.3 among them, does not
-    even call loopback)
-    all slipped a list that caught `127.0.0.0/8` and `::1`. A provider's
+    even call loopback) all slipped a detector that caught `127.0.0.0/8` and
+    `::1`. A provider's
     callback is always an ASCII DNS name, so require exactly that and refuse
     every IP literal outright, loopback or not; then refuse the names that
     mean "this machine". What a syntactic check cannot see is a public DNS

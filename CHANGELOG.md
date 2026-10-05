@@ -63,8 +63,9 @@ precisely because it is the one that does **not** announce itself.
   `OAUTH2_PROVIDER["COMPLIANT_BCP_RFC9700_REDIRECT_URI_SCHEME"]`. It changes no
   runtime behaviour — it only sets the severity of the `manage.py check
   --deploy` finding for `"http"` in `ALLOWED_REDIRECT_URI_SCHEMES`: warning
-  `oauth2_provider.W008` while the gate is `False` (DOT's default, so every
-  deployment of this package sees that warning under `--deploy`), error
+  `oauth2_provider.W008` while the gate is `False` (DOT's default, so on DOT
+  ≥ 3.4 every deployment of this package sees that warning under
+  `--deploy`), error
   `oauth2_provider.E003` once it is `True`. Since this package will not boot
   without `"http"`, no configuration satisfies both with the gate on:
   `check --deploy` fails on E003. The `http` entry is what RFC 8252 loopback
