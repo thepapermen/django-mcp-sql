@@ -272,6 +272,47 @@ class TestMCPAuthorizationViewRouting:
         # /accounts/login/, the admin login, ...) — not a hardcoded path.
         assert resolve_url(settings.LOGIN_URL) in response["Location"]
 
+    def test_anonymous_prompt_none_never_redirects_off_machine(self, client, mcp_app):
+        """DOT before 3.4.0 answered an anonymous `prompt=none` request with a
+        302 to whatever `redirect_uri` it named — before validating the client
+        or the URI (DOT #1719), so before any check of this package. The
+        `django-oauth-toolkit>=3.4` floor exists for this: the request is now
+        validated first, and an off-machine URI gets an error page.
+        """
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "prompt": "none",
+            "redirect_uri": "https://evil.example/x",
+            "state": "st4te",
+        }
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+
+    def test_anonymous_prompt_none_errors_back_to_a_valid_loopback(
+        self, client, mcp_app
+    ):
+        # Positive control: for a VALID request, `prompt=none` still answers
+        # an anonymous user with `login_required` at the client's redirect URI
+        # (OIDC Core §3.1.2.6) instead of a login page.
+        _verifier, challenge = _s256_pair()
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "prompt": "none",
+            "redirect_uri": "http://127.0.0.1:9999",
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        location = urlparse(response["Location"])
+        assert f"{location.scheme}://{location.netloc}" == "http://127.0.0.1:9999"
+        assert parse_qs(location.query)["error"] == ["login_required"]
+
 
 @pytest.mark.django_db
 class TestOAuthTokenEndpointHappyPath:

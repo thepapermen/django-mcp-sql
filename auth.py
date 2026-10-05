@@ -146,7 +146,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         if not hasattr(django_request, "_body"):
             _ = django_request.body
 
-        # DOT 3.2.0's `OAuth2Authentication.authenticate()` returns `None`
+        # DOT 3.x's `OAuth2Authentication.authenticate()` returns `None`
         # on bad / expired / unknown / revoked tokens (it does NOT raise —
         # it sets `request.oauth2_error` and yields the anonymous result).
         # The only paths from super() that DO raise are `SuspiciousOperation`

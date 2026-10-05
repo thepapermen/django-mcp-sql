@@ -55,12 +55,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     non-loopback redirect, requested or stored, is now refused for it too,
     even if an operator edited its `redirect_uris` (the documented posture
     was already loopback-only).
-  - Not covered by this fix: on django-oauth-toolkit older than 3.4.0, DOT
-    itself redirects an unauthenticated `prompt=none` authorization request
-    to the supplied `redirect_uri` before any validation runs (an open
-    redirect carrying an error, never a code; fixed upstream in 3.4.0,
-    DOT #1719). The declared `django-oauth-toolkit>=3.2` range still admits
-    those releases.
 - **Refresh tokens renewed access indefinitely (affects 0.1.0b5 and
   earlier).** The docs said refresh tokens were disabled by
   `REFRESH_TOKEN_EXPIRE_SECONDS=0`, but django-oauth-toolkit reads `0` as
@@ -97,6 +91,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - Both policies are install-wide: the validator is the DOT install's
   `OAUTH2_VALIDATOR_CLASS` (which already refuses any scope but `mcp:sql`),
   so they apply to every client of that install.
+- **Raised the `django-oauth-toolkit` floor to `>=3.4` (was `>=3.2`).**
+  Releases before 3.4.0 redirect an unauthenticated `prompt=none`
+  authorization request to whatever `redirect_uri` it names, with an
+  `error=login_required` but never a code, before any validation — and so
+  before any of this package's redirect checks (DOT #1719, fixed upstream in
+  3.4.0). With the new floor that request is validated first, like any
+  other: an unregistered `redirect_uri` gets an error page instead of a
+  redirect, while a registered one (a loopback URI, or a declared cloud
+  client's `https` callback) still receives the specified
+  `error=login_required`, never a code. A new test pins this for the
+  canonical client.
+  - **Action required** for a consumer pinning django-oauth-toolkit below
+    3.4 (e.g. `==3.2.0`): bump it. 3.4.0 still supports Django 4.2 and
+    requires `oauthlib>=3.3.0` (unchanged from 3.2.0). Django 4.2 remains
+    supported; CI's minimum-versions job now pins
+    `django-oauth-toolkit==3.4`.
 
 ### Changed
 

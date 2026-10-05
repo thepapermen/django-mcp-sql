@@ -103,7 +103,8 @@ class TestDynamicClientRegistrationHappyPath:
         assert app.skip_authorization is False
         assert "http://127.0.0.1:3456/callback" in app.redirect_uris
         # Public client — the registered "secret" is an opaque hash of an
-        # empty string (DOT 3.2 calls `make_password` on save), not the
+        # empty string (DOT hashes it on save, `hash_client_secret` defaulting
+        # to on), not the
         # plain-empty literal. What matters is that the registration
         # response carries no `client_secret` per RFC 7591 §3.2.1 — pinned
         # in `test_returns_201_and_rfc7591_shape`.

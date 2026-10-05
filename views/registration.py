@@ -83,7 +83,7 @@ def _is_loopback_redirect(uri: str) -> bool:
         # scheme + host + port + path with nothing to smuggle. Test the raw
         # `@`, not `.username`/`.password`: an EMPTY userinfo
         # (`http://@127.0.0.1/cb`) parses to falsy `""`/`None` and would slip
-        # past (DOT 3.4 tests for `@` in the netloc the same way).
+        # past (DOT 3.4.1+ tests for `@` in the netloc the same way).
         return False
     return parsed.hostname in _LOOPBACK_HOSTS
 

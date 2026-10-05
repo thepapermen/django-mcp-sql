@@ -75,10 +75,15 @@ dependencies = [
     # document the combinations that are actually supported.
     "djangorestframework>=3.14,<4",
     # DOT 3.x semantics are load-bearing: loopback port-wildcarding,
-    # validator hooks, skip_authorization flow; RFC 8707 audience binding is
-    # explicitly deferred to DOT 4.x — a major bump must be reviewed, never
-    # auto-resolved.
-    "django-oauth-toolkit>=3.2,<4",
+    # validator hooks, skip_authorization flow — a major bump must be
+    # reviewed, never auto-resolved. Floor 3.4.0: earlier releases redirect an
+    # unauthenticated `prompt=none` authorization request to whatever
+    # `redirect_uri` it names before validating it (an open redirect, DOT
+    # #1719, fixed in 3.4.0), and that runs before any hook of ours. 3.4.0
+    # still supports Django 4.2 (`django>=4.2`) and needs `oauthlib>=3.3.0`.
+    # (3.4 also ships RFC 8707 resource indicators; the package does not use
+    # them — audience binding stays implicit, see docs/architecture.md.)
+    "django-oauth-toolkit>=3.4,<4",
     # The parser is the security boundary and sqlglot bumps majors often
     # with breaking AST changes — deliberately the tightest cap; widen
     # per-major only after the CI matrix proves it.
