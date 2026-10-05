@@ -124,7 +124,9 @@ precisely because it is the one that does **not** announce itself.
   `client_kind` (migration `0013`). `client_kind` is one of `curated` / `dcr` /
   `cloud` / `local` and is **derived, never declared** — for a declared client
   it comes from its redirect scheme, so it cannot drift from what the client
-  is. The query-volume tripwire names the client too.
+  is. The query-volume tripwire names the client too — the one whose query
+  crossed the threshold; counting stays per user across clients, so a burst
+  spread over several clients still alerts.
 - **`manage.py mcp_sql_clients`** prints each declared client's client_id and
   callbacks — the values to paste into a provider connector, without scrolling
   through `migrate` output.

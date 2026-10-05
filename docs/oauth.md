@@ -579,9 +579,11 @@ which redirect a given authorization used, so the registered set is the
 closest attribution available at request time. `client_kind` is blank when the
 Application classifies as nothing, which is the de-recognised case (DOT
 resolved the token; the client is no longer part of the MCP surface). The
-query-volume tripwire names the client too, so the same user hitting a
-threshold through Claude.ai and through a self-registered client on their
-laptop reads as two incidents rather than one.
+query-volume tripwire names the client too: its alert names the client whose
+query crossed a per-user threshold. Counting is per user across clients, so a
+burst spread over several clients (say Claude.ai and a self-registered client
+on a laptop) still alerts — once, naming the client that tipped it over; the
+audit rows above give the per-client breakdown.
 
 **Troubleshooting — "your account was authorized, but … returned an error
 when connecting".** If the OAuth dance succeeds (you logged in + consented)

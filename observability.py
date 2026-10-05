@@ -25,11 +25,11 @@ executor-misconfig row counts as a `rejected` query too, consistent with
 counting every rejected row; it is independently escalated via its own
 `logger.error`, so the extra increment is accepted noise, not a second
 signal.) The alert names the user — pk plus `get_username()` (the email for
-an email-keyed user model) — and the client that presented the token (its
-client_id plus derived `ClientKind`),
-so a responder can act without a DB lookup; this is appropriate because the
-MCP surface is staff-only (employees, not clients). It never includes the
-SQL text.
+an email-keyed user model) — and the client whose query crossed the
+threshold (its client_id plus derived `ClientKind`; counting itself is per
+user across clients), so a responder can act without a DB lookup; this is
+appropriate because the MCP surface is staff-only (employees, not clients).
+It never includes the SQL text.
 """
 
 import logging
@@ -69,12 +69,13 @@ def record_query_volume(
 
     The counter keys on `user_id` (the stable pk); `user_label`
     (`get_username()`), `client_name`, and `client_kind` are carried only for
-    the alert message. They make the event answer "who, and through what" —
-    the same user hitting a threshold through Claude.ai and through a
-    self-registered client on their laptop are different incidents, and the
-    counter alone cannot tell them apart. Counting stays per (user, decision,
-    window): keying the counters on the client too would let a burst spread
-    across several clients slip under every threshold.
+    the alert message. Counting is per (user, decision, window) ACROSS
+    clients, so a burst spread over several clients still alerts — keying the
+    counters on the client too would let it slip under every threshold. The
+    one alert per crossing names the client whose query crossed the
+    threshold: a lead for the responder, not a statement that every counted
+    query came through that client (the per-row `MCPQueryLog` attribution
+    has the full breakdown).
     """
     windows = mcp_sql_config()["VOLUME_ALERT_THRESHOLDS"].get(decision)
     if not windows:
