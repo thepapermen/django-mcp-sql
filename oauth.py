@@ -208,7 +208,8 @@ class MCPOAuth2Validator(OAuth2Validator):
             and request.code_challenge_method != "S256"
         ):
             raise InvalidRequestError(
-                description='code_challenge_method must be "S256".',
+                # No `"` here: RFC 6749 §4.1.2.1 bars it from error_description.
+                description="code_challenge_method must be S256",
                 request=request,
             )
         return True

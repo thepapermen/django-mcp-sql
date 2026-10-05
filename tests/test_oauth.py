@@ -597,12 +597,10 @@ class TestPKCEEnforcedEndToEnd:
         assert AccessToken.objects.filter(token=body["access_token"]).exists()
         assert not RefreshToken.objects.exists()
 
-    @pytest.mark.parametrize("stored_method", ["plain", ""], ids=["plain", "none"])
-    def test_a_pre_fix_non_s256_grant_cannot_be_exchanged(
-        self, client, mcp_user, mcp_app, stored_method
-    ):
-        # What <= 0.1.0b5 stored for a `plain` (or method-less) authorization:
-        # the challenge IS the verifier. The token-time backstop refuses it.
+    def test_a_pre_fix_plain_grant_cannot_be_exchanged(self, client, mcp_user, mcp_app):
+        # What <= 0.1.0b5 stored for a `plain` authorization — explicit, or an
+        # omitted method that oauthlib defaulted to `plain`: the challenge IS
+        # the verifier. The token-time backstop refuses it.
         from datetime import timedelta
 
         from django.utils import timezone
@@ -617,7 +615,7 @@ class TestPKCEEnforcedEndToEnd:
             redirect_uri="http://127.0.0.1:9999",
             scope="mcp:sql",
             code_challenge=verifier,
-            code_challenge_method=stored_method,
+            code_challenge_method="plain",
         )
         response = client.post(
             reverse("token"),
