@@ -37,6 +37,7 @@ from mcp_sql import throttle
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import absolute_url
 from mcp_sql.consts import identify_application
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
@@ -115,10 +116,18 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # Resource Metadata URL via the `resource_metadata` parameter.
         # Without it the client receives a clean 401 but has nowhere to
         # discover the authorization endpoint and the flow stalls.
-        # The absolute URL is built per request so the value is correct
-        # behind any reverse proxy / hostname.
-        metadata_url = request.build_absolute_uri(
-            reverse("mcp_sql_protected_resource_metadata")
+        # Built per request so the value is correct behind any reverse proxy
+        # / hostname, and through `discovery._absolute` so this URL carries
+        # the SAME hardened scheme as the documents it points at. It is the
+        # bootstrap pointer for the whole dance, so a plain
+        # `build_absolute_uri` here would reintroduce, on the one URL that
+        # starts discovery, both problems `_absolute` exists to prevent: a
+        # client deriving its RFC 9728 resource identifier from an `http`
+        # challenge is handed an `https` `resource` and must discard the
+        # document per §3.3, and the pointer itself would be plaintext for an
+        # on-path attacker to answer with a forged `authorization_servers`.
+        metadata_url = absolute_url(
+            request, reverse("mcp_sql_protected_resource_metadata")
         )
         return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 

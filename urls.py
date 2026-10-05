@@ -8,8 +8,10 @@ Carries the seven routes the subsystem owns:
   `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin /
   introspection / userinfo surface is exposed.
 - 1 RFC 7591 dynamic client registration endpoint at `/o/register`.
-- 1 MCP transport endpoint at `/mcp/sql/`.
-- 2 OAuth 2.0 discovery URLs (RFC 9728 + RFC 8414) at `.well-known/...`.
+- 1 MCP transport endpoint at `/mcp/sql/` (plus a slash-less alias).
+- 2 OAuth 2.0 discovery URLs (RFC 9728 + RFC 8414) at `.well-known/...`
+  (the RFC 9728 one likewise served under both spellings of the resource
+  path — see the comment on those routes).
 
 Keeping the routes here makes the entire surface mount/unmountable from
 the project urlconf in one `include()` line. The URL names are the stable
@@ -68,10 +70,24 @@ urlpatterns = [
     # after the host, then appends the resource path (`/mcp/sql`); RFC 8414
     # §3.1 suffixes the AS metadata path with the issuer's path component
     # (`/o`, matching DOT's mount).
+    #
+    # Both spellings of the resource path are served, mirroring the transport
+    # alias above, because clients disagree on trailing-slash normalisation
+    # and RFC 9728 §3.3 makes that disagreement fatal: the `resource` value
+    # must equal the identifier the client built the metadata URL from, or the
+    # client MUST discard the document. The view echoes whichever spelling was
+    # used (`discovery._resource_identifier`). The named route stays the
+    # slash-less one — it is what `authenticate_header` advertises in the 401
+    # `resource_metadata` parameter, and what every client observed so far
+    # actually requests.
     path(
         ".well-known/oauth-protected-resource/mcp/sql",
         protected_resource_metadata,
         name="mcp_sql_protected_resource_metadata",
+    ),
+    path(
+        ".well-known/oauth-protected-resource/mcp/sql/",
+        protected_resource_metadata,
     ),
     path(
         ".well-known/oauth-authorization-server/o",

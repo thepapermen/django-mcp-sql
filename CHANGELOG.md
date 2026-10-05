@@ -15,9 +15,10 @@ made the request.
 
 ### Breaking
 
-All of these fail loudly at startup — none of them can be missed silently, and
-none require any client to reconnect (client_ids are unchanged, provisioning
-never deletes rows, and tokens are 6-hour anyway).
+All but the last fail loudly at startup, and none require any client to
+reconnect (client_ids are unchanged, provisioning never deletes rows, and
+tokens are 6-hour anyway). The default-ON flip is called out separately below
+precisely because it is the one that does **not** announce itself.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -47,6 +48,31 @@ never deletes rows, and tokens are 6-hour anyway).
   required by default**, because the shipped clients use https callbacks. DOT's
   own default includes it; this only affects a consumer who narrowed the list
   (e.g. to `["http"]`). Add `"https"`, or set `"CLIENTS": {}`.
+
+- **`"http"` in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` is now
+  required unconditionally**, not just when a `local` client is declared.
+  `/o/register` is mounted unconditionally and only ever mints `http` loopback
+  callbacks, and DOT enforces the scheme list at the authorization redirect
+  rather than at boot — so narrowing the list to `["https"]` used to boot clean
+  and then break every self-registering client (Claude Code, Cursor
+  desktop/CLI) opaquely at `/o/authorize/`. It is now a boot error. A consumer
+  running `["https"]` today will not start until they add `"http"`; DOT's own
+  default has both, so most consumers never declared the key at all.
+
+- **Declared clients now ship ON.** `CLOUD_CLIENTS` defaulted to `[]`; `CLIENTS`
+  defaults to `claude`, `chatgpt` and `cursor`. A consumer who declared the old
+  key hits the `ImproperlyConfigured` above and makes a deliberate choice — but
+  one who never declared it was running a structurally loopback-only surface on
+  the 0.1.0b5 default, and after this upgrade `provision_mcp_clients` creates
+  three `Application` rows bound to `claude.ai` / `chatgpt.com` / `cursor.com`
+  callbacks at the next `migrate`, with no error and no prompt. The derived
+  client_ids are guessable (`mcp-sql-cloud.claude`), so what stands between a
+  phished authorization link and a token is now the issuance gate (staff + MFA
+  + profile) and the consent screen — no longer RFC 8252 loopback delivery.
+  That is the whole point of the consent-screen rework in this release, but an
+  operator who deliberately chose loopback-only should know the posture moved.
+  Set `"CLIENTS": {}` to keep the old behaviour, or name just the clients you
+  want. Provisioning logs each client at INFO on every `migrate`.
 
 ### Added
 
@@ -112,6 +138,83 @@ never deletes rows, and tokens are 6-hour anyway).
 
 ### Fixed
 
+- **The RFC 9728 discovery document advertised a resource identifier that did
+  not match the path it was served at, making the surface unreachable from
+  clients that validate it.** `resource` was built straight off
+  `reverse("mcp_sql_endpoint")` — `https://<host>/mcp/sql/`, with the trailing
+  slash — while the document itself was served only at
+  `/.well-known/oauth-protected-resource/mcp/sql`. RFC 9728 §3.3 requires the
+  returned `resource` to be *identical* to the identifier the client inserted
+  the well-known suffix into, and says the document MUST NOT be used
+  otherwise. Cursor Desktop enforces this and aborted the flow after the
+  consent screen but before the token exchange; Claude Code and Cursor CLI
+  ignored the mismatch. Compounding it, the metadata path implied by the
+  advertised identifier (`…/oauth-protected-resource/mcp/sql/`) returned 404,
+  so no client could retrieve the document the spec-correct way.
+
+  The document is now served under **both** spellings of the resource path and
+  `resource` echoes the one requested, so every client's §3.3 check passes
+  regardless of how it normalises. Both spellings already routed to the
+  transport, so the derived audience reaches the same endpoint either way.
+  Backwards-compatible: no advertised value that previously worked stops
+  working, the named route (and therefore the `resource_metadata` URL in the
+  401 challenge) is unchanged, and nothing server-side validates `resource`,
+  so no live token is affected.
+- **Both discovery documents now agree on one origin.** The scheme is the
+  other half of the same identifier: `resource` and the four AS endpoint URLs
+  were composed with `request.build_absolute_uri`, which trusts
+  `request.scheme`, while `issuer` deliberately forced `https` off `DEBUG`.
+  Behind a TLS terminator that does not forward `X-Forwarded-Proto` (or with
+  `SECURE_PROXY_SSL_HEADER` unwired) one document therefore advertised
+  `"resource": "http://host/mcp/sql"` beside
+  `"authorization_servers": ["https://host/o"]` — the same §3.3 mismatch, and
+  AS endpoints on a different origin than the issuer naming them. Every
+  absolute URL in both documents — and the `resource_metadata` URL in the 401
+  challenge, which is where clients actually start — now goes through one
+  hardened helper (`consts.absolute_url`). Note the widened effect: with
+  `DEBUG` off, the AS endpoint URLs are now forced to https as well, where
+  previously only `issuer` was. A `DEBUG=False` plain-http deployment was
+  already out of spec for RFC 8414 §2, but it will now advertise an https
+  surface it does not serve.
+- **A declared `https://localhost` callback was classified and audited as
+  `cloud`.** Kind derives from the scheme, so an https callback aimed at the
+  operator's own machine took the `mcp-sql-cloud.*` namespace, skipped the
+  loopback hardening, and wrote `client_kind="cloud"` on every audit row for a
+  callback that never leaves the box. https to a loopback host is now refused
+  at boot — the whole of `127.0.0.0/8`, the abbreviated / hex / integer IPv4
+  spellings, IPv4-mapped IPv6, `::1`, and `localhost` including its FQDN root
+  form — so a declared client's kind and where it actually resolves cannot
+  disagree.
+- **The consent screen corrupted IPv6 destinations.** `urlparse().hostname`
+  strips the brackets, so `http://[::1]:8787/cb` rendered as
+  `http://::1:8787` — and `::1` is an accepted DCR loopback host. An explicit
+  `:0` was also dropped by a falsy-port test. Both fixed; this is the one line
+  on that page the user is asked to verify.
+- **A registered redirect URI could smuggle a second, off-machine one.**
+  `Application.redirect_uris` stores the list as `" ".join(...)` and DOT
+  matches with `redirect_uris.split()`, so a single submitted string carrying
+  whitespace became **two** registered URIs. `urlparse` reports the loopback
+  hostname for `"http://127.0.0.1:8765/cb http://evil.example/steal"`, so the
+  loopback check passed, the string was stored verbatim, and DOT then
+  exact-matched `http://evil.example/steal` as a valid redirect for that
+  client — delivering the authorization code off the victim's machine, which
+  is the one thing loopback-only registration exists to prevent. PKCE offers
+  no protection: the attacker registered the client and holds the verifier.
+  The remaining barrier was the consent screen, which this release happens to
+  have taught to name the destination. Both the anonymous DCR path and
+  operator-declared redirects now refuse embedded whitespace, using the same
+  `.split()` operation DOT performs so the two cannot drift.
+  **This predates the multi-client work** — the predicate and the join are
+  identical on 0.1.0b5 — and is fixed here because this release restates the
+  guarantee it broke.
+- **`/o/register` capped the redirect_uri count but not each URI's length.**
+  `Application.redirect_uris` is an unbounded `TextField`, so ten 6 KB URIs
+  still persisted ~60 KB from one anonymous request inside the 64 KiB body
+  cap — the thing the count cap's own comment claimed to prevent. Each stored
+  URI is now bounded at 1024 characters, applied *inside* the loopback filter
+  so an over-long callback the server discards anyway cannot fail the whole
+  registration (Cursor presents a hosted callback beside its loopback one, and
+  that URL can carry a long `state`).
 - **`validate_redirect_uri` rejected the exact callbacks of any client that
   also had a prefix rule.** It returned the prefix verdict instead of falling
   through to DOT's stock exact matching. Unreachable in 0.1.0b5 (one rule per

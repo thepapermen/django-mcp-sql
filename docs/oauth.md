@@ -32,7 +32,7 @@ discovery surface comprises two anonymous-GET endpoints plus the
 
 | URL | RFC | What it says |
 |---|---|---|
-| `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. |
+| `/.well-known/oauth-protected-resource/mcp/sql` (and `…/mcp/sql/`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. Served under **both** spellings of the resource path — see below. |
 | `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
 
 The `/mcp/sql/` 401 response advertises the RFC 9728 URL:
@@ -65,6 +65,35 @@ curl -i https://<host>/mcp/sql/ | grep -i www-authenticate
 ```
 
 Pinned by `tests/test_discovery.py`.
+
+### Trailing slashes in the resource identifier
+
+RFC 9728 §3.3 requires the `resource` value in the metadata document to be
+**identical** to the resource identifier the client inserted the well-known
+suffix into, and says a client MUST NOT use the document when they differ.
+Clients disagree about trailing-slash normalisation, so the protected-resource
+document is served at **both** `…/oauth-protected-resource/mcp/sql` and
+`…/oauth-protected-resource/mcp/sql/`, and `resource` echoes whichever
+spelling was requested. Both spellings also route to the transport, so the
+audience a client derives either way reaches the same endpoint.
+
+Observed client behaviour:
+
+| Client | Metadata path it requests | Enforces §3.3? |
+|---|---|---|
+| Cursor Desktop / CLI | strips the trailing slash | **yes** — aborts after consent, before the token exchange |
+| Claude Code | strips the trailing slash | no |
+| Claude.ai web connector | not directly observed | no — it connects fine to a deployment with the mismatch |
+
+(Claude.ai separately strips the trailing slash off the *transport* POST, which
+is why the slash-less `/mcp/sql` transport alias exists — a different
+normalisation from the metadata path, and unaffected by any of this.)
+
+Before this was fixed the document advertised `…/mcp/sql/` while being served
+only at `…/mcp/sql`, so Cursor Desktop aborted the dance after the consent
+screen and before the token exchange — the surface was unreachable from it,
+and the path implied by the advertised identifier 404'd for everyone.
+Pinned by `test_discovery.TestResourceIdentifierMatchesMetadataPath`.
 
 Both discovery endpoints return `Access-Control-Allow-Origin: *` so a
 future browser-based MCP client can `fetch()` them without CORS preflight
@@ -434,6 +463,8 @@ hardcoded in Cursor today and there is an open request to make it dynamic**
 8787 breaks the day that lands, whereas the DCR path above keeps working
 untouched. Prefer DCR; treat this entry as a stopgap.
 
+Note that `"http"` in `ALLOWED_REDIRECT_URI_SCHEMES` is required **unconditionally**, not because of this entry: `/o/register` is always mounted and only mints http loopback callbacks, so the package refuses to boot without it regardless of which clients you declare.
+
 Loopback entries are held to narrower rules than https ones: `localhost` only
 (never `127.0.0.1` / `::1`, which DOT port-wildcards — that would silently
 widen an exact rule into "any port on the user's machine"), an explicit port,
@@ -513,8 +544,9 @@ cannot 301-redirect a POST — that would drop the body — so a server routing
 *only* `/mcp/sql/` raises a 500 (`RuntimeError: … you have APPEND_SLASH set`)
 the instant the transport opens, and the client reports a generic connect
 error. The package routes **both** `/mcp/sql/` (canonical — what `reverse()`
-and the RFC 9728 `resource` advertise) **and** `/mcp/sql`, so this works out
-of the box. If you mount the endpoint under a different path, or front it with
+builds from) **and** `/mcp/sql`, so this works out
+of the box. The RFC 9728 `resource` advertises whichever spelling the client
+asked the metadata for (see "Trailing slashes in the resource identifier"). If you mount the endpoint under a different path, or front it with
 a proxy / CDN that rewrites trailing slashes, make sure the slash-less POST
 still reaches the view. (Pinned by `tests/test_mcp_endpoint.py::TestEndpointRouting`.)
 

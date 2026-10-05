@@ -43,6 +43,14 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # clients send one to three (Cursor's IDE presents the most, at three).
 _MAX_REDIRECT_URIS = 10
 
+# ...and a bound on each STORED one's length, which is the half the count cap
+# does not give: `Application.redirect_uris` is an unbounded `TextField`, so
+# ten 6 KB URIs still persist ~60 KB inside the 64 KiB body cap. A loopback
+# callback is a host, a port and a path; 1024 is already far past anything
+# real. Applied inside the loopback filter, so an over-long URI we discard
+# anyway drops out of the subset instead of failing the whole registration.
+_MAX_REDIRECT_URI_LENGTH = 1024
+
 # Upper bound on the client's self-declared name. It is echoed in the 201 and
 # written to the registration log line, so it is caller-controlled text on two
 # output paths; the log uses `%r`, which escapes newlines, so a long name is
@@ -71,6 +79,24 @@ def _is_loopback_redirect(uri: str) -> bool:
         # but the userinfo is attacker-chosen and would be stored verbatim on
         # the Application. Refuse it so a registered redirect URI is exactly
         # scheme + host + port + path with nothing to smuggle.
+        return False
+    if uri.split() != [uri]:
+        # Whitespace smuggling. `Application.redirect_uris` stores the list as
+        # `" ".join(...)` and DOT matches with `redirect_uris.split()`, so ONE
+        # submitted string containing whitespace becomes TWO registered URIs.
+        # `urlparse("http://127.0.0.1/cb http://evil.example/steal")` reports
+        # hostname `127.0.0.1` — the host check below passes, the string is
+        # stored verbatim, and DOT then exact-matches `http://evil.example/
+        # steal` as a valid redirect for this client. That delivers the
+        # authorization code off-machine, defeating the whole reason loopback-
+        # only registration is safe; PKCE does not help, because the attacker
+        # registered the client and holds the verifier.
+        #
+        # `uri.split() != [uri]` is deliberately the same operation DOT
+        # performs, so this cannot drift from it — and it covers tab / newline
+        # / CR as well as the space (`str.split()` splits on all whitespace,
+        # and `urlparse` silently strips some of it while we store the raw
+        # value, which would otherwise hide the payload from the host check).
         return False
     return parsed.hostname in _LOOPBACK_HOSTS
 
@@ -175,7 +201,16 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         dict.fromkeys(
             uri
             for uri in requested_uris
-            if isinstance(uri, str) and _is_loopback_redirect(uri)
+            if isinstance(uri, str)
+            # Length is bounded HERE, inside the filter, not over the whole
+            # request. The bound exists to cap what gets persisted, and only
+            # this subset is persisted — checking it earlier would let a URI
+            # we are about to discard fail the whole registration, which is
+            # exactly the all-or-nothing behaviour this filter replaced.
+            # Cursor sends a hosted callback alongside its loopback one, and
+            # that hosted URL can carry a long `state` query.
+            and len(uri) <= _MAX_REDIRECT_URI_LENGTH
+            and _is_loopback_redirect(uri)
         )
     )
     if not redirect_uris:

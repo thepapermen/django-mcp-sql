@@ -472,6 +472,40 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert captured["client_label"] == ""
         assert captured["client_destination"] == "http://127.0.0.1:53682"
 
+    @pytest.mark.parametrize(
+        ("redirect", "expected"),
+        [
+            # `urlparse().hostname` strips an IPv6 literal's brackets, so
+            # re-composing naively rendered `http://::1:8787` — a corrupt
+            # address on the one line of this page the user is asked to check.
+            # `::1` is an accepted DCR loopback host, so it is reachable.
+            ("http://[::1]:8787/callback", "http://[::1]:8787"),
+            ("http://[::1]/callback", "http://[::1]"),
+            # An explicit `:0` must not vanish into a falsy-port test.
+            ("http://localhost:0/callback", "http://localhost:0"),
+        ],
+    )
+    def test_destination_renders_unusual_hosts_faithfully(
+        self, monkeypatch, redirect, expected
+    ):
+        from types import SimpleNamespace
+
+        from oauth2_provider.views import AuthorizationView
+
+        captured = {}
+        monkeypatch.setattr(
+            AuthorizationView,
+            "render_to_response",
+            lambda self, context, **kw: captured.update(context) or "ok",
+        )
+        MCPAuthorizationView().render_to_response(
+            {
+                "application": SimpleNamespace(name="mcp-sql-" + "a" * 22),
+                "redirect_uri": redirect,
+            }
+        )
+        assert captured["client_destination"] == expected
+
     def test_declared_client_shows_its_operator_authored_label(
         self, settings, monkeypatch
     ):

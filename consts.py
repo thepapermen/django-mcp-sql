@@ -13,9 +13,12 @@ on the settings accessor (`mcp_sql_settings.APPLICATION_NAME` /
 import re
 from typing import Any
 
+from django.conf import settings
+from django.http import HttpRequest
 from mcp_sql.clients import ClientIdentity
 from mcp_sql.clients import ClientKind
 from mcp_sql.conf import mcp_sql_settings
+
 
 # DCR mints Application names as
 # `f"{APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"`, and
@@ -25,6 +28,28 @@ from mcp_sql.conf import mcp_sql_settings
 # `mcp-sql-superuser` or a path-traversal-shaped `mcp-sql-../../x` does not
 # match, where a bare `startswith` would accept them. Tracks
 # registration's token size.
+def absolute_url(request: HttpRequest, path: str) -> str:
+    """Absolute URL for `path` on this host, with the scheme hardened.
+
+    Django's `build_absolute_uri` trusts `request.scheme`, which is only
+    honest when the TLS-terminating proxy sets `X-Forwarded-Proto` *and* the
+    project wires `SECURE_PROXY_SSL_HEADER`. Where either is missing, a
+    document fetched over https came back advertising `http://…` URLs —
+    mixing an `https` issuer with `http` endpoints inside one payload, and,
+    for `resource`, failing the RFC 9728 §3.3 identity check against the
+    `https` identifier the client built its request from. That is the same
+    break the trailing-slash handling below exists to fix, on the other half
+    of the identifier, so both halves are hardened the same way and every
+    absolute URL in either discovery document is composed here.
+
+    `DEBUG` off means the project is unambiguously a non-loopback deploy, so
+    https is forced; local dev (`DEBUG=True`) keeps `request.scheme` and stays
+    honest about http on loopback.
+    """
+    scheme = request.scheme if settings.DEBUG else "https"
+    return f"{scheme}://{request.get_host()}{path}"
+
+
 _DCR_SUFFIX_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 
 

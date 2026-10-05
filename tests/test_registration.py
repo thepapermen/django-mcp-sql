@@ -509,3 +509,148 @@ class TestRegistrationSilentBlock:
         _post(client, {"redirect_uris": ["http://127.0.0.1:9999/cb"]})
         # Frozen: blocked requests short-circuit before record_attempt.
         assert cache.get("mcp_sql:register:ip:127.0.0.1") == 5
+
+
+@pytest.mark.django_db
+class TestRedirectUriLengthBound:
+    """`_MAX_REDIRECT_URIS` bounds the COUNT; this bounds each one's LENGTH.
+
+    `Application.redirect_uris` is an unbounded `TextField`, so ten 6 KB URIs
+    still persisted ~60 KB from a single anonymous request inside the 64 KiB
+    body cap — which is what the count cap's comment claimed to prevent.
+    """
+
+    def test_over_long_loopback_uri_drops_out_of_the_subset(self, client):
+        # Bounded, but by dropping it from the subset — the request as a whole
+        # is only refused when NOTHING loopback survives, same as any other
+        # unusable URI.
+        long_uri = "http://127.0.0.1:8765/" + "a" * 1100
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": [long_uri]}),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+
+    def test_over_long_loopback_uri_does_not_sink_a_usable_sibling(self, client):
+        long_uri = "http://127.0.0.1:8765/" + "a" * 1100
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps(
+                {"redirect_uris": ["http://localhost:8787/callback", long_uri]}
+            ),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
+
+    def test_long_discarded_hosted_callback_does_not_fail_the_registration(
+        self, client
+    ):
+        """The regression this bound nearly introduced.
+
+        Cursor Desktop presents its loopback callback alongside a hosted
+        `https://…` one and the legacy `cursor://` deeplink (observed live:
+        "registered 1 of 3"). The hosted URL can carry a long `state` query.
+        Bounding length across the WHOLE request — rather than across the
+        subset actually stored — turned that into a 400 and locked Cursor out
+        of DCR entirely, which is the all-or-nothing behaviour the subset
+        filter exists to replace.
+        """
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps(
+                {
+                    "client_name": "Cursor",
+                    "redirect_uris": [
+                        "http://localhost:8787/callback",
+                        "https://www.cursor.com/agents/mcp/oauth/callback?state="
+                        + "s" * 1100,
+                        "cursor://anysphere.cursor-mcp/oauth/callback",
+                    ],
+                }
+            ),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
+
+    def test_a_null_entry_is_filtered_not_fatal(self, client):
+        # `null` in the array is discarded like any other non-loopback entry.
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps(
+                {"redirect_uris": [None, "http://localhost:8787/callback"]}
+            ),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
+
+    def test_normal_length_redirect_uri_still_registers(self, client):
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": ["http://127.0.0.1:8765/callback"]}),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED
+
+
+@pytest.mark.django_db
+class TestWhitespaceSmuggling:
+    """A registered redirect URI must be exactly ONE URI.
+
+    `Application.redirect_uris` stores the list as `" ".join(...)` and DOT
+    matches with `redirect_uris.split()`, so a single submitted string carrying
+    whitespace used to become TWO registered URIs — `urlparse` reports the
+    loopback hostname, the string is stored verbatim, and DOT then exact-matches
+    the smuggled off-machine URI as a valid redirect for the client. That
+    delivers the authorization code off the victim's machine, which is exactly
+    what loopback-only registration exists to make impossible. PKCE is no help:
+    the attacker registered the client and holds the verifier.
+
+    Predates the multi-client work (identical predicate and join on `main`);
+    found by the 0.2.0b1 security review.
+    """
+
+    @pytest.mark.parametrize("gap", [" ", "\t", "\n", "\r", "\x0c", "\x0b"])
+    def test_smuggled_second_uri_is_refused(self, client, gap):
+        smuggled = f"http://127.0.0.1:8765/cb{gap}http://evil.example/steal"
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": [smuggled]}),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+
+    def test_smuggled_uri_does_not_ride_along_with_a_clean_one(self, client):
+        # The clean sibling registers; the smuggling attempt drops out of the
+        # subset rather than being stored beside it.
+        smuggled = "http://127.0.0.1:8765/cb http://evil.example/steal"
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps(
+                {"redirect_uris": ["http://localhost:8787/callback", smuggled]}
+            ),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
+
+    def test_dot_cannot_be_talked_into_the_off_machine_redirect(self, client):
+        """End-to-end: the guarantee, asserted through DOT's own matcher."""
+        from oauth2_provider.models import Application
+
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": ["http://localhost:8787/callback"]}),
+            content_type="application/json",
+        )
+        app = Application.objects.get(client_id=response.json()["client_id"])
+        assert app.redirect_uri_allowed("http://localhost:8787/callback")
+        assert not app.redirect_uri_allowed("http://evil.example/steal")
+        # Every stored URI is a single token, so `.split()` cannot manufacture
+        # one we never validated.
+        assert app.redirect_uris.split() == ["http://localhost:8787/callback"]

@@ -98,7 +98,14 @@ class MCPAuthorizationView(AuthorizationView):
             return ""
         if not parsed.scheme or not host:
             return ""
-        return f"{parsed.scheme}://{host}" + (f":{port}" if port else "")
+        # `hostname` strips the brackets off an IPv6 literal, so re-add them:
+        # `http://[::1]:8787/cb` would otherwise render as `http://::1:8787`,
+        # corrupting the one line on this page the user is meant to check.
+        # `::1` is an accepted DCR loopback host, so this is reachable.
+        # `port is not None` rather than a truth test, so an explicit `:0` is
+        # shown rather than silently dropped.
+        shown = f"[{host}]" if ":" in host else host
+        return f"{parsed.scheme}://{shown}" + (f":{port}" if port is not None else "")
 
     def dispatch(self, request, *args, **kwargs):
         if request.user.is_authenticated:

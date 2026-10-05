@@ -970,3 +970,93 @@ class TestQueryAuditAttribution:
         row = MCPQueryLog.objects.get()
         assert row.application_name == CLAUDE_ID
         assert row.client_kind == ClientKind.CLOUD
+
+
+@pytest.mark.django_db
+class TestReviewFindings:
+    """Regression cover for the findings of the 0.2.0b1 adversarial review.
+
+    Each of these was reachable in the shipped code and silent — none of them
+    failed a test before being fixed.
+    """
+
+    def test_https_to_a_loopback_host_is_refused(self):
+        # `redirect_kind` derives kind from the SCHEME, so an https callback
+        # aimed at the operator's own machine would classify as `cloud`: the
+        # `mcp-sql-cloud.*` namespace, exempt from the loopback hardening, and
+        # `client_kind="cloud"` in every audit row for a callback that never
+        # leaves the box. The derivation is what makes `client_kind`
+        # trustworthy, so the two must not be able to disagree.
+        # Every spelling the OS resolver reaches loopback through, not just
+        # the three obvious ones: `127.0.0.0/8` entire, the abbreviated and
+        # hex/integer IPv4 forms, the IPv4-mapped IPv6 form, and the FQDN root
+        # `localhost.`. A hand-written host set missed all but three.
+        for host in (
+            "localhost",
+            "localhost.",
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.1",
+            "2130706433",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+        ):
+            cfg = {
+                "local-in-disguise": {
+                    "REDIRECTS": [{"MATCH": "exact", "URI": f"https://{host}:8443/cb"}]
+                }
+            }
+            with pytest.raises(ImproperlyConfigured, match="loopback host"):
+                validate_mcp_sql_settings({"CLIENTS": cfg})
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "p.example",
+            "claude.ai",
+            "chatgpt.com",
+            # A remote name that merely *starts* with a loopback label, and a
+            # genuinely routable address, must both still pass.
+            "localhost.evil.example",
+            "8.8.8.8",
+        ],
+    )
+    def test_https_to_a_real_host_still_validates(self, host):
+        # The guard must not catch a genuine provider callback.
+        validate_mcp_sql_settings(
+            {
+                "CLIENTS": {
+                    "provider": {
+                        "REDIRECTS": [{"MATCH": "exact", "URI": f"https://{host}/cb"}]
+                    }
+                }
+            }
+        )
+
+    def test_declared_redirect_may_not_carry_whitespace(self):
+        # Declared clients are stored with the same `" ".join(...)` that DOT
+        # later splits, so embedded whitespace would register a second,
+        # never-validated URI — the operator-side twin of the DCR smuggling
+        # hole pinned in `test_registration.TestWhitespaceSmuggling`.
+        cfg = {
+            "sloppy": {
+                "REDIRECTS": [
+                    {"MATCH": "exact", "URI": "https://p.example/cb https://evil/x"}
+                ]
+            }
+        }
+        with pytest.raises(ImproperlyConfigured, match="whitespace"):
+            validate_mcp_sql_settings({"CLIENTS": cfg})
+
+    def test_http_scheme_is_required_even_with_no_local_clients(self, settings):
+        # `/o/register` is mounted unconditionally and only ever mints http
+        # loopback callbacks, and DOT enforces the scheme list at the
+        # authorization redirect rather than at boot. Narrowing the list to
+        # https once every declared client is cloud used to boot clean and then
+        # break Claude Code / Cursor desktop+CLI opaquely at /o/authorize/.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ALLOWED_REDIRECT_URI_SCHEMES": ["https"],
+        }
+        with pytest.raises(ImproperlyConfigured, match="/o/register"):
+            validate_mcp_sql_settings({"CLIENTS": {}})

@@ -18,7 +18,9 @@ marked `NotRequired`. Consumers may set any subset of them; the validator
 does not require them.
 """
 
+import ipaddress
 import re
+import socket
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -343,13 +345,67 @@ def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
         raise ImproperlyConfigured(msg)
 
 
+# Hostnames that resolve to the operator's own machine. `clients.redirect_kind`
+# derives kind from the SCHEME, so `https://localhost:8443/cb/` would otherwise
+# classify as `cloud`: namespaced `mcp-sql-cloud.<slug>`, exempt from the
+# loopback hardening in `_loopback_problems` (exact-match only, explicit port,
+# non-root path), and writing `client_kind="cloud"` into every audit row for a
+# callback that never leaves the box. The derivation is what makes `client_kind`
+# trustworthy, so the two must not be able to disagree — and a provider-hosted
+# callback is never on loopback, so nothing legitimate is refused.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    """True for any spelling that resolves to the machine running the server.
+
+    A literal is asked of `ipaddress` rather than compared against a list: the
+    whole of `127.0.0.0/8` is loopback, and `127.0.0.2`, the short form
+    `127.1`, and the IPv4-mapped `::ffff:127.0.0.1` all reach it while matching
+    no hand-written set. Names are already lowercased by `urlparse`; the
+    trailing dot of the FQDN root form is stripped so `localhost.` cannot slip
+    past.
+    """
+    host = hostname.rstrip(".")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    try:
+        # `ipaddress` demands four octets, but the resolver does not: `127.1`,
+        # `0x7f.1` and friends all reach loopback. `inet_aton` accepts exactly
+        # the abbreviated forms the OS does, so normalise through it before
+        # asking again. It raises for anything non-numeric, which falls through
+        # to the name check.
+        packed = socket.inet_aton(host)
+    except OSError:
+        return host in _LOOPBACK_HOSTNAMES
+    return ipaddress.ip_address(socket.inet_ntoa(packed)).is_loopback
+
+
 def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
     """Checks that hold for every declared redirect URI, whatever its kind."""
     problems: list[str] = []
     if parsed.username or parsed.password:
         problems.append("carry no userinfo component")
+    if parsed.scheme == "https" and _is_loopback_hostname(parsed.hostname or ""):
+        problems.append(
+            "not point https at a loopback host — kind is derived from the "
+            "scheme, so this would be namespaced and audited as a hosted "
+            f"'{ClientKind.CLOUD}' client while actually resolving to the "
+            "machine running the server; use an http loopback callback (or "
+            "let the client self-register via /o/register) instead"
+        )
     if "*" in uri:
         problems.append("contain no '*' wildcard")
+    if uri.split() != [uri]:
+        # `signals.provision_mcp_clients` stores these as `" ".join(...)` and
+        # DOT matches with `.split()`, so embedded whitespace would register a
+        # second, unvalidated URI. Operator-authored rather than attacker-
+        # supplied here, but the same storage contract applies, and the
+        # matching guard on the anonymous DCR path is
+        # `registration._is_loopback_redirect`.
+        problems.append("contain no whitespace")
     if ".." in unquote(parsed.path).split("/"):
         problems.append("contain no '..' path segment (literal or encoded)")
     return problems
@@ -404,16 +460,40 @@ def _validate_redirect_schemes(kinds: set[ClientKind]) -> None:
 
     required = {
         "https": ClientKind.CLOUD in kinds,
-        "http": ClientKind.LOCAL in kinds,
+        # Unconditional, not `ClientKind.LOCAL in kinds`. `/o/register` is
+        # mounted unconditionally and only ever mints `http://` loopback
+        # callbacks, so the DCR surface always needs `http` — and DOT enforces
+        # the scheme list at the authorization redirect (`http.py`
+        # `OAuth2ResponseRedirect`), not at boot. A consumer who narrowed the
+        # list to `["https"]` (plausible now the shipped clients are all
+        # cloud) would boot clean and then have every DCR client — Claude
+        # Code, Cursor desktop and CLI — fail opaquely at `/o/authorize/`,
+        # which is the exact failure this guard exists to turn into a boot
+        # error. "Feature on -> require the safe setting", and DCR is
+        # always on.
+        "http": True,
     }
     schemes = oauth2_settings.ALLOWED_REDIRECT_URI_SCHEMES
     for scheme, needed in required.items():
         if needed and scheme not in schemes:
+            reason = (
+                f"MCP_SQL.CLIENTS declares a {scheme} callback"
+                if scheme == "https"
+                else "the RFC 7591 registration endpoint at /o/register mints "
+                "http loopback callbacks for self-registering clients "
+                "(Claude Code, Cursor desktop/CLI)"
+            )
             msg = (
-                f"MCP_SQL.CLIENTS declares a {scheme} callback, but "
+                f"{reason}, but "
                 f"OAUTH2_PROVIDER['ALLOWED_REDIRECT_URI_SCHEMES'] = "
-                f"{list(schemes)!r} does not include {scheme!r}. Add it, or "
-                f"drop those clients from MCP_SQL.CLIENTS. Note that this "
+                f"{list(schemes)!r} does not include {scheme!r}. Add it"
+                + (
+                    " (the registration endpoint is always mounted, so this "
+                    "one cannot be resolved by dropping clients)"
+                    if scheme == "http"
+                    else ", or drop those clients from MCP_SQL.CLIENTS"
+                )
+                + f". Note that this "
                 f"setting is install-global: it relaxes redirect handling for "
                 f"every OAuth application in the project. DOT's own default "
                 f"({['http', 'https']!r}) already covers both, so the simplest "
