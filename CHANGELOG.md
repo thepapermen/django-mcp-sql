@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 0.1.0b6
+
 ### Security
 
 - **`/o/register` could register an off-machine redirect URI (affects
