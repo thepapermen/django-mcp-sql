@@ -75,12 +75,15 @@ def _is_loopback_redirect(uri: str) -> bool:
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False
-    if parsed.username or parsed.password:
+    if "@" in parsed.netloc:
         # Reject a userinfo component (`http://user:pass@127.0.0.1/cb`): the
         # host is still loopback, so the bare hostname check below would pass,
         # but the userinfo is attacker-chosen and would be stored verbatim on
         # the Application. Refuse it so a registered redirect URI is exactly
-        # scheme + host + port + path with nothing to smuggle.
+        # scheme + host + port + path with nothing to smuggle. Test the raw
+        # `@`, not `.username`/`.password`: an EMPTY userinfo
+        # (`http://@127.0.0.1/cb`) parses to falsy `""`/`None` and would slip
+        # past (DOT 3.4 tests for `@` in the netloc the same way).
         return False
     return parsed.hostname in _LOOPBACK_HOSTS
 

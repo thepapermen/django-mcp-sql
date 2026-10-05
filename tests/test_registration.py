@@ -210,11 +210,14 @@ class TestDynamicClientRegistrationValidation:
     def test_loopback_with_userinfo_rejected(self, client):
         # `http://user:pass@127.0.0.1/cb` has a loopback host, so a bare
         # hostname check would accept it — but the userinfo component is
-        # attacker-chosen and would be stored verbatim. Reject both the
-        # user:pass form and the username-only form.
+        # attacker-chosen and would be stored verbatim. Reject the user:pass
+        # form, the username-only form, and an EMPTY userinfo (which parses to
+        # a falsy username, so only a raw `@` test catches it).
         for uri in (
             "http://attacker:secret@127.0.0.1:3456/cb",
             "http://attacker@127.0.0.1:3456/cb",
+            "http://@127.0.0.1:3456/cb",
+            "http://:@127.0.0.1:3456/cb",
         ):
             response = _post(client, {"redirect_uris": [uri]})
             assert response.status_code == HTTPStatus.BAD_REQUEST, uri
@@ -626,9 +629,12 @@ class TestAuthorizeLoopbackRecheck:
         self, client, mcp_user, mcp_mfa_on, mcp_app, send_redirect_uri
     ):
         # The canonical row skips consent, so a stored off-machine redirect
-        # would be a silent code delivery. With `redirect_uri` omitted oauthlib
-        # resolves the stored default WITHOUT calling `validate_redirect_uri`;
-        # DOT then re-validates it when creating the response. Pin both paths.
+        # would be a silent code delivery. Explicit `redirect_uri`: refused by
+        # `validate_redirect_uri`. Omitted: oauthlib resolves the stored default
+        # WITHOUT calling `validate_redirect_uri`, and `get_default_redirect_uri`
+        # drops it, so oauthlib fails fatally. (DOT would also re-validate the
+        # default when creating the response, but only on this success path —
+        # the error paths are pinned by the test below.) Pin both.
         mcp_app.redirect_uris = "https://evil.example/cb"
         mcp_app.save()
         params = self._params(mcp_app, "https://evil.example/cb")

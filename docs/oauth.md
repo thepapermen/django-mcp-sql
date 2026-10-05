@@ -152,7 +152,10 @@ curl -s -X POST https://<host>/o/register \
 its own machine — useless for cross-machine token theft; enforced at
 registration and re-checked on the requested redirect at `/o/authorize/`,
 see the "DOT stores redirect URIs whitespace-joined" entry in
-`docs/architecture.md`) and the
+`docs/architecture.md`; one gap is upstream — django-oauth-toolkit older than
+3.4.0 redirects an unauthenticated `prompt=none` request to the supplied
+`redirect_uri`, with an error and never a code, before any of this runs
+(DOT #1719)) and the
 `/o/authorize/` issuance gate (real user with is_staff + MFA + perm
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same

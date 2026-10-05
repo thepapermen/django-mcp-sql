@@ -25,8 +25,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   own PKCE verifier.
   - Registration now refuses any URI that `str.split()` would break apart
     (deliberately DOT's own operation), any non-printable or non-ASCII
-    character, and any URI whose authority or port does not parse — each a
-    normal 400 `invalid_redirect_uri` with no `Application` row created.
+    character, any URI whose authority or port does not parse, and an empty
+    userinfo (`@` with nothing before it, which the old non-empty-userinfo
+    check let through) — each a normal 400 `invalid_redirect_uri` with no
+    `Application` row created.
     Previously a malformed authority (e.g. an unterminated IPv6 literal), a
     NUL or a lone surrogate raised an uncaught 500, and a non-numeric or
     out-of-range port was stored, leaving a client that could never complete
