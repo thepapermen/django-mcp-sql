@@ -27,9 +27,12 @@ counting every rejected row; it is independently escalated via its own
 signal.) The alert names the user — pk plus `get_username()` (the email for
 an email-keyed user model) — and the client whose query crossed the
 threshold (its client_id plus derived `ClientKind`; counting itself is per
-user across clients), so a responder can act without a DB lookup; this is
-appropriate because the MCP surface is staff-only (employees, not clients).
-It never includes the SQL text.
+user across clients), so the alert identifies who and which client without a
+query; this is appropriate because the MCP surface is staff-only (employees,
+not clients). Deciding whether the volume is legitimate still means reading
+the user's `MCPQueryLog` rows — a declared cloud client_id is shared by every
+account at its provider — and, when unsure, asking the user. It never
+includes the SQL text.
 """
 
 import logging

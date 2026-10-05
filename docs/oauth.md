@@ -594,9 +594,13 @@ visit, including for a client the user has already authorized:
 `auto` DOT would skip the page and issue a code on a plain GET to anyone
 holding a live token for that (shared) Application. Behind the page: every
 `/mcp/sql/` request whose bearer token resolves to a user re-runs the issuance
-gate (active staff, MFA, one profile); every tool call, and every gate denial for a token that resolved to
-a user, is audited under that user with the client's id and kind (the MCP
-handshake itself — `initialize`, `tools/list` — is not); a token lives only as
+gate (active staff, MFA, one profile); every tool call is audited in
+`MCPQueryLog` under that user with the client's id and kind, and every gate
+denial for a token that resolved to a user — handshake requests included —
+in `MCPAuthRejectionLog` with the application name (`client_kind` is blank
+when the Application no longer classifies); a *successful* handshake
+(`initialize`, `tools/list`) writes no row and does not count toward the
+volume tripwire; a token lives only as
 long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
 logging out deletes the MCP access tokens the user holds at that moment — not
 an authorization code issued moments before and not yet exchanged
