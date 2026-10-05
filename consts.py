@@ -8,6 +8,9 @@ taxonomy's pure half — the kinds themselves, the declared-client dataclasses,
 the namespace derivation — lives in `clients.py`; the identifier strings live
 on the settings accessor (`mcp_sql_settings.APPLICATION_NAME` /
 `.APPLICATION_NAME_PREFIX` / `.SCOPE`).
+
+Also `absolute_url`, the one place an absolute URL on the OAuth surface is
+composed (discovery documents, the 401 challenge, `/o/register`'s response).
 """
 
 import re
@@ -20,14 +23,6 @@ from mcp_sql.clients import ClientKind
 from mcp_sql.conf import mcp_sql_settings
 
 
-# DCR mints Application names as
-# `f"{APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"`, and
-# `token_urlsafe(16)` is always 22 URL-safe-base64 chars. Validating the
-# suffix *shape* (not just the prefix) means only the canonical name and
-# genuinely DCR-minted names are recognised as MCP-purpose: a hand-created
-# `mcp-sql-superuser` or a path-traversal-shaped `mcp-sql-../../x` does not
-# match, where a bare `startswith` would accept them. Tracks
-# registration's token size.
 def absolute_url(request: HttpRequest, path: str) -> str:
     """Absolute URL for `path` on this host, with the scheme hardened.
 
@@ -38,9 +33,12 @@ def absolute_url(request: HttpRequest, path: str) -> str:
     mixing an `https` issuer with `http` endpoints inside one payload, and,
     for `resource`, failing the RFC 9728 §3.3 identity check against the
     `https` identifier the client built its request from. That is the same
-    break the trailing-slash handling below exists to fix, on the other half
-    of the identifier, so both halves are hardened the same way and every
-    absolute URL in either discovery document is composed here.
+    break the trailing-slash handling in `views/discovery.py`
+    (`_resource_identifier`) exists to fix, on the other half of the
+    identifier, so both halves are hardened the same way. Every absolute URL
+    in either discovery document, the 401 challenge's `resource_metadata`
+    pointer (`auth.py`) and `/o/register`'s `registration_client_uri` are
+    composed here, so the whole surface agrees on one origin.
 
     `DEBUG` off means the project is unambiguously a non-loopback deploy, so
     https is forced; local dev (`DEBUG=True`) keeps `request.scheme` and stays
@@ -50,6 +48,14 @@ def absolute_url(request: HttpRequest, path: str) -> str:
     return f"{scheme}://{request.get_host()}{path}"
 
 
+# DCR mints Application names as
+# `f"{APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"`, and
+# `token_urlsafe(16)` is always 22 URL-safe-base64 chars. Validating the
+# suffix *shape* (not just the prefix) means only the canonical name and
+# genuinely DCR-minted names are recognised as MCP-purpose: a hand-created
+# `mcp-sql-superuser` or a path-traversal-shaped `mcp-sql-../../x` does not
+# match, where a bare `startswith` would accept them. Tracks
+# registration's token size.
 _DCR_SUFFIX_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 
 

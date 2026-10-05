@@ -23,6 +23,7 @@ from django.views.decorators.http import require_POST
 from mcp_sql import throttle
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import absolute_url
 from oauth2_provider.models import Application
 
 logger = logging.getLogger(__name__)
@@ -122,8 +123,10 @@ def _registration_response(
             "grant_types": ["authorization_code"],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
-            "registration_client_uri": request.build_absolute_uri(
-                reverse("oauth_dynamic_client_registration")
+            # Same origin as the discovery document's `registration_endpoint`
+            # (https forced with DEBUG off) — see `consts.absolute_url`.
+            "registration_client_uri": absolute_url(
+                request, reverse("oauth_dynamic_client_registration")
             ),
         },
         status=HTTPStatus.CREATED,

@@ -198,10 +198,12 @@ precisely because it is the one that does **not** announce itself.
   `"authorization_servers": ["https://host/o"]` — the same §3.3 mismatch, and
   AS endpoints on a different origin than the issuer naming them. Every
   absolute URL in both documents — and the `resource_metadata` URL in the 401
-  challenge, which is where clients actually start — now goes through one
+  challenge, which is where clients actually start, and the
+  `registration_client_uri` in `/o/register`'s 201 — now goes through one
   hardened helper (`consts.absolute_url`). Note the widened effect: with
-  `DEBUG` off, the AS endpoint URLs are now forced to https as well, where
-  previously only `issuer` was. A `DEBUG=False` plain-http deployment was
+  `DEBUG` off, the AS endpoint URLs, the 401 pointer and
+  `registration_client_uri` are now forced to https as well, where previously
+  only `issuer` was. A `DEBUG=False` plain-http deployment was
   already out of spec for RFC 8414 §2, but it will now advertise an https
   surface it does not serve.
 - **A declared https callback on a loopback host was classified and audited

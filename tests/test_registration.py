@@ -130,6 +130,23 @@ class TestDynamicClientRegistrationHappyPath:
         b = _post(client, {"redirect_uris": ["http://127.0.0.1:2222"]}).json()
         assert a["client_id"] != b["client_id"]
 
+    @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
+    def test_registration_client_uri_shares_the_discovery_origin(
+        self, client, settings, debug, scheme
+    ):
+        # Composed through `consts.absolute_url` like every discovery URL, so
+        # with DEBUG off it is https even when the request reached Django over
+        # plain http (a TLS terminator that does not forward the scheme) — the
+        # same origin the AS metadata advertises `registration_endpoint` on.
+        settings.DEBUG = debug
+        body = _post(client, {"redirect_uris": ["http://127.0.0.1:3456/cb"]}).json()
+        expected = (
+            f"{scheme}://testserver{reverse('oauth_dynamic_client_registration')}"
+        )
+        assert body["registration_client_uri"] == expected
+        asm = client.get(reverse("oauth_authorization_server_metadata")).json()
+        assert asm["registration_endpoint"] == expected
+
 
 @pytest.mark.django_db
 class TestDynamicClientRegistrationValidation:
@@ -588,6 +605,23 @@ class TestRedirectUriLengthBound:
         assert response.status_code == HTTPStatus.CREATED
         assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
 
+    @pytest.mark.parametrize(
+        ("length", "status"),
+        [(1024, HTTPStatus.CREATED), (1025, HTTPStatus.BAD_REQUEST)],
+    )
+    def test_the_bound_is_1024_characters_inclusive(self, client, length, status):
+        prefix = "http://127.0.0.1:8765/"
+        uri = prefix + "a" * (length - len(prefix))
+        assert len(uri) == length
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": [uri]}),
+            content_type="application/json",
+        )
+        assert response.status_code == status
+        if status == HTTPStatus.CREATED:
+            assert response.json()["redirect_uris"] == [uri]
+
     def test_normal_length_redirect_uri_still_registers(self, client):
         response = client.post(
             reverse("oauth_dynamic_client_registration"),
@@ -640,17 +674,29 @@ class TestWhitespaceSmuggling:
         assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
 
     def test_dot_cannot_be_talked_into_the_off_machine_redirect(self, client):
-        """End-to-end: the guarantee, asserted through DOT's own matcher."""
+        """End-to-end: the guarantee, asserted on the STORED row through DOT's
+        own matcher.
+
+        Submits the smuggling attempt beside a clean sibling, because that is
+        the shape that registers a row at all (the subset filter refuses a
+        request with nothing usable in it). Under the old, whitespace-unaware
+        predicate the smuggled string passed the host check and was stored
+        verbatim, so the row's `redirect_uris.split()` yielded the off-machine
+        URI and DOT admitted it.
+        """
         from oauth2_provider.models import Application
 
+        clean = "http://localhost:8787/callback"
+        smuggled = "http://127.0.0.1:8765/cb http://evil.example/steal"
         response = client.post(
             reverse("oauth_dynamic_client_registration"),
-            data=json.dumps({"redirect_uris": ["http://localhost:8787/callback"]}),
+            data=json.dumps({"redirect_uris": [clean, smuggled]}),
             content_type="application/json",
         )
+        assert response.status_code == HTTPStatus.CREATED
         app = Application.objects.get(client_id=response.json()["client_id"])
-        assert app.redirect_uri_allowed("http://localhost:8787/callback")
-        assert not app.redirect_uri_allowed("http://evil.example/steal")
         # Every stored URI is a single token, so `.split()` cannot manufacture
         # one we never validated.
-        assert app.redirect_uris.split() == ["http://localhost:8787/callback"]
+        assert app.redirect_uris.split() == [clean]
+        assert app.redirect_uri_allowed(clean)
+        assert not app.redirect_uri_allowed("http://evil.example/steal")

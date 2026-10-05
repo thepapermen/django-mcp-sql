@@ -692,8 +692,9 @@ The load-bearing invariants and footguns, grouped by layer:
   `consts.absolute_url()` is the structural defense in depth: even if the
   scheme ever lies, non-dev envs advertise `https://` by construction.
   Every absolute URL on the discovery surface is composed there — both
-  documents' endpoints and the `resource_metadata` pointer in the 401
-  challenge — so the whole chain agrees on one origin. That is not
+  documents' endpoints, the `resource_metadata` pointer in the 401
+  challenge, and `/o/register`'s `registration_client_uri` — so the whole
+  chain agrees on one origin. That is not
   cosmetic: RFC 9728 §3.3 makes a client discard a protected-resource
   document whose `resource` differs from the identifier it built the
   request from, so an origin split silently locks out every client that
