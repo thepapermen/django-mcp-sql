@@ -18,7 +18,6 @@ marked `NotRequired`. Consumers may set any subset of them; the validator
 does not require them.
 """
 
-import ipaddress
 import re
 import socket
 import sys
@@ -303,7 +302,10 @@ def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
     * **https** — the provider-hosted shape. Rejects anything an attacker
       could weaponise if it reached DOT's exact matching or the prefix
       override: a userinfo component, a `*` wildcard, a `..` traversal
-      segment. A "prefix" entry must additionally carry a non-root path AND
+      segment, embedded whitespace — and any host that is not a plain ASCII
+      DNS name or that names the user's own machine (`_https_host_problems`),
+      since the derived `cloud` kind is a claim about where the code goes.
+      A "prefix" entry must additionally carry a non-root path AND
       end with `/`, so the runtime match is anchored at a segment boundary and
       a sibling like `.../oauthEVIL` cannot slip past `.../oauth`.
     * **http on `localhost`** — the machine-local shape, for a client that
@@ -334,6 +336,7 @@ def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
     parsed = urlparse(uri)
     problems = [
         *_universal_redirect_problems(uri, parsed),
+        *(_https_host_problems(parsed) if kind is ClientKind.CLOUD else ()),
         *(_prefix_problems(kind, parsed) if match == MATCH_PREFIX else ()),
         *(_loopback_problems(parsed) if kind is ClientKind.LOCAL else ()),
     ]
@@ -345,42 +348,99 @@ def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
         raise ImproperlyConfigured(msg)
 
 
-# Hostnames that resolve to the operator's own machine. `clients.redirect_kind`
-# derives kind from the SCHEME, so `https://localhost:8443/cb/` would otherwise
-# classify as `cloud`: namespaced `mcp-sql-cloud.<slug>`, exempt from the
-# loopback hardening in `_loopback_problems` (exact-match only, explicit port,
-# non-root path), and writing `client_kind="cloud"` into every audit row for a
-# callback that never leaves the box. The derivation is what makes `client_kind`
-# trustworthy, so the two must not be able to disagree — and a provider-hosted
-# callback is never on loopback, so nothing legitimate is refused.
-_LOOPBACK_HOSTNAMES = frozenset({"localhost"})
+# The shape an https declared callback's host must have: a DNS name in its
+# ASCII form — LDH labels (letters, digits, inner hyphens) joined by dots, with
+# an optional root dot. `urlparse` has already lowercased it. An
+# internationalised name is admitted in its punycode (`xn--`) A-label form,
+# which is also how every browser puts it on the wire.
+_DNS_HOSTNAME_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.?"
+)
+
+# Names that mean "this machine" by convention rather than by syntax: the RFC
+# 6761 reserved `localhost` (its `*.localhost` subdomains are matched
+# separately), plus the stock `/etc/hosts` aliases Debian/Ubuntu and RHEL ship
+# for 127.0.0.1 / ::1.
+_LOOPBACK_NAMES = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "localhost6",
+        "localhost6.localdomain6",
+        "ip6-localhost",
+        "ip6-loopback",
+    }
+)
 
 
-def _is_loopback_hostname(hostname: str) -> bool:
-    """True for any spelling that resolves to the machine running the server.
+def _is_ipv4_literal(host: str) -> bool:
+    """Does the resolver read `host` as an IPv4 address?
 
-    A literal is asked of `ipaddress` rather than compared against a list: the
-    whole of `127.0.0.0/8` is loopback, and `127.0.0.2`, the short form
-    `127.1`, and the IPv4-mapped `::ffff:127.0.0.1` all reach it while matching
-    no hand-written set. Names are already lowercased by `urlparse`; the
-    trailing dot of the FQDN root form is stripped so `localhost.` cannot slip
-    past.
+    Asked of `socket.inet_aton` rather than `ipaddress`, which demands four
+    dotted-decimal octets: the resolver (and the WHATWG URL parser every
+    browser uses) also takes the abbreviated, octal, hex and integer forms —
+    `0`, `127.1`, `0x7f.1`, `0177.0.0.1`, `2130706433`. Only ever called on a
+    string that already passed `_DNS_HOSTNAME_RE`, so it is ASCII with no NUL
+    and `inet_aton` can only raise `OSError`.
     """
-    host = hostname.rstrip(".")
     try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        pass
-    try:
-        # `ipaddress` demands four octets, but the resolver does not: `127.1`,
-        # `0x7f.1` and friends all reach loopback. `inet_aton` accepts exactly
-        # the abbreviated forms the OS does, so normalise through it before
-        # asking again. It raises for anything non-numeric, which falls through
-        # to the name check.
-        packed = socket.inet_aton(host)
+        socket.inet_aton(host)
     except OSError:
-        return host in _LOOPBACK_HOSTNAMES
-    return ipaddress.ip_address(socket.inet_ntoa(packed)).is_loopback
+        return False
+    return True
+
+
+def _https_host_problems(parsed: ParseResult) -> list[str]:
+    """Extra checks for an https (`cloud`-kind) rule's host.
+
+    `clients.redirect_kind` derives kind from the SCHEME, so any https
+    callback becomes `cloud`: namespaced `mcp-sql-cloud.<slug>`, exempt from
+    the loopback hardening in `_loopback_problems` (exact-match only, explicit
+    port, non-root path), and written as `client_kind="cloud"` on every audit
+    row. If its host is really loopback, the browser that follows the
+    redirect delivers the code to the END USER's own machine while the audit
+    trail says "provider-hosted" — exactly the disagreement the derivation
+    exists to rule out.
+
+    So this is an allow-shape, not a loopback detector. Enumerating loopback
+    spellings lost every time it was tried: percent-encoding, fullwidth and
+    ideographic-dot forms, `0` / `0.0.0.0`, `*.localhost`, and IPv4-mapped
+    IPv6 (which `ipaddress` on older Pythons, 3.12.3 among them, does not
+    even call loopback)
+    all slipped a list that caught `127.0.0.0/8` and `::1`. A provider's
+    callback is always an ASCII DNS name, so require exactly that and refuse
+    every IP literal outright, loopback or not; then refuse the names that
+    mean "this machine". What a syntactic check cannot see is a public DNS
+    name that happens to resolve to loopback (`127.0.0.1.nip.io`) — this is
+    operator-authored config, and that residue is the operator's to avoid.
+    """
+    # Never empty here: `redirect_kind` only classifies a URI that has a
+    # hostname as cloud.
+    hostname = parsed.hostname or ""
+    if not _DNS_HOSTNAME_RE.fullmatch(hostname):
+        return [
+            "name its host as an ASCII DNS name — letters, digits, hyphens "
+            "and dots, an internationalised domain in its punycode ('xn--') "
+            "form. Percent-encoded, non-ASCII and IPv6-literal hosts are "
+            "refused outright: each can spell a loopback host past this check"
+        ]
+    host = hostname.removesuffix(".")
+    if _is_ipv4_literal(host):
+        return [
+            "not use an IP-literal host — a provider-hosted callback is a DNS "
+            "name, and a literal (including shorthand such as '127.1' or '0') "
+            "is how a loopback address is disguised"
+        ]
+    if host in _LOOPBACK_NAMES or host.endswith(".localhost"):
+        return [
+            "not point https at a loopback name — kind is derived from the "
+            "scheme, so this would be namespaced and audited as a hosted "
+            f"'{ClientKind.CLOUD}' client while the browser following the "
+            "redirect delivers the code to the end user's own machine; use an "
+            f"http://{LOOPBACK_HOST}:<port>/<path> loopback entry (or let the "
+            "client self-register via /o/register) instead"
+        ]
+    return []
 
 
 def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
@@ -388,14 +448,6 @@ def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
     problems: list[str] = []
     if parsed.username or parsed.password:
         problems.append("carry no userinfo component")
-    if parsed.scheme == "https" and _is_loopback_hostname(parsed.hostname or ""):
-        problems.append(
-            "not point https at a loopback host — kind is derived from the "
-            "scheme, so this would be namespaced and audited as a hosted "
-            f"'{ClientKind.CLOUD}' client while actually resolving to the "
-            "machine running the server; use an http loopback callback (or "
-            "let the client self-register via /o/register) instead"
-        )
     if "*" in uri:
         problems.append("contain no '*' wildcard")
     if uri.split() != [uri]:

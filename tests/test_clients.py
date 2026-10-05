@@ -980,57 +980,107 @@ class TestReviewFindings:
     failed a test before being fixed.
     """
 
-    def test_https_to_a_loopback_host_is_refused(self):
-        # `redirect_kind` derives kind from the SCHEME, so an https callback
-        # aimed at the operator's own machine would classify as `cloud`: the
-        # `mcp-sql-cloud.*` namespace, exempt from the loopback hardening, and
-        # `client_kind="cloud"` in every audit row for a callback that never
-        # leaves the box. The derivation is what makes `client_kind`
-        # trustworthy, so the two must not be able to disagree.
-        # Every spelling the OS resolver reaches loopback through, not just
-        # the three obvious ones: `127.0.0.0/8` entire, the abbreviated and
-        # hex/integer IPv4 forms, the IPv4-mapped IPv6 form, and the FQDN root
-        # `localhost.`. A hand-written host set missed all but three.
-        for host in (
-            "localhost",
-            "localhost.",
-            "127.0.0.1",
-            "127.0.0.2",
-            "127.1",
-            "2130706433",
-            "[::1]",
-            "[::ffff:127.0.0.1]",
-        ):
-            cfg = {
-                "local-in-disguise": {
-                    "REDIRECTS": [{"MATCH": "exact", "URI": f"https://{host}:8443/cb"}]
-                }
-            }
-            with pytest.raises(ImproperlyConfigured, match="loopback host"):
-                validate_mcp_sql_settings({"CLIENTS": cfg})
+    @staticmethod
+    def _https_client(host):
+        return {"x": {"REDIRECTS": [{"MATCH": "exact", "URI": f"https://{host}/cb"}]}}
+
+    @pytest.mark.parametrize(
+        ("host", "reason"),
+        [
+            # The names that mean "this machine": RFC 6761 `localhost`, its
+            # FQDN root form, its reserved subdomains, and the stock
+            # /etc/hosts aliases.
+            ("localhost", "loopback name"),
+            ("localhost.", "loopback name"),
+            ("app.localhost", "loopback name"),
+            ("localhost.localdomain", "loopback name"),
+            ("ip6-localhost", "loopback name"),
+            # Every IPv4 literal, loopback or not — including the abbreviated,
+            # hex and integer forms the resolver (and every browser) accepts
+            # but `ipaddress` does not, and the unspecified `0` / `0.0.0.0`.
+            ("127.0.0.1", "IP-literal"),
+            ("127.0.0.2", "IP-literal"),
+            ("127.1", "IP-literal"),
+            ("0x7f.1", "IP-literal"),
+            ("2130706433", "IP-literal"),
+            ("0", "IP-literal"),
+            ("0.0.0.0", "IP-literal"),  # noqa: S104 — a host under test, not a bind
+            ("127.0.0.1.", "IP-literal"),
+            ("8.8.8.8", "IP-literal"),
+            # IPv6 literals, refused by shape. The IPv4-mapped forms are the
+            # ones `ipaddress` on Python 3.12.3 does not call loopback, which
+            # is what failed this test there under the old detector.
+            ("[::1]", "ASCII DNS name"),
+            ("[::ffff:127.0.0.1]", "ASCII DNS name"),
+            ("[::ffff:7f00:1]", "ASCII DNS name"),
+            # Spellings that are not a plain DNS name at all: percent-encoded,
+            # fullwidth digits / letters, the ideographic full stop, and a
+            # non-ASCII IDN (admissible only as its punycode A-label).
+            ("%6c%6fcalhost", "ASCII DNS name"),
+            ("127.0.0.%31", "ASCII DNS name"),
+            ("\uff11\uff12\uff17.0.0.1", "ASCII DNS name"),
+            ("127\u30020\u30020\u30021", "ASCII DNS name"),
+            (
+                "\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54",
+                "ASCII DNS name",
+            ),
+            ("b\u00fccher.example", "punycode"),
+            ("under_score.example", "ASCII DNS name"),
+        ],
+    )
+    def test_https_host_must_be_a_plain_dns_name(self, host, reason):
+        """`redirect_kind` derives `cloud` from the SCHEME, so an https
+        callback whose host is really the user's machine would be namespaced
+        and audited as provider-hosted while the browser following the redirect
+        delivers the code locally. The derivation is what makes `client_kind`
+        trustworthy, so the two must not be able to disagree.
+
+        A loopback *detector* lost to every spelling it did not enumerate
+        (percent-encoding, fullwidth forms, `0`, `*.localhost`, and on Python
+        3.12.3 IPv4-mapped IPv6), so the rule is an allow-shape: an ASCII DNS
+        name, no IP literal of any kind, not a "this machine" name.
+        """
+        with pytest.raises(ImproperlyConfigured, match=reason):
+            validate_mcp_sql_settings({"CLIENTS": self._https_client(host)})
 
     @pytest.mark.parametrize(
         "host",
         [
-            "p.example",
-            "claude.ai",
-            "chatgpt.com",
-            # A remote name that merely *starts* with a loopback label, and a
-            # genuinely routable address, must both still pass.
-            "localhost.evil.example",
-            "8.8.8.8",
+            "a\x00b.example",  # NUL
+            "\ud800.example",  # lone surrogate
         ],
     )
-    def test_https_to_a_real_host_still_validates(self, host):
+    def test_unencodable_host_is_a_config_error_not_a_crash(self, host):
+        # These used to escape boot validation as a bare `ValueError` /
+        # `UnicodeEncodeError` (raised by `socket.inet_aton`) instead of the
+        # focused `ImproperlyConfigured` naming the URI.
+        with pytest.raises(ImproperlyConfigured, match="ASCII DNS name"):
+            validate_mcp_sql_settings({"CLIENTS": self._https_client(host)})
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            # The shipped callbacks, verbatim.
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://chatgpt.com/connector/oauth/",
+            "https://www.cursor.com/agents/mcp/oauth/callback",
+            "https://p.example/cb",
+            # An IDN in its punycode A-label form, a name that merely STARTS
+            # with a loopback label, an all-digit label that is not the last
+            # one, an explicit port, the FQDN root form, and an uppercase host
+            # (`urlparse` lowercases it).
+            "https://xn--bcher-kva.example/cb",
+            "https://localhost.evil.example/cb",
+            "https://127.example/cb",
+            "https://p.example:8443/cb",
+            "https://claude.ai./cb",
+            "https://Claude.AI/cb",
+        ],
+    )
+    def test_a_real_provider_callback_still_validates(self, uri):
         # The guard must not catch a genuine provider callback.
         validate_mcp_sql_settings(
-            {
-                "CLIENTS": {
-                    "provider": {
-                        "REDIRECTS": [{"MATCH": "exact", "URI": f"https://{host}/cb"}]
-                    }
-                }
-            }
+            {"CLIENTS": {"provider": {"REDIRECTS": [{"MATCH": "exact", "URI": uri}]}}}
         )
 
     def test_declared_redirect_may_not_carry_whitespace(self):

@@ -185,15 +185,27 @@ precisely because it is the one that does **not** announce itself.
   previously only `issuer` was. A `DEBUG=False` plain-http deployment was
   already out of spec for RFC 8414 §2, but it will now advertise an https
   surface it does not serve.
-- **A declared `https://localhost` callback was classified and audited as
-  `cloud`.** Kind derives from the scheme, so an https callback aimed at the
-  operator's own machine took the `mcp-sql-cloud.*` namespace, skipped the
-  loopback hardening, and wrote `client_kind="cloud"` on every audit row for a
-  callback that never leaves the box. https to a loopback host is now refused
-  at boot — the whole of `127.0.0.0/8`, the abbreviated / hex / integer IPv4
-  spellings, IPv4-mapped IPv6, `::1`, and `localhost` including its FQDN root
-  form — so a declared client's kind and where it actually resolves cannot
-  disagree.
+- **A declared https callback on a loopback host was classified and audited
+  as `cloud`.** Kind derives from the scheme, so an https callback whose host
+  was really the user's own machine (`https://localhost:8443/cb`) took the
+  `mcp-sql-cloud.*` namespace, skipped the loopback hardening, and wrote
+  `client_kind="cloud"` on every audit row while the browser following the
+  redirect delivered the code to the end user's machine. An https declared
+  callback's host must now be an **ASCII DNS name** (letters, digits, hyphens
+  and dots; an internationalised domain in its punycode `xn--` form), is never
+  an **IP literal** of any kind — loopback or not, IPv6 or IPv4, including the
+  resolver's shorthand forms (`127.1`, `0x7f.1`, `0`) — and is never
+  `localhost`, `*.localhost`, or one of the stock `/etc/hosts` loopback aliases
+  (`localhost.localdomain`, `ip6-localhost`, …). It is an allow-shape rather
+  than a loopback detector because the detector kept missing spellings:
+  percent-encoded and fullwidth hosts, `0.0.0.0`, `*.localhost`, and — on
+  Python 3.12.3, whose `ipaddress` does not call them loopback — IPv4-mapped
+  IPv6 addresses. All of these now fail at boot; an https callback declared on
+  an IP literal or a non-ASCII host must be re-declared as a DNS name. Not
+  covered: a public DNS name that resolves to loopback, which no syntactic
+  check can see. A NUL or lone surrogate in a declared host now fails boot
+  with `ImproperlyConfigured` naming the URI instead of escaping as a bare
+  `ValueError` / `UnicodeEncodeError`.
 - **The consent screen corrupted IPv6 destinations.** `urlparse().hostname`
   strips the brackets, so `http://[::1]:8787/cb` rendered as
   `http://::1:8787` — and `::1` is an accepted DCR loopback host. An explicit

@@ -485,6 +485,16 @@ widen an exact rule into "any port on the user's machine"), an explicit port,
 a non-root path, and `MATCH: "exact"` (prefix-matching a loopback URI would
 admit any path on that port).
 
+https entries carry a host rule of their own: the host must be an **ASCII DNS
+name** (an internationalised domain in its punycode `xn--` form), never an IP
+literal of any kind, and never `localhost`, `*.localhost` or a stock
+`/etc/hosts` loopback alias. The kind is derived from the scheme, so an https
+callback that actually pointed at the user's machine would be namespaced and
+audited as provider-hosted; refusing every non-DNS host is simpler, and harder
+to get wrong, than recognising every spelling of loopback. (A public DNS name
+that happens to resolve to loopback is beyond any syntactic check — this is
+your own config, so don't declare one.)
+
 ### Onboarding a declared client (operator + user)
 
 **Before you start.** Unlike a loopback client, a cloud client is driven by the
