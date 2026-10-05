@@ -42,6 +42,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `redirect_uris` to a non-loopback URI (the documented posture was
     already loopback-only).
 
+### Changed
+
+- Raised the `mcp` floor to `>=1.28.1` (was `>=1.27`), so the declared range
+  no longer admits releases carrying CVE-2026-52869, CVE-2026-52870 (both
+  fixed in 1.27.2) or CVE-2026-59950 (fixed in 1.28.1). The package was not
+  exposed to these: it serves Streamable HTTP with `stateless_http=True`,
+  never enables the SDK's experimental tasks, and has no WebSocket
+  transport. CI's minimum-versions job now pins `mcp==1.28.1`.
+
 ## 0.1.0b5 - 2026-07-01
 
 ### Added

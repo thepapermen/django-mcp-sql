@@ -84,8 +84,15 @@ dependencies = [
     # per-major only after the CI matrix proves it.
     "sqlglot>=30.7,<31",
     # Official MCP SDK; the FastMCP / ToolAnnotations surface used is stable
-    # within 1.x.
-    "mcp>=1.27,<2",
+    # within 1.x. Floor 1.28.1 so the range no longer admits 1.27.0/1.27.1
+    # (CVE-2026-52869 stateful-session principal binding, CVE-2026-52870
+    # experimental tasks; both fixed in 1.27.2) or anything below 1.28.1
+    # (CVE-2026-59950 WebSocket transport). The package is not exposed to
+    # any of the three — it serves Streamable HTTP with `stateless_http=True`,
+    # never enables tasks, and has no WebSocket transport — but the floor
+    # should not admit them. Not a "no known advisories" guarantee: later
+    # SDK advisories exist, and a fresh install resolves the newest 1.x.
+    "mcp>=1.28.1,<2",
     # Single entry point (ASGIMiddleware).
     "a2wsgi>=1.10,<2",
     # Plain v2 API. The package's own usage would run on older v2, but
