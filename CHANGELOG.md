@@ -11,9 +11,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Django 6.1 and Python 3.14 support.** The Django cap is widened to
   `<6.2`, and CI gains Django 6.1 × Python 3.12/3.13/3.14 and Django 6.0 ×
-  Python 3.14 legs. No package code changed: the suite, `makemigrations
-  --check`, and mypy (django-stubs 6.1) are clean on Django 6.1.1. Two
-  constraints come with 6.1, both from upstream rather than this package:
+  Python 3.14 legs. No package code changed: the suite passes on Django 6.1.1
+  (CI and locally), and `makemigrations --check` and mypy (django-stubs 6.1.2)
+  are clean on 6.1.1 in local runs — CI's `typecheck` job stays on Django
+  5.2. Two constraints come with 6.1, both from upstream rather than this
+  package:
   - **PostgreSQL 15+.** Django 6.1 refuses to connect to PostgreSQL 14; the
     floor stays 14 on Django 4.2–6.0.
   - **DRF ≥ 3.18.** DRF ≤ 3.17 fails to import on Django 6.1, and pip will
@@ -24,7 +26,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
   Not verified: Django 5.2 on Python 3.14, and PostgreSQL 16+ (CI runs 14 and
   15 only). django-oauth-toolkit doesn't declare Django 6.1 support yet; the
-  suite passes on 6.1 with DOT 3.3.0 and 3.4.1.
+  suite passes on 6.1 with DOT 3.2.0, 3.3.0, and 3.4.1.
 
 ### Changed
 

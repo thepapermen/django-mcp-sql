@@ -412,10 +412,12 @@ Django needs a higher minimum DRF:
   2026-04-07; security fixes published since then ship only for Django 5.2
   and later. The package keeps supporting 4.2 for apps that can't move yet,
   but running it is a risk you carry — plan the upgrade.
-- `django-oauth-toolkit` 3.3/3.4 don't declare Django 6.1 support yet (no 6.1
-  classifier); the suite passes on 6.1 with 3.3.0 and 3.4.1.
-- `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
-  Django-version-coupled within their declared ranges.
+- `django-oauth-toolkit` starts at 3.3 on the 6.0/6.1 rows because 3.3 is
+  the first release that declares Django 6.0; no release declares 6.1 yet.
+  The suite does pass on 6.1 with DOT 3.2.0, 3.3.0, and 3.4.1 (CI runs only
+  the newest DOT on 6.x).
+- `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not Django-version-coupled
+  within their declared ranges.
 
 ### Dropping into an existing app with an older pinned DRF
 

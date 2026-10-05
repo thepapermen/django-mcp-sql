@@ -1,11 +1,12 @@
 """Standalone Django settings for the package's own test suite.
 
 Self-contained: stock Django + DRF + django-oauth-toolkit + the package and
-its in-package test app, against a plain PostgreSQL reachable via the
-`MCP_SQL_TEST_PG_*` environment variables (defaults match the GitHub Actions
-`postgres` service containers). This is what `pytest` runs against in the
-extracted repo; an in-tree consumer instead runs the suite under its own
-settings (this project: `--ds=config.settings.test`).
+its in-package test app, against a plain PostgreSQL (15+ under Django 6.1,
+which refuses 14) reachable via the `MCP_SQL_TEST_PG_*` environment variables
+(defaults match the GitHub Actions `postgres` service containers). This is
+what `pytest` runs against in the extracted repo; an in-tree consumer instead
+runs the suite under its own settings (this project:
+`--ds=config.settings.test`).
 
 Deliberate omissions:
 
