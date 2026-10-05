@@ -183,6 +183,8 @@ class TestDynamicClientRegistrationValidation:
             b'{"redirect_uris": ["http://127.0.0.1:9999"], "client_name": "\xff"}',
             # 20k levels (~40 KB, under the 64 KiB cap): deep enough to raise
             # RecursionError on Python 3.11 through 3.13 (3.12+ tolerates ~3k).
+            # Python 3.14's decoder parses it (its recursion guard is
+            # stack-based), so there it is an object lacking `redirect_uris`.
             b'{"x": ' + b"[" * 20000 + b"]" * 20000 + b"}",
         ],
         ids=["invalid-utf8", "deeply-nested"],
@@ -190,11 +192,36 @@ class TestDynamicClientRegistrationValidation:
     def test_undecodable_body_rejected_not_500(self, client, raw):
         # The default `client` re-raises view exceptions, so an uncaught
         # UnicodeDecodeError / RecursionError fails here loudly.
+        try:
+            json.loads(raw)
+        except (ValueError, RecursionError):
+            expected = "invalid_client_metadata"
+        else:  # Python 3.14+: decodes; refused for its missing redirect_uris
+            expected = "invalid_redirect_uri"
         response = client.post(
             reverse("oauth_dynamic_client_registration"),
             data=raw,
             content_type="application/json",
         )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == expected
+        assert not Application.objects.exists()
+
+    def test_recursion_error_while_decoding_is_a_400(self, client, monkeypatch):
+        # Pins the `RecursionError` handler on every Python, including 3.14,
+        # where no body under the 64 KiB cap is deep enough to reach it.
+        from mcp_sql.views import registration
+
+        def too_deep(*_args, **_kwargs):
+            raise RecursionError
+
+        with monkeypatch.context() as patched:
+            patched.setattr(registration.json, "loads", too_deep)
+            response = client.post(
+                reverse("oauth_dynamic_client_registration"),
+                data=b'{"redirect_uris": ["http://127.0.0.1:9999"]}',
+                content_type="application/json",
+            )
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
         assert response.json()["error"] == "invalid_client_metadata"
         assert not Application.objects.exists()
