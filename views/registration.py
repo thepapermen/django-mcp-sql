@@ -88,6 +88,11 @@ def _is_loopback_redirect(uri: str) -> bool:
     return parsed.hostname in _LOOPBACK_HOSTS
 
 
+def _is_string_list(value: object) -> bool:
+    """True iff `value` is a JSON array of strings (RFC 7591 §2 metadata shape)."""
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
 def _registration_response(
     request: HttpRequest,
     client_id: str,
@@ -123,7 +128,12 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     """RFC 7591 §3 client registration endpoint."""
     try:
         body = json.loads(request.body)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # `ValueError` covers `JSONDecodeError` and the `UnicodeDecodeError` an
+        # invalid-UTF-8 body raises; `RecursionError` a pathologically nested
+        # document (a few KB of brackets on Python 3.11, tens of KB on 3.12+ —
+        # either way under the 64 KiB body cap).
+        # Both are client errors, not 500s.
         return _error("invalid_client_metadata", "Request body is not valid JSON")
 
     if not isinstance(body, dict):
@@ -151,18 +161,26 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     # client reads the response and learns what we actually allow.
     # We require `authorization_code` + `code` to be present in the
     # request so a client asking for ONLY `client_credentials` (i.e.
-    # not the OAuth 2.1 native-app pattern) is refused outright.
+    # not the OAuth 2.1 native-app pattern) is refused outright. Each must
+    # be a JSON array of strings (RFC 7591 §2): `in` on anything else either
+    # raises (null, a number → a 500) or substring-matches a plain string.
     requested_grant_types = body.get("grant_types", ["authorization_code"])
-    if "authorization_code" not in requested_grant_types:
+    if (
+        not _is_string_list(requested_grant_types)
+        or "authorization_code" not in requested_grant_types
+    ):
         return _error(
             "invalid_client_metadata",
-            "grant_types must include 'authorization_code'",
+            "grant_types must be an array of strings including 'authorization_code'",
         )
     requested_response_types = body.get("response_types", ["code"])
-    if "code" not in requested_response_types:
+    if (
+        not _is_string_list(requested_response_types)
+        or "code" not in requested_response_types
+    ):
         return _error(
             "invalid_client_metadata",
-            "response_types must include 'code'",
+            "response_types must be an array of strings including 'code'",
         )
     # Public client only. We don't accept confidential-client schemes
     # because we don't issue client_secrets. The default `"none"` for

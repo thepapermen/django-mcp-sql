@@ -120,8 +120,11 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         A ValueError from DOT's matching is a refusal, not a 500: such a row
         can also store an unparseable port (`http://localhost:99999/cb`), and
-        DOT parses every stored candidate's port while matching a request
-        for a different, valid one.
+        DOT parses a stored `localhost` candidate's port while matching a
+        request for a different, valid one. (It port-wildcards loopback IPs,
+        so it never reads the port of a stored `127.0.0.1` / `[::1]`
+        candidate: a valid request on the same path matches, staying
+        loopback.)
 
         The stored default used when a request omits `redirect_uri` never
         reaches this method — `get_default_redirect_uri` below holds it to the
@@ -198,10 +201,12 @@ class MCPOAuth2Validator(OAuth2Validator):
           the consent POST (or `skip_authorization`) creates the response.
 
         oauthlib also calls this at `/o/token/`, but only for a grant with no
-        stored challenge, which is refused either way: normally the token
-        request has no `code_challenge`, so this returns `True` and oauthlib
-        answers `invalid_grant` ("Challenge not found"); a stray
-        `code_challenge` there makes it an `invalid_request` instead.
+        stored challenge, which is refused either way. This returns `True`
+        there (a token request carries no `code_challenge`), and oauthlib
+        answers `invalid_request` ("Code verifier required.") when the request
+        has no `code_verifier`, else `invalid_grant` ("Challenge not found").
+        Only a stray non-S256 `code_challenge` on the token request makes this
+        raise instead — still `invalid_request`.
         """
         if (
             request.code_challenge is not None

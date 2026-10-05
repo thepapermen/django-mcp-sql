@@ -33,14 +33,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     NUL or a lone surrogate raised an uncaught 500, and a non-numeric or
     out-of-range port was stored, leaving a client that could never complete
     a flow (and, for some such URIs, an uncaught 500 at `/o/authorize/`).
+  - Other malformed registration input that raised an uncaught 500 is now a
+    400 `invalid_client_metadata` with no row: `grant_types` /
+    `response_types` that are not JSON arrays of strings (null or a number
+    raised; a plain string was substring-matched and accepted), and a body
+    that is not valid UTF-8 or is pathologically nested. A client asking
+    for `["authorization_code", "refresh_token"]` is still registered.
   - Rows already registered by an affected release are not deleted.
     `MCPOAuth2Validator` now re-applies the same loopback check at
     `/o/authorize/` to the requested redirect, and to the stored default
     used when a request omits one, of every client that is not a declared
     cloud client. A smuggled entry is therefore refused after upgrading (the
-    row's loopback entries keep working), and a stored unparseable port is
-    refused instead of raising a 500. `docs/oauth.md` has a shell snippet
-    that lists such rows for review and deletion.
+    row's loopback entries keep working). A stored `localhost` URI with an
+    unparseable port no longer makes `/o/authorize/` raise a 500: requests
+    against that row are refused. For a stored `127.0.0.1` / `[::1]` URI with
+    such a port, DOT never reads the stored port (it port-wildcards loopback
+    IPs), so a request for a valid port on the same path is still authorized
+    — the destination stays on the loopback. `docs/oauth.md` has a shell
+    snippet that lists such rows for review and deletion.
   - Behaviour change for the canonical `mcp-sql` row as well: a
     non-loopback redirect, requested or stored, is now refused for it too,
     even if an operator edited its `redirect_uris` (the documented posture

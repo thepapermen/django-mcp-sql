@@ -176,6 +176,61 @@ class TestDynamicClientRegistrationValidation:
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"] == "invalid_client_metadata"
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"redirect_uris": ["http://127.0.0.1:9999"], "client_name": "\xff"}',
+            # 20k levels (~40 KB, under the 64 KiB cap): deep enough to raise
+            # RecursionError on Python 3.11 through 3.13 (3.12+ tolerates ~3k).
+            b'{"x": ' + b"[" * 20000 + b"]" * 20000 + b"}",
+        ],
+        ids=["invalid-utf8", "deeply-nested"],
+    )
+    def test_undecodable_body_rejected_not_500(self, client, raw):
+        # The default `client` re-raises view exceptions, so an uncaught
+        # UnicodeDecodeError / RecursionError fails here loudly.
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=raw,
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_client_metadata"
+        assert not Application.objects.exists()
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"grant_types": None},
+            {"grant_types": 5},
+            {"grant_types": "authorization_code"},  # substring-matched before
+            {"grant_types": ["authorization_code", 5]},
+            {"grant_types": {"authorization_code": True}},
+            {"response_types": None},
+            {"response_types": 5},
+            {"response_types": "code"},
+            {"response_types": ["code", None]},
+        ],
+        ids=[
+            "grant-null",
+            "grant-number",
+            "grant-string",
+            "grant-non-string-member",
+            "grant-object",
+            "response-null",
+            "response-number",
+            "response-string",
+            "response-non-string-member",
+        ],
+    )
+    def test_malformed_grant_or_response_types_rejected(self, client, metadata):
+        response = _post(
+            client, {"redirect_uris": ["http://127.0.0.1:9999"], **metadata}
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_client_metadata"
+        assert not Application.objects.exists()
+
     def test_missing_redirect_uris_rejected(self, client):
         response = _post(client, {"client_name": "no-uri"})
         assert response.status_code == HTTPStatus.BAD_REQUEST
@@ -282,10 +337,9 @@ class TestDynamicClientRegistrationValidation:
     @pytest.mark.parametrize(
         "uri",
         [
+            # ASCII-only, so these reach `urlparse` and pin its ValueError path.
             "http://[::1/cb",  # unterminated IPv6 literal: `urlparse` raises
             "http://::1]/cb",  # stray closing bracket: `urlparse` raises
-            # A netloc character that becomes `#` under NFKC: `urlparse` raises.
-            "http://localhost\uff03@evil.example/cb",
         ],
     )
     def test_malformed_authority_rejected_not_500(self, client, uri):
@@ -322,8 +376,11 @@ class TestDynamicClientRegistrationValidation:
             "http://127.0.0.1:3456/cb\x7f",  # DEL
             "http://127.0.0.1:3456/cb\ud800",  # lone surrogate: not encodable
             "http://127.0.0.1:3456/caf\u00e9",  # non-ASCII: not an RFC 3986 URI
+            # A netloc character that becomes `#` under NFKC; `urlparse` would
+            # raise on it, but the non-ASCII rule refuses it first.
+            "http://localhost\uff03@evil.example/cb",
         ],
-        ids=["nul", "leading-c0", "del", "lone-surrogate", "non-ascii"],
+        ids=["nul", "leading-c0", "del", "lone-surrogate", "non-ascii", "nfkc-netloc"],
     )
     def test_non_printable_or_non_ascii_rejected(self, client, uri):
         before = Application.objects.count()
@@ -598,10 +655,10 @@ class TestAuthorizeLoopbackRecheck:
     def test_legacy_unparseable_port_row_is_a_400_not_a_500(
         self, client, mcp_user, mcp_mfa_on
     ):
-        # A <= 0.1.0b5 row could store a garbage port. DOT parses every stored
-        # candidate's port (`localhost` is not port-wildcarded) while matching
-        # a request for a DIFFERENT, valid loopback URI — a ValueError that
-        # must surface as the normal refusal, not an uncaught 500.
+        # A <= 0.1.0b5 row could store a garbage port. DOT parses a stored
+        # `localhost` candidate's port (only loopback IPs are port-wildcarded)
+        # while matching a request for a DIFFERENT, valid loopback URI — a
+        # ValueError that must surface as the normal refusal, not a 500.
         client_id = (
             f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
         )
@@ -623,6 +680,36 @@ class TestAuthorizeLoopbackRecheck:
         )
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
         assert "Location" not in response
+
+    def test_legacy_unparseable_port_on_a_loopback_ip_still_matches_loopback(
+        self, client, mcp_user, mcp_mfa_on
+    ):
+        # The other side of the test above: DOT port-wildcards loopback IPs, so
+        # it never reads the garbage port of a stored `127.0.0.1` candidate and
+        # a request for a valid port on the same path is authorized. Harmless —
+        # the destination stays on the loopback — and pinned so the CHANGELOG's
+        # description of it stays true.
+        client_id = (
+            f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
+        )
+        app = Application.objects.create(
+            name=client_id,
+            client_id=client_id,
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=False,
+            redirect_uris="http://127.0.0.1:99999/cb",
+            algorithm="",
+        )
+        client.force_login(mcp_user)
+        params = self._params(app, "http://127.0.0.1:3456/cb")
+        response = client.post(
+            reverse("authorize"), data={**params, "allow": "Authorize"}
+        )
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        assert response["Location"].startswith("http://127.0.0.1:3456/cb?")
+        assert "code=" in response["Location"]
 
     @pytest.mark.parametrize("send_redirect_uri", [True, False])
     def test_canonical_row_edited_off_machine_is_refused(
