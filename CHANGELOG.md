@@ -251,6 +251,23 @@ precisely because it is the one that does **not** announce itself.
   check can see. A NUL or lone surrogate in a declared host now fails boot
   with `ImproperlyConfigured` naming the URI instead of escaping as a bare
   `ValueError` / `UnicodeEncodeError`.
+- **`approval_prompt=auto` could skip the consent page.** DOT's
+  `AuthorizationView.get()` reads `approval_prompt` from the query string
+  (falling back to `REQUEST_APPROVAL_PROMPT`), and on `auto` it issues a code
+  on a plain GET — no page, no POST — whenever the user already holds an
+  unexpired token for the same Application. `skip_authorization=False` did not
+  prevent it. A declared client is one Application shared by every account at
+  its provider, so a staff user who had connected Claude.ai would hand a code,
+  carrying the attacker's `state` and PKCE challenge, to an attacker's own
+  connector just by opening a crafted link. Reproduced against DOT 3.4.1 (302
+  to the callback with the code). `MCPAuthorizationView` now pins
+  `approval_prompt` to `force` for every request, so consent is an explicit
+  POST every time; the curated `skip_authorization=True` Application is
+  unaffected. **This predates the multi-client work** — DCR clients (and
+  0.1.0b5's opt-in cloud clients) had the same skip — but declared clients
+  shipping ON makes it reachable by default. Whether a given provider then
+  completes a callback it receives in another user's browser is outside this
+  server and was not tested.
 - **The consent screen corrupted IPv6 destinations.** `urlparse().hostname`
   strips the brackets, so `http://[::1]:8787/cb` rendered as
   `http://::1:8787` — and `::1` is an accepted DCR loopback host. An explicit

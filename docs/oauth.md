@@ -294,7 +294,10 @@ why the two mitigations above matter.
 
 Every Application created via `/o/register` (i.e. every Claude Code
 install) has `skip_authorization=False`. This forces the OAuth consent
-screen on every `/o/authorize/` call for these clients. The curated
+screen on every `/o/authorize/` call for these clients — including repeat
+visits by a user who already holds a live token for the client, because
+`MCPAuthorizationView` pins DOT's `approval_prompt` to `force` (on `auto`, DOT
+skips consent for such a user). The curated
 `mcp-sql` Application from migration 0005 keeps `skip_authorization=True`
 because operators provisioned its redirect URI in the migration — there
 is no rogue-client path to that row.
@@ -581,11 +584,20 @@ shared-callback phishing surface noted under "What each entry does"). Showing
 the connector id would not help — the user cannot tell theirs from an
 attacker's. The page's real defence is its instruction, **"Only continue if
 you started this from there"**: approving is an explicit, CSRF-protected POST,
-and an approval the user did not initiate *is* the attack. Behind it, every
-request re-runs the issuance gate (active staff, MFA, one profile) and is
-audited under the user with the client's id and kind, a token lives only as
-long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config), and
-logging out revokes every MCP token the user holds. If you re-theme
+and an approval the user did not initiate *is* the attack. That holds on every
+visit, including for a client the user has already authorized:
+`MCPAuthorizationView` pins DOT's `approval_prompt` to `force`, because on
+`auto` DOT would skip the page and issue a code on a plain GET to anyone
+holding a live token for that (shared) Application. Behind the page: every
+`/mcp/sql/` request re-runs the issuance gate (active staff, MFA, one
+profile); every tool call, and every gate denial for a token that resolved to
+a user, is audited under that user with the client's id and kind (the MCP
+handshake itself — `initialize`, `tools/list` — is not); a token lives only as
+long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
+logging out deletes the MCP access tokens the user holds at that moment — not
+an authorization code issued moments before and not yet exchanged
+(`AUTHORIZATION_CODE_EXPIRE_SECONDS`, 60 s in the recommended config), whose
+token is minted after the logout and survives it. If you re-theme
 `mcp_sql/authorize.html`, keep both the destination and that instruction.
 
 **Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three

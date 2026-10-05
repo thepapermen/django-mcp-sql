@@ -611,6 +611,77 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert captured["resource_name"] == "preset"
 
 
+@pytest.mark.django_db
+class TestApprovalPromptCannotSkipConsent:
+    """DOT's `approval_prompt=auto` must not bypass the consent page.
+
+    On "auto" (from the query string, or `REQUEST_APPROVAL_PROMPT`) DOT issues
+    a code on a plain GET whenever the user already holds a live token for the
+    same Application. A declared client is one Application shared by every
+    account at its provider, so that turned a phished link into a silent code
+    for an attacker's own connector. `MCPAuthorizationView.dispatch` pins the
+    value to "force".
+    """
+
+    CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+
+    def _url(self, approval_prompt):
+        from urllib.parse import urlencode
+
+        query = {
+            "response_type": "code",
+            "client_id": "mcp-sql-cloud.claude",
+            "redirect_uri": self.CALLBACK,
+            "scope": "mcp:sql",
+            "state": "attacker-state",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        if approval_prompt is not None:
+            query["approval_prompt"] = approval_prompt
+        return reverse("authorize") + "?" + urlencode(query)
+
+    @pytest.mark.parametrize(
+        ("approval_prompt", "setting"),
+        [
+            ("auto", "force"),  # the query string overriding DOT's default
+            (None, "auto"),  # a consumer who set the global default to auto
+            ("force", "auto"),
+        ],
+    )
+    def test_live_token_still_gets_the_consent_page(  # noqa: PLR0913 — four fixtures + two parameters, all load-bearing
+        self, client, mcp_user, mcp_mfa_on, settings, approval_prompt, setting
+    ):
+        import secrets
+        from datetime import timedelta
+
+        from django.utils import timezone
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Application
+
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "REQUEST_APPROVAL_PROMPT": setting,
+        }
+        # The shipped `claude` client, provisioned by `post_migrate`.
+        app = Application.objects.get(client_id="mcp-sql-cloud.claude")
+        assert app.skip_authorization is False
+        AccessToken.objects.create(
+            user=mcp_user,
+            application=app,
+            scope="mcp:sql",
+            token=secrets.token_urlsafe(24),
+            expires=timezone.now() + timedelta(hours=1),
+        )
+        client.force_login(mcp_user)
+        response = client.get(self._url(approval_prompt))
+        # Pre-fix, ("auto", "force") was a 302 straight to the callback with
+        # `code=...&state=attacker-state` and no page in between.
+        assert response.status_code == HTTPStatus.OK
+        assert b'id="authorizationForm"' in response.content
+        assert "Location" not in response
+
+
 class TestOauthAdminUnregistered:
     """DOT ModelAdmin classes must not be reachable via Django admin.
 

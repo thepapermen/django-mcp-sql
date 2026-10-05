@@ -73,9 +73,11 @@ class MCPAuthorizationView(AuthorizationView):
     def _client_destination(context: dict[str, Any]) -> str:
         """Where the authorization code will actually be delivered.
 
-        The one fact on this page the requester does not author: oauthlib has
-        already validated this `redirect_uri` against the Application, and the
-        code is going there. `scheme://host[:port]` — enough to tell
+        The validated redirect's `scheme://host[:port]`, so it cannot be
+        dressed up as a different target: oauthlib has already validated this
+        `redirect_uri` against the Application, and the code is going there.
+        (Who chose it varies: a DCR client picked its own loopback address; a
+        declared client's host is the operator's.) Enough to tell
         `https://claude.ai` from `http://localhost:8787` from someone else's
         machine, without a long path pushing the useful part off a narrow
         screen. It names the provider or machine, NOT whose account there: a
@@ -111,6 +113,23 @@ class MCPAuthorizationView(AuthorizationView):
         return f"{parsed.scheme}://{shown}" + (f":{port}" if port is not None else "")
 
     def dispatch(self, request, *args, **kwargs):
+        # Pin DOT's `approval_prompt` to "force", whatever the query string or
+        # `OAUTH2_PROVIDER["REQUEST_APPROVAL_PROMPT"]` says. DOT's `get()`
+        # reads `request.GET.get("approval_prompt", <setting>)`, and on "auto"
+        # it skips the consent page and issues a code on a plain GET whenever
+        # the user already holds an unexpired token for the same Application.
+        # A declared client is ONE Application shared by every account at the
+        # provider (`mcp-sql-cloud.claude`), so a staff user who connected
+        # Claude.ai would hand a code — with the attacker's `state` and PKCE
+        # challenge — to an attacker's own connector just by opening a link
+        # carrying `approval_prompt=auto`. `skip_authorization=False` is
+        # supposed to make consent an explicit POST every time; this keeps it
+        # so. The curated `skip_authorization=True` row is unaffected (DOT
+        # checks that flag first). The parameter is DOT-specific and no MCP
+        # client is known to send it, so nothing legitimate loses anything.
+        query = request.GET.copy()
+        query["approval_prompt"] = "force"  # replaces every value, if repeated
+        request.GET = query
         if request.user.is_authenticated:
             self._enforce_gate(request.user)
         # If the user is NOT authenticated, super().dispatch lets
