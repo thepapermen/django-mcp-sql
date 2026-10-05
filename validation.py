@@ -357,20 +357,14 @@ _DNS_HOSTNAME_RE = re.compile(
     r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.?"
 )
 
-# Names that mean "this machine" by convention rather than by syntax: the RFC
-# 6761 reserved `localhost` (its `*.localhost` subdomains are matched
-# separately), plus the stock `/etc/hosts` aliases Debian/Ubuntu and RHEL ship
-# for 127.0.0.1 / ::1.
-_LOOPBACK_NAMES = frozenset(
-    {
-        "localhost",
-        "localhost.localdomain",
-        "localhost6",
-        "localhost6.localdomain6",
-        "ip6-localhost",
-        "ip6-loopback",
-    }
-)
+# Final labels that mean "this machine" by convention: the RFC 6761 reserved
+# `localhost` (and so every `*.localhost`), and the `localdomain` /
+# `localdomain4` / `localdomain6` pseudo-TLDs of the stock `/etc/hosts`
+# loopback aliases (`localhost.localdomain`, `localhost4.localdomain4`, …).
+# The single-label aliases (`localhost4`, `ip6-localhost`, the machine's own
+# hostname) are caught by the fully-qualified-name rule instead, so this is a
+# short closed set rather than a list of every distro's aliases.
+_LOOPBACK_TLDS = frozenset({"localhost", "localdomain", "localdomain4", "localdomain6"})
 
 
 def _is_ipv4_literal(host: str) -> bool:
@@ -408,11 +402,15 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
     IPv6 (which `ipaddress` on older Pythons, 3.12.3 among them, does not
     even call loopback) all slipped a detector that caught `127.0.0.0/8` and
     `::1`. A provider's
-    callback is always an ASCII DNS name, so require exactly that and refuse
-    every IP literal outright, loopback or not; then refuse the names that
-    mean "this machine". What a syntactic check cannot see is a public DNS
-    name that happens to resolve to loopback (`127.0.0.1.nip.io`) — this is
-    operator-authored config, and that residue is the operator's to avoid.
+    callback is always a fully-qualified ASCII DNS name, so require exactly
+    that: refuse every IP literal outright, loopback or not; refuse the
+    "this machine" pseudo-TLDs (`*.localhost`, `*.localdomain`, …); and
+    refuse every single-label name, which can only resolve somewhere local —
+    that one rule covers `localhost4`, `ip6-localhost` and the machine's own
+    hostname, where a list of distro aliases kept missing entries. What a
+    syntactic check cannot see is a public DNS name that happens to resolve
+    to loopback (`127.0.0.1.nip.io`) — this is operator-authored config, and
+    that residue is the operator's to avoid.
     """
     # Never empty here: `redirect_kind` only classifies a URI that has a
     # hostname as cloud.
@@ -431,7 +429,7 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
             "name, and a literal (including shorthand such as '127.1' or '0') "
             "is how a loopback address is disguised"
         ]
-    if host in _LOOPBACK_NAMES or host.endswith(".localhost"):
+    if host.rsplit(".", 1)[-1] in _LOOPBACK_TLDS:
         return [
             "not point https at a loopback name — kind is derived from the "
             "scheme, so this would be namespaced and audited as a hosted "
@@ -439,6 +437,13 @@ def _https_host_problems(parsed: ParseResult) -> list[str]:
             "redirect delivers the code to the end user's own machine; use an "
             f"http://{LOOPBACK_HOST}:<port>/<path> loopback entry (or let the "
             "client self-register via /o/register) instead"
+        ]
+    if "." not in host:
+        return [
+            "use a fully-qualified host name — a single-label name (such as "
+            "'localhost4', 'ip6-localhost' or a machine's own hostname) only "
+            "resolves through /etc/hosts or a search domain, i.e. somewhere "
+            "local, never at a provider"
         ]
     return []
 

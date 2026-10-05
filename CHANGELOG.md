@@ -213,17 +213,22 @@ precisely because it is the one that does **not** announce itself.
   `mcp-sql-cloud.*` namespace, skipped the loopback hardening, and wrote
   `client_kind="cloud"` on every audit row while the browser following the
   redirect delivered the code to the end user's machine. An https declared
-  callback's host must now be an **ASCII DNS name** (letters, digits, hyphens
-  and dots; an internationalised domain in its punycode `xn--` form), is never
-  an **IP literal** of any kind — loopback or not, IPv6 or IPv4, including the
-  resolver's shorthand forms (`127.1`, `0x7f.1`, `0`) — and is never
-  `localhost`, `*.localhost`, or one of the stock `/etc/hosts` loopback aliases
-  (`localhost.localdomain`, `ip6-localhost`, …). It is an allow-shape rather
-  than a loopback detector because the detector kept missing spellings:
-  percent-encoded and fullwidth hosts, `0.0.0.0`, `*.localhost`, and — on
-  Python 3.12.3, whose `ipaddress` does not call them loopback — IPv4-mapped
-  IPv6 addresses. All of these now fail at boot; an https callback declared on
-  an IP literal or a non-ASCII host must be re-declared as a DNS name. Not
+  callback's host must now be a **fully-qualified ASCII DNS name** (letters,
+  digits, hyphens and dots; an internationalised domain in its punycode
+  `xn--` form), is never an **IP literal** of any kind — loopback or not, IPv6
+  or IPv4, including the resolver's shorthand forms (`127.1`, `0x7f.1`, `0`) —
+  is never **single-label** (`localhost4`, `ip6-localhost`, a machine's own
+  hostname: such names resolve only through `/etc/hosts` or a search domain),
+  and never sits under the `localhost` or `localdomain*` pseudo-TLDs
+  (`app.localhost`, `localhost.localdomain`, `localhost4.localdomain4`). It is
+  an allow-shape rather than a loopback detector because the detector kept
+  missing spellings: percent-encoded and fullwidth hosts, `0.0.0.0`,
+  `*.localhost`, and — on Python 3.12.3, whose `ipaddress` does not call them
+  loopback — IPv4-mapped IPv6 addresses; a list of distro loopback aliases
+  missed Fedora's `localhost4` the same way, hence the single-label rule. All
+  of these now fail at boot; an https callback declared on an IP literal, a
+  single-label or a non-ASCII host must be re-declared as a fully-qualified
+  DNS name. Not
   covered: a public DNS name that resolves to loopback, which no syntactic
   check can see. A NUL or lone surrogate in a declared host now fails boot
   with `ImproperlyConfigured` naming the URI instead of escaping as a bare

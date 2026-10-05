@@ -988,13 +988,25 @@ class TestReviewFindings:
         ("host", "reason"),
         [
             # The names that mean "this machine": RFC 6761 `localhost`, its
-            # FQDN root form, its reserved subdomains, and the stock
-            # /etc/hosts aliases.
+            # FQDN root form and reserved subdomains, and the `localdomain*`
+            # pseudo-TLDs of the stock /etc/hosts aliases.
             ("localhost", "loopback name"),
             ("localhost.", "loopback name"),
             ("app.localhost", "loopback name"),
             ("localhost.localdomain", "loopback name"),
-            ("ip6-localhost", "loopback name"),
+            ("localhost4.localdomain4", "loopback name"),
+            ("localhost6.localdomain6", "loopback name"),
+            # Every single-label name — it can only resolve through /etc/hosts
+            # or a search domain. This is what catches the distro aliases a
+            # hand-written list missed (Fedora's `localhost4`, found by the
+            # review), plus `ip6-localhost` and the machine's own hostname.
+            ("localhost4", "fully-qualified"),
+            ("localhost4.", "fully-qualified"),
+            ("LOCALHOST4", "fully-qualified"),
+            ("localhost6", "fully-qualified"),
+            ("ip6-localhost", "fully-qualified"),
+            ("ip6-loopback", "fully-qualified"),
+            ("myhost", "fully-qualified"),
             # Every IPv4 literal, loopback or not — including the abbreviated,
             # hex and integer forms the resolver (and every browser) accepts
             # but `ipaddress` does not, and the unspecified `0` / `0.0.0.0`.
@@ -1037,8 +1049,9 @@ class TestReviewFindings:
 
         A loopback *detector* lost to every spelling it did not enumerate
         (percent-encoding, fullwidth forms, `0`, `*.localhost`, and on Python
-        3.12.3 IPv4-mapped IPv6), so the rule is an allow-shape: an ASCII DNS
-        name, no IP literal of any kind, not a "this machine" name.
+        3.12.3 IPv4-mapped IPv6), so the rule is an allow-shape: a
+        fully-qualified ASCII DNS name, no IP literal of any kind, not under a
+        "this machine" pseudo-TLD.
         """
         with pytest.raises(ImproperlyConfigured, match=reason):
             validate_mcp_sql_settings({"CLIENTS": self._https_client(host)})

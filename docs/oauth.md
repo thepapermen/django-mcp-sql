@@ -506,10 +506,12 @@ the exact rule into "any port on the user's machine". Without a `local` entry
 the flag is left alone — DCR and the curated Application already accept any
 port on the loopback IPs, so it changes nothing this package promises.
 
-https entries carry a host rule of their own: the host must be an **ASCII DNS
-name** (an internationalised domain in its punycode `xn--` form), never an IP
-literal of any kind, and never `localhost`, `*.localhost` or a stock
-`/etc/hosts` loopback alias. The kind is derived from the scheme, so an https
+https entries carry a host rule of their own: the host must be a
+**fully-qualified ASCII DNS name** (an internationalised domain in its
+punycode `xn--` form) — never an IP literal of any kind, never a single-label
+name (`localhost4`, a machine's own hostname: those resolve only locally), and
+never under the `localhost` / `localdomain*` pseudo-TLDs (`app.localhost`,
+`localhost.localdomain`). The kind is derived from the scheme, so an https
 callback that actually pointed at the user's machine would be namespaced and
 audited as provider-hosted; refusing every non-DNS host is simpler, and harder
 to get wrong, than recognising every spelling of loopback. (A public DNS name
