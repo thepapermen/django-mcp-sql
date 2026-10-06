@@ -16,8 +16,10 @@ class McpSqlConfig(AppConfig):
     def validate_settings():
         from django.conf import settings
         from mcp_sql.validation import validate_mcp_sql_settings
+        from mcp_sql.validation import validate_oauth2_validator_class
 
         validate_mcp_sql_settings(settings.MCP_SQL)
+        validate_oauth2_validator_class()
 
     @staticmethod
     def warn_if_mfa_unconfigured():

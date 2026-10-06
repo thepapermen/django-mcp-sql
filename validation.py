@@ -372,3 +372,33 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
 
     _validate_profiles(cfg["PROFILES"])
     _validate_cloud_clients(cfg.get("CLOUD_CLIENTS", []))
+
+
+def validate_oauth2_validator_class() -> None:
+    """`OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]` must be `MCPOAuth2Validator`
+    or a subclass.
+
+    The package's OAuth server (`oauth_server.MCPServer`) is built with the
+    install's validator, and the client pinning (only mcp-sql Applications),
+    the `mcp:sql`-only scope, mandatory PKCE, the loopback / cloud redirect
+    rules and every install-wide backstop live in that class. With DOT's
+    stock validator and `PKCE_REQUIRED=False`, for example, a code was issued
+    and exchanged without PKCE. Checked at `ready()` so such an install
+    refuses to boot instead.
+    """
+    # Lazy: `mcp_sql.oauth` imports DOT models, so only once apps are ready.
+    from mcp_sql.oauth import MCPOAuth2Validator
+    from oauth2_provider.settings import oauth2_settings
+
+    validator_class = oauth2_settings.OAUTH2_VALIDATOR_CLASS
+    if not (
+        isinstance(validator_class, type)
+        and issubclass(validator_class, MCPOAuth2Validator)
+    ):
+        msg = (
+            "OAUTH2_PROVIDER['OAUTH2_VALIDATOR_CLASS'] must be "
+            "'mcp_sql.oauth.MCPOAuth2Validator' or a subclass of it "
+            f"(got {validator_class!r}): the MCP OAuth surface relies on it "
+            "for client, scope, PKCE and redirect enforcement."
+        )
+        raise ImproperlyConfigured(msg)
