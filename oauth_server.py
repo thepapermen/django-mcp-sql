@@ -20,6 +20,9 @@ discovery documents advertise (`views/discovery.py`):
 
 The package's views and `MCPOAuth2Authentication` use it whatever the consumer
 sets `OAUTH2_SERVER_CLASS` to (`MCPServerViewMixin`, `get_mcp_oauthlib_core`).
+DOT routes the device-code grant in `TokenView.post` before any server sees
+the request, so `views/oauth_token.py::MCPTokenView` also refuses every other
+`grant_type` itself.
 """
 
 from typing import Any
@@ -100,7 +103,9 @@ class MCPServer(
     grant and no introspection endpoint. oauthlib still hands an unknown
     `response_type` / `grant_type` to the default (authorization-code)
     handler, which answers `unsupported_response_type` /
-    `unsupported_grant_type`.
+    `unsupported_grant_type` — except `grant_type=openid`, which that grant
+    accepts as an alias; `MCPTokenView` refuses it, with every other value,
+    before the server runs.
 
     The signature is DOT's: it constructs the server with
     `oauth2_settings.server_kwargs` (`token_expires_in`, `token_generator`,
