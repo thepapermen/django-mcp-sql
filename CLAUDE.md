@@ -45,10 +45,12 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   never DOT's `get_oauthlib_core()` / `super().authenticate()`, which use the
   consumer's `OAUTH2_SERVER_CLASS`. `MCPTokenView.post`'s grant-type guard
   runs before DOT's own handling.
-- **The executor sends only `parser.render_for_execution` output**: SQL
-  proven to re-parse to exactly the validated AST (no comments). Never send
-  `ast.sql()` to the database directly — sqlglot's re-emission is not
-  faithful for every input.
+- **The executor sends only `parser.render_for_execution` output**: the
+  rendered text (no comments) itself passes the full `parse_and_validate`
+  and re-renders (by sqlglot) to the same string. Never send `ast.sql()` to
+  the database directly — sqlglot's re-emission is not faithful for every
+  input; source forms its lexer and Postgres's read differently are refused
+  by the parser's lexical-fidelity check (keep that list current).
 - **The read transaction is read-only while it runs and always rolled
   back** (`SET LOCAL transaction_read_only = on` in
   `session.enter_readonly_session`; `default_transaction_read_only` alone

@@ -165,7 +165,13 @@ to turn them on:
   cap still lives its `ACCESS_TOKEN_EXPIRE_SECONDS`, so access ends at most
   that long after the cap.
 - A refresh token with no recorded consent — minted by 0.1.0b5 or earlier,
-  or by a stock DOT view while refresh was off — is refused.
+  or written by any path that bypassed `MCPOAuth2Validator.save_bearer_token`
+  — is refused.
+- `MCPRefreshTokenFamily` rows past the cap are pruned at each new exchange.
+  Rows whose refresh tokens are gone (revoked, removed by `cleartokens`, or
+  refresh switched off again) are inert and safe to delete, e.g. next to
+  `cleartokens`:
+  `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.objects.values("token_family")).delete()`.
 - The discovery document and the DCR response (when the client asked for
   it) list `refresh_token`.
 - Logout and a password change delete the user's MCP refresh tokens with
@@ -188,7 +194,7 @@ test-minimal`) to prove the first column.
 | What ends access early | Losing staff / active / the profile (checked every request); logout; password change; deleting the tokens | Removing the MFA device | Expiry or deletion of every web session | — |
 | What the token can do | Read-only `SELECT` on the profile's whitelisted tables, in a read-only, rolled-back transaction, through the checked SQL only | — | — | — |
 
-## Dynamic Client Registration (RFC 7591)## Dynamic Client Registration (RFC 7591)
+## Dynamic Client Registration (RFC 7591)
 
 Claude Code's MCP SDK requires the AS to advertise a `registration_endpoint`
 and refuses to authenticate against an AS that doesn't. The AS metadata
@@ -610,8 +616,8 @@ Paths by urgency:
 
 | Urgency | Action | Effect |
 |---|---|---|
-| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose access **and refresh** tokens — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-cloud.<name>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
-| User- or admin-driven | The password changes (the user's own change, an admin reset, `set_unusable_password`) | Same deletion, from a `pre_save`/`post_save` pair on the user model (after the change commits); an `MCPAuthRejectionLog` row with reason `password_change`. Needs no session table. |
+| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose access **and refresh** tokens and pending authorization codes — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-cloud.<name>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
+| User- or admin-driven | The password changes (the user's own change, an admin reset, `set_unusable_password`; proxies of the user model included) | Same deletion, from a `pre_save`/`post_save` pair on the user model (after the change commits); an `MCPAuthRejectionLog` row with reason `password_change`. Needs no session table. Django's login-time hash upgrade is not a change. **Not seen:** bulk `User.objects.filter(...).update(password=...)` sends no model signals — delete the tokens explicitly (row below) when changing passwords that way. |
 | Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import AccessToken; AccessToken.objects.filter(user__email='alice@example.com').delete()"` | Outstanding tokens dropped in < 1 s; user can re-OAuth |
 | Operator, kick out | Remove from `mcp_sql_users` group (admin) | Outstanding tokens still exist in DB but `MCPOAuth2Authentication` re-checks the perm on every request and rejects. Combine with the token-delete shell snippet for a clean state. |
 

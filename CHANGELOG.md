@@ -24,24 +24,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   including `RESET ROLE` and writes, which committed (see the next entry).
   Escape strings with any backslash also changed value (`E'a\\nb'` ran as
   a newline, matching the wrong rows).
-  - The parser rejects an `E'…'` escape-string literal containing a
-    backslash and any identifier written as a string constant (`AS $$…$$`,
-    `AS 'x'`, `AS E'x'`), with the new rejection reason `unsafe_literal`,
-    before every other check. `E'…'` without a backslash, standard strings
-    with backslashes and `$$…$$` values stay accepted.
-  - The executor sends only SQL proven faithful: the LIMIT-wrapped query is
-    re-serialized without comments, re-parsed, and run only if it is a
-    single statement whose tree equals the validated one exactly — node
-    types, identifiers and their quoting, aliases and literal values.
-    Otherwise nothing runs and the attempt is audited with the new reason
-    `roundtrip_mismatch`. Comments are never sent (sqlglot rewrote `--`
-    comments as `/* */`, and their text is not checked).
+  - The parser refuses source forms sqlglot and Postgres read differently,
+    with the new rejection reason `unsafe_literal`, before every other
+    check: an `E'…'` escape-string literal containing a backslash, a
+    `U&'…'` / `U&"…"` Unicode escape (sqlglot 30.7 read it as `U & '…'`,
+    which then ran and could match different rows), any identifier written
+    as a string constant (`AS $$…$$`, `AS 'x'`, `AS E'x'`), and a
+    double-quoted function name (sqlglot folded `"Lower"(x)` onto
+    `LOWER(x)`). `E'…'` without a backslash, standard strings with
+    backslashes, `$$…$$` values and `U & 'x'` with spaces stay accepted;
+    the hint shows the replacement for each (`chr(10)` for a newline, ...).
+  - The executor validates the SQL it is about to send, not only the
+    agent's text: the LIMIT-wrapped query is rendered without comments,
+    the rendered text goes through the full validation again (same
+    whitelist, every check), and it must re-render (by sqlglot) to the
+    identical string. Otherwise nothing runs and the attempt is audited
+    with the new reason `roundtrip_mismatch`, naming the rendered SQL and
+    the failing check. Comments are never sent (sqlglot rewrote `--`
+    comments as `/* */`, and their text is not checked). Faithful rewrites
+    sqlglot makes (`ROUND(AVG(x), 2)` gaining a CAST, an expanded window
+    frame, `SOME` → `ANY`, `date_part` → `EXTRACT`) still run. The
+    guarantee is about what sqlglot reads in the executed text; forms whose
+    reading by Postgres is known to differ are refused by the parser (above).
+  - Any sqlglot failure while parsing — the tokenizer's `TokenError` for an
+    unterminated literal, the `re.error` sqlglot 30.21 raises for some
+    `UESCAPE` clauses — is now an audited `parse_error`; both escaped
+    `run_query` with no `MCPQueryLog` row before.
   - `standard_conforming_strings = on` joins the per-transaction guards
     (and the role defaults in `sql/role_setup.sql`): a database- or
     login-role-level `off` would make Postgres read backslashes in standard
     strings differently from the parser.
-  - **Behaviour change:** such literals and aliases are now refused; rewrite
-    them as standard strings / double-quoted identifiers. **Action:** re-run
+  - **Behaviour change:** the forms above are now refused; rewrite them as
+    the hint suggests (a few queries whose rendering no longer validates
+    are refused as `roundtrip_mismatch`; none of 23 common analytic shapes
+    in the test corpus is). **Action:** re-run
     `sql/role_setup.sql` (or `mcp_sql_role_setup`) to pick up the new role
     default; the per-transaction guard applies without it.
 - **The read transaction was not read-only (affects every release up to and
@@ -55,12 +71,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and `session_drift` (the `mcp_sql_smoke` check) reads the live flag.
 - **A password change left MCP tokens working (affects every release up to
   and including 0.1.0b5).** A changed password (the user's own change, an
-  admin reset, `set_unusable_password`) now revokes the user's MCP access
-  and refresh tokens after the change commits, with an
-  `MCPAuthRejectionLog` row (new reason `password_change`; migration 0013).
-  Done with model signals, so it needs no session table and holds with
-  `SESSION_MODEL=None`. Logout now deletes refresh tokens as well as access
-  tokens.
+  admin reset, `set_unusable_password`, including saves through a proxy
+  of the user model) now revokes the user's MCP access and refresh tokens
+  and pending authorization codes after the change commits, with an
+  `MCPAuthRejectionLog` row (new reason `password_change`; migration
+  0013). Done with model signals, so it needs no session table and holds
+  with `SESSION_MODEL=None`; Django's login-time password-hash upgrade is
+  not treated as a change. Bulk `QuerySet.update(password=...)` sends no
+  signals and is not seen — revoke tokens explicitly there. Logout now
+  deletes refresh tokens and pending authorization codes as well as access
+  tokens (a code issued just before either event could otherwise still be
+  exchanged for a new token).
 - **The app booted with any DOT validator.** The package's OAuth server is
   built with the install's `OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]`, and
   the client pinning, the `mcp:sql`-only scope, mandatory PKCE and the
@@ -286,9 +307,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `ROTATE_REFRESH_TOKEN` says), and refuses the chain once that many seconds
   have passed since the user's consent — measured from the
   authorization-code exchange across every rotation (new
-  `MCPRefreshTokenFamily` model, migration 0013), not DOT's sliding
-  `REFRESH_TOKEN_EXPIRE_SECONDS`. Refresh tokens without a recorded consent
-  (from earlier releases) stay refused. The discovery document and DCR
+  `MCPRefreshTokenFamily` model, migration 0013, which also revokes
+  `mcp_readonly_role`'s SELECT on it like the package's other tables), not
+  DOT's sliding `REFRESH_TOKEN_EXPIRE_SECONDS`. The value must be an int
+  from 0 to ten years (`ImproperlyConfigured` otherwise). Refresh tokens
+  without a recorded consent (from earlier releases) stay refused; family
+  rows whose refresh tokens are gone are inert and safe to prune. The discovery document and DCR
   responses list `refresh_token` while it is on. Logout and password change
   revoke refresh tokens. Runbook: `docs/oauth.md` "Refresh tokens
   (opt-in)".
