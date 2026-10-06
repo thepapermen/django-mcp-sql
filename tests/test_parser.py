@@ -814,6 +814,65 @@ class TestNoTableQuery:
         assert out.referenced_tables == set()
 
 
+class TestLexicalFidelity:
+    """Input whose sqlglot re-serialization would not mean the same thing to
+    Postgres is rejected as UNSAFE_LITERAL (ledger F32 and variants)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # E'\\' (one backslash) re-emits as e'\', swallowing its quote.
+            "SELECT E'\\\\' AS v, 'AS w, codename FROM auth_group --' AS x "
+            "FROM auth_permission",
+            "SELECT e'a\\nb' AS v FROM auth_permission",
+            "SELECT E'\\x27' AS v FROM auth_permission",
+            "SELECT E'\\u0027' AS v FROM auth_permission",
+            "SELECT E'\\'' AS v FROM auth_permission",
+            "SELECT id FROM auth_permission WHERE codename = E'a\\\\nb'",
+        ],
+        ids=["quote-swallow", "newline", "hex", "unicode", "escaped-quote", "where"],
+    )
+    def test_escape_string_with_backslash(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 AS $$x, version() AS v$$ FROM auth_permission",
+            "SELECT 1 AS $t$x FROM pg_class --$t$ FROM auth_permission",
+            "SELECT 1 AS $$x; RESET ROLE; SELECT 1 --$$ FROM auth_permission",
+        ],
+        ids=["extra-projection", "comment-tail", "multi-statement"],
+    )
+    def test_dollar_quoted_alias_that_is_not_an_identifier(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT E'it''s' AS v FROM auth_permission",
+            "SELECT 'a\\b' AS v FROM auth_permission",
+            "SELECT $$it's$$ AS v FROM auth_permission",
+            'SELECT codename AS "a b"" c" FROM auth_permission',
+            "SELECT codename AS é_x$1 FROM auth_permission",
+        ],
+        ids=[
+            "escape-string-no-backslash",
+            "standard-string",
+            "dollar-string",
+            "quoted-alias",
+            "unicode-alias",
+        ],
+    )
+    def test_faithful_forms_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    def test_before_every_ast_check(self):
+        # The checked tree cannot be trusted to be what runs, so this names
+        # the problem ahead of the table / system-schema checks.
+        _expect_reject("SELECT E'\\\\' FROM pg_class", OutcomeReason.UNSAFE_LITERAL)
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

@@ -79,6 +79,15 @@ class OutcomeReason(StrEnum):
     SYSTEM_SCHEMA = "system_schema"
     WRITEABLE_CTE = "writeable_cte"
     SELECT_INTO = "select_into"
+    # The SQL contains a literal or identifier whose re-serialization by
+    # sqlglot is not faithful (an `E'…'` escape string with a backslash, an
+    # alias written as a string constant), so the SQL sent to Postgres could
+    # differ from the SQL that was checked. Parser-side.
+    UNSAFE_LITERAL = "unsafe_literal"
+    # Executor-side backstop for the same class: the final SQL (after LIMIT
+    # wrapping) did not re-parse to exactly the validated AST, so it was not
+    # executed.
+    ROUNDTRIP_MISMATCH = "roundtrip_mismatch"
     EXECUTION_ERROR = "execution_error"
     TIMEOUT = "timeout"
     MISCONFIGURED = "misconfigured"
@@ -133,6 +142,15 @@ HINTS: dict[str, str] = {
         "rejected even when the outer statement is a SELECT."
     ),
     OutcomeReason.SELECT_INTO: "SELECT INTO writes a new table. Use SELECT only.",
+    OutcomeReason.UNSAFE_LITERAL: (
+        "Escape-string literals with a backslash (E'...\\...') and aliases "
+        "written as string constants are rejected. Use a standard string "
+        "('...', doubling any quote) or a double-quoted alias instead."
+    ),
+    OutcomeReason.ROUNDTRIP_MISMATCH: (
+        "The query could not be re-serialized faithfully, so it was not run. "
+        "Rewrite unusual literals or identifiers in plain form and retry."
+    ),
     OutcomeReason.DISALLOWED_CONSTRUCT: (
         "The SQL uses a construct that is not supported on the MCP surface. "
         "See `error` for the specific construct and the recommended "

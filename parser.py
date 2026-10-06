@@ -2,12 +2,15 @@
 no Django imports). See `docs/architecture.md` for design /
 "Watch out" / parser-check ordering rules."""
 
+import re
 from dataclasses import dataclass
 
 import sqlglot
 import sqlglot.errors
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.tokens import TokenType
 
 DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
     {
@@ -221,6 +224,7 @@ def parse_and_validate(
     # `exp.Returning` only appears under write nodes, which NON_SELECT_ROOT
     # rejects first). Tables before SELECT_STAR so `SELECT * FROM pg_class`
     # attributes to the system schema, not the ergonomic star rule.
+    _check_lexical_fidelity(raw_sql, ast)
     _check_ctes_read_only(ast)
     _check_no_recursive_cte(ast)
     _check_no_select_into(ast)
@@ -249,6 +253,56 @@ def parse_and_validate(
         normalized_sql=normalized_sql,
         referenced_tables=referenced_tables,
     )
+
+
+# What PostgreSQL accepts as an unquoted identifier: a letter (any Unicode
+# letter) or underscore, then letters, digits, underscores or `$`.
+_UNQUOTED_IDENTIFIER_RE = re.compile(r"[^\W\d]\w*(?:[$]\w*)*")
+
+
+def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
+    """Reject input whose re-serialization by sqlglot is not faithful.
+
+    The executor sends sqlglot's re-emission of the checked AST to
+    Postgres, not `raw_sql`, so what runs is only what was checked if the
+    re-emission means the same thing to Postgres. Two known gaps (ledger
+    F32 and its variants), both present across the supported sqlglot range:
+
+    - An escape-string literal (`E'…'`, any case — sqlglot's `BYTE_STRING`
+      token in the postgres dialect) is decoded on parse but re-emitted with
+      its backslashes un-escaped: `E'\\\\'` (one backslash) comes back as
+      `e'\\'`, which swallows its closing quote and turns later literal text
+      into SQL; `E'a\\\\nb'` comes back as a newline. Any such literal
+      containing a backslash is rejected; one without (`E'it''s'`) is
+      faithful and allowed. Checked on the raw token text, because the
+      parsed value no longer shows which escapes were written.
+    - An alias written as a string constant (`AS $$…$$`, `AS $t$…$t$`) —
+      which Postgres itself would refuse — becomes an UNQUOTED identifier
+      whose text is re-emitted verbatim, so `AS $$x, version() AS v$$`
+      re-emits as two projections. Any unquoted identifier that is not a
+      plain Postgres identifier is rejected.
+
+    The executor's round-trip check (`executor.run_query`) is the backstop
+    for anything else of this class.
+    """
+    tokens = Dialect.get_or_raise("postgres").tokenize(raw_sql)
+    for token in tokens:
+        if (
+            token.token_type == TokenType.BYTE_STRING
+            and "\\" in raw_sql[token.start : token.end + 1]
+        ):
+            msg = (
+                "Escape-string literals containing a backslash (E'...\\...') "
+                "are not supported; use a standard string literal"
+            )
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+    for ident in ast.find_all(exp.Identifier):
+        if not ident.quoted and not _UNQUOTED_IDENTIFIER_RE.fullmatch(ident.name):
+            msg = (
+                f"Identifier {ident.name!r} is not a plain identifier (an alias "
+                "written as a string constant?); use a double-quoted identifier"
+            )
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
 
 
 def inject_limit(ast: exp.Query, n: int) -> exp.Query:
