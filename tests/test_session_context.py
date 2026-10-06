@@ -20,7 +20,7 @@ def test_dormant_by_default_issues_no_set_config():
     enter_readonly_session(cur, role="mcp_readonly_role")
     sql = _executed_sql(cur)
     assert any("SET LOCAL ROLE mcp_readonly_role" in s for s in sql)
-    # The four static guard GUCs, and nothing via set_config.
+    # The static guard GUCs, and nothing via set_config.
     assert not any("set_config" in s for s in sql)
 
 
@@ -85,7 +85,7 @@ _ROLE = "mcp_readonly_role"
 
 class TestSessionDrift:
     """`session_drift` is the smoke/executor pre-flight check that the read
-    connection actually entered the role + the four `SET LOCAL` guards.
+    connection actually entered the role + every `SET LOCAL` guard.
     Exercised against a real connection (the in-package readonly role is
     bootstrapped by `sql/role_setup.sql`, per CONTRIBUTING)."""
 
@@ -101,7 +101,7 @@ class TestSessionDrift:
             enter_readonly_session(cur, role=_ROLE)
             drift = session_drift(cur, "some_other_role")
         assert drift["current_user"] == ("some_other_role", _ROLE)
-        # The four GUCs still match — only current_user drifted.
+        # The GUCs still match — only current_user drifted.
         assert set(drift) == {"current_user"}
 
     @pytest.mark.django_db

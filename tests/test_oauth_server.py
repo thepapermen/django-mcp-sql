@@ -205,9 +205,24 @@ class TestTokenEndpointGrantTypes:
 class TestAuthorizeEndpointResponseTypes:
     """`/o/authorize/` serves the `code` response type only."""
 
-    @pytest.mark.parametrize("response_type", ["token", "id_token", "bogus"])
+    @pytest.mark.parametrize(
+        ("response_type", "error"),
+        [
+            # No `code` in it: oauthlib's grant answers.
+            ("token", "unsupported_response_type"),
+            ("id_token", "unsupported_response_type"),
+            ("bogus", "unsupported_response_type"),
+            # `none`, or `code` with something else: DOT's
+            # `validate_response_type` answers (docs/oauth.md says which).
+            ("none", "unauthorized_client"),
+            ("code token", "unauthorized_client"),
+            ("code id_token", "unauthorized_client"),
+            ("codex", "unauthorized_client"),
+        ],
+    )
+    @pytest.mark.usefixtures("mcp_app", "mcp_mfa_on")
     def test_non_code_response_type_is_refused(
-        self, client, mcp_app, mcp_user, mcp_mfa_on, response_type
+        self, client, mcp_user, response_type, error
     ):
         client.force_login(mcp_user)
         _verifier, challenge = _s256_pair()
@@ -223,7 +238,7 @@ class TestAuthorizeEndpointResponseTypes:
         query = _authorize_query(
             client.get(reverse("authorize") + "?" + urlencode(params))
         )
-        assert query["error"] == ["unsupported_response_type"]
+        assert query["error"] == [error]
         assert "code" not in query
         assert not AccessToken.objects.exists()
         assert not Grant.objects.exists()
@@ -563,7 +578,12 @@ class TestControlCharacters:
             {"grant_type": "authorization_code", "code": "x"},
         )
         assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert response.json()["error"] == "invalid_request"
+        # oauthlib refuses any query string at the token endpoint with the
+        # same error code; the description shows the package's check ran.
+        assert response.json() == {
+            "error": "invalid_request",
+            "error_description": "Control character in a request parameter.",
+        }
 
     @pytest.mark.parametrize(
         "credentials", [b"\x00:x", b"%00:x"], ids=["raw", "percent-encoded"]
