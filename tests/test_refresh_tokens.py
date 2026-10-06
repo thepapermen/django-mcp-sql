@@ -17,8 +17,12 @@ from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 import pytest
+from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.signals import user_logged_out
 from django.core.exceptions import ImproperlyConfigured
+from django.db import DatabaseError
+from django.db import transaction
 from django.test import RequestFactory
 from django.urls import reverse
 from django.utils import timezone
@@ -30,6 +34,7 @@ from mcp_sql.tests.settings import MCP_SQL as BASE_MCP_SQL
 from mcp_sql.validation import validate_mcp_sql_settings
 from mcp_sql.views.oauth_token import MCPTokenView
 from oauth2_provider.models import AccessToken
+from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauthlib.oauth2.rfc6749.grant_types import RefreshTokenGrant
 
@@ -269,3 +274,120 @@ class TestPasswordChangeRevokes:
             save(mcp_user)
         assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
         assert not MCPAuthRejectionLog.objects.exists()
+
+
+class _StaffUserProxy(get_user_model()):  # type: ignore[misc]
+    """A proxy of the user model, as an admin may be registered on one."""
+
+    class Meta:
+        proxy = True
+        app_label = "mcp_sql_testapp"
+
+
+@pytest.mark.django_db
+class TestPasswordChangeEdgeCases:
+    """Review round 2: proxies, the login-time hash upgrade, failed saves,
+    unusable passwords, and pending authorization codes."""
+
+    @pytest.fixture(autouse=True)
+    def _no_session_gate(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": None}
+
+    def test_proxy_model_save_revokes(
+        self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        proxy = _StaffUserProxy.objects.get(pk=mcp_user.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            proxy.set_password("a-new-password-123")
+            proxy.save()
+        assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+
+    def test_login_time_hash_upgrade_revokes_nothing(
+        self, settings, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        # Stored with an older hasher: `check_password` re-hashes it with the
+        # preferred one and saves `update_fields=["password"]`.
+        mcp_user.password = make_password("same-password", hasher="md5")
+        mcp_user.save()
+        settings.PASSWORD_HASHERS = [
+            "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+            "django.contrib.auth.hashers.MD5PasswordHasher",
+        ]
+        old_hash = mcp_user.password
+        with django_capture_on_commit_callbacks(execute=True):
+            assert mcp_user.check_password("same-password")
+        assert type(mcp_user)._default_manager.get(pk=mcp_user.pk).password != (
+            old_hash
+        )  # the upgrade happened ...
+        # ... and is not a password change.
+        assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+        assert not MCPAuthRejectionLog.objects.exists()
+
+    def test_unusable_password_with_update_fields_revokes(
+        self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        with django_capture_on_commit_callbacks(execute=True):
+            mcp_user.set_unusable_password()
+            mcp_user.save(update_fields=["password"])
+        assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+
+    def test_a_failed_save_leaves_no_pending_revocation(
+        self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        good_name = mcp_user.get_username()
+        old_hash = mcp_user.password
+        mcp_user.set_password("never-committed")
+        setattr(mcp_user, mcp_user.USERNAME_FIELD, "x" * 400)
+        with pytest.raises(DatabaseError), transaction.atomic():
+            mcp_user.save()
+        setattr(mcp_user, mcp_user.USERNAME_FIELD, good_name)
+        mcp_user.password = old_hash
+        with django_capture_on_commit_callbacks(execute=True):
+            mcp_user.save(update_fields=[mcp_user.USERNAME_FIELD])
+        assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+
+    @pytest.mark.parametrize("event", ["password-change", "logout"])
+    @pytest.mark.usefixtures("mcp_app", "mcp_mfa_on")
+    def test_pending_authorization_codes_are_deleted(
+        self, client, mcp_user, event, django_capture_on_commit_callbacks
+    ):
+        client.force_login(mcp_user)
+        verifier, challenge = _s256_pair()
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "redirect_uri": _LOOPBACK,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        location = client.get(reverse("authorize") + "?" + urlencode(params))[
+            "Location"
+        ]
+        code = parse_qs(urlparse(location).query)["code"][0]
+        assert Grant.objects.filter(user=mcp_user).exists()
+        with django_capture_on_commit_callbacks(execute=True):
+            if event == "logout":
+                user_logged_out.send(
+                    sender=type(mcp_user),
+                    request=RequestFactory().get("/logout/"),
+                    user=mcp_user,
+                )
+            else:
+                mcp_user.set_password("a-new-password-123")
+                mcp_user.save()
+        assert not Grant.objects.filter(user=mcp_user).exists()
+        response = client.post(
+            reverse("token"),
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _LOOPBACK,
+                "client_id": "mcp-sql",
+                "code_verifier": verifier,
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_grant"
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
