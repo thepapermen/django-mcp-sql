@@ -399,12 +399,13 @@ DRF:
   already pins one.
 - **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13** — hence
   the ragged Python columns.
-- `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
-  Django-version-coupled within their declared ranges. django-oauth-toolkit
-  is floored at **3.4.1** on every row: earlier releases have an
-  unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed in
-  3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
-  §2.1).
+- `django-oauth-toolkit`, `oauthlib`, `mcp`, `sqlglot`, `a2wsgi`, and
+  `pydantic` are not Django-version-coupled within their declared ranges.
+  django-oauth-toolkit is floored at **3.4.1** on every row: earlier releases
+  have an unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed
+  in 3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
+  §2.1). `oauthlib` (3.3.0+, below 5) is declared directly because the
+  package builds its OAuth server from oauthlib's classes.
 
 ### Dropping into an existing app with an older pinned DRF
 

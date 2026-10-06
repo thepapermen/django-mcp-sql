@@ -87,6 +87,14 @@ dependencies = [
     # (3.4 also ships RFC 8707 resource indicators; the package does not use
     # them — audience binding stays implicit, see docs/architecture.md.)
     "django-oauth-toolkit>=3.4.1,<4",
+    # Imported directly, not only through DOT: `oauth_server.MCPServer` is
+    # built from oauthlib's endpoints, grant and bearer classes, and relies
+    # on two of their internals (`AuthorizationCodeGrant._code_challenge_methods`,
+    # the per-grant `refresh_token` flag; pinned by
+    # `tests/test_oauth_server.py::TestOauthlibInternals`). Floor 3.3.0 =
+    # DOT 3.4.1's own floor (exercised by CI's min-versions job); cap <5 so
+    # a new major is reviewed against those internals first.
+    "oauthlib>=3.3.0,<5",
     # The parser is the security boundary and sqlglot bumps majors often
     # with breaking AST changes — deliberately the tightest cap; widen
     # per-major only after the CI matrix proves it.

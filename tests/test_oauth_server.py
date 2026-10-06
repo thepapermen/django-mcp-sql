@@ -703,3 +703,22 @@ class TestDotStrictQueryTokenSetting:
             **headers,
         )
         assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+
+class TestOauthlibInternals:
+    """`MCPServer` leans on oauthlib internals that are not public API; a new
+    oauthlib release that renames them must fail here, not silently widen
+    the server (a renamed method table would bring `plain` PKCE back)."""
+
+    def test_code_challenge_method_table_exists(self):
+        from oauthlib.oauth2.rfc6749.grant_types import AuthorizationCodeGrant
+
+        table = AuthorizationCodeGrant._code_challenge_methods
+        assert isinstance(table, dict)
+        assert set(table) == {"plain", "S256"}
+        assert set(MCPAuthorizationCodeGrant._code_challenge_methods) == {"S256"}
+
+    def test_grant_reads_its_refresh_token_flag(self):
+        # `GrantTypeBase.__init__` copies the class attribute onto the
+        # instance, and `create_token_response` passes it to the handler.
+        assert MCPAuthorizationCodeGrant(MCPOAuth2Validator()).refresh_token is False
