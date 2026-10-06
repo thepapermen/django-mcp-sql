@@ -778,6 +778,24 @@ class TestMCPAuthorizationViewConsentTemplate:
         assert captured["resource_name"] == "preset"
 
 
+@pytest.mark.django_db
+class TestConsentFormInvalidRender:
+    """DOT's `form_invalid` re-renders the consent template without
+    `application`; `{{ resource_name|default:application.name }}` resolved
+    the filter argument anyway and raised `VariableDoesNotExist` (500)."""
+
+    def test_incomplete_consent_post_renders(self, client, mcp_user, mcp_mfa_on):
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        _verifier, challenge = _s256_pair()
+        params = _authorize_params(client_id, challenge, "S256")
+        del params["scope"]  # a required AllowForm field
+        response = client.post(reverse("authorize"), data={**params, "allow": "1"})
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert b"MCP SQL" in response.content
+        assert not Grant.objects.exists()
+
+
 class TestOauthAdminUnregistered:
     """DOT ModelAdmin classes must not be reachable via Django admin.
 

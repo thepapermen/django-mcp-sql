@@ -52,11 +52,14 @@ class MCPAuthorizationView(MCPServerViewMixin, AuthorizationView):
     template_name = "mcp_sql/authorize.html"
 
     def render_to_response(self, context, **response_kwargs):
-        # `render_to_response` is the single chokepoint for the only two
-        # template renders this view performs: the consent page (`get`)
-        # and the fatal-client-error page (`error_response` when oauthlib
-        # refuses to redirect — unknown `client_id` / untrusted
-        # `redirect_uri`). Every other outcome is a redirect (recoverable
+        # `render_to_response` is the single chokepoint for every template
+        # render this view performs: the consent page (`get`), its
+        # re-render when the consent POST's form is invalid (DOT's
+        # `form_invalid`, whose context has no `application`), and the
+        # fatal-client-error page (`error_response` when oauthlib refuses
+        # to redirect — unknown `client_id` / untrusted `redirect_uri` —
+        # or when `dispatch` screens out a parameter). Every other outcome
+        # is a redirect (recoverable
         # OAuth errors bounce back to the client, success carries the auth
         # code, login / `prompt=none` 302), and a failed issuance gate
         # raises `PermissionDenied` rendered by the consumer's 403 page —
