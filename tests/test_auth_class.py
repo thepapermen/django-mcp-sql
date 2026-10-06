@@ -714,6 +714,13 @@ _ACCEPT = {"HTTP_ACCEPT": "application/json, text/event-stream"}
 @pytest.mark.django_db
 @pytest.mark.usefixtures("_isolated_mcp_cache", "mcp_mfa_on", "mcp_active_session")
 @pytest.mark.parametrize("url", _MCP_URLS)
+# DOT's own RFC 9700 nag for a query-string token: expected here, the point is
+# that the token is ignored all the same (`test_oauth_server.py` pins DOT's
+# opt-in setting that refuses such a request without it).
+@pytest.mark.filterwarnings(
+    "ignore:Presenting an OAuth 2.0 access token in the URI query string"
+    ":DeprecationWarning"
+)
 class TestBearerTokenOnlyInHeader:
     """A bearer token is accepted from the `Authorization` header only.
 

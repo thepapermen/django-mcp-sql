@@ -376,6 +376,10 @@ class TestConsumerServerClassDoesNotWiden:
         )
         assert response.json() == {"error": "unsupported_grant_type"}
 
+    @pytest.mark.filterwarnings(
+        "ignore:Presenting an OAuth 2.0 access token in the URI query string"
+        ":DeprecationWarning"
+    )
     def test_query_string_token_stays_refused(
         self, client, mcp_access_token, mcp_mfa_on, mcp_active_session
     ):
