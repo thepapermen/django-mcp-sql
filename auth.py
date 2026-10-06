@@ -28,20 +28,14 @@ is `logger.exception`-logged but does not mask the underlying
 """
 
 import logging
-from io import BytesIO
 from typing import TYPE_CHECKING
 from typing import Any
 
 from django.apps import apps
-from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import SuspiciousOperation
-from django.core.files.uploadhandler import load_handler
 from django.db import DatabaseError
 from django.http import HttpRequest
-from django.http import QueryDict
-from django.http.multipartparser import MultiPartParser
-from django.http.multipartparser import MultiPartParserError
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import throttle
@@ -57,7 +51,6 @@ from oauth2_provider.contrib.rest_framework import OAuth2Authentication
 from rest_framework import exceptions
 from rest_framework.exceptions import APIException
 from rest_framework.request import Request
-from rest_framework.request import is_form_media_type
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
@@ -118,63 +111,6 @@ def _enforce_body_size_cap(django_request: HttpRequest) -> None:
         raise PayloadTooLarge
 
 
-# RFC 6750 names this parameter for the two token transports this endpoint
-# refuses: the URI query (§2.3) and a form-encoded body (§2.2).
-_TOKEN_PARAM = "access_token"  # noqa: S105 — an RFC 6750 parameter name, not a credential.
-
-
-class BearerTokenOutsideHeader(exceptions.AuthenticationFailed):
-    """400 `invalid_request` (RFC 6750 §3.1) for an `access_token` parameter.
-
-    A subclass of `AuthenticationFailed`, not a bare `APIException`, so DRF
-    still attaches our `WWW-Authenticate` challenge (it does so only for
-    authentication failures, and keeps the status as long as there is one).
-    The status is 400 rather than 401: the request is malformed, not merely
-    unauthenticated. The detail doubles as the challenge's `error_description`,
-    so it must stay free of `"` and `\\` (RFC 6750 §3).
-    """
-
-    status_code = 400
-    default_detail = "access_token must be sent in the Authorization header only"
-    default_code = "invalid_request"
-
-
-def _carries_token_outside_header(django_request: HttpRequest) -> bool:
-    """True if an `access_token` parameter rides in the query or a form body.
-
-    oauthlib (and so DOT) accepts a bearer token from either place when there is
-    no `Authorization` header (RFC 6750 §2.2/§2.3); this endpoint accepts the
-    header only. The body is parsed here from the cached raw bytes, for form
-    media types only and on EVERY method: DOT reads the token through DRF's
-    `Request.POST`, which runs the form parsers whatever the method, whereas
-    Django's own `request.POST` is filled for POST alone — so checking that
-    would miss a form-body token on GET / DELETE / OPTIONS / PUT. The JSON-RPC
-    body is never parsed here, the bytes stay cached for the MCP bridge, and
-    the multipart parse uses fresh upload handlers so it leaves the request's
-    own untouched. A form body that cannot be parsed counts as carrying no
-    token: DRF's parsers, and so DOT, could not read one from it either.
-    """
-    if _TOKEN_PARAM in django_request.GET:
-        return True
-    if not is_form_media_type(django_request.content_type or ""):
-        return False
-    body = django_request.body
-    fields: QueryDict
-    if django_request.content_type == "application/x-www-form-urlencoded":
-        fields = QueryDict(body, encoding=django_request.encoding)
-    else:  # multipart/form-data
-        handlers = [
-            load_handler(path, django_request) for path in settings.FILE_UPLOAD_HANDLERS
-        ]
-        try:
-            fields, _files = MultiPartParser(
-                django_request.META, BytesIO(body), handlers, django_request.encoding
-            ).parse()
-        except MultiPartParserError:
-            return False
-    return _TOKEN_PARAM in fields
-
-
 class MCPOAuth2Authentication(OAuth2Authentication):
     """OAuth2 bearer auth + per-request user-state revalidation."""
 
@@ -189,17 +125,9 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         metadata_url = request.build_absolute_uri(
             reverse("mcp_sql_protected_resource_metadata")
         )
-        challenge = 'Bearer realm="api"'
-        # Set by `authenticate` when it refuses a token outside the header:
-        # RFC 6750 §3 puts the error code in the challenge itself.
-        if getattr(request, "mcp_sql_bearer_error", None):
-            challenge += (
-                ', error="invalid_request", '
-                f'error_description="{BearerTokenOutsideHeader.default_detail}"'
-            )
-        return f'{challenge}, resource_metadata="{metadata_url}"'
+        return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 
-    def authenticate(self, request):  # noqa: C901, PLR0912, PLR0915 — linear defense-in-depth chain reads better than extracted helpers
+    def authenticate(self, request):  # noqa: C901, PLR0912 — linear defense-in-depth chain reads better than extracted helpers
         # `_verify_bearer` calls `oauthlib_core.verify_request`, which
         # extracts the body via DRF's `request.POST`; that runs DRF's parsers
         # (JSON for the MCP wire protocol, and the default form / multipart
@@ -208,8 +136,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # `RawPostDataException`. Force-cache the raw bytes on the underlying
         # Django HttpRequest BEFORE it runs — always, whatever the method
         # or content type — so the MCP view can still re-seed `wsgi.input`
-        # from `request.body`, and so `_carries_token_outside_header` can
-        # parse a form body from the cached bytes.
+        # from `request.body`.
         django_request = getattr(request, "_request", request)
         _enforce_body_size_cap(django_request)
         # The `hasattr` guard makes the force-cache idempotent — a re-run
@@ -218,26 +145,18 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         if not hasattr(django_request, "_body"):
             _ = django_request.body
 
-        # Header-only bearer tokens (RFC 6750 §2.1). oauthlib would otherwise
-        # take an `access_token` from the query string or a form body when no
-        # `Authorization` header is present — a token in a URL lands in proxy
-        # and access logs and in Referer headers, and the MCP spec forbids it
-        # outright. Refuse any request carrying the parameter, even alongside a
-        # valid header (one strict rule; "header wins" would still invite
-        # clients to put tokens in URLs), and refuse it HERE, before the
-        # throttle and before any token lookup, so a URL token is never
-        # validated: the 400 answers the same for a valid and a bogus token
-        # and is no token oracle. Like the body cap above it is malformed
-        # transport, not a resolved-user denial: no `MCPAuthRejectionLog`
-        # row, and no `bad_token` throttle count.
-        if _carries_token_outside_header(django_request):
-            django_request.mcp_sql_bearer_error = True
-            raise BearerTokenOutsideHeader
+        # Header-only bearer tokens (RFC 6750 §2.1) are the server's job:
+        # `_verify_bearer` runs on `MCPServer`, whose `HeaderOnlyBearer` never
+        # reads an `access_token` query or form parameter. A request carrying
+        # its token only there is simply unauthenticated — never looked up,
+        # not counted by the `bad_token` throttle (no `Authorization`
+        # header), answered with the ordinary 401 challenge — and beside a
+        # header the parameter is ignored: the header's token decides.
 
         # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate`, on
         # `MCPServer`) returns `None` on bad / expired / unknown / revoked
-        # tokens (it does NOT raise — it sets `request.oauth2_error` and
-        # yields the anonymous result). The only paths from it that DO raise
+        # tokens (it does NOT raise — it yields the anonymous result). The
+        # only paths from it that DO raise
         # are `SuspiciousOperation`
         # (hex-encoding bug) and re-raised `ValueError` from oauthlib —
         # both indicate malformed transport, not credential probing; we

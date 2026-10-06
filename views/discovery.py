@@ -50,11 +50,11 @@ def _cors(response: JsonResponse) -> JsonResponse:
 def protected_resource_metadata(request):
     """RFC 9728 Protected Resource Metadata for the MCP SQL surface.
 
-    `bearer_methods_supported: ["header"]` is backed by our own refusal, not
-    by DOT: oauthlib (and so DOT) would also take an `access_token` from the
-    query string or a form body, so `MCPOAuth2Authentication` answers any
-    request carrying that parameter with a 400 `invalid_request` before any
-    token lookup (`auth.py::_carries_token_outside_header`).
+    `bearer_methods_supported: ["header"]` is enforced by the package, not by
+    DOT's default: oauthlib's stock bearer handler would also take an
+    `access_token` from the query string or a form body, but
+    `MCPOAuth2Authentication` verifies on `oauth_server.MCPServer`, whose
+    `HeaderOnlyBearer` reads the `Authorization` header only.
     """
     return _cors(
         JsonResponse(

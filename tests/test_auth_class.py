@@ -717,18 +717,19 @@ _ACCEPT = {"HTTP_ACCEPT": "application/json, text/event-stream"}
 class TestBearerTokenOnlyInHeader:
     """A bearer token is accepted from the `Authorization` header only.
 
-    oauthlib (and so DOT) also takes an `access_token` from the query string
-    or a form body when no header is present — every release up to and
-    including 0.1.0b5 authenticated `/mcp/sql/?access_token=<token>`. Any
-    request carrying that parameter is now a 400 `invalid_request` (RFC 6750
-    §3.1) with the usual `resource_metadata` challenge, even alongside a valid
-    header, and the URL/body token is never looked up.
+    oauthlib's stock `BearerToken` (and so DOT) also takes an `access_token`
+    from the query string or a form body when no header is present — every
+    release up to and including 0.1.0b5 authenticated
+    `/mcp/sql/?access_token=<token>`. On `MCPServer`'s `HeaderOnlyBearer`
+    such a parameter is not a credential: a request carrying a token only
+    there is unauthenticated (the ordinary 401 challenge, the same for a
+    valid and a bogus token), the parameter is never looked up, and beside a
+    header it is ignored — the header's token decides.
     """
 
     @pytest.fixture
     def token_lookups(self, monkeypatch) -> list:
-        # Spy on DOT's token lookup — the guard must fire before it, so a URL
-        # token is never validated.
+        # Spy on DOT's token lookup: a parameter token must never reach it.
         calls: list = []
         original = OAuth2Validator._load_access_token
 
@@ -739,15 +740,15 @@ class TestBearerTokenOnlyInHeader:
         monkeypatch.setattr(OAuth2Validator, "_load_access_token", spy)
         return calls
 
-    def _assert_refused(self, response, token_lookups) -> None:
-        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+    def _assert_unauthenticated(self, response, token_lookups) -> None:
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
         challenge = response["WWW-Authenticate"]
         assert challenge.startswith('Bearer realm="api"')
-        assert 'error="invalid_request"' in challenge
         assert "resource_metadata=" in challenge
+        assert "error=" not in challenge
         assert token_lookups == []
-        # Malformed transport, not a resolved-user denial: no audit row, and
-        # no bad-token throttle count.
+        # No `Authorization` header: anonymous traffic, not a resolved-user
+        # denial (no audit row) and not a bearer probe (no throttle count).
         assert not MCPAuthRejectionLog.objects.exists()
         assert cache.get("mcp_sql:bad_token:ip:127.0.0.1") is None
 
@@ -760,9 +761,9 @@ class TestBearerTokenOnlyInHeader:
             **_ACCEPT,
         )
         assert response.status_code == HTTPStatus.OK, response.content
-        assert len(token_lookups) == 1
+        assert token_lookups == [mcp_access_token.token]
 
-    def test_valid_token_in_query_is_refused(
+    def test_valid_token_in_query_is_not_a_credential(
         self, client, url, mcp_access_token, token_lookups
     ):
         response = client.post(
@@ -771,9 +772,9 @@ class TestBearerTokenOnlyInHeader:
             content_type="application/json",
             **_ACCEPT,
         )
-        self._assert_refused(response, token_lookups)
+        self._assert_unauthenticated(response, token_lookups)
 
-    def test_bogus_token_in_query_is_400_not_401(self, client, url, token_lookups):
+    def test_bogus_token_in_query_gets_the_same_401(self, client, url, token_lookups):
         # Same answer as for a valid token: the URL token is never checked.
         response = client.post(
             f"{url}?access_token=not-a-token",
@@ -781,21 +782,36 @@ class TestBearerTokenOnlyInHeader:
             content_type="application/json",
             **_ACCEPT,
         )
-        self._assert_refused(response, token_lookups)
+        self._assert_unauthenticated(response, token_lookups)
 
-    def test_header_plus_query_token_is_refused(
+    def test_query_token_beside_a_valid_header_is_ignored(
         self, client, url, mcp_access_token, token_lookups
     ):
         response = client.post(
-            f"{url}?access_token={mcp_access_token.token}",
+            f"{url}?access_token=not-a-token",
             data=_INITIALIZE,
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
             **_ACCEPT,
         )
-        self._assert_refused(response, token_lookups)
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert token_lookups == [mcp_access_token.token]
 
-    def test_query_token_on_a_get_is_refused(
+    def test_query_token_never_rescues_a_bad_header(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        # The valid parameter token is not a fallback for a failed header.
+        response = client.post(
+            f"{url}?access_token={mcp_access_token.token}",
+            data=_INITIALIZE,
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer not-a-token",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
+        assert token_lookups == ["not-a-token"]
+
+    def test_query_token_on_a_get_is_not_a_credential(
         self, url, mcp_access_token, token_lookups
     ):
         # At the auth-class level: an authenticated GET opens the MCP
@@ -804,13 +820,10 @@ class TestBearerTokenOnlyInHeader:
         request = Request(
             APIRequestFactory().get(f"{url}?access_token={mcp_access_token.token}")
         )
-        with pytest.raises(AuthenticationFailed) as excinfo:
-            MCPOAuth2Authentication().authenticate(request)
-        assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST
-        assert excinfo.value.get_codes() == "invalid_request"
+        assert MCPOAuth2Authentication().authenticate(request) is None
         assert token_lookups == []
 
-    def test_valid_token_in_urlencoded_body_is_refused(
+    def test_valid_token_in_urlencoded_body_is_not_a_credential(
         self, client, url, mcp_access_token, token_lookups
     ):
         response = client.post(
@@ -819,30 +832,29 @@ class TestBearerTokenOnlyInHeader:
             content_type="application/x-www-form-urlencoded",
             **_ACCEPT,
         )
-        self._assert_refused(response, token_lookups)
+        self._assert_unauthenticated(response, token_lookups)
 
-    def test_valid_token_in_multipart_body_is_refused(
+    def test_valid_token_in_multipart_body_is_not_a_credential(
         self, client, url, mcp_access_token, token_lookups
     ):
         # The test client's default content type for a dict is multipart.
         response = client.post(
             url, data={"access_token": mcp_access_token.token}, **_ACCEPT
         )
-        self._assert_refused(response, token_lookups)
+        self._assert_unauthenticated(response, token_lookups)
 
-    def test_header_plus_form_body_token_is_refused(
+    def test_form_body_token_never_rescues_a_bad_header(
         self, client, url, mcp_access_token, token_lookups
     ):
-        # oauthlib ignores a body token once a header is present, so only the
-        # guard can enforce "refused even beside a valid header" here.
         response = client.post(
             url,
             data=f"access_token={mcp_access_token.token}",
             content_type="application/x-www-form-urlencoded",
-            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            HTTP_AUTHORIZATION="Bearer not-a-token",
             **_ACCEPT,
         )
-        self._assert_refused(response, token_lookups)
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
+        assert token_lookups == ["not-a-token"]
 
     @pytest.mark.parametrize(
         "case",
@@ -853,7 +865,7 @@ class TestBearerTokenOnlyInHeader:
         ],
         ids=lambda case: "-".join(case),
     )
-    def test_form_body_token_is_refused_on_every_method(
+    def test_form_body_token_is_not_a_credential_on_any_method(
         self, client, url, mcp_access_token, token_lookups, case
     ):
         method, encoding = case
@@ -874,23 +886,12 @@ class TestBearerTokenOnlyInHeader:
             content_type=content_type,
             HTTP_ACCEPT="application/json",
         )
-        self._assert_refused(response, token_lookups)
-
-    def test_bogus_form_body_token_is_400_not_401(self, client, url, token_lookups):
-        response = client.generic(
-            "DELETE",
-            url,
-            data="access_token=not-a-token",
-            content_type="application/x-www-form-urlencoded",
-            HTTP_ACCEPT="application/json",
-        )
-        self._assert_refused(response, token_lookups)
+        self._assert_unauthenticated(response, token_lookups)
 
     def test_json_body_field_named_access_token_is_not_inspected(
         self, client, url, mcp_access_token, token_lookups
     ):
-        # Only the query and FORM bodies are token transports; the JSON-RPC
-        # body is never parsed by the guard and is unaffected.
+        # The JSON-RPC body is no token transport and is unaffected.
         body = json.loads(_INITIALIZE)
         body["params"]["access_token"] = "irrelevant"
         response = client.post(
