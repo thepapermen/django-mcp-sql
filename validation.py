@@ -96,6 +96,9 @@ class McpSqlSettings(TypedDict):
     REFRESH_TOKEN_MAX_AGE_SECONDS: NotRequired[int]
 
 
+# Upper bound for MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]: ten years.
+_REFRESH_TOKEN_MAX_AGE_LIMIT = 10 * 365 * 24 * 3600
+
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
 
 # A profile's ROLE is interpolated UNQUOTED into `SET LOCAL ROLE <role>` by
@@ -372,11 +375,17 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
         )
         raise ImproperlyConfigured(msg)
 
+    # Checked on the RAW value: pydantic's lax mode lets "3600" (a str from
+    # an env var) and 3600.0 past the TypedDict, and a huge value overflows
+    # `timedelta` at every token exchange.
     refresh_cap = cfg.get("REFRESH_TOKEN_MAX_AGE_SECONDS", 0)
-    if isinstance(refresh_cap, bool) or refresh_cap < 0:
+    if type(refresh_cap) is not int or not (
+        0 <= refresh_cap <= _REFRESH_TOKEN_MAX_AGE_LIMIT
+    ):
         msg = (
-            "MCP_SQL.REFRESH_TOKEN_MAX_AGE_SECONDS must be a non-negative "
-            f"integer (0 disables refresh tokens; got {refresh_cap!r})"
+            "MCP_SQL.REFRESH_TOKEN_MAX_AGE_SECONDS must be an int from 0 "
+            f"(refresh tokens off) to {_REFRESH_TOKEN_MAX_AGE_LIMIT} (10 years); "
+            f"got {refresh_cap!r}"
         )
         raise ImproperlyConfigured(msg)
 

@@ -100,13 +100,17 @@ class TestSetting:
 
         assert DEFAULTS["REFRESH_TOKEN_MAX_AGE_SECONDS"] == 0
 
-    @pytest.mark.parametrize("value", [-1, True])
+    @pytest.mark.parametrize(
+        "value",
+        [-1, True, False, "3600", 3600.0, None, 10 * 365 * 24 * 3600 + 1, 10**30],
+        ids=["negative", "true", "false", "str", "float", "none", "over-10y", "huge"],
+    )
     def test_invalid_values_refuse_to_boot(self, value):
         cfg = {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": value}
         with pytest.raises(ImproperlyConfigured):
             validate_mcp_sql_settings(cfg)
 
-    @pytest.mark.parametrize("value", [0, 86400])
+    @pytest.mark.parametrize("value", [0, 86400, 10 * 365 * 24 * 3600])
     def test_valid_values(self, value):
         validate_mcp_sql_settings(
             {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": value}
