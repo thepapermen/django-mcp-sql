@@ -19,6 +19,7 @@ from mcp_sql.oauth import MCPOAuth2Validator
 from mcp_sql.oauth_server import HeaderOnlyBearer
 from mcp_sql.oauth_server import MCPAuthorizationCodeGrant
 from mcp_sql.oauth_server import MCPServer
+from mcp_sql.oauth_server import get_mcp_oauthlib_core
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
 from mcp_sql.views.oauth_token import MCPRevokeTokenView
 from mcp_sql.views.oauth_token import MCPTokenView
@@ -265,7 +266,6 @@ class TestServerShape:
         settings.OAUTH2_PROVIDER = {
             **settings.OAUTH2_PROVIDER,
             "OAUTH2_SERVER_CLASS": "oauthlib.oauth2.Server",
-            "ALWAYS_RELOAD_OAUTHLIB_CORE": True,
         }
         server = view.get_oauthlib_core().server
         assert type(server) is MCPServer
@@ -282,10 +282,28 @@ class TestServerShape:
         settings.OAUTH2_PROVIDER = {
             **settings.OAUTH2_PROVIDER,
             "ACCESS_TOKEN_EXPIRE_SECONDS": 1234,
-            "ALWAYS_RELOAD_OAUTHLIB_CORE": True,
         }
         server = MCPTokenView.get_oauthlib_core().server
         assert server.bearer.expires_in == 1234
+
+    @pytest.mark.parametrize(
+        "get_core",
+        [
+            MCPAuthorizationView.get_oauthlib_core,
+            MCPTokenView.get_oauthlib_core,
+            MCPRevokeTokenView.get_oauthlib_core,
+            get_mcp_oauthlib_core,
+        ],
+        ids=["authorize", "token", "revoke", "auth-class"],
+    )
+    def test_backend_is_pinned_to_the_form_body_core(self, settings, get_core):
+        # The token guard reads `request.POST`; the server must parse the
+        # same body, whatever backend the consumer configured.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "OAUTH2_BACKEND_CLASS": "oauth2_provider.oauth2_backends.JSONOAuthLibCore",
+        }
+        assert type(get_core()) is OAuthLibCore
 
     @pytest.mark.parametrize(
         ("stock", "mcp"),
@@ -303,7 +321,6 @@ class TestServerShape:
         has served a request, the subclass must still build its own."""
         stock_core = OAuthLibCore(Server(MCPOAuth2Validator()))
         monkeypatch.setattr(stock, "_oauthlib_core", stock_core, raising=False)
-        monkeypatch.delattr(mcp, "_oauthlib_core", raising=False)
         assert type(mcp.get_oauthlib_core().server) is MCPServer
         assert stock.get_oauthlib_core() is stock_core
 
@@ -327,8 +344,6 @@ class TestConsumerServerClassDoesNotWiden:
                 OAuthLibCore(Server(MCPOAuth2Validator())),
                 raising=False,
             )
-        for mcp in (MCPAuthorizationView, MCPTokenView, MCPRevokeTokenView):
-            monkeypatch.delattr(mcp, "_oauthlib_core", raising=False)
 
     def test_implicit_grant_stays_refused(self, client, mcp_app, mcp_user, mcp_mfa_on):
         client.force_login(mcp_user)

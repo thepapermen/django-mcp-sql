@@ -27,6 +27,7 @@ the request, so `views/oauth_token.py::MCPTokenView` also refuses every other
 
 from typing import Any
 
+from oauth2_provider.oauth2_backends import OAuthLibCore
 from oauth2_provider.settings import oauth2_settings
 from oauth2_provider.views.mixins import OAuthLibMixin
 from oauthlib.oauth2.rfc6749.endpoints import AuthorizationEndpoint
@@ -151,34 +152,39 @@ class MCPServer(
 
 
 def get_mcp_oauthlib_core() -> Any:
-    """DOT's `get_oauthlib_core()`, on `MCPServer` instead of the
-    consumer's `OAUTH2_SERVER_CLASS` (same validator, server kwargs and
-    `OAUTH2_BACKEND_CLASS`)."""
+    """DOT's `get_oauthlib_core()`, on `MCPServer` instead of the consumer's
+    `OAUTH2_SERVER_CLASS`, and always with DOT's form-body `OAuthLibCore`
+    (same validator and server kwargs). Built per call, as DOT's own DRF
+    authentication class does."""
     server = MCPServer(
         oauth2_settings.OAUTH2_VALIDATOR_CLASS(), **oauth2_settings.server_kwargs
     )
-    return oauth2_settings.OAUTH2_BACKEND_CLASS(server)
+    return OAuthLibCore(server)
 
 
 class MCPServerViewMixin(OAuthLibMixin):
-    """Run a DOT `OAuthLibMixin` view on `MCPServer`.
+    """Run a DOT `OAuthLibMixin` view on `MCPServer` with `OAuthLibCore`.
 
-    Setting `server_class` is DOT's own hook; overriding `get_oauthlib_core`
-    is not optional. DOT caches the core on the view class behind
-    `hasattr(cls, "_oauthlib_core")`, which an attribute INHERITED from the
-    stock parent view also satisfies: once any stock `TokenView` /
-    `AuthorizationView` / `RevokeTokenView` in the process has served a
-    request (a consumer may mount DOT's URLs too), a subclass would reuse
-    that core — the all-grants server — and `server_class` would never be
-    read. This cache is looked up in the class's own `__dict__` only.
+    Setting `server_class` is DOT's own hook, but overriding
+    `get_oauthlib_core` is not optional. DOT caches the core on the view
+    class behind `hasattr(cls, "_oauthlib_core")`, which an attribute
+    INHERITED from the stock parent view also satisfies: once any stock
+    `TokenView` / `AuthorizationView` / `RevokeTokenView` in the process has
+    served a request (a consumer may mount DOT's URLs too), a subclass would
+    reuse that core — built on the consumer's `OAUTH2_SERVER_CLASS` — and
+    `server_class` would never be read. This mixin builds the core per call
+    instead (a few small objects): no cache to inherit, and the server's
+    shape follows the current settings.
+
+    The backend is pinned to `OAuthLibCore`, which reads form bodies
+    (`request.POST`) — what `MCPTokenView`'s guard reads. A consumer's
+    `OAUTH2_BACKEND_CLASS` (e.g. DOT's deprecated `JSONOAuthLibCore`) could
+    otherwise parse a body the guard never saw.
     """
 
     server_class = MCPServer
+    oauthlib_backend_class = OAuthLibCore
 
     @classmethod
     def get_oauthlib_core(cls) -> Any:
-        core = cls.__dict__.get("_oauthlib_core")
-        if core is None or oauth2_settings.ALWAYS_RELOAD_OAUTHLIB_CORE:
-            core = cls.get_oauthlib_backend_class()(cls.get_server())
-            cls._oauthlib_core = core
-        return core
+        return cls.get_oauthlib_backend_class()(cls.get_server())
