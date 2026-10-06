@@ -11,6 +11,64 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **The SQL Postgres ran could differ from the SQL that was checked
+  (critical; affects every release up to and including 0.1.0b5).** The
+  executor sends sqlglot's re-serialization of the validated query, not the
+  agent's text, and that re-serialization is not faithful for some inputs,
+  on every supported sqlglot (30.7 and 30.21 alike). `E'\\'` (one
+  backslash) came back as `e'\'`, swallowing its closing quote so that
+  later literal text ran as SQL; an alias written as a dollar-quoted string
+  (`AS $$x, version() AS v$$`, which Postgres itself refuses) came back
+  unquoted as SQL. Either let an agent read the catalogs or any table the
+  login role can read, and run further `;`-separated statements —
+  including `RESET ROLE` and writes, which committed (see the next entry).
+  Escape strings with any backslash also changed value (`E'a\\nb'` ran as
+  a newline, matching the wrong rows).
+  - The parser rejects an `E'…'` escape-string literal containing a
+    backslash and any identifier written as a string constant (`AS $$…$$`,
+    `AS 'x'`, `AS E'x'`), with the new rejection reason `unsafe_literal`,
+    before every other check. `E'…'` without a backslash, standard strings
+    with backslashes and `$$…$$` values stay accepted.
+  - The executor sends only SQL proven faithful: the LIMIT-wrapped query is
+    re-serialized without comments, re-parsed, and run only if it is a
+    single statement whose tree equals the validated one exactly — node
+    types, identifiers and their quoting, aliases and literal values.
+    Otherwise nothing runs and the attempt is audited with the new reason
+    `roundtrip_mismatch`. Comments are never sent (sqlglot rewrote `--`
+    comments as `/* */`, and their text is not checked).
+  - `standard_conforming_strings = on` joins the per-transaction guards
+    (and the role defaults in `sql/role_setup.sql`): a database- or
+    login-role-level `off` would make Postgres read backslashes in standard
+    strings differently from the parser.
+  - **Behaviour change:** such literals and aliases are now refused; rewrite
+    them as standard strings / double-quoted identifiers. **Action:** re-run
+    `sql/role_setup.sql` (or `mcp_sql_role_setup`) to pick up the new role
+    default; the per-transaction guard applies without it.
+- **The read transaction was not read-only (affects every release up to and
+  including 0.1.0b5).** `SET LOCAL default_transaction_read_only = on`
+  only affects transactions that start later, and the executor's had
+  already started, so it stayed read-write: a SECURITY DEFINER function
+  owned by a privileged role could write, and the write committed (ledger
+  F01). `session.enter_readonly_session` now also sets `SET LOCAL
+  transaction_read_only = on` (any write fails with SQLSTATE 25006), the
+  executor always rolls its read transaction back instead of committing,
+  and `session_drift` (the `mcp_sql_smoke` check) reads the live flag.
+- **A password change left MCP tokens working (affects every release up to
+  and including 0.1.0b5).** A changed password (the user's own change, an
+  admin reset, `set_unusable_password`) now revokes the user's MCP access
+  and refresh tokens after the change commits, with an
+  `MCPAuthRejectionLog` row (new reason `password_change`; migration 0013).
+  Done with model signals, so it needs no session table and holds with
+  `SESSION_MODEL=None`. Logout now deletes refresh tokens as well as access
+  tokens.
+- **The app booted with any DOT validator.** The package's OAuth server is
+  built with the install's `OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]`, and
+  the client pinning, the `mcp:sql`-only scope, mandatory PKCE and the
+  redirect rules live in `MCPOAuth2Validator`; with DOT's stock validator
+  and `PKCE_REQUIRED=False` a code was issued and exchanged without PKCE.
+  `ready()` now raises `ImproperlyConfigured` unless the setting is
+  `MCPOAuth2Validator` or a subclass. **Action required** only for an
+  install that did not follow the documented settings.
 - **`/o/register` could register an off-machine redirect URI (affects
   0.1.0b5 and earlier).** The anonymous dynamic-client-registration endpoint
   validated each submitted redirect URI with `urlparse` (scheme `http`, no
@@ -71,17 +129,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   URLs, held back only by per-Application checks.
   The package's three OAuth views and `MCPOAuth2Authentication` now run on
   the package's own oauthlib server, `oauth_server.MCPServer`, whatever
-  `OAUTH2_SERVER_CLASS` says: the `code` response type and the
-  `authorization_code` grant only, with no refresh token, `S256`-only PKCE
-  and the bearer token from the `Authorization` header only.
-  - `/o/token/` answers anything but exactly one
-    `grant_type=authorization_code` (password, client credentials, refresh
-    token, device code, `openid`, unknown, missing or repeated) with 400
-    `unsupported_grant_type` before DOT's own token handling or the server
+  `OAUTH2_SERVER_CLASS` says, and parse requests with DOT's form-body
+  `OAuthLibCore`, whatever `OAUTH2_BACKEND_CLASS` says: the `code` response
+  type and the `authorization_code` grant only (plus the opt-in refresh
+  grant, see "Added"), `S256`-only PKCE and the bearer token from the
+  `Authorization` header only.
+  - `/o/token/` answers a refresh grant with a constant 400 `invalid_grant`
+    (see the next entry) and anything else but exactly one
+    `grant_type=authorization_code` (password, client credentials, device
+    code, `openid`, unknown, missing or repeated) with 400
+    `unsupported_grant_type`, before DOT's own token handling or the server
     runs (DOT routes the device-code grant to its own handler before any
-    server), and a control character in any token-request parameter with
-    400 `invalid_request`. A `response_type` other than `code` at `/o/authorize/`
-    is redirected back as `unsupported_response_type`.
+    server); then a control character in any other token-request parameter
+    gets 400 `invalid_request`. At `/o/authorize/`, a `response_type`
+    without `code` in it is redirected back as `unsupported_response_type`,
+    and `none` or a value containing `code` but not exactly `code` (`code
+    token`, ...) as `unauthorized_client`.
+  - `/o/authorize/` screens its parameters (query string and consent POST)
+    before DOT could store them on a `Grant`: a control character anywhere,
+    a `code_challenge` outside RFC 7636 §4.2's shape (43-128 characters of
+    `[A-Za-z0-9-._~]`) or a `nonce` over 255 characters raised an uncaught
+    500 (DataError) for a gate-passing user and now gets the error page (400
+    `invalid_request`, no redirect, nothing stored).
+  - The consent page no longer 500s when DOT re-renders it for an invalid
+    consent POST (the template resolved `application.name`, which that
+    render does not supply).
   - A `client_id` carrying a control character is never looked up
     (`MCPOAuth2Validator`): it previously raised a 500 from HTTP Basic
     credentials at `/o/token/` and `/o/revoke_token/`, from the body at
@@ -89,10 +161,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     included); now `invalid_client` / the error page.
   - `MCPOAuth2Validator` is the install's `OAUTH2_VALIDATOR_CLASS`, so for a
     consumer that also mounts DOT's stock views it keeps install-wide
-    backstops there: password and refresh grants are refused with
-    `invalid_grant` (the password is never checked), PKCE stays required and
-    a non-`S256` code cannot be exchanged. Those stock views are not
-    otherwise narrowed.
+    backstops there: password grants are refused with `invalid_grant` (the
+    password is never checked), with refresh off no refresh token is stored
+    or returned and refresh grants are refused with `invalid_grant`, PKCE
+    stays required and a non-`S256` code cannot be exchanged. Those stock
+    views are not otherwise narrowed.
   - **Behaviour change:** none for a client using the advertised flow. A
     client that relied on any other grant, response type or PKCE method was
     already outside the documented surface and is now refused.
@@ -103,13 +176,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   access token and honoured it on `grant_type=refresh_token` (verified on
   DOT 3.2.0 and 3.4.1). A client could therefore keep renewing its access
   token without the user ever re-consenting.
-  `MCPServer`'s authorization-code grant no longer generates a refresh
-  token: the `/o/token/` response has no `refresh_token` field and no
-  `RefreshToken` row is created. `/o/token/` has no refresh grant, so a
-  refresh token already stored by an earlier release is refused with
-  `unsupported_grant_type` (and with `invalid_grant` by
-  `MCPOAuth2Validator.validate_refresh_token` on a stock DOT token view).
-  Existing `RefreshToken` rows are left in place and are inert.
+  By default (refresh tokens are now opt-in, see "Added") `MCPServer`'s
+  authorization-code grant generates no refresh token and
+  `MCPOAuth2Validator.save_bearer_token` drops one a stock DOT token view
+  would mint: no `refresh_token` field, no `RefreshToken` row. `/o/token/`
+  answers every `grant_type=refresh_token` request with a constant 400
+  `invalid_grant` and no token lookup — the error that makes an MCP client
+  (the MCP TypeScript SDK among them) drop its refresh token and
+  re-authorize — so a refresh token stored by an earlier release is refused
+  and its client recovers on its own. Existing `RefreshToken` rows are left
+  in place and are inert.
   - **Behaviour change:** a client that relied on refresh now re-authorizes
     every `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the documented settings),
     with the consent screen for DCR and cloud clients — the interval the
@@ -202,8 +278,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     supported; CI's minimum-versions job now pins
     `django-oauth-toolkit==3.4.1`.
 
+### Added
+
+- **Opt-in refresh tokens**: `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`
+  (default `0` = off, today's behaviour). A positive value issues a refresh
+  token with every access token, rotates it on every refresh (whatever DOT's
+  `ROTATE_REFRESH_TOKEN` says), and refuses the chain once that many seconds
+  have passed since the user's consent — measured from the
+  authorization-code exchange across every rotation (new
+  `MCPRefreshTokenFamily` model, migration 0013), not DOT's sliding
+  `REFRESH_TOKEN_EXPIRE_SECONDS`. Refresh tokens without a recorded consent
+  (from earlier releases) stay refused. The discovery document and DCR
+  responses list `refresh_token` while it is on. Logout and password change
+  revoke refresh tokens. Runbook: `docs/oauth.md` "Refresh tokens
+  (opt-in)".
+- CI runs the whole suite a second time under a minimal security posture
+  (allow-all `MFA_CHECKER`, no `SESSION_MODEL`; `MCP_SQL_TEST_POSTURE=minimal`,
+  `make test-minimal`), and `docs/oauth.md` has a table of what MFA, the
+  session gate and the refresh cap each add and what holds without them.
+
 ### Changed
 
+- `oauthlib` is now a declared dependency (`>=3.3.0,<5`): the package builds
+  its OAuth server from oauthlib's classes and relies on two internals,
+  pinned by a test. CI's minimum-versions job pins `oauthlib==3.3.0`.
+- `docs/oauth.md`, README and the example settings recommend DOT's
+  `COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT = True`: DOT then refuses a
+  request carrying an `access_token` query parameter itself and stops
+  logging a deprecation warning for each one (the package never accepted
+  such a token).
+- `docs/architecture.md`: a curated view that filters rows must be created
+  `WITH (security_barrier)` — otherwise a cast in the agent's `WHERE` runs
+  on the hidden rows first and the error text quotes their values (ledger
+  F71). Column-only views are unaffected. Documentation only for now.
 - Raised the `mcp` floor to `>=1.28.1` (was `>=1.27`), so the declared range
   no longer admits releases carrying CVE-2026-52869, CVE-2026-52870 (both
   fixed in 1.27.2) or CVE-2026-59950 (fixed in 1.28.1). The package was not

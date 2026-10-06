@@ -318,6 +318,10 @@ MCP_SQL = {
     #     {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
     #      "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
     # ],
+    # Opt-in refresh tokens (default 0 = OFF): rotating, and refused once this
+    # many seconds have passed since the user's consent. See docs/oauth.md
+    # "Refresh tokens (opt-in)".
+    # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
 }
 
 OAUTH2_PROVIDER = {
@@ -326,12 +330,18 @@ OAUTH2_PROVIDER = {
     "DEFAULT_SCOPES": ["mcp:sql"],
     "ACCESS_TOKEN_EXPIRE_SECONDS": 6 * 3600,
     # Moot for MCP: the package's OAuth endpoints mint no refresh tokens and
-    # refuse every refresh grant, so ACCESS_TOKEN_EXPIRE_SECONDS is the
-    # re-consent interval. (On its own, DOT reads 0 as "no age limit".)
+    # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
+    # opts in (with its own hard cap from the consent), so
+    # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
+    # DOT reads 0 as "no age limit".)
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
+    # in the URL query string outright, without DOT's per-request warning.
+    # The package never accepts such a token either way.
+    "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
     # "http" alone is fine loopback-only (the default); add "https" whenever
     # CLOUD_CLIENTS is non-empty, or the app won't boot.
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],   # RFC 8252 loopback; add "https" for cloud clients

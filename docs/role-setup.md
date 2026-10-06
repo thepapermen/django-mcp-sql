@@ -174,12 +174,12 @@ docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> 
     -c "SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'mcp_readonly_role';"
 ```
 
-Expected (one row, four GUCs):
+Expected (one row, five GUCs):
 
 ```
       rolname      |                              rolconfig
 -------------------+----------------------------------------------------------------------
- mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s}
+ mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on}
 ```
 
 **3. App role is a member of `mcp_readonly_role`:**
@@ -345,7 +345,7 @@ python manage.py mcp_sql_smoke
 Expected output:
 
 ```
-Read path ok: SET LOCAL ROLE + 4 GUCs verified, SELECT FROM auth_permission ok
+Read path ok: SET LOCAL ROLE + session GUCs (incl. the live transaction_read_only) verified, SELECT FROM auth_permission ok
 Audit table mcp_sql_mcpquerylog unreadable (pgcode=42501) — 0002_revoke_audit_grants is in effect.
 Write attempt rejected as expected: ReadOnlySqlTransaction (pgcode=25006)
 ```
