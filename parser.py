@@ -10,6 +10,7 @@ import sqlglot.errors
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
+from sqlglot.tokens import Token
 from sqlglot.tokens import TokenType
 
 DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
@@ -306,18 +307,64 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
       identifier (checked on its source text, via sqlglot's position
       metadata).
 
-    The executor's round-trip check (`executor.run_query`) is the backstop
-    for anything else of this class.
+    - A Unicode-escape literal or identifier (`U&'…'`, `U&"…"`, any case):
+      sqlglot 30.7 tokenizes it as a column `U`, a bitwise `&` and a plain
+      string, and re-emits `U & '…'`, which Postgres then evaluates as
+      exactly that — different rows than the original text. Rejected on
+      every sqlglot version, by its source text: the `U` / `u` adjacent to
+      `&` adjacent to a quote, or (newer sqlglot) one `UNICODE_STRING`
+      token. `U & 'x'` with spaces is a real operator and stays allowed.
+    - A double-quoted function name (`"Lower"(...)`): Postgres resolves it
+      case-sensitively (`Lower` does not exist), but sqlglot folds it onto
+      its builtin and re-emits `LOWER(...)`, a different function. Rejected
+      wherever a double-quoted identifier is directly followed by `(` —
+      except after `AS`, where `AS "s"(c1, c2)` names a derived table's
+      columns.
+
+    The executor's round-trip check (`parser.render_for_execution`) is the
+    backstop for anything else of this class.
     """
     tokens = Dialect.get_or_raise("postgres").tokenize(raw_sql)
-    for token in tokens:
-        if (
-            token.token_type == TokenType.BYTE_STRING
-            and "\\" in raw_sql[token.start : token.end + 1]
-        ):
+
+    def source(token: Token) -> str:
+        return raw_sql[token.start : token.end + 1]
+
+    for i, token in enumerate(tokens):
+        text = source(token)
+        if token.token_type == TokenType.BYTE_STRING and "\\" in text:
             msg = (
                 "Escape-string literals containing a backslash (E'...\\...') "
-                "are not supported; use a standard string literal"
+                "are not supported; use a standard string literal (use chr(10) "
+                "for a newline, chr(9) for a tab, '' for a quote)"
+            )
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+        nxt = tokens[i + 1 : i + 3]
+        unicode_escape = (
+            text[:2].lower() == "u&"
+            or (
+                text.lower() == "u"
+                and len(nxt) == 2  # noqa: PLR2004 — `&` and the quoted token
+                and source(nxt[0]) == "&"
+                and nxt[0].start == token.end + 1
+                and nxt[1].start == nxt[0].end + 1
+                and source(nxt[1])[:1] in {"'", '"'}
+            )
+        )
+        if unicode_escape:
+            msg = (
+                "Unicode-escape literals and identifiers (U&'...', U&\"...\") "
+                "are not supported; write the characters directly"
+            )
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+        if (
+            text.startswith('"')
+            and nxt
+            and nxt[0].token_type == TokenType.L_PAREN
+            and not (i > 0 and tokens[i - 1].token_type == TokenType.ALIAS)
+        ):
+            msg = (
+                f"Quoted function name {text} is not supported; write the "
+                "function name unquoted"
             )
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
     for ident in ast.find_all(exp.Identifier):

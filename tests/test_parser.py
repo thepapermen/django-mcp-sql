@@ -860,6 +860,41 @@ class TestLexicalFidelity:
     @pytest.mark.parametrize(
         "sql",
         [
+            "SELECT U&'d\\0061t' AS v FROM auth_permission",
+            "SELECT u&'x' AS v FROM auth_permission",
+            'SELECT U&"x" AS v FROM auth_permission',
+            "SELECT id FROM auth_permission WHERE codename = U&'2'",
+        ],
+    )
+    def test_unicode_escape(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT "Lower"(codename) AS v FROM auth_permission',
+            'SELECT "public"."lower"(codename) AS v FROM auth_permission',
+            'SELECT "count" (*) AS n FROM auth_permission',
+        ],
+    )
+    def test_quoted_function_name(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id & 3 AS v FROM auth_permission",
+            'SELECT c1 FROM (SELECT 1) AS "s"(c1)',
+            'SELECT codename AS "Lower" FROM auth_permission',
+        ],
+        ids=["bitwise-and", "derived-column-list", "quoted-alias"],
+    )
+    def test_near_misses_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
             "SELECT E'it''s' AS v FROM auth_permission",
             "SELECT 'a\\b' AS v FROM auth_permission",
             "SELECT $$it's$$ AS v FROM auth_permission",

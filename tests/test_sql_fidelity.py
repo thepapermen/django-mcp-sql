@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 import sqlglot
+from django.db import DatabaseError
 from django.db import connection
 from django.db import transaction
 from django.utils import timezone
@@ -81,20 +82,56 @@ class TestValueRoundTrip:
         assert "/*" not in rendered
         assert "smuggled" not in rendered
 
-    def test_unicode_escape_string_never_changes_value(self):
-        # `U&'d\0061t'`: sqlglot >= the newest 30.x keeps it as a Unicode
-        # string; 30.7 reads it as `U & 'd\0061t'` (a column), which Postgres
-        # then refuses. Either the value is exact or nothing runs.
-        sql = "SELECT U&'d\\0061t' AS v"
-        try:
-            rendered = _rendered(sql)
-        except QueryRejectedError:
-            return
-        try:
-            got = _pg(rendered)
-        except Exception:  # noqa: BLE001 — 30.7: Postgres refuses the column
-            return
-        assert got == _pg(sql) == (["v"], [("dat",)])
+
+def _pg_or_error(sql: str):
+    """`_pg(sql)`, or the Postgres error text if it refuses the statement."""
+    try:
+        return _pg(sql)
+    except DatabaseError as exc:
+        return f"ERROR: {str(exc).splitlines()[0]}"
+
+
+@pytest.mark.django_db
+class TestPostgresReadsTheSourceDifferently:
+    """Source text sqlglot reads (and would re-emit) differently from how
+    Postgres reads it is refused before any check, on every sqlglot. Each
+    case also shows, against Postgres itself, why: the original text and
+    sqlglot's naive re-emission do not give the same answer."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # sqlglot folds a quoted name onto its builtin `LOWER`; Postgres
+            # looks up the case-sensitive "Lower", which does not exist.
+            "SELECT \"Lower\"('AbC') AS v",
+            "SELECT \"Upper\"('AbC') AS v",
+        ],
+    )
+    def test_quoted_function_name(self, sql):
+        naive = sqlglot.parse_one(sql, dialect="postgres").sql(dialect="postgres")
+        assert _pg_or_error(naive) != _pg_or_error(sql)
+        with pytest.raises(QueryRejectedError) as exc:
+            parse_and_validate(sql, allowed_tables=set())
+        assert exc.value.reason == OutcomeReason.UNSAFE_LITERAL
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT name FROM (SELECT 0 AS name, 5 AS u) s WHERE name = U&'2'",
+            "SELECT (U&'2' = '2') AS ok FROM (SELECT 5 AS u) s",
+            "SELECT U&'d\\0061t' AS v",
+            'SELECT U&"d\\0061t" AS v FROM (SELECT 1 AS dat, 2 AS u) s',
+        ],
+        ids=["where", "comparison", "value", "identifier"],
+    )
+    def test_unicode_escape(self, sql):
+        naive = sqlglot.parse_one(sql, dialect="postgres").sql(dialect="postgres")
+        if "U&" not in naive.replace("u&", "U&"):
+            # sqlglot 30.7 splits it into `U & '...'`: a different query.
+            assert _pg_or_error(naive) != _pg_or_error(sql)
+        with pytest.raises(QueryRejectedError) as exc:
+            parse_and_validate(sql, allowed_tables=set())
+        assert exc.value.reason == OutcomeReason.UNSAFE_LITERAL
 
 
 class TestParserRejectsUnfaithfulInput:

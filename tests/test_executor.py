@@ -732,27 +732,49 @@ class TestExecutorHookFailureAudit:
 @pytest.mark.django_db
 class TestEveryParserFailureIsAudited:
     """Tokenizer errors (`TokenError` is not a `ParseError`) and the
-    `re.error` sqlglot raises for some `UESCAPE` clauses escaped `run_query`
-    with no audit row (ledger F31 / F103)."""
+    `re.error` sqlglot 30.21 raises for some `UESCAPE` clauses escaped
+    `run_query` with no audit row (ledger F31 / F103)."""
 
     @pytest.mark.parametrize(
-        "raw_sql",
+        ("raw_sql", "reason"),
         [
-            "SELECT 'unterminated",
-            'SELECT "unterminated',
-            "SELECT $$unterminated",
-            "SELECT U&'x' UESCAPE '(' AS v",
-            "SELECT U&'x' UESCAPE '\\' AS v",
+            ("SELECT 'unterminated", OutcomeReason.PARSE_ERROR),
+            ('SELECT "unterminated', OutcomeReason.PARSE_ERROR),
+            ("SELECT $$unterminated", OutcomeReason.PARSE_ERROR),
+            # Refused before sqlglot's regex runs now (U& is unsupported);
+            # either way the attempt is audited.
+            ("SELECT U&'x' UESCAPE '(' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' UESCAPE '\\' AS v", OutcomeReason.UNSAFE_LITERAL),
         ],
         ids=["string", "identifier", "dollar", "uescape-paren", "uescape-backslash"],
     )
-    def test_audited_as_parse_error(self, monkeypatch, raw_sql):
+    def test_audited(self, monkeypatch, raw_sql, reason):
         cursor = _stub_readonly_connections(monkeypatch)
         result = run_query(
             user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
         )
-        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        if reason is OutcomeReason.UNSAFE_LITERAL:
+            # sqlglot 30.7 already fails to parse `UESCAPE`.
+            assert result.rejection_reason in {reason.value, "parse_error"}
+        else:
+            assert result.rejection_reason == reason.value
         cursor.execute.assert_not_called()
         log = MCPQueryLog.objects.get()
         assert log.decision == MCPQueryLog.DECISION_REJECTED
         assert log.rejection_reason == result.rejection_reason
+
+    def test_a_regex_error_inside_sqlglot_is_a_parse_error(self, monkeypatch):
+        import re
+
+        def boom(*_a, **_k):
+            msg = "unbalanced parenthesis"
+            raise re.error(msg)
+
+        monkeypatch.setattr("mcp_sql.parser.sqlglot.parse", boom)
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql="SELECT 1"
+        )
+        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == "parse_error"
