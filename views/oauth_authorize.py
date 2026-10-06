@@ -1,21 +1,23 @@
-"""DOT `AuthorizationView` + the Option D session-trust issuance gate
-(is_active + is_staff + MFA + an unambiguous single-profile assignment via
-`resolve_profile`). See `docs/architecture.md` "OAuth surface" for the
-full design rationale."""
+"""DOT `AuthorizationView` on the narrow `MCPServer` + the Option D
+session-trust issuance gate (is_active + is_staff + MFA + an unambiguous
+single-profile assignment via `resolve_profile`). See `docs/architecture.md`
+"OAuth surface" for the full design rationale."""
 
 from typing import TYPE_CHECKING
 
 from django.core.exceptions import PermissionDenied
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.oauth_server import MCPServerViewMixin
 from oauth2_provider.views import AuthorizationView
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
 
 
-class MCPAuthorizationView(AuthorizationView):
-    """`AuthorizationView` + the MCP issuance gate."""
+class MCPAuthorizationView(MCPServerViewMixin, AuthorizationView):
+    """`AuthorizationView` + the MCP issuance gate, on `MCPServer` (the
+    `code` response type only, `S256` PKCE only)."""
 
     # Package-owned consent template (overrides DOT's
     # `oauth2_provider/authorize.html`). Named under `mcp_sql/` so a

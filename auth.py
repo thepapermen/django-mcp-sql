@@ -9,8 +9,11 @@ view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. See
 Option D session-trust, the body-cap rationale, and the isolation
 contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalDRF`.
 
+Bearer tokens are verified on the package's narrow `oauth_server.MCPServer`
+(header-only `HeaderOnlyBearer`), not on the consumer's `OAUTH2_SERVER_CLASS`.
+
 Every **resolved-user** rejection in `authenticate` (the six defense-
-in-depth gates below `super().authenticate(...)` returns a user/token
+in-depth gates below `_verify_bearer(...)` returns a user/token
 pair) writes one `MCPAuthRejectionLog` row via `_audit_rejection`.
 Anonymous / bad-token traffic is deliberately NOT audited at this
 layer — that high-volume noise floor goes through django-axes-on-Redis
@@ -27,10 +30,12 @@ is `logger.exception`-logged but does not mask the underlying
 import logging
 from io import BytesIO
 from typing import TYPE_CHECKING
+from typing import Any
 
 from django.apps import apps
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import SuspiciousOperation
 from django.core.files.uploadhandler import load_handler
 from django.db import DatabaseError
 from django.http import HttpRequest
@@ -46,6 +51,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.oauth_server import get_mcp_oauthlib_core
 from mcp_sql.schemas import AuthRejectionReason
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
 from rest_framework import exceptions
@@ -194,13 +200,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         return f'{challenge}, resource_metadata="{metadata_url}"'
 
     def authenticate(self, request):  # noqa: C901, PLR0912, PLR0915 — linear defense-in-depth chain reads better than extracted helpers
-        # DOT's parent class calls `oauthlib_core.verify_request`, which
+        # `_verify_bearer` calls `oauthlib_core.verify_request`, which
         # extracts the body via DRF's `request.POST`; that runs DRF's parsers
         # (JSON for the MCP wire protocol, and the default form / multipart
         # parsers on ANY method), consuming the body stream, so the
         # downstream `request.body` access in `_invoke_wsgi_app` would raise
         # `RawPostDataException`. Force-cache the raw bytes on the underlying
-        # Django HttpRequest BEFORE super() runs — always, whatever the method
+        # Django HttpRequest BEFORE it runs — always, whatever the method
         # or content type — so the MCP view can still re-seed `wsgi.input`
         # from `request.body`, and so `_carries_token_outside_header` can
         # parse a form body from the cached bytes.
@@ -228,10 +234,11 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             django_request.mcp_sql_bearer_error = True
             raise BearerTokenOutsideHeader
 
-        # DOT 3.x's `OAuth2Authentication.authenticate()` returns `None`
-        # on bad / expired / unknown / revoked tokens (it does NOT raise —
-        # it sets `request.oauth2_error` and yields the anonymous result).
-        # The only paths from super() that DO raise are `SuspiciousOperation`
+        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate`, on
+        # `MCPServer`) returns `None` on bad / expired / unknown / revoked
+        # tokens (it does NOT raise — it sets `request.oauth2_error` and
+        # yields the anonymous result). The only paths from it that DO raise
+        # are `SuspiciousOperation`
         # (hex-encoding bug) and re-raised `ValueError` from oauthlib —
         # both indicate malformed transport, not credential probing; we
         # let them bubble.
@@ -278,7 +285,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             ip, scope="bad_token", threshold=threshold
         ):
             return None
-        result = super().authenticate(request)
+        result = self._verify_bearer(request)
         if result is None:
             if has_auth_header:
                 throttle.record_attempt(
@@ -427,6 +434,26 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         django_request.mcp_profile = outcome
         return user, token
 
+    @staticmethod
+    def _verify_bearer(request: Request) -> "tuple[Any, AccessToken] | None":
+        """DOT's `OAuth2Authentication.authenticate`, verifying on `MCPServer`.
+
+        DOT's version builds its core from the consumer's `OAUTH2_SERVER_CLASS`
+        (`get_oauthlib_core()`), which could take the token from the query
+        string or a form body too; the package's core reads the
+        `Authorization` header only (`oauth_server.HeaderOnlyBearer`). DOT's
+        version also keeps oauthlib's `oauth2_error` on the request for its
+        own challenge; `authenticate_header` here builds its own, so it is
+        not carried over.
+        """
+        try:
+            valid, r = get_mcp_oauthlib_core().verify_request(request, scopes=[])
+        except ValueError as error:
+            if str(error) == "Invalid hex encoding in query string.":
+                raise SuspiciousOperation(error) from error
+            raise
+        return (r.user, r.access_token) if valid else None
+
     def _audit_rejection(
         self,
         request: Request,
@@ -438,7 +465,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
     ) -> None:
         """Write an `MCPAuthRejectionLog` row for a resolved-user rejection.
 
-        Called only after `super().authenticate(request)` returned a
+        Called only after `_verify_bearer(request)` returned a
         `(user, token)` pair, so `user` and `token` are always present.
         Anonymous / bad-token rejections take the `throttle.record_attempt`
         path instead and never reach this method.

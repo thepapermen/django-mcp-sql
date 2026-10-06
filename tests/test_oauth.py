@@ -678,7 +678,9 @@ class TestRefreshRefused:
     """`ACCESS_TOKEN_EXPIRE_SECONDS` is the re-consent interval: no refresh
     token is minted, and a refresh token minted by an earlier release (DOT
     honoured those indefinitely under `REFRESH_TOKEN_EXPIRE_SECONDS=0`) is
-    refused with `invalid_grant`."""
+    refused: `MCPServer` has no refresh grant, so `/o/token/` answers
+    `unsupported_grant_type`. (`MCPOAuth2Validator.validate_refresh_token`
+    is the backstop for DOT's stock server.)"""
 
     def _exchange_code(self, client, client_id) -> dict:
         verifier, challenge = _s256_pair()
@@ -698,32 +700,31 @@ class TestRefreshRefused:
         assert token.status_code == HTTPStatus.OK, token.content
         return token.json()
 
-    def test_a_pre_fix_refresh_token_is_refused(
-        self, client, mcp_user, mcp_mfa_on, monkeypatch
-    ):
+    def test_a_pre_fix_refresh_token_is_refused(self, client, mcp_user, mcp_mfa_on):
         client_id = _register_dcr_client(client)
         client.force_login(mcp_user)
-        # Mint the token exactly as <= 0.1.0b5 did: through DOT's own
-        # `save_bearer_token`, which stores a RefreshToken row and returns it.
-        with monkeypatch.context() as legacy:
-            legacy.setattr(
-                MCPOAuth2Validator,
-                "save_bearer_token",
-                OAuth2Validator.save_bearer_token,
-            )
-            body = self._exchange_code(client, client_id)
-        assert RefreshToken.objects.filter(token=body["refresh_token"]).exists()
+        body = self._exchange_code(client, client_id)
+        assert "refresh_token" not in body
+        # What <= 0.1.0b5 also stored with every access token: a live
+        # RefreshToken row bound to it, as DOT's `save_bearer_token` writes it.
+        access = AccessToken.objects.get(token=body["access_token"])
+        legacy = RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=access.application,
+            access_token=access,
+        )
 
         response = client.post(
             reverse("token"),
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": body["refresh_token"],
+                "refresh_token": legacy.token,
                 "client_id": client_id,
             },
         )
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
-        assert response.json()["error"] == "invalid_grant"
+        assert response.json()["error"] == "unsupported_grant_type"
         # No new access token; the original one is untouched.
         assert list(AccessToken.objects.values_list("token", flat=True)) == [
             body["access_token"]
