@@ -175,7 +175,28 @@ def parse_and_validate(
     pre-resolved by the caller (`mcp_sql.grants.declared_tables`).
     Matching is case-insensitive on the table name only (schema is rejected
     unconditionally when it's a system schema).
+
+    Raises only `QueryRejectedError`. Any other sqlglot failure — the
+    tokenizer's `TokenError` (an unterminated literal), not a `ParseError`
+    subclass — and the `re.error` sqlglot raises for some `UESCAPE` clauses
+    become a `PARSE_ERROR` reject, so `run_query` audits them like every
+    other rejection instead of letting them escape unaudited.
     """
+    try:
+        return _parse_and_validate(
+            raw_sql, allowed_tables=allowed_tables, ban_select_star=ban_select_star
+        )
+    except (sqlglot.errors.SqlglotError, re.error) as exc:
+        msg = f"SQL could not be parsed: {exc}"
+        raise QueryRejectedError(OutcomeReason.PARSE_ERROR, msg) from exc
+
+
+def _parse_and_validate(
+    raw_sql: str,
+    *,
+    allowed_tables: set[str],
+    ban_select_star: bool,
+) -> ParsedQuery:
     try:
         parsed = sqlglot.parse(raw_sql, dialect="postgres")
     except sqlglot.errors.ParseError as exc:

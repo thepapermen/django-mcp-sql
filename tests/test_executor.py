@@ -727,3 +727,32 @@ class TestExecutorHookFailureAudit:
             raw_sql="SELECT id FROM auth_permission",
         )
         self._assert_hook_misconfig(result)
+
+
+@pytest.mark.django_db
+class TestEveryParserFailureIsAudited:
+    """Tokenizer errors (`TokenError` is not a `ParseError`) and the
+    `re.error` sqlglot raises for some `UESCAPE` clauses escaped `run_query`
+    with no audit row (ledger F31 / F103)."""
+
+    @pytest.mark.parametrize(
+        "raw_sql",
+        [
+            "SELECT 'unterminated",
+            'SELECT "unterminated',
+            "SELECT $$unterminated",
+            "SELECT U&'x' UESCAPE '(' AS v",
+            "SELECT U&'x' UESCAPE '\\' AS v",
+        ],
+        ids=["string", "identifier", "dollar", "uescape-paren", "uescape-backslash"],
+    )
+    def test_audited_as_parse_error(self, monkeypatch, raw_sql):
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
+        )
+        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        cursor.execute.assert_not_called()
+        log = MCPQueryLog.objects.get()
+        assert log.decision == MCPQueryLog.DECISION_REJECTED
+        assert log.rejection_reason == result.rejection_reason
