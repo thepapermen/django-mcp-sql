@@ -841,10 +841,20 @@ class TestLexicalFidelity:
             "SELECT 1 AS $$x, version() AS v$$ FROM auth_permission",
             "SELECT 1 AS $t$x FROM pg_class --$t$ FROM auth_permission",
             "SELECT 1 AS $$x; RESET ROLE; SELECT 1 --$$ FROM auth_permission",
+            "SELECT 1 AS $$plain$$ FROM auth_permission",
+            "SELECT id FROM auth_permission AS $t$p$t$",
+            "SELECT 1 AS 'lit' FROM auth_permission",
         ],
-        ids=["extra-projection", "comment-tail", "multi-statement"],
+        ids=[
+            "extra-projection",
+            "comment-tail",
+            "multi-statement",
+            "plain-dollar",
+            "table-alias",
+            "string",
+        ],
     )
-    def test_dollar_quoted_alias_that_is_not_an_identifier(self, sql):
+    def test_identifier_written_as_a_string_constant(self, sql):
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
 
     @pytest.mark.parametrize(

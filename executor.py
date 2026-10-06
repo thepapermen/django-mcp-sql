@@ -24,8 +24,8 @@ from mcp_sql.grants import declared_tables
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
-from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
+from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import HINTS
 from mcp_sql.schemas import Cell
 from mcp_sql.schemas import OutcomeReason
@@ -54,7 +54,7 @@ class ExecutorMisconfiguredError(RuntimeError):
     'execution_error'`, `error=<misconfig reason>`."""
 
 
-def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
+def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by design
     *,
     user: "AbstractBaseUser",
     profile: Profile,
@@ -156,9 +156,30 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
     # cleared the parser). Audit it as a parse-class reject anyway so the
     # "every code path writes exactly one audit row" invariant holds with no
     # `RecursionError` escaping to the agent as an unaudited 500.
+    #
+    # `render_for_execution` also proves the SQL sent to Postgres re-parses to
+    # exactly the validated tree (ledger F32: sqlglot's re-emission is not
+    # always faithful); a mismatch is refused and audited, never executed.
     try:
-        wrapped_sql = inject_limit(parsed.ast, effective_limit + 1).sql(
-            dialect="postgres"
+        wrapped_sql = render_for_execution(parsed.ast, effective_limit + 1)
+    except QueryRejectedError as exc:
+        _audit_safely(
+            user=user,
+            profile=profile.name,
+            token_id=token_id,
+            decision=MCPQueryLog.DECISION_REJECTED,
+            rejection_reason=exc.reason,
+            raw_sql=raw_sql,
+            normalized_sql=parsed.normalized_sql,
+            started_at=started_at,
+            client_ip=client_ip,
+            client_redirect=client_redirect,
+            error=exc.detail,
+        )
+        return QueryResult(
+            rejection_reason=exc.reason,
+            hint=HINTS.get(exc.reason, ""),
+            error=exc.detail,
         )
     except RecursionError:
         msg = "SQL nesting is too deep to serialize"

@@ -47,6 +47,7 @@ ALTER ROLE mcp_readonly_role SET default_transaction_read_only = on;
 ALTER ROLE mcp_readonly_role SET statement_timeout = '5s';
 ALTER ROLE mcp_readonly_role SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE mcp_readonly_role SET lock_timeout = '1s';
+ALTER ROLE mcp_readonly_role SET standard_conforming_strings = on;
 
 BEGIN;
 

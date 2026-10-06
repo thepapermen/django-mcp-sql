@@ -276,11 +276,14 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
       containing a backslash is rejected; one without (`E'it''s'`) is
       faithful and allowed. Checked on the raw token text, because the
       parsed value no longer shows which escapes were written.
-    - An alias written as a string constant (`AS $$…$$`, `AS $t$…$t$`) —
-      which Postgres itself would refuse — becomes an UNQUOTED identifier
-      whose text is re-emitted verbatim, so `AS $$x, version() AS v$$`
-      re-emits as two projections. Any unquoted identifier that is not a
-      plain Postgres identifier is rejected.
+    - An identifier written as a string constant (`AS $$…$$`,
+      `AS $t$…$t$`, `AS 'x'`, `AS E'x'`) — which Postgres itself refuses —
+      becomes an identifier whose text sqlglot re-emits, unquoted for the
+      dollar forms, so `AS $$x, version() AS v$$` re-emits as two
+      projections and `AS $$x; RESET ROLE; …$$` as several statements.
+      Every identifier must be written as a plain or double-quoted
+      identifier (checked on its source text, via sqlglot's position
+      metadata).
 
     The executor's round-trip check (`executor.run_query`) is the backstop
     for anything else of this class.
@@ -297,10 +300,24 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
             )
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
     for ident in ast.find_all(exp.Identifier):
-        if not ident.quoted and not _UNQUOTED_IDENTIFIER_RE.fullmatch(ident.name):
+        start, end = ident.meta.get("start"), ident.meta.get("end")
+        written = (
+            raw_sql[start : end + 1] if start is not None and end is not None else None
+        )
+        if written is not None:
+            # As written: a plain identifier or a double-quoted one.
+            faithful = written.startswith('"') or bool(
+                _UNQUOTED_IDENTIFIER_RE.fullmatch(written)
+            )
+        else:
+            # No source position (sqlglot synthesized it): judge the name.
+            faithful = ident.quoted or bool(
+                _UNQUOTED_IDENTIFIER_RE.fullmatch(ident.name)
+            )
+        if not faithful:
             msg = (
-                f"Identifier {ident.name!r} is not a plain identifier (an alias "
-                "written as a string constant?); use a double-quoted identifier"
+                f"Identifier {written or ident.name!r} is written as a string "
+                "constant; use a plain or double-quoted identifier"
             )
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
 
@@ -312,6 +329,83 @@ def inject_limit(ast: exp.Query, n: int) -> exp.Query:
     rather than appending. Idempotent; safe to re-emit via `.sql()`.
     """
     return ast.limit(n)
+
+
+def render_for_execution(ast: exp.Query, limit: int) -> str:
+    """The SQL to send to Postgres: `ast` with `LIMIT limit`, proven faithful.
+
+    Emits the LIMIT-wrapped tree WITHOUT comments (sqlglot rewrites `--`
+    comments as `/* */` and their text is not part of the AST, so it can
+    never be checked) and re-parses the result. Raises
+    `QueryRejectedError(ROUNDTRIP_MISMATCH)` unless the re-parse is exactly
+    one statement whose tree equals the validated one node for node —
+    every node type, identifier text and `quoted` flag, alias and literal
+    value, compared exactly (`_same_tree`; sqlglot's own `==` compares
+    hashes of case-folded strings, which is not enough here). So whatever
+    sqlglot's generator gets wrong, Postgres only ever runs SQL that parses
+    back to the tree every check passed — never an extra projection,
+    statement or table smuggled through a literal or alias. A
+    dollar-quoted string is the one expected difference: it re-emits as a
+    standard string with the same value, so it is compared as one.
+
+    `RecursionError` (a pathologically deep tree) propagates; the caller
+    audits it.
+    """
+    expected = _canonical(inject_limit(ast, limit))
+    sql = expected.sql(dialect="postgres", comments=False)
+    try:
+        reparsed = [
+            p
+            for p in sqlglot.parse(sql, dialect="postgres")
+            if p is not None and not isinstance(p, exp.Semicolon)
+        ]
+    except sqlglot.errors.SqlglotError as exc:
+        msg = f"Re-serialized SQL does not re-parse: {exc}"
+        raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
+    if len(reparsed) != 1 or not _same_tree(expected, _canonical(reparsed[0])):
+        msg = "Re-serialized SQL differs from the validated query"
+        raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg)
+    return sql
+
+
+def _canonical(tree: exp.Expr) -> exp.Expr:
+    """A copy of `tree` with each dollar-quoted string (`exp.RawString`) as
+    the standard string literal sqlglot re-emits it as."""
+    return tree.transform(
+        lambda node: (
+            exp.Literal.string(node.this) if isinstance(node, exp.RawString) else node
+        )
+    )
+
+
+def _arg_items(node: exp.Expr) -> dict[str, object]:
+    # sqlglot leaves unset args as None / False / [] interchangeably.
+    return {k: v for k, v in node.args.items() if v not in (None, False, [])}
+
+
+def _same_tree(left: exp.Expr, right: exp.Expr) -> bool:
+    """Exact structural equality: same node types, same arg keys, equal
+    scalar values (case-sensitive, type-checked). Iterative, so a deep tree
+    cannot overflow here."""
+    stack: list[tuple[object, object]] = [(left, right)]
+    while stack:
+        a, b = stack.pop()
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, exp.Expr):  # every node class, on every 30.x
+            assert isinstance(b, exp.Expr)
+            a_args, b_args = _arg_items(a), _arg_items(b)
+            if a_args.keys() != b_args.keys():
+                return False
+            stack.extend((a_args[k], b_args[k]) for k in a_args)
+        elif isinstance(a, list):
+            assert isinstance(b, list)
+            if len(a) != len(b):
+                return False
+            stack.extend(zip(a, b, strict=True))
+        elif a != b:
+            return False
+    return True
 
 
 def extract_limit(ast: exp.Query) -> int | None:

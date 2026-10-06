@@ -320,17 +320,17 @@ class TestExecutorParserRejectAudit:
         self, settings, monkeypatch
     ):
         # A parseable-but-pathologically-deep AST can clear the parser yet
-        # overflow during the executor's LIMIT-injection serialization
-        # (`inject_limit(...).sql()`, outside the parser's own RecursionError
-        # guard). It must still be audited as PARSE_ERROR, not escape as an
-        # unaudited 500. Triggering real recursion here is impractical (parse
-        # overflows first), so we mock `inject_limit` to raise directly.
+        # overflow during the executor's LIMIT-injection serialization and
+        # round-trip check (`render_for_execution`, outside the parser's own
+        # RecursionError guard). It must still be audited as PARSE_ERROR, not
+        # escape as an unaudited 500. Triggering real recursion here is
+        # impractical (parse overflows first), so we mock it to raise.
         user = UserFactory()
 
         def boom(*args, **kwargs):
             raise RecursionError
 
-        monkeypatch.setattr("mcp_sql.executor.inject_limit", boom)
+        monkeypatch.setattr("mcp_sql.executor.render_for_execution", boom)
 
         with patch("mcp_sql.executor.connections") as mock_conns:
             mock_conns.databases = {"default": {}, "mcp_readonly": {}}

@@ -9,7 +9,7 @@ new tier. On local/test the example app pipes this into `psql` (see its
 Makefile `roles` target).
 
 Mirrors `role_setup.sql`'s shape exactly: an idempotent `CREATE ROLE … NOLOGIN`
-(swallowing `duplicate_object`), the four session GUC defaults via `ALTER ROLE`
+(swallowing `duplicate_object`), the session GUC defaults via `ALTER ROLE`
 (sourced from `session.EXPECTED_SESSION_GUCS` so they never drift from the
 runtime `SET LOCAL` guards), and the membership `GRANT … TO <app_role>` block
 that reads the connecting role from the psql variable `app_role` via a

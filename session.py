@@ -33,6 +33,13 @@ EXPECTED_SESSION_GUCS: dict[str, str] = {
     "lock_timeout": "1s",
     "idle_in_transaction_session_timeout": "10s",
     "default_transaction_read_only": "on",
+    # The parser (sqlglot) reads `'a\b'` as a backslash and a `b`, which is
+    # what Postgres reads only with `standard_conforming_strings` on. A
+    # database- or login-role-level `off` would make Postgres treat
+    # backslashes in standard strings as escapes, so the executed SQL would
+    # no longer mean what was checked (`'a\' AS x, '...'` shifts quotes).
+    # Pinned per transaction, like every guard.
+    "standard_conforming_strings": "on",
 }
 
 # `SET LOCAL` does not accept parameter binding, so the GUC name/value above
