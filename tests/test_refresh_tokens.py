@@ -203,8 +203,9 @@ class TestRefreshEnabled:
     def test_a_refresh_token_without_a_consent_record_is_refused(
         self, client, mcp_app, mcp_user, mcp_access_token
     ):
-        # Minted by 0.1.0b5 or earlier, or by a stock DOT view while refresh
-        # was off: DOT would accept it, the package has no consent time.
+        # As 0.1.0b5 or earlier stored it (or any path that bypassed
+        # `save_bearer_token`): DOT would accept it, the package has no
+        # consent time.
         legacy = RefreshToken.objects.create(
             user=mcp_user,
             token=secrets.token_urlsafe(32),

@@ -320,9 +320,9 @@ class MCPOAuth2Validator(OAuth2Validator):
         have a consent record (`MCPRefreshTokenFamily`) younger than
         `REFRESH_TOKEN_MAX_AGE_SECONDS`. Measured from the consent, across
         rotations — unlike DOT's `REFRESH_TOKEN_EXPIRE_SECONDS`, a window
-        that slides with each new access token. A family with no record (an
-        earlier release's token, or one a stock view minted while refresh
-        was off) is refused.
+        that slides with each new access token. A family with no record (a
+        token from 0.1.0b5 or earlier, or any written outside
+        `save_bearer_token`) is refused.
         """
         if not refresh_tokens_enabled():
             return False

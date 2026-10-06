@@ -798,5 +798,15 @@ class TestOauthlibInternals:
 
     def test_grant_reads_its_refresh_token_flag(self):
         # `GrantTypeBase.__init__` copies the class attribute onto the
-        # instance, and `create_token_response` passes it to the handler.
-        assert MCPAuthorizationCodeGrant(MCPOAuth2Validator()).refresh_token is False
+        # instance, and a constructor kwarg overrides it (how `MCPServer`
+        # turns refresh on). That `create_token_response` then honours the
+        # flag is pinned end to end: no `refresh_token` in the exchange
+        # response by default (`TestAuthorizeEndpointResponseTypes`,
+        # `test_oauth.py::TestRefreshRefused`), one when refresh is on
+        # (`test_refresh_tokens.py::TestRefreshEnabled`).
+        validator = MCPOAuth2Validator()
+        assert MCPAuthorizationCodeGrant(validator).refresh_token is False
+        assert (
+            MCPAuthorizationCodeGrant(validator, refresh_token=True).refresh_token
+            is True
+        )

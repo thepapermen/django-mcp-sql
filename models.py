@@ -215,9 +215,15 @@ class MCPRefreshTokenFamily(models.Model):
     (`MCPOAuth2Validator.save_bearer_token`). The hard cap is measured from
     it, across rotations. DOT's own rows cannot carry it: `cleartokens`
     deletes revoked (rotated) refresh tokens, so the chain's first row does
-    not survive. A family with no row here — refresh tokens minted by an
-    earlier release or by a stock DOT view while refresh was off — is
-    refused.
+    not survive. A family with no row here — refresh tokens from 0.1.0b5 or
+    earlier, or any written outside `save_bearer_token` — is refused.
+
+    Rows past the cap are pruned at each new exchange. Rows whose refresh
+    tokens are gone (revoked, deleted by `cleartokens`, or refresh switched
+    off again) are inert — a family is only consulted for a live refresh
+    token — and can be deleted at will, e.g. alongside `cleartokens`:
+    `MCPRefreshTokenFamily.objects.exclude(token_family__in=
+    RefreshToken.objects.values("token_family")).delete()`.
     """
 
     token_family = models.UUIDField(primary_key=True)

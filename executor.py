@@ -268,9 +268,11 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_rows = cur.fetchall()
             columns = [c.name for c in cur.description] if cur.description else []
             # Never commit the read transaction. `transaction_read_only`
-            # already refuses writes; rolling back means that whatever a
-            # query could still change (a sequence's `nextval`, a function
-            # with side effects outside the read-only rule) is not kept.
+            # already refuses writes to tables and sequences (`nextval` fails
+            # with 25006); rolling back additionally discards the
+            # transactional effects the read-only rule permits (e.g. writes
+            # to temporary tables). It cannot undo non-transactional effects
+            # (sequence advances, anything outside the database).
             transaction.set_rollback(True, using=db_alias)
     except DatabaseError as exc:
         duration_ms = (perf_counter_ns() - t0) // 1_000_000
