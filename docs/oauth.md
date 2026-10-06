@@ -9,8 +9,10 @@ responding to an incident.
 ## Architecture in five lines
 
 - Single OAuth Application `mcp-sql`; single scope `mcp:sql`; PKCE
-  required, `S256` only (enforced by `MCPOAuth2Validator` whatever
-  `PKCE_REQUIRED` says); `authorization_code` grant only.
+  required, `S256` only (whatever `PKCE_REQUIRED` says);
+  `authorization_code` grant only, bearer token in the `Authorization`
+  header only — enforced by the package's own OAuth server (see "The OAuth
+  server" below), not by the consumer's `OAUTH2_SERVER_CLASS`.
 - Token lifetime: 6 h access, no refresh tokens, 60 s authorization code.
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
@@ -33,8 +35,8 @@ discovery surface comprises two anonymous-GET endpoints plus the
 
 | URL | RFC | What it says |
 |---|---|---|
-| `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]` (enforced: a request carrying an `access_token` query or form parameter gets 400 `invalid_request`). |
-| `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
+| `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]` (enforced: an `access_token` query or form parameter is not a credential, so a request carrying its token only there gets the ordinary 401). |
+| `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE), `token_endpoint_auth_methods_supported=["none"]` (public client). The response type, grant type and PKCE method lists are enforced, see "The OAuth server". |
 
 The `/mcp/sql/` 401 response advertises the RFC 9728 URL:
 
@@ -74,6 +76,49 @@ per-origin secret — they describe public endpoints by spec. The
 companion `Access-Control-Allow-Methods: GET, HEAD` matches the actual
 `@require_safe` posture; OPTIONS is deliberately absent so the
 advertisement does not lie about a method the view rejects.
+
+## The OAuth server
+
+DOT runs its views on `OAUTH2_PROVIDER["OAUTH2_SERVER_CLASS"]`, by default
+oauthlib's all-grants `Server` (password, client credentials, refresh token,
+device code and implicit, besides the authorization code). The package's own
+OAuth views — `/o/authorize/`, `/o/token/`, `/o/revoke_token/` — and
+`MCPOAuth2Authentication` on `/mcp/sql/` instead run on
+`oauth_server.MCPServer`, whatever `OAUTH2_SERVER_CLASS` is set to:
+
+- `/o/authorize/` serves the `code` response type only (`response_type=token`
+  or anything else is redirected back as `unsupported_response_type`). PKCE
+  is mandatory and `S256` only: a missing challenge, `plain`, or an omitted
+  `code_challenge_method` (which oauthlib would default to `plain`) is
+  redirected back as `invalid_request`, on the authorize GET and on the
+  consent POST.
+- `/o/token/` accepts exactly one `grant_type=authorization_code`.
+  Anything else — `password`, `client_credentials`, `refresh_token`, the
+  device-code grant, `openid`, an unknown, missing or repeated value — is a
+  400 `unsupported_grant_type` before DOT's own token handling or the server
+  runs, so a password grant cannot test a password and DOT's device-code
+  branch is unreachable. A control character in any parameter is a 400
+  `invalid_request`. The response never carries a `refresh_token`.
+- `/mcp/sql/` takes the bearer token from the `Authorization` header only.
+  An `access_token` query or form-body parameter is not a credential: a
+  request carrying its token only there gets the ordinary 401 (never looked
+  up, not counted by the bad-token throttle), and beside a header the
+  parameter is ignored. DOT logs an RFC 9700 deprecation warning for each
+  request with an `access_token` query parameter; setting
+  `OAUTH2_PROVIDER["COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT"] = True`
+  makes DOT refuse such a request itself before the server runs — also a
+  401, and then even beside a valid header — without the warning.
+- `/o/revoke_token/` is DOT's RFC 7009 token revocation.
+
+`MCPOAuth2Validator` is the install's `OAUTH2_VALIDATOR_CLASS`, so it also
+serves any stock DOT view a consumer mounts for another purpose (e.g.
+`include("oauth2_provider.urls")`) on the stock server. There it keeps
+backstops, not the narrowing above: PKCE stays required and a non-`S256`
+code cannot be exchanged (`invalid_grant`, though such a view still accepts
+`plain` at authorize), refresh and password grants are refused with
+`invalid_grant` (the password is never checked, so a correct and a wrong one
+get the same answer), and a `client_id` carrying a control character is never
+looked up. Pinned by `tests/test_oauth_server.py`.
 
 ## Dynamic Client Registration (RFC 7591)
 
@@ -640,15 +685,17 @@ volume.
   access without the user. Users instead re-OAuth every 6 h (the
   session-trust gate at `/o/authorize/` runs without re-prompting MFA so
   long as the Django session is still valid; DCR and cloud clients show the
-  consent screen each time), mediated by the client. Enforcement is in
-  `MCPOAuth2Validator`: `save_bearer_token` drops the `refresh_token` field
-  before DOT stores the token (so `/o/token/` returns none and no
-  `RefreshToken` row is created), and `validate_refresh_token` refuses every
-  `grant_type=refresh_token` request with `invalid_grant` — including refresh
-  tokens minted by releases up to and including 0.1.0b5, which did emit them.
-  `REFRESH_TOKEN_EXPIRE_SECONDS` is not what disables refresh: DOT reads `0`
-  as *no age limit*, and on those releases such a token renewed access
-  indefinitely.
+  consent screen each time), mediated by the client. Enforcement is the
+  package's OAuth server (see "The OAuth server"): its authorization-code
+  grant never generates a refresh token (so `/o/token/` returns none and no
+  `RefreshToken` row is created), and `/o/token/` refuses every
+  `grant_type=refresh_token` request with `unsupported_grant_type` —
+  including refresh tokens minted by releases up to and including 0.1.0b5,
+  which did emit them. (On a stock DOT token view,
+  `MCPOAuth2Validator.validate_refresh_token` refuses them with
+  `invalid_grant`.) `REFRESH_TOKEN_EXPIRE_SECONDS` is not what disables
+  refresh: DOT reads `0` as *no age limit*, and on those releases such a
+  token renewed access indefinitely.
 - **Why no idle timeout?** Out of scope. The 6 h hard cap + logout
   revocation + the daily-volume Sentry alerts bound exposure for **every**
   consumer. A consumer that enables the **opt-in** session-existence gate

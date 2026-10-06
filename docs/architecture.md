@@ -25,8 +25,10 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
   per RFC 8252 §7.3 (DOT 3.x port-wildcards any port on the loopback IP
   `127.0.0.1`; bare `localhost` can't be port-wildcarded so the curated app
   omits it — but the DCR endpoint DOES accept `localhost` via exact-match,
-  see "OAuth surface"). 6h hard cap on tokens, no refresh tokens (the
-  validator refuses refresh grants and mints none). Audience
+  see "OAuth surface"). The package's OAuth views and auth class run on
+  its own narrow oauthlib server (`oauth_server.MCPServer`), not the
+  consumer's `OAUTH2_SERVER_CLASS`. 6h hard cap on tokens, no refresh tokens
+  (the server has no refresh grant and mints none). Audience
   binding is implicit: the binding is achieved via the single `mcp:sql`
   scope plus the auth class being mounted only on `/mcp/sql/` (no explicit
   `aud` claim). DOT 3.4+ (3.4.1 is the floor) ships RFC 8707 resource-indicator
@@ -63,9 +65,11 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 | `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery` and `inject_limit(ast, n) -> Expression`. sqlglot-backed AST validators: single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *`, no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte`; a flat global CTE-name set let an inner CTE shadow an outer-scope real table), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`). Raises `QueryRejectedError(reason, detail)`. |
 | `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → inject `LIMIT N+1` → open `mcp_readonly` tx → `enter_readonly_session` → execute → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, and `rejection_reason` — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
 | `observability.py` | `record_query_volume(*, user_id, decision, user_label="")` — per-(user, decision, window) fixed-window cache counters (mirrors `throttle`'s `cache.add`+`incr` primitive), called from `executor._audit_safely` on every audited row. Emits ONE `logger.error` (Sentry event) at each crossing of `MCP_SQL["VOLUME_ALERT_THRESHOLDS"][decision][window]` (hour + day, allowed + rejected). ALERTS, never blocks; fail-open on cache trouble. The alert names the user (pk + `get_username()`); it never logs SQL. |
-| `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't the `mcp-sql` Application and any scope set that isn't `{"mcp:sql"}`. Its `validate_redirect_uri` / `get_default_redirect_uri` also re-apply the `/o/register` predicate (`views/registration.py::_is_loopback_redirect`) to the requested redirect and to the stored default of every client that is not a declared cloud client (see "Watch out: DOT stores redirect URIs whitespace-joined"). It also owns the PKCE and refresh policy: `is_pkce_required` forces PKCE on and refuses any `code_challenge_method` but `S256`, `get_code_challenge_method` refuses to redeem a stored non-S256 grant, `validate_refresh_token` refuses every refresh grant and `save_bearer_token` mints no refresh token (see "Watch out: PKCE and refresh policy live in the hooks oauthlib actually calls"). |
-| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_staff`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. Bearer tokens are taken from the `Authorization` header only: a request carrying an `access_token` query or form parameter is refused with 400 `invalid_request` before any token lookup (see "Watch out: bearer tokens travel in the header only"). |
-| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` and runs the issuance gate (`is_active + is_staff + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects `resource_name = RESOURCE_NAME` so the consent page shows the configured server name (the same identity in the RFC 9728 metadata) instead of DOT's opaque per-client `application.name` (`mcp-sql-<token>` for every DCR client). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
+| `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't the `mcp-sql` Application and any scope set that isn't `{"mcp:sql"}`. Its `validate_redirect_uri` / `get_default_redirect_uri` also re-apply the `/o/register` predicate (`views/registration.py::_is_loopback_redirect`) to the requested redirect and to the stored default of every client that is not a declared cloud client (see "Watch out: DOT stores redirect URIs whitespace-joined"). It is also the install's `OAUTH2_VALIDATOR_CLASS`, so it keeps one-line backstops for any stock DOT view on DOT's stock server: `is_pkce_required` always `True`, `get_code_challenge_method` refuses to redeem a stored non-S256 grant (`invalid_grant`, on any server), `validate_refresh_token` / `validate_user` refuse every refresh / password grant, and `_load_application` never looks up a `client_id` carrying a control character (see "Watch out: the OAuth server is narrowed on the package's views"). |
+| `oauth_server.py` | The narrow oauthlib server the package's OAuth views and `MCPOAuth2Authentication` run on, whatever the consumer's `OAUTH2_SERVER_CLASS`. `MCPAuthorizationCodeGrant` (no refresh token, `S256`-only PKCE table), `HeaderOnlyBearer` (bearer token from the `Authorization` header only), `MCPServer` (authorization endpoint with the `code` response type only, token endpoint with the `authorization_code` grant only, resource endpoint, revocation endpoint; takes DOT's `server_kwargs`), `MCPServerViewMixin` (`server_class = MCPServer` + a per-class oauthlib-core cache, see "Watch out") and `get_mcp_oauthlib_core()` (DOT's `get_oauthlib_core()` on `MCPServer`, for the auth class). |
+| `views/oauth_token.py` | `MCPTokenView` / `MCPRevokeTokenView` — DOT's `TokenView` / `RevokeTokenView` on `MCPServer`. `MCPTokenView.post` answers anything but exactly one `grant_type=authorization_code` with 400 `unsupported_grant_type` (before DOT's own device-code branch, which no server setting reaches) and a control character in any parameter with 400 `invalid_request`. |
+| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_staff`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. Tokens are verified on `MCPServer` (`_verify_bearer`, DOT's own `authenticate` logic on `get_mcp_oauthlib_core()`), so a bearer token is taken from the `Authorization` header only: an `access_token` query or form parameter is not a credential (see "Watch out: bearer tokens travel in the header only"). |
+| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` (on `MCPServer`, via `MCPServerViewMixin`: `code` response type and `S256` PKCE only) and runs the issuance gate (`is_active + is_staff + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects `resource_name = RESOURCE_NAME` so the consent page shows the configured server name (the same identity in the RFC 9728 metadata) instead of DOT's opaque per-client `application.name` (`mcp-sql-<token>` for every DCR client). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
 | `views/mcp_endpoint.py` | `/mcp/sql/` view. Per-request `FastMCP` instantiation with three tool callables (`list_tables`, `describe_table`, `run_query`) closed over the authenticated `user`/`token_id`/`client_ip`. Mounted via `a2wsgi.ASGIMiddleware`; the DRF auth class decorator runs first, so anonymous / wrong-scope requests are rejected before the bridge runs. CSRF exempt (bearer auth, not cookies). The `FastMCP` carries `instructions=_SERVER_INSTRUCTIONS` (the standing untrusted-data + human-in-the-loop security posture, delivered once in the `initialize` response — see "Watch out") and each tool carries honest `readOnlyHint=True` / `openWorldHint=False` `ToolAnnotations`. **Routed (`urls.py`) at BOTH `/mcp/sql/` (canonical — named, what `reverse()` + the RFC 9728 `resource` advertise) and the slash-less alias `/mcp/sql`**: Claude.ai's web connector normalises the trailing slash off and POSTs to `/mcp/sql`, and `APPEND_SLASH` can't 301-redirect a POST without dropping the body, so a slash-only route 500s the instant the transport opens (`docs/oauth.md` → "Cloud clients" → Troubleshooting; pinned by `test_mcp_endpoint.py::TestEndpointRouting`). |
 | `views/discovery.py` | OAuth 2.0 discovery surface. `protected_resource_metadata` (RFC 9728) at `/.well-known/oauth-protected-resource/mcp/sql` advertises the MCP endpoint's `resource`, the env's `resource_name` (sourced from `MCP_SQL["RESOURCE_NAME"]`; consuming projects typically override this to an env-distinct value), and the AS URL. `authorization_server_metadata` (RFC 8414) at `/.well-known/oauth-authorization-server/o` (path-suffix per RFC 8414 §3.1, matching the `https://<host>/o` issuer) advertises `issuer`, the three OAuth endpoints, the `registration_endpoint`, scopes, grant types, `code_challenge_methods_supported=["S256"]`, and `token_endpoint_auth_methods_supported=["none"]` (public client). Both anonymous-GET, CSRF-exempt. Referenced by `MCPOAuth2Authentication.authenticate_header()` via the `resource_metadata` parameter in `WWW-Authenticate` so MCP clients can bootstrap the OAuth dance off a 401. |
 | `throttle.py` | Shared per-IP fixed-window block backed by the Django cache (use a SHARED backend — Redis, Memcached — in production: with a per-process backend like LocMem the counters, and therefore the block, are per-worker). One primitive, two surfaces: `auth` (`bad_token` scope, silent 401) and `views/registration` (`register` scope, silent inert 201). Both share `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]` / `["BAD_TOKEN_IP_WINDOW_SECONDS"]`; keys are scope-namespaced so one surface never depletes the other's budget. Keys on `REMOTE_ADDR` — sound only behind a hardened edge proxy (see "Watch out: the per-IP throttle trusts the proxy's IP handling"). |
@@ -334,8 +338,8 @@ column-level grants scattered in tooling state.
 - **Consent screen asymmetry**: the curated migration-0005 `mcp-sql` Application has `skip_authorization=True`; every DCR-minted `mcp-sql-<token>` Application has `skip_authorization=False`. The curated client is operator-provisioned — its redirect URI is fixed in the migration so there is no rogue-client attack surface — and consent would be friction without security. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template. Settings-declared `mcp-sql-cloud.<name>` clients also carry `skip_authorization=False`: their redirect is a provider-hosted, off-device callback, so the same phishing surface applies and consent is required.
 - **Single scope**: `mcp:sql`. `MCPOAuth2Validator` refuses to mint anything else, and `MCPOAuth2Authentication` re-checks the scope on every request.
 - **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb` — any `@` in the authority, even an empty userinfo), any whitespace inside a URI (see "Watch out: DOT stores redirect URIs whitespace-joined"), any non-printable or non-ASCII character, and an unparseable authority or port — each a 400 `invalid_redirect_uri`, never a 500. `MCPOAuth2Validator` re-applies the same predicate at `/o/authorize/` to the requested redirect and to the stored default of every client that is not a declared cloud client, so a row that already stores an off-machine redirect cannot be redirected to it. **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins. **Non-loopback (`https`) redirects are admitted only for operator-declared cloud clients** (`MCP_SQL["CLOUD_CLIENTS"]`, see the "OAuth surface" cloud-clients note below): exact-match entries ride DOT's stock exact matching, and the single `MCPOAuth2Validator.validate_redirect_uri` prefix override (`_redirect_under_prefix`) admits a per-instance callback under an allowlisted `https` host+path prefix (host-exact never `endswith`, no `@` in the authority, no query / fragment / `;params`, no `..`, port-exact). `/o/register` itself is **unchanged — still loopback-only**; the cloud path never touches it.
-- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`), which is also the re-consent interval: no refresh tokens. `MCPOAuth2Validator.save_bearer_token` drops the `refresh_token` oauthlib generates before DOT stores the token (no `RefreshToken` row, no response field) and `validate_refresh_token` refuses every refresh grant with `invalid_grant`, including refresh tokens minted by releases up to and including 0.1.0b5. `REFRESH_TOKEN_EXPIRE_SECONDS` plays no part — on its own, `0` means *no age limit* to DOT, and such tokens did renew access. Authorization code expires in 60 s.
-- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
+- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`), which is also the re-consent interval: no refresh tokens. `MCPServer`'s authorization-code grant never generates one (no `RefreshToken` row, no response field) and `/o/token/` has no refresh grant (`unsupported_grant_type`), so refresh tokens minted by releases up to and including 0.1.0b5 are refused too; on a stock DOT token view `MCPOAuth2Validator.validate_refresh_token` refuses them with `invalid_grant`. `REFRESH_TOKEN_EXPIRE_SECONDS` plays no part — on its own, `0` means *no age limit* to DOT, and such tokens did renew access. Authorization code expires in 60 s.
+- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs, as `MCPServer`-backed subclasses, plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
 - **Issuance gate** at `/o/authorize/`: `is_active AND is_staff AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
 - **Runtime gate** in `MCPOAuth2Authentication.authenticate` (every MCP request): the same issuance checks PLUS an **opt-in** session-existence check. When `MCP_SQL["SESSION_MODEL"]` is set to a session-with-user model, the gate runs `<model>.objects.filter(user=user, expire_date__gt=now()).exists()` and rejects on miss. When `SESSION_MODEL` is unset (`None`, the in-package default), the gate is skipped — stock `django.contrib.sessions.Session` has no `user` FK, so defaulting to it would crash with `FieldError`; making the gate opt-in is the honest contract. Consumers who DO enable the gate get the runtime half of Option D — without it, a Django session can die (cookie cleared, admin deletes the row, `clearsessions` sweeps an expired row, a restart wipes a cache-only session store) while the OAuth bearer outlives it for up to the token's 6h TTL. With the gate enabled, the consumer's `SESSION_COOKIE_AGE` becomes the *real* upper bound on token usefulness rather than just an issuance-time freshness proxy. Explicit logout still has its own fast path via the `user_logged_out` signal regardless of gate setting (revokes tokens immediately so the next request 401s on missing-token, not on missing-session).
 - **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
@@ -527,26 +531,23 @@ The load-bearing invariants and footguns, grouped by layer:
   MCP clients (Claude Code) would never receive the challenge they
   need to bootstrap OAuth. The regression is pinned by
   `tests/test_mcp_endpoint.py::TestStockDRFDefaultsDoNotPiercePackage`.
-- **Bearer tokens travel in the header only — and that is OUR guard, not
-  DOT's.** oauthlib falls back to an `access_token` request parameter when
-  there is no `Authorization` header, so DOT on its own authenticates
-  `/mcp/sql/?access_token=<token>` (and a form-body token); every release up
-  to and including 0.1.0b5 did. `MCPOAuth2Authentication.authenticate`
-  therefore refuses any request carrying an `access_token` query parameter,
-  or one in a form-encoded / multipart body, with 400 `invalid_request` and
-  the usual `resource_metadata` challenge (plus `error="invalid_request"`) —
-  even next to a valid header — right after the body cap and BEFORE the
-  bad-token throttle and any token lookup, so a URL token is never validated
-  and the answer is the same for a valid and a bogus one. The form check
-  parses the cached raw body itself, for form media types only, on EVERY
-  method: DOT reads the token through DRF's `Request.POST`, which parses a
-  form body whatever the method, while Django's own `request.POST` is filled
-  for POST alone — reading that would miss a form-body token on GET /
-  DELETE / OPTIONS / PUT. The JSON-RPC body is never parsed there and the MCP
-  bridge still gets the bytes. Like the 413 cap it is malformed transport:
-  no `MCPAuthRejectionLog` row, no throttle count. This is what keeps the RFC
-  9728 `bearer_methods_supported: ["header"]` honest; pinned by
-  `tests/test_auth_class.py::TestBearerTokenOnlyInHeader`.
+- **Bearer tokens travel in the header only — and that is OUR server, not
+  DOT's default.** oauthlib's stock `BearerToken` falls back to an
+  `access_token` request parameter (query string, or a form body on any
+  method, since DOT reads it through DRF's `Request.POST`) when there is no
+  `Authorization` header, so DOT on its own authenticates
+  `/mcp/sql/?access_token=<token>`; every release up to and including
+  0.1.0b5 did. `MCPOAuth2Authentication` therefore verifies on `MCPServer`
+  (`_verify_bearer` → `get_mcp_oauthlib_core()`), whose `HeaderOnlyBearer`
+  reads the header only: a token carried only as a parameter is never looked
+  up and the request is an ordinary 401 (same for a valid and a bogus token;
+  no `MCPAuthRejectionLog` row; no throttle count, as there is no header),
+  and beside a header the parameter is ignored. Never verify through DOT's
+  `get_oauthlib_core()` / `super().authenticate()` here — that is the
+  consumer's server. This is what keeps the RFC 9728
+  `bearer_methods_supported: ["header"]` honest; pinned by
+  `tests/test_auth_class.py::TestBearerTokenOnlyInHeader` and
+  `tests/test_oauth_server.py::TestConsumerServerClassDoesNotWiden`.
 ### MCP transport & tool dispatch
 
 - **`run_query` results are fenced; `rows` is a string, not a list.** The
@@ -719,7 +720,8 @@ The load-bearing invariants and footguns, grouped by layer:
   plain `startswith` no longer matches the canonical row. Refresh tokens
   are not deleted separately: none are minted any more, and a `RefreshToken`
   row left by a release up to and including 0.1.0b5 is refused at
-  `/o/token/` by `MCPOAuth2Validator.validate_refresh_token`.
+  `/o/token/` (`MCPServer` has no refresh grant; on a stock DOT token view,
+  `MCPOAuth2Validator.validate_refresh_token` refuses it).
 - **Trailing dash on `APPLICATION_NAME_PREFIX` is structural, and the DCR
   suffix shape is checked.** Without the dash `startswith("mcp-sql")` would
   match BOTH the canonical `mcp-sql` row AND every DCR-minted
@@ -756,25 +758,40 @@ The load-bearing invariants and footguns, grouped by layer:
   row (its loopback entries still authorize, like any DCR client's). Pinned
   by `test_registration.py::TestDynamicClientRegistrationValidation` and
   `::TestAuthorizeLoopbackRecheck`.
-- **PKCE and refresh policy live in the hooks oauthlib actually calls.**
-  Releases up to and including 0.1.0b5 carried a
-  `validate_code_challenge_method` override that nothing in oauthlib or DOT
-  ever calls, so `plain` PKCE (and an omitted method, which oauthlib
-  defaults to `plain`) was accepted; and they relied on
-  `REFRESH_TOKEN_EXPIRE_SECONDS=0`, which DOT reads as "no age limit", so
-  refresh tokens renewed access indefinitely. The enforcement now sits in
-  `MCPOAuth2Validator.is_pkce_required` — called by oauthlib's
-  `validate_authorization_request` after the fatal client/redirect checks
-  and before it defaults the method, on the authorize GET and again when
-  the consent POST creates the response; it returns the literal `True`
-  (oauthlib tests `is True`), ignoring the consumer's `PKCE_REQUIRED`, and
-  raises `InvalidRequestError` for any method but `S256` — plus the
-  token-time backstop `get_code_challenge_method`, and
-  `validate_refresh_token` / `save_bearer_token` for refresh. Before adding
-  any other policy override, check that oauthlib or DOT really calls the
-  method, and pin it with an end-to-end test through `/o/authorize/` and
-  `/o/token/` (`test_oauth.py::TestPKCEEnforcedEndToEnd`,
-  `::TestRefreshRefused`), not a unit call to the method alone.
+- **The OAuth server is narrowed on the package's views; the validator
+  keeps install-wide backstops.** DOT serves its views from
+  `OAUTH2_SERVER_CLASS`, by default oauthlib's all-grants `Server`, which
+  left the password (an anonymous password oracle: `unauthorized_client` for
+  a right password, `invalid_grant` for a wrong one), client-credentials,
+  refresh-token, device-code and implicit paths reachable behind the
+  package's URLs, and it is why releases up to and including 0.1.0b5
+  accepted `plain` PKCE and renewed access through refresh tokens forever.
+  The package's views and auth class now run on `oauth_server.MCPServer`
+  (one response type, one grant, no refresh token, `S256` only, header-only
+  bearer), which the consumer's settings cannot widen. Three traps keep it
+  that way:
+  - DOT's `TokenView.post` sends the device-code grant to its own handler
+    BEFORE any server runs, and oauthlib's authorization-code grant also
+    accepts `grant_type=openid`; `MCPTokenView.post` therefore refuses every
+    `grant_type` but one `authorization_code` itself. Keep that check first.
+  - DOT caches a view's oauthlib core behind `hasattr(cls,
+    "_oauthlib_core")`, which a core cached on the STOCK parent view
+    satisfies, so a subclass that only sets `server_class` silently runs on
+    the all-grants server once any stock view in the process has served a
+    request. `MCPServerViewMixin.get_oauthlib_core` caches in the class's
+    own `__dict__`; any new package OAuth view must use the mixin.
+  - The validator is the install's `OAUTH2_VALIDATOR_CLASS`, so it also
+    serves stock DOT views a consumer mounts. Its backstops
+    (`is_pkce_required` → `True`, `get_code_challenge_method` S256-only,
+    `validate_refresh_token` / `validate_user` → `False`, `_load_application`
+    refusing a control-character `client_id`) are one-liners on purpose;
+    policy lives in the server. `get_code_challenge_method` is also what
+    turns a stored non-S256 grant into `invalid_grant` on `MCPServer` (the
+    grant's method table alone would answer `server_error`).
+  Before adding a policy hook, check that oauthlib or DOT really calls it
+  and pin it end to end through the URLs (`test_oauth_server.py`,
+  `test_oauth.py::TestPKCEEnforcedEndToEnd`, `::TestRefreshRefused`), not
+  with a unit call alone.
 ### Curated-view migrations
 
 - **Curated-view migrations have two mandatory invariants** that any new

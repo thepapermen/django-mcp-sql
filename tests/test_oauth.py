@@ -182,7 +182,8 @@ class TestMCPOAuth2ValidatorPKCE:
 
 class TestMCPOAuth2ValidatorGrantBackstops:
     """No refresh grant and no password grant, even on DOT's stock server.
-    End-to-end: `TestRefreshRefused`."""
+    End-to-end: `TestRefreshRefused` and
+    `test_oauth_server.py::TestValidatorBackstopsOnStockViews`."""
 
     def test_refuses_a_refresh_token_dot_would_accept(self, monkeypatch):
         monkeypatch.setattr(

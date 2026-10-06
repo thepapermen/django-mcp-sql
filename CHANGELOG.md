@@ -57,6 +57,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     non-loopback redirect, requested or stored, is now refused for it too,
     even if an operator edited its `redirect_uris` (the documented posture
     was already loopback-only).
+- **`/o/token/` and `/o/authorize/` served every grant of DOT's default
+  oauthlib server, not just the advertised one (affects every release up to
+  and including 0.1.0b5).** The package's OAuth views ran on DOT's
+  `OAUTH2_SERVER_CLASS`, by default oauthlib's all-grants `Server`, although
+  the discovery document advertises `authorization_code` / `code` only. So,
+  anonymously: a `grant_type=password` request answered `unauthorized_client`
+  for a correct password and `invalid_grant` for a wrong one (a password
+  oracle against any active account of the consumer's user model, whatever
+  its MCP access); `grant_type=openid`, a device-code request without
+  `device_code`, and a NUL in `code` or `client_id` raised uncaught 500s;
+  and the implicit and client-credentials grants ran behind the package's
+  URLs, held back only by per-Application checks.
+  The package's three OAuth views and `MCPOAuth2Authentication` now run on
+  the package's own oauthlib server, `oauth_server.MCPServer`, whatever
+  `OAUTH2_SERVER_CLASS` says: the `code` response type and the
+  `authorization_code` grant only, with no refresh token, `S256`-only PKCE
+  and the bearer token from the `Authorization` header only.
+  - `/o/token/` answers anything but exactly one
+    `grant_type=authorization_code` (password, client credentials, refresh
+    token, device code, `openid`, unknown, missing or repeated) with 400
+    `unsupported_grant_type` before DOT's own token handling or the server
+    runs (DOT routes the device-code grant to its own handler before any
+    server), and a control character in any token-request parameter with
+    400 `invalid_request`. A `response_type` other than `code` at `/o/authorize/`
+    is redirected back as `unsupported_response_type`.
+  - A `client_id` carrying a control character is never looked up
+    (`MCPOAuth2Validator`): it previously raised a 500 from HTTP Basic
+    credentials at `/o/token/` and `/o/revoke_token/`, from the body at
+    `/o/revoke_token/`, and at `/o/authorize/` (anonymous `prompt=none`
+    included); now `invalid_client` / the error page.
+  - `MCPOAuth2Validator` is the install's `OAUTH2_VALIDATOR_CLASS`, so for a
+    consumer that also mounts DOT's stock views it keeps install-wide
+    backstops there: password and refresh grants are refused with
+    `invalid_grant` (the password is never checked), PKCE stays required and
+    a non-`S256` code cannot be exchanged. Those stock views are not
+    otherwise narrowed.
+  - **Behaviour change:** none for a client using the advertised flow. A
+    client that relied on any other grant, response type or PKCE method was
+    already outside the documented surface and is now refused.
 - **Refresh tokens renewed access indefinitely (affects 0.1.0b5 and
   earlier).** The docs said refresh tokens were disabled by
   `REFRESH_TOKEN_EXPIRE_SECONDS=0`, but django-oauth-toolkit reads `0` as
@@ -64,11 +103,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   access token and honoured it on `grant_type=refresh_token` (verified on
   DOT 3.2.0 and 3.4.1). A client could therefore keep renewing its access
   token without the user ever re-consenting.
-  `MCPOAuth2Validator.validate_refresh_token` now refuses every refresh
-  grant with `invalid_grant`, including refresh tokens already stored, and
-  `save_bearer_token` no longer mints them: the `/o/token/` response has no
-  `refresh_token` field and no `RefreshToken` row is created. Existing
-  `RefreshToken` rows are left in place and are inert.
+  `MCPServer`'s authorization-code grant no longer generates a refresh
+  token: the `/o/token/` response has no `refresh_token` field and no
+  `RefreshToken` row is created. `/o/token/` has no refresh grant, so a
+  refresh token already stored by an earlier release is refused with
+  `unsupported_grant_type` (and with `invalid_grant` by
+  `MCPOAuth2Validator.validate_refresh_token` on a stock DOT token view).
+  Existing `RefreshToken` rows are left in place and are inert.
   - **Behaviour change:** a client that relied on refresh now re-authorizes
     every `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the documented settings),
     with the consent screen for DCR and cloud clients — the interval the
@@ -82,17 +123,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   authorization URL is the verifier itself, so anyone who observes that
   request can redeem an intercepted code. A consumer's
   `PKCE_REQUIRED=False` also turned PKCE off altogether.
-  `MCPOAuth2Validator.is_pkce_required` now requires PKCE on every
-  authorization regardless of `PKCE_REQUIRED` and refuses any method but
-  `S256` with `invalid_request` — redirected, like any non-fatal authorize
-  error, to the already-validated redirect URI — on the authorize GET and
-  on the consent POST. `get_code_challenge_method` refuses to exchange a
-  stored non-S256 grant (`invalid_grant`). The dead override is removed.
+  `MCPServer`'s authorization-code grant knows the `S256` method only, and
+  `MCPOAuth2Validator.is_pkce_required` now returns `True` regardless of
+  `PKCE_REQUIRED`: a missing challenge, `plain` or an omitted method is
+  refused with `invalid_request` — redirected, like any non-fatal authorize
+  error, to the already-validated redirect URI — on the authorize GET and on
+  the consent POST. `MCPOAuth2Validator.get_code_challenge_method` refuses
+  to exchange a stored non-S256 grant (`invalid_grant`), on any server. The
+  dead override is removed.
   - **Behaviour change:** a client that sends `plain`, or no
     `code_challenge_method`, is now refused at `/o/authorize/`.
-- Both policies are install-wide: the validator is the DOT install's
-  `OAUTH2_VALIDATOR_CLASS` (which already refuses any scope but `mcp:sql`),
-  so they apply to every client of that install.
 - **`/mcp/sql/` accepted a bearer token in the URL query string (affects
   every release up to and including 0.1.0b5).** oauthlib, and so DOT, falls
   back to an `access_token` request parameter when there is no
@@ -106,16 +146,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the MCP authorization specification requires clients to use the
   `Authorization` header and says access tokens MUST NOT be included in the
   URI query string.
-  `MCPOAuth2Authentication` now refuses any request to `/mcp/sql/` (with or
-  without the trailing slash) that carries an `access_token` query parameter
-  or a form-body `access_token` — even alongside a valid header — with 400
-  `invalid_request` (RFC 6750 §3.1) and the usual `WWW-Authenticate`
-  challenge, now including `error="invalid_request"`. The check runs before
-  any token lookup, so a URL token is never validated. Nothing is written
-  to `MCPAuthRejectionLog` and the bad-token throttle is not counted (it is
-  malformed transport, like the 413 body cap).
+  `MCPOAuth2Authentication` now verifies tokens on `MCPServer`, whose bearer
+  handler reads the `Authorization` header only. An `access_token` query or
+  form-body parameter on `/mcp/sql/` (with or without the trailing slash) is
+  not a credential: a request carrying its token only there gets the
+  ordinary 401 challenge — the same for a valid and a bogus token — and the
+  parameter is never looked up; nothing is written to `MCPAuthRejectionLog`
+  and the bad-token throttle is not counted. Beside an `Authorization`
+  header the parameter is ignored and the header's token decides. (DOT's
+  opt-in `COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT=True` makes DOT
+  refuse any request with an `access_token` query parameter outright, also
+  with 401; see `docs/oauth.md`.)
   - **Behaviour change:** a client sending its token anywhere but the
-    `Authorization` header is now refused.
+    `Authorization` header is now unauthenticated.
 - **The "prefix" cloud-client redirect matcher accepted near-miss callbacks
   (affects 0.1.0b5, which introduced cloud clients).** `_redirect_under_prefix`
   checked the scheme, host, port and path exactly but ignored query strings,
