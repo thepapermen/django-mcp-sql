@@ -6,6 +6,7 @@ the full picture (consent-screen asymmetry, audience-binding policy, prefix
 semantics)."""
 
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
@@ -15,10 +16,25 @@ from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
+if TYPE_CHECKING:
+    from django.http import QueryDict
+
 # C0 controls, DEL and C1 controls. No identifier or parameter of this OAuth
-# surface carries one, and a NUL reaching a Postgres text lookup raises an
-# uncaught 500 (DataError).
+# surface carries one, and a NUL reaching a Postgres text lookup or insert
+# raises an uncaught 500 (DataError).
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def has_control_character(*params: "QueryDict") -> bool:
+    """True if any key or value of the given query dicts carries a control
+    character (`_CONTROL_CHARS`). The OAuth views run it over the query
+    string and the form body before DOT or the server sees them."""
+    return any(
+        _CONTROL_CHARS.search(text)
+        for qd in params
+        for key, values in qd.lists()
+        for text in (key, *values)
+    )
 
 
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:

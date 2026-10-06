@@ -563,6 +563,114 @@ class TestControlCharacters:
 
 
 @pytest.mark.django_db
+@pytest.mark.usefixtures("mcp_mfa_on")
+class TestAuthorizeParameterScreening:
+    """`/o/authorize/` refuses parameters DOT would store raw on the `Grant`
+    row before DOT runs: a control character anywhere, a `code_challenge`
+    outside RFC 7636 §4.2's shape, an over-long `nonce`. Each reached the
+    INSERT for a gate-passing user and raised an uncaught 500 (DataError);
+    now it is the fatal error page (400, no redirect, nothing stored)."""
+
+    @staticmethod
+    def _params(**overrides) -> dict:
+        _verifier, challenge = _s256_pair()
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "redirect_uri": _LOOPBACK,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        params.update(overrides)
+        return params
+
+    @staticmethod
+    def _assert_error_page(response, description: str) -> None:
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+        assert description.encode() in response.content
+        assert not Grant.objects.exists()
+        assert not AccessToken.objects.exists()
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"code_challenge": "\x00" * 43},
+            {"nonce": "\x00"},
+            {"resource": "https://example.com/\x00"},
+            {"state": "st\x01te"},
+            {"x-extra\x00": "1"},
+        ],
+        ids=["code_challenge", "nonce", "resource", "state", "key"],
+    )
+    def test_control_character_on_the_skip_consent_get(
+        self, client, mcp_app, mcp_user, overrides
+    ):
+        # The canonical client skips consent: the GET itself stores the Grant.
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize") + "?" + urlencode(self._params(**overrides))
+        )
+        self._assert_error_page(response, "Control character")
+
+    @pytest.mark.parametrize(
+        "challenge",
+        ["x" * 42, "x" * 129, "x" * 300, "x" * 42 + "=", "x" * 42 + "+"],
+        ids=["short", "129", "300", "padding", "non-url-safe"],
+    )
+    def test_malformed_code_challenge(self, client, mcp_app, mcp_user, challenge):
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize")
+            + "?"
+            + urlencode(self._params(code_challenge=challenge))
+        )
+        self._assert_error_page(response, "code_challenge must be")
+
+    def test_over_long_nonce(self, client, mcp_app, mcp_user):
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize") + "?" + urlencode(self._params(nonce="n" * 256))
+        )
+        self._assert_error_page(response, "nonce must be")
+
+    def test_boundary_values_still_issue_a_code(self, client, mcp_app, mcp_user):
+        client.force_login(mcp_user)
+        params = self._params(code_challenge="A" * 128, nonce="n" * 255)
+        query = _authorize_query(
+            client.get(reverse("authorize") + "?" + urlencode(params))
+        )
+        assert "code" in query
+
+    def test_control_character_on_the_consent_post(self, client, mcp_user):
+        # A DCR client shows consent; the crafted POST is screened too
+        # (Django's form would otherwise re-render the consent page).
+        registered = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data='{"redirect_uris": ["http://127.0.0.1:8765/cb"]}',
+            content_type="application/json",
+        ).json()
+        client.force_login(mcp_user)
+        params = self._params(
+            client_id=registered["client_id"],
+            redirect_uri="http://127.0.0.1:8765/cb",
+            code_challenge="\x00" * 43,
+        )
+        response = client.post(reverse("authorize"), {**params, "allow": "Authorize"})
+        self._assert_error_page(response, "Control character")
+
+    def test_anonymous_request_is_screened_before_the_login_redirect(
+        self, client, mcp_app
+    ):
+        response = client.get(
+            reverse("authorize") + "?" + urlencode(self._params(nonce="\x00"))
+        )
+        self._assert_error_page(response, "Control character")
+
+
+@pytest.mark.django_db
 @pytest.mark.usefixtures("mcp_mfa_on", "mcp_active_session")
 class TestDotStrictQueryTokenSetting:
     """DOT's opt-in `COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT` (documented

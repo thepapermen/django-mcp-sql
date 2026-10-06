@@ -2,7 +2,7 @@
 token-endpoint guard. See `oauth_server.py` for what the server admits and why."""
 
 from django.http import HttpResponse
-from mcp_sql.oauth import _CONTROL_CHARS
+from mcp_sql.oauth import has_control_character
 from mcp_sql.oauth_server import MCPServerViewMixin
 from oauth2_provider.views import RevokeTokenView
 from oauth2_provider.views import TokenView
@@ -42,14 +42,12 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
         """
         if request.POST.getlist("grant_type") != ["authorization_code"]:
             return _error_response(errors.UnsupportedGrantTypeError())
-        for params in (request.GET, request.POST):
-            for key, values in params.lists():
-                if any(_CONTROL_CHARS.search(s) for s in (key, *values)):
-                    return _error_response(
-                        errors.InvalidRequestError(
-                            description="Control character in a request parameter."
-                        )
-                    )
+        if has_control_character(request.GET, request.POST):
+            return _error_response(
+                errors.InvalidRequestError(
+                    description="Control character in a request parameter."
+                )
+            )
         return super().post(request, *args, **kwargs)
 
 
