@@ -189,7 +189,7 @@ DEFAULTS: dict[str, Any] = {
     #                         unique across profiles (resolution counts
     #                         distinct codenames — see `resolve_profile`).
     #   GROUP_NAME          — Django Group carrying that permission; admins
-    #                         add staff to it to confer the tier.
+    #                         add users to it to confer the tier.
     #   ALLOWED_MODELS      — this tier's `app_label.ModelName` whitelist.
     #   SESSION_CONTEXT     — OPTIONAL dotted path to
     #                         `callable(user, profile) -> Mapping[str, str]

@@ -1,7 +1,7 @@
 """DRF auth class + 413 body cap for the `/mcp/sql/` endpoint.
 
 `MCPOAuth2Authentication` re-runs every issuance-time gate on every
-request (scope, application-name match, is_active+is_staff, MFA,
+request (scope, application-name match, is_active, MFA,
 single-profile assignment via `resolve_profile`, live Django session).
 Mounted on the MCP
 view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. See
@@ -267,11 +267,11 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 token=token,
             )
             raise exceptions.AuthenticationFailed(msg)
-        if not (user.is_active and user.is_staff):
-            msg = "User is not an active staff member."
+        if not user.is_active:
+            msg = "User account is inactive."
             self._audit_rejection(
                 request,
-                reason=AuthRejectionReason.INACTIVE_OR_NON_STAFF,
+                reason=AuthRejectionReason.INACTIVE,
                 error=msg,
                 user=user,
                 token=token,

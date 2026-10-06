@@ -88,15 +88,18 @@ class TestMCPOAuth2AuthenticationRejections:
         mcp_user.is_active = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
+        with pytest.raises(AuthenticationFailed, match="inactive"):
             MCPOAuth2Authentication().authenticate(request)
 
-    def test_non_staff_user_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
+    def test_non_staff_user_is_accepted(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, mcp_active_session
+    ):
+        # No staff requirement: the explicit profile assignment is the gate.
         mcp_user.is_staff = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
-            MCPOAuth2Authentication().authenticate(request)
+        user, _token = MCPOAuth2Authentication().authenticate(request)
+        assert user.pk == mcp_user.pk
 
     def test_no_mfa_rejected(self, mcp_access_token, mcp_mfa_off):
         request = _bearer_request(mcp_access_token.token)
@@ -241,7 +244,7 @@ class TestAuthRejectionAuditLog:
             MCPOAuth2Authentication().authenticate(request)
 
         log = MCPAuthRejectionLog.objects.get()
-        assert log.reason == AuthRejectionReason.INACTIVE_OR_NON_STAFF
+        assert log.reason == AuthRejectionReason.INACTIVE
         assert log.user_id == mcp_user.pk
 
     def test_no_mfa_writes_audit_row(self, mcp_user, mcp_access_token, mcp_mfa_off):

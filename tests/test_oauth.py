@@ -117,14 +117,23 @@ class TestMCPAuthorizationViewGate:
     def test_inactive_user_denied(self, mcp_user, mcp_mfa_on):
         mcp_user.is_active = False
         mcp_user.save()
-        with pytest.raises(PermissionDenied, match="active staff"):
+        with pytest.raises(PermissionDenied, match="active account"):
             MCPAuthorizationView._enforce_gate(mcp_user)
 
-    def test_non_staff_user_denied(self, mcp_user, mcp_mfa_on):
+    def test_non_staff_user_passes(self, mcp_user, mcp_mfa_on):
+        # No staff requirement: the explicit profile assignment is the gate.
         mcp_user.is_staff = False
         mcp_user.save()
-        with pytest.raises(PermissionDenied, match="active staff"):
-            MCPAuthorizationView._enforce_gate(mcp_user)
+        assert MCPAuthorizationView._enforce_gate(mcp_user) is None
+
+    def test_non_staff_user_without_profile_denied(self, mcp_user, mcp_mfa_on):
+        mcp_user.is_staff = False
+        mcp_user.save()
+        mcp_user.user_permissions.clear()
+        mcp_user.groups.clear()
+        user = type(mcp_user).objects.get(pk=mcp_user.pk)  # drop the perm cache
+        with pytest.raises(PermissionDenied, match="profile assignment"):
+            MCPAuthorizationView._enforce_gate(user)
 
     def test_no_mfa_denied(self, mcp_user, mcp_mfa_off):
         with pytest.raises(PermissionDenied, match="verified TOTP"):
@@ -379,12 +388,14 @@ class TestMCPAuthorizationViewLiveGate:
     # BEFORE the gate runs. The gate's inactive-user branch is exercised
     # directly in `TestMCPAuthorizationViewGate.test_inactive_user_denied`.
 
-    def test_non_staff_user_denied(self, client, mcp_user, mcp_mfa_on):
+    def test_non_staff_user_with_profile_is_not_forbidden(
+        self, client, mcp_user, mcp_mfa_on
+    ):
         mcp_user.is_staff = False
         mcp_user.save()
         client.force_login(mcp_user)
         response = client.get(self._authorize_url())
-        assert response.status_code == HTTPStatus.FORBIDDEN
+        assert response.status_code != HTTPStatus.FORBIDDEN
 
     def test_user_without_mfa_denied(self, client, mcp_user, mcp_mfa_off):
         client.force_login(mcp_user)

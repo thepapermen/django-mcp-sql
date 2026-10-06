@@ -13,7 +13,7 @@ responding to an incident.
 - Token lifetime: 6 h access, no refresh tokens, 60 s authorization code.
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
-- Issuance gate at `/o/authorize/`: `is_active AND is_staff AND
+- Issuance gate at `/o/authorize/`: `is_active AND
   is_mfa_enabled AND resolve_profile(user) binds exactly one profile`
   (the profile gate reads the user's EXPLICIT permission assignments —
   see [Profiles](architecture.md#profiles-access-tiers); 0 → denied,
@@ -166,7 +166,7 @@ curl -s -X POST https://<host>/o/register \
 **Security**: the structural mitigations are the loopback-only
 `redirect_uris` restriction (a rogue registered client can only redirect to
 its own machine — useless for cross-machine token theft) and the
-`/o/authorize/` issuance gate (real user with is_staff + MFA + perm
+`/o/authorize/` issuance gate (real, active user with MFA + an MCP profile
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same
 `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]`)
@@ -205,11 +205,12 @@ full threat-model analysis.
 
 ## Onboarding a user to the MCP cohort
 
-1. **Pre-flight**: the user must be `is_staff=True` and satisfy your
+1. **Pre-flight**: the user must be active and satisfy your
    configured `MCP_SQL["MFA_CHECKER"]` (MFA is opt-in — the default
    `deny_unconfigured_mfa` denies everyone until you wire a real predicate,
    e.g. `allauth.mfa.utils.is_mfa_enabled`). If not, sort that first via the
-   user admin.
+   user admin. Staff status (`is_staff`) is not required: the profile
+   assignment in step 2 is what grants access.
 2. **Add to the profile group**: in Django admin, open the user, attach the
    group for the access tier you're granting. Each `MCP_SQL["PROFILES"]`
    entry has its own `GROUP_NAME` / `PERMISSION_CODENAME`; the in-package
@@ -594,7 +595,7 @@ visit, including for a client the user has already authorized:
 `auto` DOT would skip the page and issue a code on a plain GET to anyone
 holding a live token for that (shared) Application. Behind the page: every
 `/mcp/sql/` request whose bearer token resolves to a user re-runs the issuance
-gate (active staff, MFA, one profile); every tool call is audited in
+gate (active account, MFA, one profile); every tool call is audited in
 `MCPQueryLog` under that user with the client's id and kind, and every gate
 denial for a token that resolved to a user — handshake requests included —
 in `MCPAuthRejectionLog` with the application name (`client_kind` is blank
@@ -881,7 +882,7 @@ volume.
 
 - `"Token was not issued by an mcp-sql Application."`
 - `"Token does not carry the mcp:sql scope."`
-- `"User is not an active staff member."`
+- `"User account is inactive."`
 - `"User does not have a verified TOTP device."`
 - `"User holds no MCP profile permission."` (resolves to no profile)
 - `"User is assigned to more than one MCP profile; access is denied …"`
@@ -891,7 +892,7 @@ volume.
 
 These reach the MCP client (typically Claude Code) as the body of a 401
 response, and from there the user sees them. The verbosity is **deliberate**:
-the consumers are internal staff members onboarding to the surface, and
+the consumers are internal users onboarding to the surface, and
 "your MFA device was removed, re-set it up" is faster to act on than a
 generic "Token is no longer valid." If the threat model ever changes —
 the surface gets opened to external partners, or token-holders need to be

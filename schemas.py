@@ -43,6 +43,9 @@ class AuthRejectionReason(StrEnum):
 
     BAD_APPLICATION = "bad_application"
     BAD_SCOPE = "bad_scope"
+    INACTIVE = "inactive"
+    # Legacy: written up to 0.1.x, when the gate also required `is_staff`.
+    # Never written now; kept so those rows still validate and display.
     INACTIVE_OR_NON_STAFF = "inactive_or_non_staff"
     NO_MFA = "no_mfa"
     NO_PERM = "no_perm"

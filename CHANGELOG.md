@@ -15,10 +15,11 @@ made the request.
 
 ### Breaking
 
-All but the last fail loudly at startup, and none require any client to
+All but the last two fail loudly at startup, and none require any client to
 reconnect (client_ids are unchanged, provisioning never deletes rows, and
-tokens are 6-hour anyway). The default-ON flip is called out separately below
-precisely because it is the one that does **not** announce itself.
+tokens are 6-hour anyway). The default-ON flip and the dropped `is_staff`
+requirement are called out separately below precisely because they do **not**
+announce themselves.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -83,7 +84,7 @@ precisely because it is the one that does **not** announce itself.
   three `Application` rows bound to `claude.ai` / `chatgpt.com` / `cursor.com`
   callbacks at the next `migrate`, with no error and no prompt. The derived
   client_ids are guessable (`mcp-sql-cloud.claude`), so what stands between a
-  phished authorization link and a token is now a cohort user (staff + MFA +
+  phished authorization link and a token is now a cohort user (active + MFA +
   profile — the issuance gate limits who can be a victim, not whether the
   link works) declining the consent screen — no longer RFC 8252 loopback
   delivery. Under loopback-only, a phished code still landed on the victim's
@@ -95,6 +96,19 @@ precisely because it is the one that does **not** announce itself.
   deliberately chose loopback-only should know the posture moved.
   Set `"CLIENTS": {}` to keep the old behaviour, or name just the clients you
   want. Provisioning logs each client at INFO on every `migrate`.
+
+- **`is_staff` is no longer required for MCP access.** Both the issuance gate
+  at `/o/authorize/` and the per-request gate now check only `is_active`,
+  `MFA_CHECKER`, and exactly one MCP profile: the explicit profile assignment
+  (the profile's permission, via its group or granted directly) is the access
+  grant, and a staff flag only duplicated it. At upgrade, any **active
+  non-staff** user who already holds an MCP profile permission — for example
+  through a group that also has non-staff members — gains access, with no
+  error. Check who holds the profile permissions before upgrading. New
+  auth-rejection rows use reason `inactive` ("User account is inactive"); rows
+  written by 0.1.x keep `inactive_or_non_staff`, which stays a valid choice
+  (migration `0014` adds the new one). Custom user models without an
+  `is_staff` field now work.
 
 ### Added
 

@@ -160,9 +160,10 @@ class MCPAuthRejectionLog(models.Model):
                 "Token not issued by an mcp-sql Application",
             ),
             (AuthRejectionReason.BAD_SCOPE, "Token does not carry mcp:sql scope"),
+            (AuthRejectionReason.INACTIVE, "User account is inactive"),
             (
                 AuthRejectionReason.INACTIVE_OR_NON_STAFF,
-                "User is not an active staff member",
+                "User is not an active staff member (up to 0.1.x)",
             ),
             (AuthRejectionReason.NO_MFA, "User does not have a verified TOTP device"),
             (

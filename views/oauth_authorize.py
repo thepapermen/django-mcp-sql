@@ -1,5 +1,5 @@
 """DOT `AuthorizationView` + the Option D session-trust issuance gate
-(is_active + is_staff + MFA + an unambiguous single-profile assignment via
+(is_active + MFA + an unambiguous single-profile assignment via
 `resolve_profile`). See `docs/architecture.md` "OAuth surface" for the
 full design rationale."""
 
@@ -143,15 +143,10 @@ class MCPAuthorizationView(AuthorizationView):
 
     @staticmethod
     def _enforce_gate(user: "AbstractBaseUser") -> None:
-        # `is_staff` lives on `AbstractUser` / the stock user, not the
-        # `AbstractBaseUser` base a consumer may subclass directly; read it
-        # defensively so a user model without the attribute is treated as
-        # non-staff (fail-closed) rather than raising.
-        if not (user.is_active and getattr(user, "is_staff", False)):
-            msg = (
-                "MCP SQL access requires an active staff account. "
-                "Contact an administrator."
-            )
+        # No `is_staff` requirement: the explicit profile assignment below is
+        # the access gate, so a staff flag would only duplicate it.
+        if not user.is_active:
+            msg = "MCP SQL access requires an active account. Contact an administrator."
             raise PermissionDenied(msg)
         if not mcp_sql_settings.MFA_CHECKER(user):
             msg = (
