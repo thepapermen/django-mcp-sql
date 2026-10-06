@@ -48,6 +48,8 @@ FAITHFUL = [
     'SELECT 1 AS "MixedCase"',
     'SELECT v FROM (SELECT 1 AS v) AS "s""q"',
     "SELECT 1 AS v /* note */ -- trailing */ , 2 AS smuggled",
+    # Function names keep the case they were written in.
+    "SELECT Lower('AbC') AS v, UPPER('x') AS w, length('abc') AS n",
 ]
 
 

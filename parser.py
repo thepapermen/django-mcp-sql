@@ -334,7 +334,8 @@ def inject_limit(ast: exp.Query, n: int) -> exp.Query:
 def render_for_execution(ast: exp.Query, limit: int) -> str:
     """The SQL to send to Postgres: `ast` with `LIMIT limit`, proven faithful.
 
-    Emits the LIMIT-wrapped tree WITHOUT comments (sqlglot rewrites `--`
+    Emits the LIMIT-wrapped tree as written (function-name case kept) and
+    WITHOUT comments (sqlglot rewrites `--`
     comments as `/* */` and their text is not part of the AST, so it can
     never be checked) and re-parses the result. Raises
     `QueryRejectedError(ROUNDTRIP_MISMATCH)` unless the re-parse is exactly
@@ -352,7 +353,10 @@ def render_for_execution(ast: exp.Query, limit: int) -> str:
     audits it.
     """
     expected = _canonical(inject_limit(ast, limit))
-    sql = expected.sql(dialect="postgres", comments=False)
+    # `normalize_functions=False`: sqlglot otherwise upper-cases the names of
+    # functions it does not model (`Anonymous`), which Postgres folds back
+    # anyway but which would no longer compare equal on re-parse.
+    sql = expected.sql(dialect="postgres", comments=False, normalize_functions=False)
     try:
         reparsed = [
             p
