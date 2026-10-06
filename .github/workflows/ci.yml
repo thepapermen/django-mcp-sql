@@ -152,6 +152,42 @@ jobs:
       - name: Run the test suite
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
+  # Minimal security posture: the whole suite again with an allow-all
+  # MFA_CHECKER and no SESSION_MODEL (`MCP_SQL_TEST_POSTURE=minimal`, read by
+  # tests/settings.py), as an install without MFA or a session-with-user model
+  # runs. Tests of a specific gate turn it on themselves, so this proves the
+  # access control that holds without the optional layers (auth class,
+  # authorize gate, token endpoint, refresh, revocation).
+  test-minimal-posture:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bootstrap the MCP read-only role
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Install package + test deps
+        run: pip install -e '.[allauth,test]'
+      - name: Run the suite under the minimal posture
+        env:
+          MCP_SQL_TEST_POSTURE: minimal
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
   # Single representative run (newest-resolve on the current Python) that
   # measures coverage and uploads it to Codecov. One job, not the whole matrix
   # — coverage of the code is version-independent, so a per-leg upload would

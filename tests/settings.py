@@ -137,6 +137,15 @@ MCP_SQL = {
     "SESSION_MODEL": "mcp_sql_testapp.TestSession",
 }
 
+# Minimal security posture (`MCP_SQL_TEST_POSTURE=minimal`; CI runs the suite
+# under it as a separate job): an allow-all MFA checker and no session gate,
+# as an install without MFA or a session-with-user model runs. Tests that
+# exercise a gate configure it themselves (`mcp_mfa_on` / `mcp_mfa_off`, an
+# explicit `SESSION_MODEL`), so the same suite proves what holds without them.
+if os.environ.get("MCP_SQL_TEST_POSTURE") == "minimal":
+    MCP_SQL["MFA_CHECKER"] = "mcp_sql.tests.conftest.allow_all_mfa"
+    del MCP_SQL["SESSION_MODEL"]  # the in-package default: None, gate off
+
 OAUTH2_PROVIDER = {
     "OAUTH2_VALIDATOR_CLASS": "mcp_sql.oauth.MCPOAuth2Validator",
     "SCOPES": {"mcp:sql": "Read-only SQL surface for MCP agents"},

@@ -138,6 +138,7 @@ class TestMCPOAuth2AuthenticationRejections:
         row = MCPAuthRejectionLog.objects.get()
         assert row.reason == AuthRejectionReason.AMBIGUOUS_PROFILE
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_no_active_session_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
         """A token with all issuance-time properties intact but no live
         Django session for the user must still be rejected. This pins the
@@ -166,6 +167,7 @@ class TestMCPOAuth2AuthenticationRejections:
         assert user.pk == mcp_user.pk
         assert token.pk == mcp_access_token.pk
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_expired_session_rejected(
         self, mcp_user, mcp_access_token, mcp_mfa_on, mcp_active_session
     ):
@@ -277,6 +279,7 @@ class TestAuthRejectionAuditLog:
         assert log.reason == AuthRejectionReason.NO_PERM
         assert log.user_id == mcp_user.pk
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_no_session_writes_audit_row(self, mcp_user, mcp_access_token, mcp_mfa_on):
         from mcp_sql.models import MCPAuthRejectionLog
 
@@ -345,6 +348,7 @@ class TestAuthRejectionAuditLog:
         assert MCPOAuth2Authentication().authenticate(request) is None
         assert MCPAuthRejectionLog.objects.count() == 0
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_audit_write_failure_does_not_mask_auth_failure(
         self, mcp_user, mcp_access_token, mcp_mfa_on, monkeypatch, caplog
     ):
