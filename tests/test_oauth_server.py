@@ -101,11 +101,6 @@ class TestTokenEndpointGrantTypes:
         "data",
         [
             {"grant_type": "client_credentials", "client_id": "mcp-sql"},
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": "x",
-                "client_id": "mcp-sql",
-            },
             {"grant_type": "implicit", "client_id": "mcp-sql"},
             {"grant_type": "urn:ietf:params:oauth:grant-type:device_code"},
             {
@@ -121,7 +116,6 @@ class TestTokenEndpointGrantTypes:
         ],
         ids=[
             "client_credentials",
-            "refresh_token",
             "implicit",
             "device_code-without-device_code",
             "device_code",
@@ -138,6 +132,35 @@ class TestTokenEndpointGrantTypes:
         assert response.json() == {"error": "unsupported_grant_type"}
         assert response["Cache-Control"] == "no-store"
         assert not AccessToken.objects.exists()
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"grant_type": "refresh_token", "refresh_token": "x"},
+            {"grant_type": "refresh_token", "refresh_token": "\x00", "client_id": "x"},
+            {"grant_type": "refresh_token"},
+        ],
+        ids=["unknown-token", "control-character", "no-token"],
+    )
+    def test_refresh_grant_is_a_constant_invalid_grant(
+        self, client, mcp_app, data, monkeypatch
+    ):
+        """Refresh is off: a constant `invalid_grant` (what makes an MCP
+        client drop its refresh token and re-authorize), with no lookup."""
+        lookups: list = []
+        monkeypatch.setattr(
+            OAuth2Validator,
+            "validate_refresh_token",
+            lambda *a, **k: lookups.append(a) or False,
+        )
+        response = client.post(reverse("token"), data)
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json() == {
+            "error": "invalid_grant",
+            "error_description": "Refresh tokens are not accepted; re-authorize.",
+        }
+        assert response["Cache-Control"] == "no-store"
+        assert lookups == []
 
     def test_password_grant_is_no_password_oracle(
         self, client, mcp_app, password_user, no_authenticate
@@ -389,7 +412,7 @@ class TestConsumerServerClassDoesNotWiden:
                 "client_id": "mcp-sql",
             },
         )
-        assert response.json() == {"error": "unsupported_grant_type"}
+        assert response.json()["error"] == "invalid_grant"
 
     @pytest.mark.filterwarnings(
         "ignore:Presenting an OAuth 2.0 access token in the URI query string"
@@ -472,6 +495,26 @@ class TestValidatorBackstopsOnStockViews:
             OAuth2Validator.validate_refresh_token,
         )
         assert stock_token(data).status_code == HTTPStatus.OK
+
+    def test_code_exchange_mints_no_refresh_token(self, mcp_app, mcp_user, stock_token):
+        # DOT's stock server generates a refresh token for the authorization
+        # code grant; `MCPOAuth2Validator.save_bearer_token` drops it before
+        # DOT stores the token or oauthlib serialises the response.
+        verifier, challenge = _s256_pair()
+        grant = _grant(mcp_user, mcp_app, challenge=challenge, method="S256")
+        response = stock_token(
+            {
+                "grant_type": "authorization_code",
+                "code": grant.code,
+                "redirect_uri": _LOOPBACK,
+                "client_id": "mcp-sql",
+                "code_verifier": verifier,
+            }
+        )
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert b"refresh_token" not in response.content
+        assert AccessToken.objects.count() == 1
+        assert not RefreshToken.objects.exists()
 
     def test_stored_plain_grant_is_invalid_grant(self, mcp_app, mcp_user, stock_token):
         verifier = secrets.token_urlsafe(48)

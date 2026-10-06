@@ -194,6 +194,20 @@ class TestMCPOAuth2ValidatorGrantBackstops:
             is False
         )
 
+    def test_refresh_token_is_dropped_before_dot_stores_the_token(self, monkeypatch):
+        stored: dict = {}
+        monkeypatch.setattr(
+            OAuth2Validator,
+            "save_bearer_token",
+            lambda _self, token, _request, *_a, **_k: stored.update(token),
+        )
+        token = {"access_token": "at", "refresh_token": "rt", "scope": "mcp:sql"}
+        MCPOAuth2Validator().save_bearer_token(token, MagicMock())
+        # Mutated in place: oauthlib serialises this same dict as the response.
+        assert "refresh_token" not in token
+        assert "refresh_token" not in stored
+        assert stored["access_token"] == "at"
+
     def test_refuses_a_password_without_checking_it(self, monkeypatch):
         checked: list = []
         # DOT's own `validate_user` calls the `authenticate` it imported.
@@ -666,9 +680,10 @@ class TestRefreshRefused:
     """`ACCESS_TOKEN_EXPIRE_SECONDS` is the re-consent interval: no refresh
     token is minted, and a refresh token minted by an earlier release (DOT
     honoured those indefinitely under `REFRESH_TOKEN_EXPIRE_SECONDS=0`) is
-    refused: `MCPServer` has no refresh grant, so `/o/token/` answers
-    `unsupported_grant_type`. (`MCPOAuth2Validator.validate_refresh_token`
-    is the backstop for DOT's stock server.)"""
+    refused: `/o/token/` answers every refresh grant with a constant
+    `invalid_grant`, the error that makes an MCP client re-authorize.
+    (`MCPOAuth2Validator.validate_refresh_token` is the backstop for DOT's
+    stock server.)"""
 
     def _exchange_code(self, client, client_id) -> dict:
         verifier, challenge = _s256_pair()
@@ -712,7 +727,7 @@ class TestRefreshRefused:
             },
         )
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
-        assert response.json()["error"] == "unsupported_grant_type"
+        assert response.json()["error"] == "invalid_grant"
         # No new access token; the original one is untouched.
         assert list(AccessToken.objects.values_list("token", flat=True)) == [
             body["access_token"]

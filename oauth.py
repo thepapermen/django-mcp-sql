@@ -250,6 +250,18 @@ class MCPOAuth2Validator(OAuth2Validator):
         method = super().get_code_challenge_method(code, request)
         return method if method == "S256" else None
 
+    def save_bearer_token(self, token, request, *args, **kwargs):
+        """Never store or return a refresh token.
+
+        `MCPServer`'s grant does not generate one, but DOT's stock server
+        does, and oauthlib serialises this same dict as the `/o/token/` body
+        after `save_token` (which calls this method) — so dropping the key
+        here also keeps it out of a stock token view's response, and DOT
+        creates no `RefreshToken` row without it.
+        """
+        token.pop("refresh_token", None)
+        return super().save_bearer_token(token, request, *args, **kwargs)
+
     def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
         """Refuse every refresh grant (`invalid_grant`), including refresh
         tokens minted by releases up to and including 0.1.0b5 (DOT reads the

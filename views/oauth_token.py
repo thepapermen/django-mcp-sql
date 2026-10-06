@@ -36,11 +36,25 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
         or a repeated one — the same response whether a password grant's
         credentials are right or wrong.
 
-        A control character in any parameter (query or body) is an
+        `grant_type=refresh_token` is the exception: it gets a constant
+        `invalid_grant`, with no token lookup. That is the answer that makes
+        an MCP client drop its refresh token and re-authorize (the MCP
+        TypeScript SDK re-authorizes on `invalid_grant`, not on
+        `unsupported_grant_type`); clients still holding a refresh token
+        from 0.1.0b5 or earlier would otherwise be stuck.
+
+        A control character in any other parameter (query or body) is an
         `invalid_request`: a NUL in `code` or `client_id` otherwise reached a
         Postgres lookup and raised an uncaught 500.
         """
-        if request.POST.getlist("grant_type") != ["authorization_code"]:
+        grant_types = request.POST.getlist("grant_type")
+        if grant_types == ["refresh_token"]:
+            return _error_response(
+                errors.InvalidGrantError(
+                    description="Refresh tokens are not accepted; re-authorize."
+                )
+            )
+        if grant_types != ["authorization_code"]:
             return _error_response(errors.UnsupportedGrantTypeError())
         if has_control_character(request.GET, request.POST):
             return _error_response(
