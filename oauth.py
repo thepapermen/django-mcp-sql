@@ -5,6 +5,7 @@ refresh and password grants). See `docs/architecture.md` "OAuth surface" for
 the full picture (consent-screen asymmetry, audience-binding policy, prefix
 semantics)."""
 
+import re
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
@@ -13,6 +14,11 @@ from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
 from oauth2_provider.oauth2_validators import OAuth2Validator
+
+# C0 controls, DEL and C1 controls. No identifier or parameter of this OAuth
+# surface carries one, and a NUL reaching a Postgres text lookup raises an
+# uncaught 500 (DataError).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
@@ -87,6 +93,22 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
 
 class MCPOAuth2Validator(OAuth2Validator):
     """Validator pinned to the mcp-sql Application surface + the single scope."""
+
+    def _load_application(self, client_id, request):
+        """No client lookup for a `client_id` carrying a control character.
+
+        DOT resolves every client through this (private) method: the
+        `client_id` of `/o/authorize/` (`validate_client_id`), of a public
+        client at `/o/token/` and `/o/revoke_token/`
+        (`authenticate_client_id`), and the one decoded from HTTP Basic
+        credentials there. A NUL in it reached the Postgres lookup and
+        raised an uncaught 500 — from anonymous requests, and from a header
+        the token view's parameter check cannot see. Pinned end to end by
+        `test_oauth_server.py::TestControlCharacters`.
+        """
+        if client_id and _CONTROL_CHARS.search(client_id):
+            return None
+        return super()._load_application(client_id, request)
 
     def validate_client_id(self, client_id, request, *args, **kwargs):
         """Accept the request only if `client_id` resolves to an mcp-sql Application.
