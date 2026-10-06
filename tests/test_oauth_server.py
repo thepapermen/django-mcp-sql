@@ -556,3 +556,38 @@ class TestControlCharacters:
         # A fatal client error: the error page, never a redirect.
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert "Location" not in response
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("mcp_mfa_on", "mcp_active_session")
+class TestDotStrictQueryTokenSetting:
+    """DOT's opt-in `COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT` (documented
+    in docs/oauth.md) makes DOT refuse any request with an `access_token`
+    query parameter before the server runs — even beside a valid header —
+    as the same 401, and without DOT's per-request deprecation warning."""
+
+    @pytest.fixture(autouse=True)
+    def _strict(self, settings):
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
+        }
+
+    @pytest.mark.parametrize(
+        "with_header", [False, True], ids=["alone", "beside-header"]
+    )
+    @pytest.mark.filterwarnings("error::DeprecationWarning")
+    def test_query_token_is_refused(self, client, mcp_access_token, with_header):
+        headers = (
+            {"HTTP_AUTHORIZATION": f"Bearer {mcp_access_token.token}"}
+            if with_header
+            else {}
+        )
+        response = client.post(
+            f"/mcp/sql/?access_token={mcp_access_token.token}",
+            data="{}",
+            content_type="application/json",
+            HTTP_ACCEPT="application/json, text/event-stream",
+            **headers,
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
