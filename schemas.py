@@ -82,14 +82,16 @@ class OutcomeReason(StrEnum):
     SYSTEM_SCHEMA = "system_schema"
     WRITEABLE_CTE = "writeable_cte"
     SELECT_INTO = "select_into"
-    # The SQL contains a literal or identifier whose re-serialization by
-    # sqlglot is not faithful (an `E'…'` escape string with a backslash, an
-    # alias written as a string constant), so the SQL sent to Postgres could
-    # differ from the SQL that was checked. Parser-side.
+    # The SQL uses a source form sqlglot and Postgres read differently (an
+    # `E'…'` escape string with a backslash, a `U&` escape, an identifier
+    # written as a string constant, a double-quoted function name), so the
+    # SQL sent to Postgres could differ from the SQL that was checked.
+    # Parser-side (`parser._check_lexical_fidelity`).
     UNSAFE_LITERAL = "unsafe_literal"
-    # Executor-side backstop for the same class: the final SQL (after LIMIT
-    # wrapping) did not re-parse to exactly the validated AST, so it was not
-    # executed.
+    # Executor-side backstop for the same class: the SQL rendered for
+    # execution (after LIMIT wrapping) did not itself pass validation, or did
+    # not settle into a stable rendering (`parser.render_for_execution`), so
+    # it was not executed.
     ROUNDTRIP_MISMATCH = "roundtrip_mismatch"
     EXECUTION_ERROR = "execution_error"
     TIMEOUT = "timeout"
@@ -146,13 +148,17 @@ HINTS: dict[str, str] = {
     ),
     OutcomeReason.SELECT_INTO: "SELECT INTO writes a new table. Use SELECT only.",
     OutcomeReason.UNSAFE_LITERAL: (
-        "Escape-string literals with a backslash (E'...\\...') and aliases "
-        "written as string constants are rejected. Use a standard string "
-        "('...', doubling any quote) or a double-quoted alias instead."
+        "The SQL uses a form that is read differently by the checker and by "
+        "Postgres, so it is refused: an E'...' string with a backslash (write "
+        "'line1' || chr(10) || 'line2' for a newline, chr(9) for a tab, '' "
+        "for a quote), a U&'...' or U&\"...\" escape (write the characters "
+        "directly), an alias written as a string ('x', $$x$$; use x or \"x\"), "
+        "or a double-quoted function name (write it unquoted)."
     ),
     OutcomeReason.ROUNDTRIP_MISMATCH: (
-        "The query could not be re-serialized faithfully, so it was not run. "
-        "Rewrite unusual literals or identifiers in plain form and retry."
+        "The query was not run: the SQL generated from it did not pass the "
+        "same checks (see `error` for the generated SQL and the reason). "
+        "Rewrite the construct it names in a plainer form and retry."
     ),
     OutcomeReason.DISALLOWED_CONSTRUCT: (
         "The SQL uses a construct that is not supported on the MCP surface. "

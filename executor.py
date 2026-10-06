@@ -157,11 +157,16 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     # "every code path writes exactly one audit row" invariant holds with no
     # `RecursionError` escaping to the agent as an unaudited 500.
     #
-    # `render_for_execution` also proves the SQL sent to Postgres re-parses to
-    # exactly the validated tree (ledger F32: sqlglot's re-emission is not
-    # always faithful); a mismatch is refused and audited, never executed.
+    # `render_for_execution` also re-validates the rendered text itself and
+    # requires it to be a stable rendering (ledger F32: sqlglot's re-emission
+    # is not always faithful); a failure is refused and audited, never run.
     try:
-        wrapped_sql = render_for_execution(parsed.ast, effective_limit + 1)
+        wrapped_sql = render_for_execution(
+            parsed.ast,
+            effective_limit + 1,
+            allowed_tables=allowed,
+            ban_select_star=ban_select_star,
+        )
     except QueryRejectedError as exc:
         _audit_safely(
             user=user,

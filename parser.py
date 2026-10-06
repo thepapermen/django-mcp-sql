@@ -399,85 +399,78 @@ def inject_limit(ast: exp.Query, n: int) -> exp.Query:
     return ast.limit(n)
 
 
-def render_for_execution(ast: exp.Query, limit: int) -> str:
-    """The SQL to send to Postgres: `ast` with `LIMIT limit`, proven faithful.
+def render_for_execution(
+    ast: exp.Query,
+    limit: int,
+    *,
+    allowed_tables: set[str],
+    ban_select_star: bool = True,
+) -> str:
+    """The SQL to send to Postgres: `ast` with `LIMIT limit`, rendered once
+    and validated AS RENDERED.
 
-    Emits the LIMIT-wrapped tree as written (function-name case kept) and
-    WITHOUT comments (sqlglot rewrites `--`
-    comments as `/* */` and their text is not part of the AST, so it can
-    never be checked) and re-parses the result. Raises
-    `QueryRejectedError(ROUNDTRIP_MISMATCH)` unless the re-parse is exactly
-    one statement whose tree equals the validated one node for node —
-    every node type, identifier text and `quoted` flag, alias and literal
-    value, compared exactly (`_same_tree`; sqlglot's own `==` compares
-    hashes of case-folded strings, which is not enough here). So whatever
-    sqlglot's generator gets wrong, Postgres only ever runs SQL that parses
-    back to the tree every check passed — never an extra projection,
-    statement or table smuggled through a literal or alias. A
-    dollar-quoted string is the one expected difference: it re-emits as a
-    standard string with the same value, so it is compared as one.
+    The executor never sends the agent's text; it sends sqlglot's rendering
+    of the validated tree, and that rendering is not always faithful (ledger
+    F32 and its variants). So the rendered text is what gets checked:
+
+    1. Render the LIMIT-wrapped tree as written (`normalize_functions=False`
+       keeps function-name case) and WITHOUT comments (sqlglot rewrites `--`
+       comments as `/* */`; their text is not part of the tree, so it can
+       never be checked).
+    2. Run the full `parse_and_validate` on that text, with the same
+       whitelist — every check the agent's text passed, now on the text
+       that will run. A rendering that smuggles in an extra projection,
+       statement, table or function fails here.
+    3. Render the re-parsed tree again and require the identical string:
+       sqlglot reads its own output back as exactly what it wrote (a
+       fixpoint), so the text that ran the checks is the text executed.
+       A rendering from the agent's tree can still differ in spelling from
+       one of its own output (`y > SOME(...)` renders `ANY(...)`, then
+       `ANY (...)`), so if the first re-render differs, that text becomes
+       the candidate and is validated and re-rendered in turn — up to
+       `_MAX_RENDER_ROUNDS` times; the text executed is always one that
+       passed every check and re-renders to itself.
+
+    Any failure is `QueryRejectedError(ROUNDTRIP_MISMATCH)` naming the
+    step; nothing runs. Rewrites that keep the meaning — sqlglot's `CAST` in
+    `ROUND(AVG(x), 2)`, an expanded window frame, `SOME` → `ANY`,
+    `date_part` → `EXTRACT` — validate and run.
+
+    The residual: the checks prove what sqlglot reads in the executed text,
+    not what Postgres's lexer reads. Where the two lexers disagree on a
+    source form, the parser refuses that form up front
+    (`_check_lexical_fidelity`); a disagreement nobody has found yet would
+    not be caught here.
 
     `RecursionError` (a pathologically deep tree) propagates; the caller
     audits it.
     """
-    expected = _canonical(inject_limit(ast, limit))
-    # `normalize_functions=False`: sqlglot otherwise upper-cases the names of
-    # functions it does not model (`Anonymous`), which Postgres folds back
-    # anyway but which would no longer compare equal on re-parse.
-    sql = expected.sql(dialect="postgres", comments=False, normalize_functions=False)
-    try:
-        reparsed = [
-            p
-            for p in sqlglot.parse(sql, dialect="postgres")
-            if p is not None and not isinstance(p, exp.Semicolon)
-        ]
-    except sqlglot.errors.SqlglotError as exc:
-        msg = f"Re-serialized SQL does not re-parse: {exc}"
-        raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
-    if len(reparsed) != 1 or not _same_tree(expected, _canonical(reparsed[0])):
-        msg = "Re-serialized SQL differs from the validated query"
-        raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg)
-    return sql
+    sql = _render(inject_limit(ast, limit))
+    for _ in range(_MAX_RENDER_ROUNDS):
+        try:
+            rendered = parse_and_validate(
+                sql, allowed_tables=allowed_tables, ban_select_star=ban_select_star
+            )
+        except QueryRejectedError as exc:
+            msg = (
+                f"The rendered SQL does not pass validation ({exc.reason}: "
+                f"{exc.detail}): {sql}"
+            )
+            raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
+        again = _render(rendered.ast)
+        if again == sql:
+            return sql
+        sql = again
+    msg = f"The rendered SQL is not stable: it keeps changing, last as {sql!r}"
+    raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg)
 
 
-def _canonical(tree: exp.Expr) -> exp.Expr:
-    """A copy of `tree` with each dollar-quoted string (`exp.RawString`) as
-    the standard string literal sqlglot re-emits it as."""
-    return tree.transform(
-        lambda node: (
-            exp.Literal.string(node.this) if isinstance(node, exp.RawString) else node
-        )
-    )
+# Rendering normally reaches its fixpoint on the first or second round.
+_MAX_RENDER_ROUNDS = 3
 
 
-def _arg_items(node: exp.Expr) -> dict[str, object]:
-    # sqlglot leaves unset args as None / False / [] interchangeably.
-    return {k: v for k, v in node.args.items() if v not in (None, False, [])}
-
-
-def _same_tree(left: exp.Expr, right: exp.Expr) -> bool:
-    """Exact structural equality: same node types, same arg keys, equal
-    scalar values (case-sensitive, type-checked). Iterative, so a deep tree
-    cannot overflow here."""
-    stack: list[tuple[object, object]] = [(left, right)]
-    while stack:
-        a, b = stack.pop()
-        if type(a) is not type(b):
-            return False
-        if isinstance(a, exp.Expr):  # every node class, on every 30.x
-            assert isinstance(b, exp.Expr)
-            a_args, b_args = _arg_items(a), _arg_items(b)
-            if a_args.keys() != b_args.keys():
-                return False
-            stack.extend((a_args[k], b_args[k]) for k in a_args)
-        elif isinstance(a, list):
-            assert isinstance(b, list)
-            if len(a) != len(b):
-                return False
-            stack.extend(zip(a, b, strict=True))
-        elif a != b:
-            return False
-    return True
+def _render(tree: exp.Query) -> str:
+    return tree.sql(dialect="postgres", comments=False, normalize_functions=False)
 
 
 def extract_limit(ast: exp.Query) -> int | None:

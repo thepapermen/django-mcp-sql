@@ -1,16 +1,16 @@
 """The SQL the executor sends to Postgres is the SQL that was checked.
 
-The executor runs sqlglot's re-serialization of the validated AST, not the
-agent's text (ledger F32 and its variants). `parser.render_for_execution`
-proves the re-serialization re-parses to exactly the validated tree, and
-`parse_and_validate` rejects the input forms known to re-serialize wrongly.
-These tests pin both on whichever sqlglot is installed (CI runs the 30.7
-floor and the newest 30.x), and check literal values and column names
-against Postgres itself: the rendered SQL must return what Postgres returns
-for the original text.
+The executor runs sqlglot's rendering of the validated AST, not the agent's
+text (ledger F32 and its variants). `parser.render_for_execution` runs the
+full validation on the rendered text and requires it to re-render to the
+same string, and `parse_and_validate` rejects the source forms sqlglot and
+Postgres read differently. These tests pin both on whichever sqlglot is
+installed (CI runs the 30.7 floor and the newest 30.x), and check values and
+column names against Postgres itself: the rendered SQL must return what
+Postgres returns for the original text. (The guarantee is about what
+sqlglot reads; where its lexer and Postgres's disagree on a form, the
+parser refuses that form — the cases below.)
 """
-
-from unittest.mock import patch
 
 import pytest
 import sqlglot
@@ -67,7 +67,7 @@ def _pg(sql: str) -> tuple[list[str], list[tuple]]:
 
 def _rendered(sql: str) -> str:
     parsed = parse_and_validate(sql, allowed_tables=set())
-    return render_for_execution(parsed.ast, 11)
+    return render_for_execution(parsed.ast, 11, allowed_tables=set())
 
 
 @pytest.mark.django_db
@@ -158,10 +158,10 @@ class TestParserRejectsUnfaithfulInput:
         assert exc.value.reason == OutcomeReason.UNSAFE_LITERAL
 
 
-class TestRoundTripBackstop:
-    """`render_for_execution` refuses a tree whose re-serialization does not
-    re-parse to it, whatever the parser let through. These trees are built
-    by hand, as a future sqlglot or parser gap could produce them."""
+class TestRenderedTextIsValidated:
+    """`render_for_execution` validates the rendered text itself and refuses
+    an unstable rendering, whatever the parser let through. The trees are
+    built by hand, as a future sqlglot or parser gap could produce them."""
 
     @staticmethod
     def _select(projection: exp.Expression) -> exp.Select:
@@ -170,43 +170,77 @@ class TestRoundTripBackstop:
     @pytest.mark.parametrize(
         "projection",
         [
-            # An escape string holding one backslash: re-emits as e'\'.
+            # An escape string holding one backslash: renders as e'\', which
+            # does not even tokenize.
             exp.alias_(exp.ByteString(this="\\"), "v"),
-            # An unquoted alias carrying SQL: re-emits as two projections.
+            # An unquoted alias carrying SQL: renders as a denied function...
             exp.Alias(
                 this=exp.Literal.number(1),
                 alias=exp.Identifier(this="x, version() AS v", quoted=False),
             ),
-            # ... or as a second statement.
+            # ... as a second statement ...
             exp.Alias(
                 this=exp.Literal.number(1),
                 alias=exp.Identifier(this="x; RESET ROLE; SELECT 1", quoted=False),
             ),
+            # ... or as a read of a table off the whitelist.
+            exp.Alias(
+                this=exp.Literal.number(1),
+                alias=exp.Identifier(this="x FROM secret_table --", quoted=False),
+            ),
         ],
-        ids=["escape-string", "alias-projection", "alias-statement"],
+        ids=["escape-string", "denied-function", "second-statement", "table"],
     )
-    def test_divergent_tree_is_refused(self, projection):
+    def test_a_rendering_that_fails_validation_is_refused(self, projection):
         with pytest.raises(QueryRejectedError) as exc:
-            render_for_execution(self._select(projection), 11)
+            render_for_execution(self._select(projection), 11, allowed_tables=set())
         assert exc.value.reason == OutcomeReason.ROUNDTRIP_MISMATCH
 
-    def test_identifier_case_and_quoting_are_compared(self):
-        # sqlglot's own `==` folds case; the check must not.
-        tree = sqlglot.parse_one('SELECT 1 AS "Abc"', dialect="postgres")
-        with (
-            patch(
-                "mcp_sql.parser.sqlglot.parse",
-                return_value=[sqlglot.parse_one('SELECT 1 AS "abc" LIMIT 11')],
-            ),
-            pytest.raises(QueryRejectedError) as exc,
-        ):
-            render_for_execution(tree, 11)
+    def test_a_valid_rendering_runs_as_rendered(self):
+        # What runs is the rendered text, and it is what was validated:
+        # here a harmless extra projection, which passes every check.
+        tree = self._select(
+            exp.Alias(
+                this=exp.Literal.number(1),
+                alias=exp.Identifier(this="x, 2 AS y", quoted=False),
+            )
+        )
+        assert (
+            render_for_execution(tree, 11, allowed_tables=set())
+            == "SELECT 1 AS x, 2 AS y LIMIT 11"
+        )
+
+    def test_an_unstable_rendering_is_refused(self, monkeypatch):
+        renders = iter(f"SELECT {n} AS v LIMIT 11" for n in range(10))
+        monkeypatch.setattr("mcp_sql.parser._render", lambda _tree: next(renders))
+        tree = sqlglot.parse_one("SELECT 1 AS v", dialect="postgres")
+        with pytest.raises(QueryRejectedError) as exc:
+            render_for_execution(tree, 11, allowed_tables=set())
         assert exc.value.reason == OutcomeReason.ROUNDTRIP_MISMATCH
+        assert "not stable" in exc.value.detail
+
+    def test_a_rendering_that_settles_on_the_second_round_runs(self, monkeypatch):
+        # The executed text is the settled one, and it passed validation.
+        renders = iter(
+            [
+                "SELECT 1 AS v LIMIT 11",
+                "SELECT 1 AS w LIMIT 11",
+                "SELECT 1 AS w LIMIT 11",
+            ]
+        )
+        monkeypatch.setattr("mcp_sql.parser._render", lambda _tree: next(renders))
+        tree = sqlglot.parse_one("SELECT 1 AS v", dialect="postgres")
+        assert (
+            render_for_execution(tree, 11, allowed_tables=set())
+            == "SELECT 1 AS w LIMIT 11"
+        )
 
     @pytest.mark.django_db
     def test_run_query_audits_the_refusal_and_runs_nothing(self, monkeypatch):
         cursor = _stub_readonly_connections(monkeypatch)
-        monkeypatch.setattr("mcp_sql.parser._same_tree", lambda *_a: False)
+        monkeypatch.setattr(
+            "mcp_sql.parser._render", lambda _tree: "SELECT 1 FROM pg_class"
+        )
         result = run_query(
             user=UserFactory(),
             profile=_DEFAULT_PROFILE,
@@ -218,3 +252,55 @@ class TestRoundTripBackstop:
         assert log.decision == MCPQueryLog.DECISION_REJECTED
         assert log.rejection_reason == OutcomeReason.ROUNDTRIP_MISMATCH.value
         assert log.started_at <= timezone.now()
+
+
+# Common analytic shapes over an inline VALUES table. Each must be accepted on
+# both supported sqlglot versions, and its rendered SQL must return exactly
+# what Postgres returns for the original text. Several are rewritten by
+# sqlglot on the way (a CAST in ROUND(AVG(..), n), an expanded window frame,
+# SOME -> ANY, date_part -> EXTRACT on 30.7), which the earlier exact-tree
+# gate refused.
+_DATA = (
+    "WITH t AS ("
+    "SELECT 1.5 AS x, 2 AS y, 'a' AS g, DATE '2024-01-01' AS d, "
+    "'{\"k\": 1}'::jsonb AS j "
+    "UNION ALL SELECT 2.5, 3, 'b', DATE '2024-02-15', '{\"k\": 2}'::jsonb "
+    "UNION ALL SELECT 4.0, 5, 'a', DATE '2024-03-31', '{\"k\": 3}'::jsonb) "
+)
+ANALYTIC_CORPUS = [
+    "SELECT ROUND(AVG(x), 2) AS a FROM t",
+    "SELECT ROUND(STDDEV(x), 3) AS s, ROUND(VARIANCE(y)::numeric, 3) AS v FROM t",
+    "SELECT g, SUM(y) OVER (ORDER BY d ROWS 1 PRECEDING) AS r FROM t ORDER BY d",
+    "SELECT g, SUM(y) OVER (PARTITION BY g ORDER BY d ROWS BETWEEN UNBOUNDED "
+    "PRECEDING AND CURRENT ROW) AS r FROM t ORDER BY d",
+    "SELECT y FROM t WHERE y > SOME (SELECT y FROM t WHERE g = 'b') ORDER BY y",
+    "SELECT y FROM t WHERE y = ANY (ARRAY[2, 5]) ORDER BY y",
+    "SELECT date_part('year', d) AS yr, EXTRACT(MONTH FROM d) AS mo FROM t ORDER BY d",
+    "SELECT date_trunc('month', d)::date AS m, COUNT(*) AS n FROM t GROUP BY 1 "
+    "ORDER BY 1",
+    "SELECT g, COUNT(*) FILTER (WHERE y > 2) AS n FROM t GROUP BY g ORDER BY g",
+    "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS med FROM t",
+    "SELECT string_agg(g, ',' ORDER BY d) AS gs, array_agg(DISTINCT g) AS a FROM t",
+    "SELECT COALESCE(NULLIF(g, 'a'), '-') AS g2, GREATEST(x, y) AS m FROM t ORDER BY d",
+    "SELECT CASE WHEN y > 2 THEN 'hi' ELSE 'lo' END AS c FROM t ORDER BY d",
+    "SELECT j ->> 'k' AS k, j @> '{\"k\": 2}' AS has2 FROM t ORDER BY d",
+    "SELECT DISTINCT ON (g) g, d FROM t ORDER BY g, d DESC",
+    "SELECT g, y, rank() OVER (PARTITION BY g ORDER BY y DESC) AS r, lag(y) "
+    "OVER (ORDER BY d) AS p FROM t ORDER BY d",
+    "SELECT to_char(d, 'YYYY-MM') AS ym, d + INTERVAL '1 day' AS next FROM t "
+    "ORDER BY d",
+    "SELECT y % 2 AS odd, y ^ 2 AS sq, round(x::numeric, 1) AS r FROM t ORDER BY d",
+    "SELECT g FROM t WHERE g ILIKE 'A%' AND x BETWEEN 1 AND 3 ORDER BY d",
+    "SELECT g, MAX(y) AS m FROM t GROUP BY g HAVING MAX(y) > 2 ORDER BY g",
+    "SELECT y FROM t UNION ALL SELECT y FROM t ORDER BY 1",
+    "SELECT EXISTS (SELECT 1 FROM t WHERE y > 4) AS e",
+    "SELECT d - DATE '2024-01-01' AS days, now() > d AS past FROM t ORDER BY d",
+]
+
+
+@pytest.mark.django_db
+class TestAnalyticCorpus:
+    @pytest.mark.parametrize("body", ANALYTIC_CORPUS)
+    def test_accepted_and_returns_what_postgres_reads(self, body):
+        sql = _DATA + body
+        assert _pg(_rendered(sql)) == _pg(sql)
