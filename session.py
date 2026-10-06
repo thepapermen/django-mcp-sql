@@ -42,13 +42,23 @@ EXPECTED_SESSION_GUCS: dict[str, str] = {
     "standard_conforming_strings": "on",
 }
 
+# Per-transaction only, never a role default. `default_transaction_read_only`
+# above is read when a transaction STARTS, and the executor's transaction has
+# already started (Django's `atomic` BEGIN) when it is set, so on its own it
+# left the running transaction read-WRITE: a SECURITY DEFINER function owned
+# by a privileged role could write, and the write committed (ledger F01).
+# `transaction_read_only` is the running transaction's own flag; with it on,
+# any write — inside a SECURITY DEFINER function too — fails with SQLSTATE
+# 25006 (read_only_sql_transaction).
+TRANSACTION_GUCS: dict[str, str] = {"transaction_read_only": "on"}
+
 # `SET LOCAL` does not accept parameter binding, so the GUC name/value above
 # are f-string-interpolated into SQL. Validate at import that every key and
 # value is a safe identifier — a future contributor who slips `"; SELECT 1 --`
 # into the dict should fail at module load, not at the next cursor open.
 _SAFE_GUC_NAME = re.compile(r"^[a-z_]+$")
 _SAFE_GUC_VALUE = re.compile(r"^[a-z0-9]+$")
-for _name, _value in EXPECTED_SESSION_GUCS.items():
+for _name, _value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
     if not _SAFE_GUC_NAME.fullmatch(_name):
         _msg = f"unsafe GUC name in EXPECTED_SESSION_GUCS: {_name!r}"
         raise ValueError(_msg)
@@ -103,7 +113,7 @@ def enter_readonly_session(
     (never interpolated), name restricted to the `mcp_sql.*` namespace.
     """
     cursor.execute(f"SET LOCAL ROLE {role}")
-    for name, value in EXPECTED_SESSION_GUCS.items():
+    for name, value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
         cursor.execute(f"SET LOCAL {name} = '{value}'")
     if session_context:
         validate_session_context(session_context)
@@ -116,8 +126,10 @@ def session_drift(cursor: SQLCursor, expected_role: str) -> dict[str, tuple[str,
 
     `expected_role` is the profile role the caller entered via
     `enter_readonly_session`. Empty dict means the session matches both that
-    role and `EXPECTED_SESSION_GUCS`. Use this in smoke / executor pre-flight
-    to catch a connection that did not enter the session correctly.
+    role, `EXPECTED_SESSION_GUCS` and `TRANSACTION_GUCS` — the LIVE
+    `transaction_read_only` flag included, not only its default. Use this in
+    smoke / executor pre-flight to catch a connection that did not enter the
+    session correctly.
     """
     drift: dict[str, tuple[str, str]] = {}
     cursor.execute("SELECT current_user")
@@ -126,7 +138,7 @@ def session_drift(cursor: SQLCursor, expected_role: str) -> dict[str, tuple[str,
     actual_role = str(row[0])
     if actual_role != expected_role:
         drift["current_user"] = (expected_role, actual_role)
-    for name, expected in EXPECTED_SESSION_GUCS.items():
+    for name, expected in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
         cursor.execute(f"SHOW {name}")
         row = cursor.fetchone()
         assert row is not None  # SHOW always returns exactly one row

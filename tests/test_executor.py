@@ -86,6 +86,8 @@ def _stub_readonly_connections(monkeypatch):
     # `transaction.atomic(using="mcp_readonly")` would try to use a real
     # connection; replace with a no-op context manager.
     monkeypatch.setattr("mcp_sql.executor.transaction.atomic", MagicMock())
+    # ... and the always-rollback that runs inside it.
+    monkeypatch.setattr("mcp_sql.executor.transaction.set_rollback", MagicMock())
     return mock_cursor
 
 

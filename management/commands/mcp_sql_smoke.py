@@ -205,7 +205,8 @@ class Command(BaseCommand):
             cur.fetchall()
         self.stdout.write(
             self.style.SUCCESS(
-                f"Read path ok: SET LOCAL ROLE + 4 GUCs verified, "
+                "Read path ok: SET LOCAL ROLE + session GUCs (incl. the live "
+                f"transaction_read_only) verified, "
                 f"SELECT FROM {table} ok"
             )
         )
