@@ -131,6 +131,25 @@ class TestRunQueryAttribution:
         assert captured_run_query["user"].pk == only.pk
 
     @pytest.mark.django_db
+    def test_user_model_without_is_staff_falls_back_to_any_user(
+        self, captured_run_query, mcp_user_factory, monkeypatch
+    ):
+        # MCP access no longer needs `is_staff`, so a custom user model may not
+        # define it; the attribution fallback must not filter on a missing field.
+        from django.contrib.auth import get_user_model
+
+        first = mcp_user_factory(is_staff=False)
+        mcp_user_factory(is_staff=True)  # would win if the staff filter still ran
+        user_model = get_user_model()
+        fields = [f for f in user_model._meta.get_fields() if f.name != "is_staff"]
+        monkeypatch.setattr(user_model._meta, "get_fields", lambda **_: fields)
+        cmd = self._cmd()
+        cmd._run_query(
+            "SELECT 1", None, profile=Command._smoke_profile(None), as_user_email=None
+        )
+        assert captured_run_query["user"].pk == first.pk
+
+    @pytest.mark.django_db
     def test_no_user_at_all_raises(self):
         cmd = self._cmd()
         with pytest.raises(CommandError, match="No user in the DB"):

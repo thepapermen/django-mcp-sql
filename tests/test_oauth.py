@@ -395,7 +395,12 @@ class TestMCPAuthorizationViewLiveGate:
         mcp_user.save()
         client.force_login(mcp_user)
         response = client.get(self._authorize_url())
-        assert response.status_code != HTTPStatus.FORBIDDEN
+        # Same pass-through contract as `test_user_with_all_gates_passes`,
+        # and a 302 must not be a bounce to the login page.
+        assert response.status_code in {HTTPStatus.FOUND, HTTPStatus.BAD_REQUEST}, (
+            f"status={response.status_code}, body={response.content[:200]!r}"
+        )
+        assert "login" not in response.get("Location", "")
 
     def test_user_without_mfa_denied(self, client, mcp_user, mcp_mfa_off):
         client.force_login(mcp_user)

@@ -148,7 +148,17 @@ class Command(BaseCommand):
                 )
                 raise CommandError(msg)
         else:
-            user = user_model.objects.filter(is_staff=True).first()
+            # Prefer a staff user for attribution when the user model has the
+            # flag; MCP access no longer requires it, and a custom user model
+            # may not define it at all (filtering on it would raise FieldError).
+            has_staff_flag = any(
+                f.name == "is_staff" for f in user_model._meta.get_fields()
+            )
+            user = (
+                user_model.objects.filter(is_staff=True).first()
+                if has_staff_flag
+                else None
+            )
             if user is None:
                 user = user_model.objects.first()
             if user is None:

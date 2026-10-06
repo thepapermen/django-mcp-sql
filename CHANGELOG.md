@@ -108,7 +108,8 @@ announce themselves.
   auth-rejection rows use reason `inactive` ("User account is inactive"); rows
   written by 0.1.x keep `inactive_or_non_staff`, which stays a valid choice
   (migration `0014` adds the new one). Custom user models without an
-  `is_staff` field now work.
+  `is_staff` field now pass the gates, and `mcp_sql_smoke`'s attribution
+  fallback no longer assumes the field.
 
 ### Added
 

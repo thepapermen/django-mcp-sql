@@ -232,6 +232,15 @@ class TestAuthRejectionAuditLog:
         assert log.application_name == mcp_app.name
         assert "mcp:sql scope" in log.error
 
+    def test_legacy_inactive_or_non_staff_reason_stays_valid(self):
+        # Rows written by 0.1.x carry `inactive_or_non_staff`; the choice must
+        # survive so those rows still validate and display (migration 0014).
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        choices = dict(MCPAuthRejectionLog._meta.get_field("reason").choices)
+        assert AuthRejectionReason.INACTIVE_OR_NON_STAFF in choices
+        assert AuthRejectionReason.INACTIVE in choices
+
     def test_inactive_user_writes_audit_row(
         self, mcp_user, mcp_access_token, mcp_mfa_on
     ):
