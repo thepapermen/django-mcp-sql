@@ -213,10 +213,10 @@ class TestAuthorizationServerMetadata:
         assert body["scopes_supported"] == ["mcp:sql"]
         assert body["response_types_supported"] == ["code"]
         assert body["grant_types_supported"] == ["authorization_code"]
-        # S256 only — `MCPOAuth2Validator.is_pkce_required` refuses any other
-        # method at /o/authorize/ and `.get_code_challenge_method` refuses a
-        # stored non-S256 grant at /o/token/; the advertised list must match
-        # the enforced one (pinned end to end in test_oauth.py).
+        # S256 only — `MCPServer`'s grant refuses any other method at
+        # /o/authorize/ and `MCPOAuth2Validator.get_code_challenge_method`
+        # refuses a stored non-S256 grant at /o/token/; the advertised list
+        # must match the enforced one (pinned end to end in test_oauth.py).
         assert body["code_challenge_methods_supported"] == ["S256"]
         # Public client — PKCE is the client-auth proxy, no secret.
         assert body["token_endpoint_auth_methods_supported"] == ["none"]

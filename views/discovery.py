@@ -78,12 +78,13 @@ def protected_resource_metadata(request):
 def authorization_server_metadata(request):
     """RFC 8414 Authorization Server Metadata for the DOT-backed AS.
 
-    `code_challenge_methods_supported: ["S256"]` is the canonical
-    advertisement of the S256-only PKCE posture; the matching enforcement
-    lives in `oauth.py::MCPOAuth2Validator.is_pkce_required` (authorize)
-    and `.get_code_challenge_method` (token). `grant_types_supported` lists
-    only `authorization_code`: the validator refuses refresh grants and mints
-    no refresh tokens.
+    `response_types_supported`, `grant_types_supported` and
+    `code_challenge_methods_supported` are what the package's endpoints
+    enforce: they run on `oauth_server.MCPServer`, whose only grant is
+    `authorization_code` with the `code` response type, issues no refresh
+    token and accepts only `S256` PKCE (a stored non-S256 grant is refused
+    at /o/token/ by `oauth.py::MCPOAuth2Validator.get_code_challenge_method`),
+    and `MCPTokenView` refuses every other `grant_type`.
     `token_endpoint_auth_methods_supported: ["none"]` reflects the
     public-client setup (no client_secret); same posture applies to the
     revocation endpoint per RFC 8414 §2.

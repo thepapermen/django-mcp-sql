@@ -56,11 +56,12 @@ class MCPAuthorizationCodeGrant(AuthorizationCodeGrant):
     `plain` (RFC 7636 §4.3), so `plain` and an omitted method alike are
     refused with `invalid_request`, redirected to the already-validated URI
     — on the authorize GET and again when the consent POST creates the
-    response. (oauthlib reaches this check only when PKCE is required, which
-    `MCPOAuth2Validator.is_pkce_required` always answers.) At `/o/token/`,
-    a grant stored with another method would hit the same table as a 500
-    `server_error`; `MCPOAuth2Validator.get_code_challenge_method` refuses it
-    one step earlier with `invalid_grant`.
+    response. (oauthlib checks the method only when a `code_challenge` is
+    present, which `MCPOAuth2Validator.is_pkce_required` makes mandatory.)
+    At `/o/token/`, a grant stored with another method would hit the same
+    table as a 400 `server_error`;
+    `MCPOAuth2Validator.get_code_challenge_method` refuses it one step
+    earlier with `invalid_grant`.
     """
 
     refresh_token = False

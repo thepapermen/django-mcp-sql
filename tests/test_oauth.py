@@ -22,7 +22,6 @@ from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauth2_provider.oauth2_validators import OAuth2Validator
-from oauthlib.oauth2.rfc6749.errors import InvalidRequestError
 
 # A dynamically-registered client's loopback callback for the end-to-end flows.
 _LOOPBACK = "http://127.0.0.1:8765/cb"
@@ -153,30 +152,18 @@ class TestMCPOAuth2ValidatorScopes:
 
 
 class TestMCPOAuth2ValidatorPKCE:
-    """S256-only PKCE through the hooks oauthlib actually calls.
-
-    `is_pkce_required` (authorize) forces PKCE on and refuses any method but
-    `S256`; `get_code_challenge_method` (token) refuses a stored non-S256
-    grant. End-to-end behaviour: `TestPKCEEnforcedEndToEnd`.
+    """The validator's PKCE backstops: `is_pkce_required` forces PKCE on and
+    `get_code_challenge_method` (token) refuses a stored non-S256 grant. The
+    S256-only method check at /o/authorize/ is `MCPServer`'s grant.
+    End-to-end behaviour: `TestPKCEEnforcedEndToEnd`.
     """
 
-    @staticmethod
-    def _request(challenge, method):
-        return MagicMock(code_challenge=challenge, code_challenge_method=method)
-
-    def test_s256_challenge_is_required_and_accepted(self):
-        request = self._request("x" * 43, "S256")
-        assert MCPOAuth2Validator().is_pkce_required("c", request) is True
+    def test_pkce_is_required(self):
+        assert MCPOAuth2Validator().is_pkce_required("c", MagicMock()) is True
 
     def test_pkce_stays_required_when_the_consumer_disables_it(self, settings):
         settings.OAUTH2_PROVIDER = {**settings.OAUTH2_PROVIDER, "PKCE_REQUIRED": False}
-        request = self._request(None, None)
-        assert MCPOAuth2Validator().is_pkce_required("c", request) is True
-
-    @pytest.mark.parametrize("method", ["plain", None, "", "s256", "S512"])
-    def test_any_other_method_is_an_invalid_request(self, method):
-        with pytest.raises(InvalidRequestError):
-            MCPOAuth2Validator().is_pkce_required("c", self._request("x" * 43, method))
+        assert MCPOAuth2Validator().is_pkce_required("c", MagicMock()) is True
 
     @pytest.mark.parametrize(
         ("stored", "returned"), [("S256", "S256"), ("plain", None), (None, None)]
@@ -193,8 +180,9 @@ class TestMCPOAuth2ValidatorPKCE:
         )
 
 
-class TestMCPOAuth2ValidatorRefresh:
-    """No refresh grants, no refresh tokens. End-to-end: `TestRefreshRefused`."""
+class TestMCPOAuth2ValidatorGrantBackstops:
+    """No refresh grant and no password grant, even on DOT's stock server.
+    End-to-end: `TestRefreshRefused`."""
 
     def test_refuses_a_refresh_token_dot_would_accept(self, monkeypatch):
         monkeypatch.setattr(
@@ -205,19 +193,18 @@ class TestMCPOAuth2ValidatorRefresh:
             is False
         )
 
-    def test_refresh_token_is_dropped_before_dot_stores_the_token(self, monkeypatch):
-        stored: dict = {}
+    def test_refuses_a_password_without_checking_it(self, monkeypatch):
+        checked: list = []
+        # DOT's own `validate_user` calls the `authenticate` it imported.
         monkeypatch.setattr(
-            OAuth2Validator,
-            "save_bearer_token",
-            lambda _self, token, _request, *_a, **_k: stored.update(token),
+            "oauth2_provider.oauth2_validators.authenticate",
+            lambda *_a, **k: checked.append(k),
         )
-        token = {"access_token": "at", "refresh_token": "rt", "scope": "mcp:sql"}
-        MCPOAuth2Validator().save_bearer_token(token, MagicMock())
-        # Mutated in place: oauthlib serialises this same dict as the response.
-        assert "refresh_token" not in token
-        assert "refresh_token" not in stored
-        assert stored["access_token"] == "at"
+        assert (
+            MCPOAuth2Validator().validate_user("u", "p", MagicMock(), MagicMock())
+            is False
+        )
+        assert checked == []
 
 
 @pytest.mark.django_db
@@ -382,10 +369,10 @@ class TestOAuthTokenEndpointHappyPath:
         assert body["token_type"] == "Bearer"
         assert body["scope"] == "mcp:sql"
         assert "access_token" in body
-        # No refresh token: `MCPOAuth2Validator.save_bearer_token` drops it
-        # before DOT stores the token, so neither the response field nor a
-        # `RefreshToken` row exists (`REFRESH_TOKEN_EXPIRE_SECONDS=0` alone
-        # would NOT have stopped one from working — see TestRefreshRefused).
+        # No refresh token: `MCPServer`'s grant never generates one, so
+        # neither the response field nor a `RefreshToken` row exists
+        # (`REFRESH_TOKEN_EXPIRE_SECONDS=0` alone would NOT have stopped one
+        # from working — see TestRefreshRefused).
         assert "refresh_token" not in body
         assert not RefreshToken.objects.exists()
 
