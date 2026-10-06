@@ -165,6 +165,10 @@ class MCPAuthRejectionLog(models.Model):
                 AuthRejectionReason.SESSION_LOGOUT,
                 "MCP tokens revoked on user logout",
             ),
+            (
+                AuthRejectionReason.PASSWORD_CHANGE,
+                "MCP tokens revoked on password change",
+            ),
         )
     )
 
@@ -198,3 +202,30 @@ class MCPAuthRejectionLog(models.Model):
         return (
             f"#{self.pk} {self.reason} user={who} {self.started_at:%Y-%m-%d %H:%M:%S}"
         )
+
+
+class MCPRefreshTokenFamily(models.Model):
+    """When the consent behind a refresh-token chain was given.
+
+    Only used when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables refresh
+    tokens. django-oauth-toolkit gives every refresh token a `token_family`
+    UUID, new at the authorization-code exchange and inherited on each
+    rotation; one row here records that family's consent time, written when
+    the exchange stores the first refresh token
+    (`MCPOAuth2Validator.save_bearer_token`). The hard cap is measured from
+    it, across rotations. DOT's own rows cannot carry it: `cleartokens`
+    deletes revoked (rotated) refresh tokens, so the chain's first row does
+    not survive. A family with no row here — refresh tokens minted by an
+    earlier release or by a stock DOT view while refresh was off — is
+    refused.
+    """
+
+    token_family = models.UUIDField(primary_key=True)
+    consented_at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        verbose_name = "MCP refresh-token family"
+        verbose_name_plural = "MCP refresh-token families"
+
+    def __str__(self) -> str:
+        return f"{self.token_family} (consented {self.consented_at:%Y-%m-%d %H:%M})"

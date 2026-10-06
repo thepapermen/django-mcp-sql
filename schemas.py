@@ -57,6 +57,9 @@ class AuthRejectionReason(StrEnum):
     # carries a complete access-ending timeline — see
     # `signals.revoke_mcp_tokens_on_logout`.
     SESSION_LOGOUT = "session_logout"
+    # Not a denial either: the user's password changed, so their MCP access
+    # and refresh tokens were revoked (`signals.revoke_mcp_tokens_on_password_change`).
+    PASSWORD_CHANGE = "password_change"  # noqa: S105 — an audit reason code, not a credential.
 
 
 class OutcomeReason(StrEnum):

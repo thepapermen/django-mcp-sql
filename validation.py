@@ -92,6 +92,8 @@ class McpSqlSettings(TypedDict):
     DB_ALIAS: NotRequired[str]
     # Opt-in cloud clients. Empty / absent = feature off.
     CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
+    # Opt-in refresh tokens: chain cap in seconds; 0 / absent = off.
+    REFRESH_TOKEN_MAX_AGE_SECONDS: NotRequired[int]
 
 
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
@@ -367,6 +369,14 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
         msg = (
             f"MCP_SQL.BAD_TOKEN_IP_WINDOW_SECONDS must be positive "
             f"(got {cfg['BAD_TOKEN_IP_WINDOW_SECONDS']})"
+        )
+        raise ImproperlyConfigured(msg)
+
+    refresh_cap = cfg.get("REFRESH_TOKEN_MAX_AGE_SECONDS", 0)
+    if isinstance(refresh_cap, bool) or refresh_cap < 0:
+        msg = (
+            "MCP_SQL.REFRESH_TOKEN_MAX_AGE_SECONDS must be a non-negative "
+            f"integer (0 disables refresh tokens; got {refresh_cap!r})"
         )
         raise ImproperlyConfigured(msg)
 

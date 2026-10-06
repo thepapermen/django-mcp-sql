@@ -10,6 +10,15 @@ from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
+
+
+def _grant_types_supported() -> list[str]:
+    """`authorization_code`, plus `refresh_token` when the opt-in refresh
+    grant is on — shared by the AS metadata and the DCR response."""
+    if refresh_tokens_enabled():
+        return ["authorization_code", "refresh_token"]
+    return ["authorization_code"]
 
 
 def _issuer(request: HttpRequest) -> str:
@@ -81,10 +90,11 @@ def authorization_server_metadata(request):
     `response_types_supported`, `grant_types_supported` and
     `code_challenge_methods_supported` are what the package's endpoints
     enforce: they run on `oauth_server.MCPServer`, whose only grant is
-    `authorization_code` with the `code` response type, issues no refresh
-    token and accepts only `S256` PKCE (a stored non-S256 grant is refused
-    at /o/token/ by `oauth.py::MCPOAuth2Validator.get_code_challenge_method`),
-    and `MCPTokenView` refuses every other `grant_type`.
+    `authorization_code` with the `code` response type, accepting only
+    `S256` PKCE (a stored non-S256 grant is refused at /o/token/ by
+    `oauth.py::MCPOAuth2Validator.get_code_challenge_method`), plus
+    `refresh_token` exactly when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`
+    enables it; `MCPTokenView` refuses every other `grant_type`.
     `token_endpoint_auth_methods_supported: ["none"]` reflects the
     public-client setup (no client_secret); same posture applies to the
     revocation endpoint per RFC 8414 §2.
@@ -105,7 +115,7 @@ def authorization_server_metadata(request):
                 ),
                 "scopes_supported": [mcp_sql_settings.SCOPE],
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
+                "grant_types_supported": _grant_types_supported(),
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
                 "revocation_endpoint_auth_methods_supported": ["none"],

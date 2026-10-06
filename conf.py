@@ -247,6 +247,19 @@ DEFAULTS: dict[str, Any] = {
     # "exact" | "prefix"; REDIRECT_URI = the https callback or host+path prefix.
     # Runbook (onboarding, prerequisites, matching): docs/oauth.md "Cloud clients".
     "CLOUD_CLIENTS": [],
+    # === Refresh tokens (opt-in) ===
+    #
+    # Hard cap, in seconds, on a refresh-token chain, measured from the
+    # consent that started it (the authorization-code exchange) across every
+    # rotation — NOT django-oauth-toolkit's sliding idle window
+    # (`REFRESH_TOKEN_EXPIRE_SECONDS`). `0` (the default) disables refresh
+    # tokens: none are issued and `grant_type=refresh_token` gets
+    # `invalid_grant`, so `ACCESS_TOKEN_EXPIRE_SECONDS` is the re-consent
+    # interval. A positive value issues a rotating refresh token with every
+    # access token; once the cap passes, the client must re-authorize.
+    # Logout and a password change revoke refresh tokens with the access
+    # tokens. See docs/oauth.md "Refresh tokens (opt-in)".
+    "REFRESH_TOKEN_MAX_AGE_SECONDS": 0,
 }
 
 
@@ -394,6 +407,12 @@ class MCPSQLSettings:
 
 
 mcp_sql_settings = MCPSQLSettings()
+
+
+def refresh_tokens_enabled() -> bool:
+    """`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` is positive: the opt-in
+    refresh grant is on (see `oauth.MCPOAuth2Validator.validate_refresh_token`)."""
+    return bool(mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS > 0)
 
 
 def mcp_sql_config() -> "McpSqlSettings":

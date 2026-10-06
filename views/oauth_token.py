@@ -2,6 +2,7 @@
 token-endpoint guard. See `oauth_server.py` for what the server admits and why."""
 
 from django.http import HttpResponse
+from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.oauth import has_control_character
 from mcp_sql.oauth_server import MCPServerViewMixin
 from oauth2_provider.views import RevokeTokenView
@@ -24,7 +25,8 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
     """`/o/token/`: the authorization-code exchange and nothing else."""
 
     def post(self, request, *args, **kwargs):
-        """Refuse anything but one `grant_type=authorization_code` up front.
+        """Refuse anything but one `grant_type=authorization_code` (or, when
+        refresh is enabled, `refresh_token`) up front.
 
         `MCPServer` already handles only that grant, but DOT's `TokenView.post`
         sends `grant_type=urn:ietf:params:oauth:grant-type:device_code` to its
@@ -36,8 +38,10 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
         or a repeated one — the same response whether a password grant's
         credentials are right or wrong.
 
-        `grant_type=refresh_token` is the exception: it gets a constant
-        `invalid_grant`, with no token lookup. That is the answer that makes
+        With refresh enabled (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`),
+        `grant_type=refresh_token` goes to the server's refresh grant. With it
+        off (the default) a refresh grant gets a constant `invalid_grant`,
+        with no token lookup. That is the answer that makes
         an MCP client drop its refresh token and re-authorize (the MCP
         TypeScript SDK re-authorizes on `invalid_grant`, not on
         `unsupported_grant_type`); clients still holding a refresh token
@@ -48,13 +52,15 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
         Postgres lookup and raised an uncaught 500.
         """
         grant_types = request.POST.getlist("grant_type")
-        if grant_types == ["refresh_token"]:
+        refresh = refresh_tokens_enabled()
+        if grant_types == ["refresh_token"] and not refresh:
             return _error_response(
                 errors.InvalidGrantError(
                     description="Refresh tokens are not accepted; re-authorize."
                 )
             )
-        if grant_types != ["authorization_code"]:
+        allowed = (["authorization_code"], ["refresh_token"] if refresh else None)
+        if grant_types not in allowed:
             return _error_response(errors.UnsupportedGrantTypeError())
         if has_control_character(request.GET, request.POST):
             return _error_response(

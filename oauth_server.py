@@ -12,8 +12,11 @@ the same oauthlib endpoints, and enforces by its shape exactly what the
 discovery documents advertise (`views/discovery.py`):
 
 - one grant, `authorization_code` (`response_types_supported: ["code"]`,
-  `grant_types_supported: ["authorization_code"]`), which never issues a
-  refresh token and accepts only `S256` PKCE (`MCPAuthorizationCodeGrant`);
+  `grant_types_supported: ["authorization_code"]`), which accepts only
+  `S256` PKCE and issues no refresh token (`MCPAuthorizationCodeGrant`) —
+  unless `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` opts in to rotating,
+  hard-capped refresh tokens, which adds the `refresh_token` grant (and
+  `views/discovery.py` advertises it);
 - a bearer token read from the `Authorization` header only
   (`bearer_methods_supported: ["header"]`, `HeaderOnlyBearer`);
 - token revocation.
@@ -27,6 +30,7 @@ the request, so `views/oauth_token.py::MCPTokenView` also refuses every other
 
 from typing import Any
 
+from mcp_sql.conf import refresh_tokens_enabled
 from oauth2_provider.oauth2_backends import OAuthLibCore
 from oauth2_provider.settings import oauth2_settings
 from oauth2_provider.views.mixins import OAuthLibMixin
@@ -35,6 +39,7 @@ from oauthlib.oauth2.rfc6749.endpoints import ResourceEndpoint
 from oauthlib.oauth2.rfc6749.endpoints import RevocationEndpoint
 from oauthlib.oauth2.rfc6749.endpoints import TokenEndpoint
 from oauthlib.oauth2.rfc6749.grant_types import AuthorizationCodeGrant
+from oauthlib.oauth2.rfc6749.grant_types import RefreshTokenGrant
 from oauthlib.oauth2.rfc6749.grant_types.authorization_code import (
     code_challenge_method_s256,
 )
@@ -43,13 +48,17 @@ from oauthlib.oauth2.rfc6749.tokens import get_token_from_header
 
 
 class MCPAuthorizationCodeGrant(AuthorizationCodeGrant):
-    """The authorization-code grant: no refresh token, `S256` PKCE only.
+    """The authorization-code grant: `S256` PKCE only; no refresh token
+    unless refresh is enabled.
 
     `refresh_token = False` is the flag oauthlib passes to the token handler,
     so the `/o/token/` response carries no `refresh_token` and DOT stores no
     `RefreshToken` row (it creates one only when the key is present). The
     access token's lifetime (`ACCESS_TOKEN_EXPIRE_SECONDS`) is then the
-    re-consent interval, as documented.
+    re-consent interval, as documented. `MCPServer` passes
+    `refresh_token=True` when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` opts
+    in (oauthlib's `GrantTypeBase.__init__` sets constructor kwargs as
+    attributes).
 
     `_code_challenge_methods` is the table oauthlib checks a challenge method
     against. At `/o/authorize/` it applies only after the fatal client_id /
@@ -101,8 +110,13 @@ class MCPServer(
 ):
     """oauthlib's pre-configured `Server`, cut down to the MCP surface.
 
-    No implicit, password, client-credentials, refresh-token or device-code
-    grant and no introspection endpoint. oauthlib still hands an unknown
+    No implicit, password, client-credentials or device-code grant and no
+    introspection endpoint; the refresh-token grant only when
+    `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables it (read at
+    construction, which is per request — see `MCPServerViewMixin`). The
+    refresh grant then rotates (`MCPOAuth2Validator.rotate_refresh_token`)
+    and is capped from the original consent
+    (`MCPOAuth2Validator.validate_refresh_token`). oauthlib still hands an unknown
     `response_type` / `grant_type` to the default (authorization-code)
     handler, which answers `unsupported_response_type` /
     `unsupported_grant_type` — except `grant_type=openid`, which that grant
@@ -124,7 +138,13 @@ class MCPServer(
         refresh_token_generator=None,
         **kwargs,
     ):
-        self.auth_grant = MCPAuthorizationCodeGrant(request_validator)
+        refresh = refresh_tokens_enabled()
+        self.auth_grant = MCPAuthorizationCodeGrant(
+            request_validator, refresh_token=refresh
+        )
+        grant_types: dict[str, Any] = {"authorization_code": self.auth_grant}
+        if refresh:
+            grant_types["refresh_token"] = RefreshTokenGrant(request_validator)
         self.bearer = HeaderOnlyBearer(
             request_validator,
             token_generator,
@@ -140,7 +160,7 @@ class MCPServer(
         TokenEndpoint.__init__(
             self,
             default_grant_type="authorization_code",
-            grant_types={"authorization_code": self.auth_grant},
+            grant_types=grant_types,
             default_token_type=self.bearer,
         )
         ResourceEndpoint.__init__(

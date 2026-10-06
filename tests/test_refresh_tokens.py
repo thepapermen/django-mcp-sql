@@ -1,0 +1,267 @@
+"""Opt-in refresh tokens (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`).
+
+Off by default (the refresh tests in `test_oauth.py` / `test_oauth_server.py`
+pin that). When on: the authorization-code exchange returns a refresh
+token, every refresh rotates it, the chain is refused once the cap —
+measured from the consent, across rotations — has passed, and logout or a
+password change revokes refresh tokens along with access tokens.
+"""
+
+import base64
+import hashlib
+import secrets
+from datetime import timedelta
+from http import HTTPStatus
+from urllib.parse import parse_qs
+from urllib.parse import urlencode
+from urllib.parse import urlparse
+
+import pytest
+from django.contrib.auth.signals import user_logged_out
+from django.core.exceptions import ImproperlyConfigured
+from django.test import RequestFactory
+from django.urls import reverse
+from django.utils import timezone
+from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import MCPRefreshTokenFamily
+from mcp_sql.oauth_server import MCPServer
+from mcp_sql.schemas import AuthRejectionReason
+from mcp_sql.tests.settings import MCP_SQL as BASE_MCP_SQL
+from mcp_sql.validation import validate_mcp_sql_settings
+from mcp_sql.views.oauth_token import MCPTokenView
+from oauth2_provider.models import AccessToken
+from oauth2_provider.models import RefreshToken
+from oauthlib.oauth2.rfc6749.grant_types import RefreshTokenGrant
+
+_LOOPBACK = "http://127.0.0.1:9999"
+_CAP = 3600
+
+
+@pytest.fixture
+def refresh_on(settings):
+    settings.MCP_SQL = {**settings.MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
+
+
+def _s256_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _consent_and_exchange(client, user) -> dict:
+    """Authorize the canonical (skip-consent) client and exchange the code."""
+    client.force_login(user)
+    verifier, challenge = _s256_pair()
+    params = {
+        "client_id": "mcp-sql",
+        "response_type": "code",
+        "redirect_uri": _LOOPBACK,
+        "scope": "mcp:sql",
+        "state": "st4te",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    location = client.get(reverse("authorize") + "?" + urlencode(params))["Location"]
+    code = parse_qs(urlparse(location).query)["code"][0]
+    response = client.post(
+        reverse("token"),
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _LOOPBACK,
+            "client_id": "mcp-sql",
+            "code_verifier": verifier,
+        },
+    )
+    assert response.status_code == HTTPStatus.OK, response.content
+    return response.json()
+
+
+def _refresh(client, refresh_token: str):
+    return client.post(
+        reverse("token"),
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": "mcp-sql",
+        },
+    )
+
+
+def _family(refresh_token: str) -> MCPRefreshTokenFamily:
+    checksum = hashlib.sha256(refresh_token.encode()).hexdigest()
+    rt = RefreshToken.objects.get(token_checksum=checksum)
+    return MCPRefreshTokenFamily.objects.get(token_family=rt.token_family)
+
+
+class TestSetting:
+    def test_off_by_default(self):
+        from mcp_sql.conf import DEFAULTS
+
+        assert DEFAULTS["REFRESH_TOKEN_MAX_AGE_SECONDS"] == 0
+
+    @pytest.mark.parametrize("value", [-1, True])
+    def test_invalid_values_refuse_to_boot(self, value):
+        cfg = {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": value}
+        with pytest.raises(ImproperlyConfigured):
+            validate_mcp_sql_settings(cfg)
+
+    @pytest.mark.parametrize("value", [0, 86400])
+    def test_valid_values(self, value):
+        validate_mcp_sql_settings(
+            {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": value}
+        )
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("refresh_on", "mcp_mfa_on")
+class TestRefreshEnabled:
+    def test_server_registers_the_refresh_grant(self):
+        server = MCPTokenView.get_oauthlib_core().server
+        assert type(server) is MCPServer
+        assert set(server.grant_types) == {"authorization_code", "refresh_token"}
+        assert isinstance(server.grant_types["refresh_token"], RefreshTokenGrant)
+        assert server.grant_types["authorization_code"].refresh_token is True
+
+    def test_discovery_and_registration_advertise_it(self, client):
+        metadata = client.get(reverse("oauth_authorization_server_metadata")).json()
+        assert metadata["grant_types_supported"] == [
+            "authorization_code",
+            "refresh_token",
+        ]
+        for requested, echoed in (
+            (
+                ["authorization_code", "refresh_token"],
+                ["authorization_code", "refresh_token"],
+            ),
+            (["authorization_code"], ["authorization_code"]),
+        ):
+            response = client.post(
+                reverse("oauth_dynamic_client_registration"),
+                data={"redirect_uris": [_LOOPBACK], "grant_types": requested},
+                content_type="application/json",
+            )
+            assert response.json()["grant_types"] == echoed
+
+    def test_exchange_issues_a_refresh_token_and_records_the_consent(
+        self, client, mcp_app, mcp_user
+    ):
+        before = timezone.now()
+        body = _consent_and_exchange(client, mcp_user)
+        assert body["refresh_token"]
+        family = _family(body["refresh_token"])
+        assert before <= family.consented_at <= timezone.now()
+
+    def test_refresh_rotates(self, client, mcp_app, mcp_user, settings):
+        # Rotation on whatever DOT's own setting says.
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "ROTATE_REFRESH_TOKEN": False,
+        }
+        first = _consent_and_exchange(client, mcp_user)
+        response = _refresh(client, first["refresh_token"])
+        assert response.status_code == HTTPStatus.OK, response.content
+        second = response.json()
+        assert second["refresh_token"] != first["refresh_token"]
+        assert second["access_token"] != first["access_token"]
+        assert _family(second["refresh_token"]) == _family(first["refresh_token"])
+        # The presented token is spent.
+        assert _refresh(client, first["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+
+    def test_cap_is_measured_from_consent_across_rotations(
+        self, client, mcp_app, mcp_user
+    ):
+        first = _consent_and_exchange(client, mcp_user)
+        second = _refresh(client, first["refresh_token"]).json()
+        family = _family(second["refresh_token"])
+        # Each rotation minted a fresh token, but the chain started at the
+        # consent: once the cap has passed since then, refresh is refused.
+        family.consented_at = timezone.now() - timedelta(seconds=_CAP + 1)
+        family.save()
+        response = _refresh(client, second["refresh_token"])
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_grant"
+
+    def test_within_the_cap_refresh_succeeds(self, client, mcp_app, mcp_user):
+        first = _consent_and_exchange(client, mcp_user)
+        family = _family(first["refresh_token"])
+        family.consented_at = timezone.now() - timedelta(seconds=_CAP - 60)
+        family.save()
+        assert _refresh(client, first["refresh_token"]).status_code == HTTPStatus.OK
+
+    def test_a_refresh_token_without_a_consent_record_is_refused(
+        self, client, mcp_app, mcp_user, mcp_access_token
+    ):
+        # Minted by 0.1.0b5 or earlier, or by a stock DOT view while refresh
+        # was off: DOT would accept it, the package has no consent time.
+        legacy = RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=mcp_app,
+            access_token=mcp_access_token,
+        )
+        response = _refresh(client, legacy.token)
+        assert response.json()["error"] == "invalid_grant"
+
+    def test_logout_revokes_refresh_tokens(
+        self, client, mcp_app, mcp_user, django_capture_on_commit_callbacks
+    ):
+        body = _consent_and_exchange(client, mcp_user)
+        with django_capture_on_commit_callbacks(execute=True):
+            user_logged_out.send(
+                sender=type(mcp_user),
+                request=RequestFactory().get("/logout/"),
+                user=mcp_user,
+            )
+        assert not RefreshToken.objects.filter(user=mcp_user).exists()
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
+        assert _refresh(client, body["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+
+
+@pytest.mark.django_db
+class TestPasswordChangeRevokes:
+    """Ledger F15: a password change revokes the user's MCP access and
+    refresh tokens, with no dependency on a session table."""
+
+    @pytest.fixture(autouse=True)
+    def _no_session_gate(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": None}
+
+    def test_password_change_revokes_and_audits(
+        self, mcp_user, mcp_app, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=mcp_app,
+            access_token=mcp_access_token,
+        )
+        with django_capture_on_commit_callbacks(execute=True):
+            mcp_user.set_password("a-new-password-123")
+            mcp_user.save()
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
+        assert not RefreshToken.objects.filter(user=mcp_user).exists()
+        row = MCPAuthRejectionLog.objects.get(user=mcp_user)
+        assert row.reason == AuthRejectionReason.PASSWORD_CHANGE
+        assert "on password change" in row.error
+
+    @pytest.mark.parametrize(
+        "save",
+        [
+            lambda user: user.save(update_fields=["last_login"]),
+            lambda user: user.save(),
+        ],
+        ids=["last-login-update", "unchanged-password"],
+    )
+    def test_other_saves_revoke_nothing(
+        self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks, save
+    ):
+        mcp_user.last_login = timezone.now()
+        with django_capture_on_commit_callbacks(execute=True):
+            save(mcp_user)
+        assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+        assert not MCPAuthRejectionLog.objects.exists()

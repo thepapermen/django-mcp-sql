@@ -1,9 +1,10 @@
-"""Signal receivers: revoke MCP tokens on user_logged_out; provision the
-per-profile groups/permissions on post_migrate; alert (Sentry ERROR) when a
-user is added to an MCP profile group (and, layered on top, when the addition
-leaves them in >1 profile = ambiguous); log a WARNING on grants drift after
-post_migrate (advisory only — apply happens via `mcp_sql_grants --apply`).
-See `docs/architecture.md` file-map row for `signals.py`."""
+"""Signal receivers: revoke MCP tokens on user_logged_out and on a password
+change; provision the per-profile groups/permissions on post_migrate; alert
+(Sentry ERROR) when a user is added to an MCP profile group (and, layered on
+top, when the addition leaves them in >1 profile = ambiguous); log a WARNING
+on grants drift after post_migrate (advisory only — apply happens via
+`mcp_sql_grants --apply`). See `docs/architecture.md` file-map row for
+`signals.py`."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -17,6 +18,8 @@ from django.db import transaction
 from django.db.models import Q
 from django.db.models.signals import m2m_changed
 from django.db.models.signals import post_migrate
+from django.db.models.signals import post_save
+from django.db.models.signals import pre_save
 from django.dispatch import receiver
 from django.http import HttpRequest
 from django.utils import timezone
@@ -63,32 +66,54 @@ def revoke_mcp_tokens_on_logout(
 
 
 def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
+    """Post-commit logout revocation; see `_revoke_and_audit`."""
+    _revoke_and_audit(
+        user=user,
+        client_ip=client_ip,
+        at=logged_out_at,
+        reason=AuthRejectionReason.SESSION_LOGOUT,
+        event="logout",
+    )
+
+
+def _revoke_and_audit(*, user, client_ip, at, reason, event):
     """Best-effort post-commit MCP token revocation + a forensic audit row.
 
-    Runs after the logout transaction commits. Both the delete and the
-    audit write are wrapped so a DB blip is logged (Sentry via
-    `logger.exception`) rather than surfacing as a 500 on an already-
-    completed logout.
+    Deletes the user's MCP-purpose access AND refresh tokens (refresh tokens
+    exist only when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables them;
+    a refresh token left behind would mint new access tokens) in one
+    transaction, then writes one `MCPAuthRejectionLog` row with `reason`.
+    Runs after the triggering transaction (logout, password change)
+    commits. Both the delete and the audit write are wrapped so a DB blip
+    is logged (Sentry via `logger.exception`) rather than surfacing as a
+    500 on an already-completed logout / password change.
     """
     # Lazy import keeps `apps.ready()` import-graph small.
     from oauth2_provider.models import AccessToken
+    from oauth2_provider.models import RefreshToken
 
     # Match BOTH the curated `mcp-sql` Application (exact name) AND every
     # DCR-minted `mcp-sql-<token>` Application (prefix). The prefix carries
     # a trailing dash, so a `startswith` on it does NOT match the canonical
     # name — that's why the Q-OR is required here.
+    mcp_apps = Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
+        application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
+    )
     try:
-        deleted, _ = AccessToken.objects.filter(
-            Q(application__name=mcp_sql_settings.APPLICATION_NAME)
-            | Q(application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX),
-            user=user,
-        ).delete()
+        with transaction.atomic():
+            refresh_deleted, _ = RefreshToken.objects.filter(
+                mcp_apps, user=user
+            ).delete()
+            access_deleted, _ = AccessToken.objects.filter(mcp_apps, user=user).delete()
     except DatabaseError:
-        logger.exception("Failed to revoke MCP tokens on logout for user %s", user.pk)
+        logger.exception(
+            "Failed to revoke MCP tokens on %s for user %s", event, user.pk
+        )
         return
+    deleted = access_deleted + refresh_deleted
     if not deleted:
         return
-    logger.info("Revoked %d MCP token(s) on logout for user %s", deleted, user.pk)
+    logger.info("Revoked %d MCP token(s) on %s for user %s", deleted, event, user.pk)
     # Record the revocation in the access-ending audit table alongside the
     # per-request gate denials, so the timeline of why a user lost MCP
     # access is complete.
@@ -97,17 +122,65 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
             user=user,
             token_pk="",
             application_name="",
-            reason=AuthRejectionReason.SESSION_LOGOUT,
-            error=f"Revoked {deleted} MCP token(s) on logout",
+            reason=reason,
+            error=f"Revoked {deleted} MCP token(s) on {event}",
             client_ip=client_ip,
-            started_at=logged_out_at,
+            started_at=at,
         )
     except DatabaseError:
         logger.exception(
-            "Revoked MCP tokens on logout for user %s but failed to write the "
-            "audit row",
+            "Revoked MCP tokens on %s for user %s but failed to write the audit row",
+            event,
             user.pk,
         )
+
+
+@receiver(pre_save, sender=User)
+def note_password_change(sender, instance, **kwargs):
+    """Flag a saved user whose password hash is about to change.
+
+    A password change (the user's own, an admin reset, `set_unusable_password`)
+    ends every other credential the old password stood behind, so the MCP
+    access and refresh tokens go too (ledger F15) — via model signals, with
+    no dependency on a session table, so it holds with `SESSION_MODEL=None`.
+    Saves that name their `update_fields` without `password` (e.g.
+    `update_last_login` on every login) skip the lookup.
+    """
+    update_fields = kwargs.get("update_fields")
+    if kwargs.get("raw") or instance.pk is None:
+        return
+    if update_fields is not None and "password" not in update_fields:
+        return
+    old = (
+        sender._default_manager.filter(pk=instance.pk)
+        .values_list("password", flat=True)
+        .first()
+    )
+    if old is not None and old != instance.password:
+        instance._mcp_sql_password_changed = True
+
+
+@receiver(post_save, sender=User)
+def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
+    """Revoke the user's MCP tokens once a password change commits.
+
+    Deferred to `on_commit` like the logout revocation, so a failure in it
+    can never abort the password change; if the change rolls back, nothing
+    is revoked.
+    """
+    if not getattr(instance, "_mcp_sql_password_changed", False):
+        return
+    instance._mcp_sql_password_changed = False
+    changed_at = timezone.now()
+    transaction.on_commit(
+        lambda: _revoke_and_audit(
+            user=instance,
+            client_ip=None,
+            at=changed_at,
+            reason=AuthRejectionReason.PASSWORD_CHANGE,
+            event="password change",
+        )
+    )
 
 
 @receiver(post_migrate)

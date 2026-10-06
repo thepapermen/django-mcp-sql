@@ -20,6 +20,7 @@ from django.views.decorators.http import require_POST
 from mcp_sql import throttle
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
 from oauth2_provider.models import Application
 
 # RFC 8252 §7.3 specifies `127.0.0.1` and `[::1]` as the loopback hostnames
@@ -93,11 +94,21 @@ def _is_string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+def _registered_grant_types(requested: list[str]) -> list[str]:
+    """RFC 7591 §3.2.1: the supported subset of the requested grant types,
+    which the response echoes — `refresh_token` only while the opt-in
+    refresh grant is on (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`)."""
+    if refresh_tokens_enabled() and "refresh_token" in requested:
+        return ["authorization_code", "refresh_token"]
+    return ["authorization_code"]
+
+
 def _registration_response(
     request: HttpRequest,
     client_id: str,
     client_name: str,
     redirect_uris: list[str],
+    grant_types: list[str],
 ) -> JsonResponse:
     """RFC 7591 §3.2.1 success body.
 
@@ -111,7 +122,7 @@ def _registration_response(
             "client_id_issued_at": int(timezone.now().timestamp()),
             "client_name": client_name,
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
             "registration_client_uri": request.build_absolute_uri(
@@ -192,6 +203,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             "Only token_endpoint_auth_method='none' is supported (public client)",
         )
 
+    grant_types = _registered_grant_types(requested_grant_types)
     client_name = body.get("client_name") or "Unnamed MCP client"
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).
@@ -219,7 +231,9 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     cfg = mcp_sql_config()
     threshold = cfg["BAD_TOKEN_IP_THRESHOLD"]
     if throttle.is_ip_blocked(ip, scope="register", threshold=threshold):
-        return _registration_response(request, client_id, client_name, redirect_uris)
+        return _registration_response(
+            request, client_id, client_name, redirect_uris, grant_types
+        )
 
     Application.objects.create(
         name=client_id,
@@ -251,4 +265,6 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         threshold=threshold,
     )
 
-    return _registration_response(request, client_id, client_name, redirect_uris)
+    return _registration_response(
+        request, client_id, client_name, redirect_uris, grant_types
+    )

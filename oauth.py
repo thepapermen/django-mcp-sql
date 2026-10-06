@@ -5,15 +5,23 @@ refresh and password grants). See `docs/architecture.md` "OAuth surface" for
 the full picture (consent-screen asymmetry, audience-binding policy, prefix
 semantics)."""
 
+import hashlib
 import re
+from datetime import timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
+from django.db import router
+from django.db import transaction
+from django.utils import timezone
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
+from oauth2_provider.models import RefreshToken
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
 if TYPE_CHECKING:
@@ -23,6 +31,27 @@ if TYPE_CHECKING:
 # surface carries one, and a NUL reaching a Postgres text lookup or insert
 # raises an uncaught 500 (DataError).
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _record_refresh_family(raw_refresh_token: str) -> None:
+    """Record the consent time of the chain `raw_refresh_token` starts, and
+    prune family records past the cap (their tokens are refused anyway)."""
+    checksum = hashlib.sha256(raw_refresh_token.encode("utf-8")).hexdigest()
+    family = (
+        RefreshToken.objects.filter(token_checksum=checksum)
+        .values_list("token_family", flat=True)
+        .first()
+    )
+    if family is None:
+        return  # nothing stored (DOT's grace-period reuse path): nothing new
+    now = timezone.now()
+    MCPRefreshTokenFamily.objects.get_or_create(
+        token_family=family, defaults={"consented_at": now}
+    )
+    MCPRefreshTokenFamily.objects.filter(
+        consented_at__lte=now
+        - timedelta(seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS)
+    ).delete()
 
 
 def has_control_character(*params: "QueryDict") -> bool:
@@ -225,8 +254,9 @@ class MCPOAuth2Validator(OAuth2Validator):
         )
 
     # Install-wide backstops. The package's own endpoints run on
-    # `oauth_server.MCPServer`, which has no refresh, password or other grant
-    # and accepts only S256 PKCE. This class is the install's
+    # `oauth_server.MCPServer`, which has no password or other extra grant
+    # (and a refresh grant only when `REFRESH_TOKEN_MAX_AGE_SECONDS` enables
+    # it) and accepts only S256 PKCE. This class is the install's
     # `OAUTH2_VALIDATOR_CLASS`, so the hooks below also hold the line for a
     # consumer who mounts DOT's stock views on DOT's stock server.
 
@@ -251,22 +281,71 @@ class MCPOAuth2Validator(OAuth2Validator):
         return method if method == "S256" else None
 
     def save_bearer_token(self, token, request, *args, **kwargs):
-        """Never store or return a refresh token.
+        """Store a refresh token only when refresh is enabled, and record
+        when its chain was consented to.
 
-        `MCPServer`'s grant does not generate one, but DOT's stock server
-        does, and oauthlib serialises this same dict as the `/o/token/` body
-        after `save_token` (which calls this method) — so dropping the key
-        here also keeps it out of a stock token view's response, and DOT
-        creates no `RefreshToken` row without it.
+        Refresh off (the default): drop `refresh_token` before DOT stores the
+        token. `MCPServer`'s grant does not generate one then, but DOT's
+        stock server does, and oauthlib serialises this same dict as the
+        `/o/token/` body after `save_token` (which calls this method) — so
+        the field is gone from a stock token view's response too, and DOT
+        creates no `RefreshToken` row.
+
+        Refresh on: a refresh token minted by the authorization-code exchange
+        starts a new chain (DOT gives it a fresh `token_family`); its consent
+        time is recorded in `MCPRefreshTokenFamily`, in the same transaction,
+        for `validate_refresh_token`'s hard cap. Rotations inherit the family
+        and record nothing. Expired family rows are pruned here too.
         """
-        token.pop("refresh_token", None)
-        return super().save_bearer_token(token, request, *args, **kwargs)
+        if not refresh_tokens_enabled():
+            token.pop("refresh_token", None)
+            return super().save_bearer_token(token, request, *args, **kwargs)
+        with transaction.atomic(using=router.db_for_write(RefreshToken)):
+            result = super().save_bearer_token(token, request, *args, **kwargs)
+            raw = token.get("refresh_token")
+            if raw and request.grant_type == "authorization_code":
+                _record_refresh_family(raw)
+        return result
 
     def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
-        """Refuse every refresh grant (`invalid_grant`), including refresh
-        tokens minted by releases up to and including 0.1.0b5 (DOT reads the
-        documented `REFRESH_TOKEN_EXPIRE_SECONDS=0` as "no age limit")."""
-        return False
+        """Refresh only when enabled, and only within the chain's hard cap.
+
+        Refresh off: refuse every refresh grant (`invalid_grant`), including
+        refresh tokens minted by releases up to and including 0.1.0b5 (DOT
+        reads the documented `REFRESH_TOKEN_EXPIRE_SECONDS=0` as "no age
+        limit").
+
+        Refresh on: DOT's own checks (token known, not revoked, issued to
+        this client) and then the package's cap: the token's family must
+        have a consent record (`MCPRefreshTokenFamily`) younger than
+        `REFRESH_TOKEN_MAX_AGE_SECONDS`. Measured from the consent, across
+        rotations — unlike DOT's `REFRESH_TOKEN_EXPIRE_SECONDS`, a window
+        that slides with each new access token. A family with no record (an
+        earlier release's token, or one a stock view minted while refresh
+        was off) is refused.
+        """
+        if not refresh_tokens_enabled():
+            return False
+        if not super().validate_refresh_token(
+            refresh_token, client, request, *args, **kwargs
+        ):
+            return False
+        family = getattr(request.refresh_token_instance, "token_family", None)
+        cutoff = timezone.now() - timedelta(
+            seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS
+        )
+        return (
+            family is not None
+            and MCPRefreshTokenFamily.objects.filter(
+                token_family=family, consented_at__gt=cutoff
+            ).exists()
+        )
+
+    def rotate_refresh_token(self, request):
+        """Always rotate: each refresh revokes the presented refresh token
+        and issues a new one (in the same family), whatever DOT's
+        `ROTATE_REFRESH_TOKEN` says."""
+        return True
 
     def validate_user(self, username, password, client, request, *args, **kwargs):
         """Refuse every password grant (`invalid_grant`) without calling
