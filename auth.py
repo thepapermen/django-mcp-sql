@@ -99,6 +99,10 @@ class GateUnavailable(APIException):
     status_code = 503
     default_detail = "MCP access could not be verified; try again later."
     default_code = "gate_unavailable"
+    # DRF's stock exception handler turns `wait` into `Retry-After` (as it
+    # does for `Throttled`), telling a client when retrying makes sense. A
+    # consumer with a custom `EXCEPTION_HANDLER` may drop it; the 503 stands.
+    wait = 30
 
 
 class PayloadTooLarge(APIException):

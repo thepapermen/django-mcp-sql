@@ -473,6 +473,7 @@ class TestGateFailuresAreAuditedDenials:
         )
         assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
         assert "WWW-Authenticate" not in response
+        assert response["Retry-After"] == "30"
         assert reached == []
         row = MCPAuthRejectionLog.objects.get()
         assert row.reason == AuthRejectionReason.GATE_ERROR

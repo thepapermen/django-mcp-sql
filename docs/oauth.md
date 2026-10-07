@@ -910,8 +910,8 @@ challenge) for each gate it fails:
 
 and one that is not a 401: when a gate raises instead of deciding (the
 `MFA_CHECKER` failing, a DB blip, a bad `SESSION_MODEL`), the response is a
-**503** with `"MCP access could not be verified; try again later."` and no
-`WWW-Authenticate` challenge (`auth.GateUnavailable`, audited as
+**503** with `"MCP access could not be verified; try again later."`,
+`Retry-After: 30` and no `WWW-Authenticate` challenge (`auth.GateUnavailable`, audited as
 `gate_error`), so clients retry instead of starting an OAuth
 re-authorization that would fail the same way.
 

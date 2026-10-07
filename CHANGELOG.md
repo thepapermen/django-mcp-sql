@@ -394,8 +394,8 @@ announce themselves.
   the `SESSION_MODEL` lookup escaped the auth class: fail-closed, but with no
   `MCPAuthRejectionLog` row. It is now a denial with the new reason
   `gate_error` (a choice folded into the unreleased migration `0014`; no new
-  migration), answered `503` with no `WWW-Authenticate` challenge, with the
-  traceback logged. Deliberately not a 401: MCP clients answer a 401 with a
+  migration), answered `503` with `Retry-After: 30` and no `WWW-Authenticate`
+  challenge, with the traceback logged. Deliberately not a 401: MCP clients answer a 401 with a
   full OAuth re-authorization, which during an MFA-backend or session-store
   outage fails the same way and can leave a hosted connector needing a manual
   reconnect. Likewise a cache fault in the once-per-hour "ambiguous profile"
