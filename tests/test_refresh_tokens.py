@@ -544,6 +544,169 @@ class TestPasswordChangeEdgeCases:
         assert not AccessToken.objects.filter(user=mcp_user).exists()
 
 
+def _install_filtering_default_manager(monkeypatch, user_model, narrow):
+    """Make `user_model`'s default manager filter rows, as a consumer's
+    `objects = ActiveUserManager()` (or a soft-delete manager) declared
+    first on its user model would: a subclass of the model's own manager
+    class whose `get_queryset` narrows. `_base_manager` is untouched, as
+    Django leaves it."""
+    base = type(user_model._default_manager)
+
+    class FilteringManager(base):  # type: ignore[misc, valid-type]
+        def get_queryset(self):
+            return narrow(super().get_queryset())
+
+    manager = FilteringManager()
+    manager.model = user_model
+    manager.name = user_model._default_manager.name
+    monkeypatch.setattr(user_model._meta, "default_manager", manager)
+    assert user_model._default_manager is manager
+
+
+_HIDING_MANAGERS = {
+    "active-only": lambda qs: qs.filter(is_active=True),
+    "hides-every-row": lambda qs: qs.none(),
+}
+
+
+@pytest.mark.django_db
+class TestPasswordChangeSeesTheStoredRow:
+    """A14 (Grok, review of cf29249): the stored hash is read through the
+    base manager on the alias being written. Through the default manager,
+    a consumer manager that filters rows hid the user, the change read as
+    "no stored hash", and a user reactivated with a new password kept
+    every token."""
+
+    @pytest.fixture(autouse=True)
+    def _no_session_gate(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": None}
+
+    @pytest.fixture
+    def credentials(self, mcp_user, mcp_app, mcp_access_token):
+        """An access token, a refresh token and a pending authorization
+        code for `mcp_user`, who is then deactivated (no password change,
+        so nothing is revoked yet)."""
+        if not any(f.name == "is_active" for f in type(mcp_user)._meta.concrete_fields):
+            pytest.skip("the user model has no is_active column")
+        RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=mcp_app,
+            access_token=mcp_access_token,
+        )
+        Grant.objects.create(
+            user=mcp_user,
+            code=secrets.token_urlsafe(24),
+            application=mcp_app,
+            expires=timezone.now() + timedelta(minutes=1),
+            redirect_uri=_LOOPBACK,
+            scope="mcp:sql",
+            code_challenge=_s256_pair()[1],
+            code_challenge_method="S256",
+        )
+        mcp_user.is_active = False
+        mcp_user.save()
+        assert AccessToken.objects.filter(user=mcp_user).exists()
+        return mcp_user
+
+    @pytest.mark.parametrize("narrow", _HIDING_MANAGERS.values(), ids=_HIDING_MANAGERS)
+    def test_reactivation_with_a_new_password_revokes(
+        self, monkeypatch, credentials, django_capture_on_commit_callbacks, narrow
+    ):
+        user_model = type(credentials)
+        _install_filtering_default_manager(monkeypatch, user_model, narrow)
+        assert not user_model._default_manager.filter(pk=credentials.pk).exists()
+        target = user_model._base_manager.get(pk=credentials.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            target.is_active = True
+            target.set_password("a-new-password-123")
+            target.save()
+        assert not AccessToken.objects.filter(user=credentials).exists()
+        assert not RefreshToken.objects.filter(user=credentials).exists()
+        assert not Grant.objects.filter(user=credentials).exists()
+        assert MCPAuthRejectionLog.objects.filter(
+            user=credentials, reason=AuthRejectionReason.PASSWORD_CHANGE
+        ).exists()
+
+    @pytest.mark.parametrize("narrow", _HIDING_MANAGERS.values(), ids=_HIDING_MANAGERS)
+    def test_reactivation_without_a_password_change_revokes_nothing(
+        self, monkeypatch, credentials, django_capture_on_commit_callbacks, narrow
+    ):
+        user_model = type(credentials)
+        _install_filtering_default_manager(monkeypatch, user_model, narrow)
+        target = user_model._base_manager.get(pk=credentials.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            target.is_active = True
+            target.save()
+        assert AccessToken.objects.filter(user=credentials).exists()
+        assert RefreshToken.objects.filter(user=credentials).exists()
+        assert Grant.objects.filter(user=credentials).exists()
+        assert not MCPAuthRejectionLog.objects.exists()
+
+    def test_the_stored_hash_is_read_on_the_alias_being_written(self, mcp_user):
+        """`pre_save` passes the alias the save writes to; the lookup must
+        go there, not to the default database. An alias that does not exist
+        makes that observable with one database."""
+        from django.db.utils import ConnectionDoesNotExist
+        from mcp_sql.signals import note_password_change
+
+        mcp_user.set_password("a-new-password-123")
+        with pytest.raises(ConnectionDoesNotExist):
+            note_password_change(
+                sender=type(mcp_user),
+                instance=mcp_user,
+                raw=False,
+                using="mcp_sql_tests_no_such_alias",
+                update_fields=None,
+            )
+
+    def test_the_revocation_waits_for_the_alias_being_written(self, mcp_user):
+        """The deferred revocation hangs on the saving alias's transaction
+        (a rollback of another alias's transaction must not drop it)."""
+        from django.db.utils import ConnectionDoesNotExist
+        from mcp_sql import signals
+
+        setattr(mcp_user, signals._PENDING_REVOCATION_ATTR, True)
+        with pytest.raises(ConnectionDoesNotExist):
+            signals.revoke_mcp_tokens_on_password_change(
+                sender=type(mcp_user),
+                instance=mcp_user,
+                created=False,
+                raw=False,
+                using="mcp_sql_tests_no_such_alias",
+                update_fields=None,
+            )
+
+    def test_the_token_deletes_run_in_one_transaction_on_their_database(
+        self, monkeypatch, mcp_user, mcp_access_token
+    ):
+        """The deletes are routed by the install's routers; the transaction
+        that groups them is opened on the alias they are routed to (the
+        default database's would group nothing on a multi-database install).
+        With one database both are `default`, so the alias is asserted as
+        passed: explicitly the routed one, not left to default."""
+        from django.db import router
+        from mcp_sql import signals
+
+        opened = []
+        real_atomic = transaction.atomic
+
+        def atomic(using=None, *args, **kwargs):
+            opened.append(using)
+            return real_atomic(using, *args, **kwargs)
+
+        monkeypatch.setattr(signals.transaction, "atomic", atomic)
+        signals._revoke_and_audit(
+            user=mcp_user,
+            client_ip=None,
+            at=timezone.now(),
+            reason=AuthRejectionReason.PASSWORD_CHANGE,
+            event="password change",
+        )
+        assert opened[0] == router.db_for_write(AccessToken)
+        assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+
+
 @pytest.mark.django_db
 def test_documented_family_prune_deletes_only_orphaned_families(mcp_user, mcp_app):
     """The prune snippet in `MCPRefreshTokenFamily`'s docstring and

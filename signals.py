@@ -18,6 +18,7 @@ from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
 from django.db import DatabaseError
+from django.db import router
 from django.db import transaction
 from django.db.models import Q
 from django.db.models.signals import m2m_changed
@@ -108,7 +109,9 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event):
         application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
     )
     try:
-        with transaction.atomic():
+        # One transaction on the database the token deletes are routed to
+        # (as `MCPOAuth2Validator.save_bearer_token` does).
+        with transaction.atomic(using=router.db_for_write(AccessToken)):
             refresh_deleted, _ = RefreshToken.objects.filter(
                 mcp_apps, user=user
             ).delete()
@@ -188,8 +191,15 @@ def note_password_change(sender, instance, **kwargs):
         return
     if update_fields is not None and "password" not in update_fields:
         return
+    # The stored hash, read through the base manager on the alias being
+    # written: a consumer's default manager may filter rows (active users
+    # only, soft delete), and a hidden row would read as "no stored hash"
+    # and skip the revocation — reactivating a user with a new password
+    # is exactly such a save. A multi-database install writes the user on
+    # `using`, which need not be the default database.
     old = (
-        User._default_manager.filter(pk=instance.pk)
+        User._base_manager.db_manager(kwargs.get("using"))
+        .filter(pk=instance.pk)
         .values_list("password", flat=True)
         .first()
     )
@@ -291,6 +301,9 @@ def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
         return
     setattr(instance, _PENDING_REVOCATION_ATTR, False)
     changed_at = timezone.now()
+    # On the alias the user was saved to: the revocation must wait for THAT
+    # transaction (on another alias's, a rollback there would drop the
+    # revocation of a password change that committed).
     transaction.on_commit(
         lambda: _revoke_and_audit(
             user=instance,
@@ -298,7 +311,8 @@ def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
             at=changed_at,
             reason=AuthRejectionReason.PASSWORD_CHANGE,
             event="password change",
-        )
+        ),
+        using=kwargs.get("using"),
     )
 
 
@@ -513,7 +527,7 @@ def _alert_mcp_group_grant(user_ids: set[int], mcp_group_pks: dict[int, str]) ->
         return
     memberships = _mcp_memberships(user_ids, mcp_group_pks)
     try:
-        users = {u.pk: u for u in User.objects.filter(pk__in=user_ids)}
+        users = {u.pk: u for u in User._base_manager.filter(pk__in=user_ids)}
     except DatabaseError:
         users = {}
     for uid in user_ids:

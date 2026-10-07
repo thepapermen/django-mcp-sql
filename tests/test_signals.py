@@ -194,6 +194,30 @@ class TestMcpGroupGrantAlert:
         assert f"pk={user.pk}" in msg
         assert "default" in msg  # names the profile the user gained
 
+    def test_group_add_names_a_user_the_default_manager_hides(
+        self, mcp_group, caplog, monkeypatch
+    ):
+        """The alert names the user through the base manager, so a consumer
+        `objects` manager that filters rows (active users only, soft delete)
+        cannot turn the name into "?" (A14)."""
+        user = UserFactory()
+        user_model = type(user)
+
+        class HidesEveryRow(type(user_model._default_manager)):  # type: ignore[misc]
+            def get_queryset(self):
+                return super().get_queryset().none()
+
+        manager = HidesEveryRow()
+        manager.model = user_model
+        monkeypatch.setattr(user_model, "objects", manager, raising=False)
+        monkeypatch.setattr(user_model._meta, "default_manager", manager)
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.signals"):
+            user.groups.add(mcp_group)
+        (alert,) = _cohort_alerts(caplog)
+        assert alert.getMessage().startswith(
+            f"MCP cohort change: {user.get_username()} (pk={user.pk})"
+        )
+
     def test_group_remove_is_silent(self, mcp_group, caplog):
         user = UserFactory()
         user.groups.add(mcp_group)  # the grant alert
