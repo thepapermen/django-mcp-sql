@@ -36,6 +36,7 @@ NOT tested (acknowledged gaps)
 """
 
 import datetime
+import decimal
 from decimal import Decimal
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -734,16 +735,18 @@ class TestExecutorHookFailureAudit:
 class TestEveryParserFailureIsAudited:
     """Tokenizer errors (`TokenError` is not a `ParseError`), the `re.error`
     sqlglot 30.21 raises for some `UESCAPE` clauses, and the plain Python
-    exceptions its function builders raise escaped `run_query` with no audit
-    row (ledger F31 / F103). The `re.error` conversion itself is pinned by
-    `test_a_regex_error_inside_sqlglot_is_a_parse_error`: the `U&` rule now
-    refuses every `UESCAPE` input before sqlglot's regex could run."""
+    exceptions sqlglot's function builders raised escaped `run_query` with
+    no audit row (ledger F31 / F103). Inputs sqlglot's own parser raises on
+    are audited `parse_error` before any check runs; on versions whose
+    parser accepts them, the `U&` rule refuses them. The conversion of an
+    arbitrary exception is pinned by `test_any_exception_inside_sqlglot_is_
+    a_parse_error`."""
 
-    # sqlglot 30.7 cannot parse `UESCAPE` at all (a parse error); newer
-    # versions parse it and the package refuses the `U&` form.
+    # sqlglot up to 30.12 cannot parse `UESCAPE` at all (a parse error);
+    # 30.13 and later parse it and the package refuses the `U&` form.
     _UESCAPE_REASON = (
         OutcomeReason.PARSE_ERROR
-        if sqlglot.__version__.startswith("30.7.")
+        if tuple(int(part) for part in sqlglot.__version__.split(".")[:2]) < (30, 13)
         else OutcomeReason.UNSAFE_LITERAL
     )
 
@@ -778,21 +781,29 @@ class TestEveryParserFailureIsAudited:
         assert log.rejection_reason == result.rejection_reason
 
     @pytest.mark.parametrize(
-        "raw_sql",
+        "error",
         [
-            "SELECT J_S_O_N_OBJECT(id) AS v FROM auth_permission",
-            "SELECT levenshtein_less_equal() AS v FROM auth_permission",
-            "SELECT var_map('') AS v FROM auth_permission",
-            "SELECT json_extract_scalar(name, 1e400) AS v FROM auth_permission",
+            TypeError("builder"),
+            IndexError("builder"),
+            KeyError("builder"),
+            ValueError("builder"),
+            decimal.InvalidOperation("builder"),
         ],
-        ids=["type-error", "index-error", "index-error-2", "value-error"],
+        ids=["type-error", "index-error", "key-error", "value-error", "decimal"],
     )
-    def test_any_sqlglot_builder_exception_is_a_parse_error(self, monkeypatch, raw_sql):
-        # sqlglot's function builders raise plain ValueError / IndexError /
-        # TypeError / KeyError / decimal.InvalidOperation on bad arguments.
+    def test_any_exception_inside_sqlglot_is_a_parse_error(self, monkeypatch, error):
+        # sqlglot's function builders raised these on bad arguments
+        # (`date_part('', d)`, `var_map('')`, a `1e400` argument); calls are
+        # now kept as written, but any such exception stays a parse error.
+        def boom(*_a, **_k):
+            raise error
+
+        monkeypatch.setattr("mcp_sql.parser.sqlglot.parse", boom)
         cursor = _stub_readonly_connections(monkeypatch)
         result = run_query(
-            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            raw_sql="SELECT id FROM auth_permission",
         )
         assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
         cursor.execute.assert_not_called()

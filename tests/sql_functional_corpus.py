@@ -6,6 +6,15 @@ the reviewers' corpora (audit-verify/opus-review3/probes/corpus.txt and
 corpus2.txt), filtered to valid Postgres that the package accepts on both
 supported sqlglot versions.
 
+MIN_SERVER_VERSION: entries that need a newer Postgres than the oldest one
+CI runs (functions added in 15 / 16, the PG16 numeric constants); skipped on
+older servers.
+
+POSTGRES_REJECTS: queries the package accepts and runs as written, which
+Postgres itself rejects (no such function, a quoted name that does not
+exist, a negative LIMIT, ...). They must fail in Postgres through
+`run_query` too, not be translated into something that runs.
+
 REFUSED: queries from those corpora the package refuses, with the reason —
 by design (SELECT *, OFFSET / FETCH, set-returning functions, catalog and
 identity functions, locking reads, recursive CTEs) or because the input is
@@ -897,7 +906,10 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "reviewers",
         "SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY x)::numeric, 2) AS m FROM t",
     ),
-    ("reviewers", "SELECT g, count(*) AS n FROM t GROUP BY g ORDER BY n DESC LIMIT 2"),
+    (
+        "reviewers",
+        "SELECT g, count(*) AS n FROM t GROUP BY g ORDER BY n DESC LIMIT 2",
+    ),
     ("reviewers", "SELECT g, count(*) AS n FROM t GROUP BY 1 ORDER BY 2 DESC, 1"),
     ("reviewers", "SELECT g AS grp, count(*) AS n FROM t GROUP BY grp ORDER BY grp"),
     ("reviewers", "SELECT id, lower(g) = 'a' AS isa FROM t ORDER BY id"),
@@ -1372,6 +1384,92 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "reviewers",
         "SELECT id, extract(day FROM ts - TIMESTAMPTZ '2024-01-01') AS dd FROM t ORDER BY id",
     ),
+    # Review round 4: rewrites that changed results, now rendered as
+    # written (see `parser.FaithfulPostgres`).
+    (
+        "as-written",
+        "SELECT id, like(g, 'b%') AS l, like('abc', 'a%') AS m FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT id, strpos(g, 'a'), ceiling(x), char_length(g), character_length(g), pow(y, 2), mod(y, 3), log10(f), log10(x), substr(g, 1, 1), substr('abc', '2') FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT now(), now()::date, transaction_timestamp() = now() AS same FROM t WHERE id = 1",
+    ),
+    (
+        "as-written",
+        "SELECT g, variance(y), var_samp(y), stddev(y) FROM t GROUP BY g ORDER BY g",
+    ),
+    (
+        "as-written",
+        "SELECT id, to_char(d, 'YYYY %m %d') AS a, to_char(ts, '%H:%M HH24') AS b, to_char(x, '999D9%') AS c FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT id, date_bin('15 minutes', ts, '2001-01-01') AS a, date_bin('1 day', ts, TIMESTAMPTZ '2001-01-01') AS b FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT id, jsonb_contains(j, '{\"k\": 1}') AS a, jsonb_exists(j, 'k') AS b, json_object('{a,b}', '{1,2}') AS c, json_object('{a,1,b,2}') AS e FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT id, convert(g::bytea, 'UTF8', 'LATIN1') AS a, decode('aGk=', 'base64') AS b, encode('hi', 'base64') AS c, btrim(' x ') AS e, initcap(g) AS f FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT g, json_agg(y ORDER BY id) AS a, string_agg(DISTINCT upper(g), ', ' ORDER BY upper(g)) AS b, ceil(max(x)), floor(min(x)), chr(65 + max(y)) FROM t GROUP BY g ORDER BY g",
+    ),
+    (
+        "as-written",
+        "SELECT id, regexp_like(g, 'B', 'i') AS a, regexp_count(g, 'a') AS b, regexp_instr(g, 'b') AS c, regexp_substr(g, '[a-z]') AS e FROM t ORDER BY id",
+    ),
+    (
+        "as-written",
+        "SELECT id, date_add(ts, INTERVAL '1 day', 'Asia/Tokyo') AS a, date_add(ts, INTERVAL '1 month') AS b FROM t ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '1 day 02:03:04' AS a, INTERVAL '3 days ago' AS b, INTERVAL '1 day 01:00', interval '-1 day +02:00' AS c, INTERVAL '2 hours', INTERVAL '5' DAY",
+    ),
+    (
+        "intervals",
+        "SELECT id, d + INTERVAL '1 day 06:00' AS a, ts - interval '1 day 2 hours ago' AS b FROM t ORDER BY id",
+    ),
+    (
+        "json",
+        "SELECT id, j -> 'n' ->> '' AS a, j -> '' AS b, j ->> 'a''b' AS c, j -> 'a' -> -1 AS e, j -> ('k') AS f, j -> 'Key' AS g FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, (x, y) IS NOT NULL AS a, NOT (x, y) IS NULL AS b, ROW(x, y) IS NULL AS c, (x, y) NOTNULL AS e, y NOTNULL AS f, NOT y IS NOT NULL AS h FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id FROM t WHERE (x, y) IS NOT NULL AND (g, b) NOTNULL ORDER BY id",
+    ),
+    (
+        "types",
+        'SELECT id, x::"numeric"(10, 1) AS a, CAST(y AS "int8") AS b, 65::"char" AS c, g::"char" AS e, arr::"int8"[] AS f, \'011\'::"bit" AS h FROM t ORDER BY id',
+    ),
+    (
+        "types",
+        "SELECT bit '011', char 'abc', character 'abc', nchar 'abc', varchar 'abc', bit(3) '011', char(2) 'abc'",
+    ),
+    (
+        "numbers",
+        "SELECT 0x1F, 0o17, 0b101",
+    ),
+    (
+        "numbers",
+        "SELECT 1_000",
+    ),
+    (
+        "numbers",
+        "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -1453,8 +1551,6 @@ REFUSED: list[tuple[str, str]] = [
         "roundtrip_mismatch",
         "SELECT id, first_value(y) IGNORE NULLS OVER (ORDER BY id) AS l FROM t ORDER BY id",
     ),
-    ("roundtrip_mismatch", "SELECT id, initcap(g, '-') AS i FROM t ORDER BY id"),
-    ("roundtrip_mismatch", "SELECT id, to_number(g) AS n FROM t WHERE id = 1"),
     (
         "roundtrip_mismatch",
         "SELECT id FROM t QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = 1",
@@ -1467,4 +1563,33 @@ REFUSED: list[tuple[str, str]] = [
         "disallowed_construct",
         "SELECT id, generate_subscripts(arr, 1) AS s FROM t WHERE id = 1",
     ),
+]
+
+# Need a newer Postgres than the oldest CI runs (see the module docstring).
+MIN_SERVER_VERSION: dict[str, int] = {
+    "SELECT id, regexp_count('aaa', 'a') AS c, regexp_substr('abc', 'b') AS s FROM t WHERE id = 1": 150000,
+    "SELECT id, regexp_like(g, '^a') AS m FROM t ORDER BY id": 150000,
+    "SELECT id, regexp_instr('abc', 'c') AS i FROM t WHERE id = 1": 150000,
+    "SELECT id, regexp_like(g, 'B', 'i') AS a, regexp_count(g, 'a') AS b, regexp_instr(g, 'b') AS c, regexp_substr(g, '[a-z]') AS e FROM t ORDER BY id": 150000,
+    "SELECT id, date_add(ts, INTERVAL '1 day', 'Asia/Tokyo') AS a, date_add(ts, INTERVAL '1 month') AS b FROM t ORDER BY id": 160000,
+    "SELECT 0x1F, 0o17, 0b101": 160000,
+    "SELECT 1_000": 160000,
+    "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F": 160000,
+}
+
+# Accepted and run as written; Postgres itself rejects them.
+POSTGRES_REJECTS: list[str] = [
+    "SELECT id, initcap(g, '-') AS i FROM t ORDER BY id",
+    "SELECT id, to_number(g) AS n FROM t WHERE id = 1",
+    'SELECT "Lower"(g) FROM t',
+    'SELECT g::"Text" FROM t',
+    'SELECT x::"Numeric"(10, 2) FROM t',
+    'SELECT x::"int" FROM t',
+    "SELECT nvl(g, 'z') FROM t",
+    "SELECT id, array_length(arr) FROM t",
+    "SELECT last_day(d) FROM t",
+    "SELECT now(3)",
+    "SELECT current_timestamp(0, 1)",
+    "SELECT percentile_cont(x, 0.5) FROM t",
+    "SELECT g, string_agg(g, ',') WITHIN GROUP (ORDER BY g) FROM t GROUP BY g",
 ]

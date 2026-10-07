@@ -12,6 +12,7 @@ from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
 from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
+from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
 from sqlglot import parse_one
@@ -872,13 +873,37 @@ class TestLexicalFidelity:
     @pytest.mark.parametrize(
         "sql",
         [
-            'SELECT "Lower"(codename) AS v FROM auth_permission',
-            'SELECT "public"."lower"(codename) AS v FROM auth_permission',
+            # Names sqlglot still folds onto its own nodes (typed functions
+            # and keyword-syntax functions): they would run unquoted.
             'SELECT "count" (*) AS n FROM auth_permission',
+            'SELECT "Count"(id) AS n FROM auth_permission',
+            "SELECT \"Extract\"(year FROM DATE '2024-01-01') AS v",
+            "SELECT \"substring\"('abc' FROM 2) AS v",
+            # Wherever it appears (review round 4: after AS, ZONE, BOTH, ...).
+            'SELECT "Count"(id) AS (c) FROM auth_permission',
+            'SELECT now() AT TIME ZONE "Extract"(year FROM now()) AS v',
+            "SELECT trim(BOTH \"Count\"(id)::text FROM 'x') AS v FROM auth_permission",
         ],
     )
     def test_quoted_function_name(self, sql):
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT "Lower"(codename) AS v FROM auth_permission',
+            'SELECT "public"."lower"(codename) AS v FROM auth_permission',
+            "SELECT \"Lower\"('AbC') AS (c)",
+            "SELECT now() AT TIME ZONE \"Lower\"('UTC') AS v",
+        ],
+    )
+    def test_quoted_function_name_kept_as_written(self, sql):
+        # Every other call is kept as written (`FaithfulPostgres`), quotes
+        # included, so Postgres resolves the name exactly as in the source.
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        rendered = render_for_execution(parsed.ast, 5, allowed_tables=ALLOWED)
+        quoted = sql[sql.index('"') : sql.index("(", sql.index('"'))]
+        assert quoted in rendered
 
     @pytest.mark.parametrize(
         "sql",
@@ -914,6 +939,7 @@ class TestLexicalFidelity:
             'WITH a AS (SELECT 1 AS x), "q"(c1) AS NOT MATERIALIZED (SELECT 1) '
             'SELECT c1 FROM "q"',
             'SELECT id::"numeric"(10, 2) AS v FROM auth_permission',
+            'SELECT CAST(id AS "Numeric"(10, 2)) AS v FROM auth_permission',
             'SELECT codename AS "Lower" FROM auth_permission',
             "SELECT 'a' || 'b' AS v FROM auth_permission",
             "SELECT $t1$x$t1$ AS v, $$y$$ AS w FROM auth_permission",
@@ -926,6 +952,7 @@ class TestLexicalFidelity:
             "cte-column-list",
             "later-cte-column-list",
             "quoted-type-modifiers",
+            "quoted-type-modifiers-cast",
             "quoted-alias",
             "concat-operator",
             "dollar-tags",

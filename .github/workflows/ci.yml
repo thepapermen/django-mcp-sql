@@ -18,6 +18,8 @@ jobs:
       # DRF/DOT/allauth for its Django line, so the 6.0 legs pull DRF 3.17).
       # The columns are ragged because the interpreters differ per Django:
       # 6.0 dropped Python 3.11, and 4.2 never supported 3.13.
+      # One leg runs a newer PostgreSQL, so the SQL corpus entries that need
+      # it (PG15/16 functions, PG16 numeric constants) run in CI too.
       matrix:
         include:
           - { python-version: "3.11", django: "4.2" }
@@ -26,11 +28,12 @@ jobs:
           - { python-version: "3.12", django: "5.2" }
           - { python-version: "3.13", django: "5.2" }
           - { python-version: "3.12", django: "6.0" }
-          - { python-version: "3.13", django: "6.0" }
+          - { python-version: "3.13", django: "6.0", postgres: "16" }
     services:
       postgres:
-        # The documented PostgreSQL floor (README "Compatibility").
-        image: postgres:14
+        # The documented PostgreSQL floor (README "Compatibility"), or the
+        # newer server one leg asks for.
+        image: postgres:${{ matrix.postgres || '14' }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:

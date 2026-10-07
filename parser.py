@@ -151,27 +151,122 @@ def _keep_precision(name: str) -> Callable[[Generator, exp.Func], str]:
     return render
 
 
+def _json_arrow(operator: str, base: Any) -> Callable[[Generator, exp.Expression], str]:
+    """Render `a -> b` / `a ->> b` with the right operand as written (the
+    parser keeps it raw: see `FaithfulPostgres`)."""
+
+    def render(self: Generator, node: exp.Expression) -> str:
+        if isinstance(node.expression, exp.JSONPath):
+            return str(base(self, node))
+        return f"{self.sql(node, 'this')} {operator} {self.sql(node, 'expression')}"
+
+    return render
+
+
+def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
+    """A primary parser for a number / bit-string token: the constant as
+    written (`_number_as_written`), else sqlglot's own `base` reading."""
+
+    def parse(self: Any, token: Token) -> Any:
+        return self._number_as_written(token) or base(self, token)
+
+    return parse
+
+
+class _IsNotNull(exp.Expression, exp.Condition):
+    """`x IS NOT NULL` / `x NOTNULL` as written. sqlglot before 30.x's
+    `Is(negate=...)` builds `NOT x IS NULL` for both, which Postgres
+    evaluates differently for a row value (`(1, NULL) IS NOT NULL` is false,
+    `NOT (1, NULL) IS NULL` is true)."""
+
+    arg_types = {"this": True}
+
+
+# Everything Postgres accepts as a numeric constant, including the PG16 forms
+# (`0x1F`, `0o17`, `0b101`, `1_000`, `1_000.5e1_0`).
+_PG_NUMBER_RE = re.compile(
+    r"0[xX](?:_?[0-9a-fA-F])+|0[oO](?:_?[0-7])+|0[bB](?:_?[01])+"
+    r"|(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][-+]?\d(?:_?\d)*)?"
+)
+# sqlglot reads `0x1F` / `0b101` as the bit strings `x'1F'` / `b'101'`.
+_PG_PREFIXED_NUMBER = ("0x", "0X", "0b", "0B")
+
 # The postgres dialect's parser / generator classes, as bases (sqlglot types
 # them as class attributes, which mypy will not take as a base class).
 _PostgresParser: Any = Postgres.Parser
 _PostgresGenerator: Any = Postgres.Generator
 
+# The only function names sqlglot still builds into its own node classes:
+# the ones the checks below match structurally (`COUNT(*)`'s star carve-out,
+# the set-returning `generate_series` / `unnest`). See `FaithfulPostgres`.
+_TYPED_FUNCTIONS = frozenset({"COUNT", "GENERATE_SERIES", "UNNEST"})
+# Postgres's keyword-syntax functions (`EXTRACT(year FROM d)`,
+# `SUBSTRING(s FROM 2 FOR 3)`, `TRIM(BOTH 'x' FROM s)`, `CAST(x AS t)`, the
+# SQL/JSON constructors, ...), which only sqlglot's own parsers can read.
+_SYNTAX_FUNCTIONS = frozenset(
+    {
+        "CAST",
+        "EXTRACT",
+        "JSON_OBJECT",
+        "JSON_OBJECTAGG",
+        "JSON_TABLE",
+        "NORMALIZE",
+        "OVERLAY",
+        "POSITION",
+        "SUBSTRING",
+        "TRIM",
+        "XMLELEMENT",
+        "XMLTABLE",
+    }
+)
+_SYNTAX_NO_PAREN_FUNCTIONS = frozenset({"ANY", "CASE", "VARIADIC"})
+# Words that make a `json_object(...)` call the SQL/JSON constructor
+# (`json_object('a': 1)`, `json_object(KEY 'a' VALUE 1 RETURNING jsonb)`)
+# rather than Postgres's `json_object(text[] [, text[]])` function.
+_SQL_JSON_WORDS = frozenset(
+    {"ABSENT", "FORMAT", "KEY", "ON", "RETURNING", "UNIQUE", "VALUE", "WITH", "WITHOUT"}
+)
+
 
 class FaithfulPostgres(Postgres):
-    """sqlglot's postgres dialect minus the rewrites that change what a
-    Postgres query returns. The executor runs sqlglot's rendering of the
-    query, so a "normalising" rewrite that is not exact is a wrong answer:
+    """sqlglot's postgres dialect, reading and rendering Postgres SQL as
+    written. The executor runs sqlglot's rendering of the query, so any
+    "normalising" rewrite that is not exact is a wrong answer (or a wrong
+    column name). What it changes from the stock dialect:
 
-    - `date_part('year', d)` was rewritten to `EXTRACT(year FROM d)`, which
-      returns `numeric` instead of `double precision` (`2024` instead of
-      `2024.0`). It now stays a plain function call, rendered as written.
-    - `to_hex(n)` was rewritten to `HEX(n)`, which Postgres does not have.
-    - `date_trunc(unit, ts, zone)` lost its time-zone argument on sqlglot
-      30.7 (different rows). It now stays a plain call, rendered as written.
-    - `current_timestamp(0)` lost its precision, and `current_time` was
-      rendered `CURRENT_TIME()`, a syntax error in Postgres. Both now keep
-      exactly the precision written (`now()` still renders
-      `CURRENT_TIMESTAMP`, the same value).
+    - Function calls stay as written. Stock sqlglot maps hundreds of names
+      onto its own node classes and renders them back in its canonical
+      spelling, which is not always the same function or the same column
+      name: `like(a, b)` → `b LIKE a` (arguments swapped), `regexp_like(x,
+      p, 'i')` → `x ~ p` (flags dropped), `date_part` → `EXTRACT` (numeric,
+      not double precision), `log10(x)` → `LOG(10, x)` (numeric),
+      `to_char(d, '%Y')` → `TO_CHAR(d, 'YYYY')` (format "translated"),
+      `date_add(t, i, zone)` → `t + i` (zone dropped), `strpos` →
+      `POSITION` and `now()` → `CURRENT_TIMESTAMP` (other column names),
+      `nvl` / `iif` / `last_day` → their Postgres equivalents (where Postgres
+      itself rejects the call). Every plain call `name(args)` now parses as
+      `exp.Anonymous` and renders exactly as written, except the few the
+      checks match structurally (`_TYPED_FUNCTIONS`) and Postgres's
+      keyword-syntax functions (`_SYNTAX_FUNCTIONS`), whose renderings mean
+      the same to Postgres. `json_object(a, b)` (the plain function) is told
+      apart from the SQL/JSON constructor by its arguments.
+    - `INTERVAL '1 day 02:03:04'` / `INTERVAL '3 days ago'` keep their
+      string: sqlglot canonicalised them to their first `<n> <unit>` part.
+    - `j -> k` / `j ->> k` keep their right operand as written: sqlglot
+      turned it into a JSON path, dropping an empty key (`j -> ''`) and, on
+      30.7, a quote inside the key.
+    - A quoted type name stays quoted (`x::"char"`, `x::"Numeric"(10, 2)`):
+      sqlglot folded it onto its builtin (`CHAR`, `DECIMAL`), a different
+      type or one Postgres does not have under that spelling.
+    - `bit '011'` / `char 'abc'` (no length) keep their full value: sqlglot
+      rendered `CAST('011' AS BIT)`, which Postgres reads as `bit(1)`.
+    - Numeric constants keep their spelling, including the PG16 forms
+      (`0x1F`, `0o17`, `0b101`, `1_000`), which sqlglot read as a bit
+      string or as a number with an alias (`1 AS _000`). Postgres then reads
+      the text it would have read from the agent.
+    - `x IS NOT NULL` / `x NOTNULL` stay as written on sqlglot versions that
+      build `NOT x IS NULL` (different for a row value).
+    - `current_timestamp` / `current_time` keep the precision written.
 
     Used for every parse, tokenization and rendering in this module. The
     tokenizers are the postgres dialect's own classes, assigned rather than
@@ -184,23 +279,244 @@ class FaithfulPostgres(Postgres):
     JSONPathTokenizer = Postgres.jsonpath_tokenizer_class
 
     class Parser(_PostgresParser):
-        FUNCTION_PARSERS = {
-            name: build
-            for name, build in Postgres.Parser.FUNCTION_PARSERS.items()
-            if name != "DATE_PART"
-        }
         FUNCTIONS = {
             name: build
             for name, build in Postgres.Parser.FUNCTIONS.items()
-            if name not in {"TO_HEX", "DATE_TRUNC"}
+            if name in _TYPED_FUNCTIONS
         }
+        FUNCTION_PARSERS = {
+            **{
+                name: parse
+                for name, parse in Postgres.Parser.FUNCTION_PARSERS.items()
+                if name in _SYNTAX_FUNCTIONS
+            },
+            "JSON_OBJECT": lambda self: self._parse_json_object_or_call(),
+        }
+        NO_PAREN_FUNCTION_PARSERS = {
+            name: parse
+            for name, parse in Postgres.Parser.NO_PAREN_FUNCTION_PARSERS.items()
+            if name in _SYNTAX_NO_PAREN_FUNCTIONS
+        }
+        PRIMARY_PARSERS = {
+            **Postgres.Parser.PRIMARY_PARSERS,
+            **{
+                kind: _number_as_written_or(Postgres.Parser.PRIMARY_PARSERS[kind])
+                for kind in (
+                    TokenType.NUMBER,
+                    TokenType.HEX_STRING,
+                    TokenType.BIT_STRING,
+                )
+            },
+        }
+        TYPE_LITERAL_PARSERS = {
+            **Postgres.Parser.TYPE_LITERAL_PARSERS,
+            exp.DType.BIT: lambda self, this, to: self._unrestricted(this, to, "bit"),
+            exp.DType.CHAR: lambda self, this, to: self._unrestricted(
+                this, to, "bpchar"
+            ),
+            exp.DType.NCHAR: lambda self, this, to: self._unrestricted(
+                this, to, "bpchar"
+            ),
+        }
+        # sqlglot 30.21 parses `->` / `->>` at the binary-operator tier
+        # (`JSON_OPERATORS`), 30.7 as column operators: keep the right
+        # operand raw in whichever table this sqlglot uses.
+        _ARROWS = {
+            TokenType.ARROW: lambda self, this, path: self.expression(
+                exp.JSONExtract(this=this, expression=path)
+            ),
+            TokenType.DARROW: lambda self, this, path: self.expression(
+                exp.JSONExtractScalar(this=this, expression=path)
+            ),
+        }
+        if getattr(Postgres.Parser, "JSON_OPERATORS", None):
+            JSON_OPERATORS = {**Postgres.Parser.JSON_OPERATORS, **_ARROWS}
+        else:
+            COLUMN_OPERATORS = {**Postgres.Parser.COLUMN_OPERATORS, **_ARROWS}
+
+        def _number_as_written(self, token: Token) -> exp.Expression | None:
+            """A numeric constant spelled the way Postgres reads it, or
+            `None` to keep sqlglot's reading. sqlglot splits `1_000` into
+            `1` and `_000` (an alias) and reads `0x1F` as a bit string; the
+            whole constant is taken as one literal, rendered verbatim."""
+            sql = self.sql
+            prefixed = token.token_type in {TokenType.HEX_STRING, TokenType.BIT_STRING}
+            if (
+                prefixed
+                and sql[token.start : token.start + 2] not in _PG_PREFIXED_NUMBER
+            ):
+                return None  # x'1F' / b'101': a real bit string
+            match = _PG_NUMBER_RE.match(sql, token.start)
+            if match is None or (not prefixed and match.end() <= token.end + 1):
+                return None  # sqlglot read it whole already
+            end = match.end()
+            if end < len(sql) and (sql[end].isalnum() or sql[end] in "_$"):
+                return None  # "trailing junk" to PG16: keep sqlglot's reading
+            index, tokens = self._index, self._tokens
+            while self._index < len(tokens) and tokens[self._index].start < end:
+                self._advance()
+            if tokens[self._index - 1].end != end - 1:
+                self._retreat(index)
+                return None
+            return exp.Literal.number(sql[token.start : end])
+
+        def _parse_primary(self) -> exp.Expression | None:
+            # `.5_0` (PG16): sqlglot reads `.5` and then an alias `_0`.
+            tokens, index = self._tokens, self._index
+            curr = tokens[index] if index < len(tokens) else None
+            nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+            if (
+                curr is not None
+                and nxt is not None
+                and curr.token_type == TokenType.DOT
+                and nxt.token_type == TokenType.NUMBER
+                and nxt.start == curr.end + 1
+            ):
+                self._advance()
+                literal = self._number_as_written(curr)
+                if literal is not None:
+                    return literal
+                self._retreat(index)
+            primary: exp.Expression | None = super()._parse_primary()
+            return primary
+
+        def _unrestricted(
+            self, this: exp.Expression, to: exp.DataType, type_name: str
+        ) -> exp.Expression:
+            """`bit '011'` / `char 'abc'`: a typed literal without a length
+            keeps its whole value, which `CAST(... AS BIT)` / `CHAR` (length
+            1) would not. The quoted catalog name means the same
+            unrestricted type to Postgres."""
+            if not to.expressions:
+                to = exp.DataType(
+                    this=exp.DType.USERDEFINED,
+                    kind=exp.to_identifier(type_name, quoted=True),
+                )
+            cast: exp.Expression = self.expression(exp.Cast(this=this, to=to))
+            return cast
+
+        def _parse_types(self, *args: Any, **kwargs: Any) -> exp.Expression | None:
+            index = self._index
+            token = self._tokens[index] if index < len(self._tokens) else None
+            parsed: exp.Expression | None = super()._parse_types(*args, **kwargs)
+            if (
+                token is not None
+                and token.token_type == TokenType.IDENTIFIER
+                and isinstance(parsed, exp.DataType)
+            ):
+                _keep_quoted_type(parsed, token)
+            return parsed
+
+        def _parse_interval_span(
+            self, this: exp.Expression, *args: Any, **kwargs: Any
+        ) -> exp.Interval:
+            written = this.name if this is not None and this.is_string else None
+            interval: exp.Interval = super()._parse_interval_span(this, *args, **kwargs)
+            if (
+                written is not None
+                and len(exp.INTERVAL_STRING_RE.findall(written)) == 1
+                and not exp.INTERVAL_STRING_RE.fullmatch(written)
+                and not isinstance(interval.args.get("unit"), exp.IntervalSpan)
+            ):
+                # sqlglot kept only the first `<n> <unit>` of the string.
+                interval.set("this", exp.Literal.string(written))
+                interval.set("unit", None)
+            return interval
+
+        def _parse_json_object_or_call(self) -> exp.Expression | None:
+            if self._plain_call_arguments():
+                args = self._parse_csv(self._parse_assignment)
+                call: exp.Expression = self.expression(
+                    exp.Anonymous(this="json_object", expressions=args)
+                )
+                return call
+            constructor: exp.Expression | None = self._parse_json_object()
+            return constructor
+
+        def _plain_call_arguments(self) -> bool:
+            """True if the tokens up to the closing parenthesis are plain
+            comma-separated arguments (no SQL/JSON key-value syntax)."""
+            tokens, depth, j = self._tokens, 0, self._index
+            if j >= len(tokens) or tokens[j].token_type == TokenType.R_PAREN:
+                return False
+            while j < len(tokens):
+                kind = tokens[j].token_type
+                if kind == TokenType.R_PAREN and depth == 0:
+                    return True
+                depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
+                if depth == 0 and (
+                    kind == TokenType.COLON
+                    or (
+                        tokens[j].text.upper() in _SQL_JSON_WORDS
+                        and not _alone_in_argument(tokens, j, self._index)
+                    )
+                ):
+                    return False
+                j += 1
+            return False
+
+        if "negate" not in exp.Is.arg_types:  # sqlglot without `Is(negate=)`
+
+            def expression(self, instance: Any, *args: Any, **kwargs: Any) -> Any:
+                if (
+                    type(instance) is exp.Not
+                    and type(instance.this) is exp.Is
+                    and isinstance(instance.this.expression, exp.Null)
+                    and self._wrote_is_not_null()
+                ):
+                    instance = _IsNotNull(this=instance.this.this)
+                return super().expression(instance, *args, **kwargs)
+
+            def _wrote_is_not_null(self) -> bool:
+                last = self._tokens[: self._index][-3:]
+                kinds = [token.token_type for token in last]
+                return kinds[-1:] == [TokenType.NOTNULL] or kinds == [
+                    TokenType.IS,
+                    TokenType.NOT,
+                    TokenType.NULL,
+                ]
 
     class Generator(_PostgresGenerator):
+        # `string_agg(DISTINCT a, ',')`: Postgres takes DISTINCT over several
+        # aggregate arguments; stock sqlglot rewrites it into a CASE tuple.
+        MULTI_ARG_DISTINCT = True
         TRANSFORMS = {
             **Postgres.Generator.TRANSFORMS,
             exp.CurrentTimestamp: _keep_precision("CURRENT_TIMESTAMP"),
             exp.CurrentTime: _keep_precision("CURRENT_TIME"),
+            exp.JSONExtract: _json_arrow(
+                "->", Postgres.Generator.TRANSFORMS[exp.JSONExtract]
+            ),
+            exp.JSONExtractScalar: _json_arrow(
+                "->>", Postgres.Generator.TRANSFORMS[exp.JSONExtractScalar]
+            ),
+            _IsNotNull: lambda self, node: f"{self.sql(node, 'this')} IS NOT NULL",
         }
+
+
+def _alone_in_argument(tokens: list[Token], j: int, first: int) -> bool:
+    """True if `tokens[j]` is a whole argument on its own (a column named
+    `value` / `key`), not a keyword inside one."""
+    before = tokens[j - 1].token_type if j > first else TokenType.COMMA
+    after = tokens[j + 1].token_type if j + 1 < len(tokens) else TokenType.R_PAREN
+    return before == TokenType.COMMA and after in {TokenType.COMMA, TokenType.R_PAREN}
+
+
+def _keep_quoted_type(parsed: exp.DataType, token: Token) -> None:
+    """Make the type `parsed` from the double-quoted name `token` render as
+    that quoted name (Postgres resolves it case-sensitively, as written)."""
+    base = parsed
+    while base.this == exp.DType.ARRAY and base.expressions:
+        inner = base.expressions[0]
+        if not isinstance(inner, exp.DataType):
+            return
+        base = inner
+    if base.this == exp.DType.USERDEFINED:
+        return  # already the name as written
+    name = exp.to_identifier(token.text, quoted=True)
+    name.update_positions(token)
+    base.set("this", exp.DType.USERDEFINED)
+    base.set("kind", name)
 
 
 class QueryRejectedError(Exception):
@@ -244,12 +560,12 @@ def parse_and_validate(
     Raises only `QueryRejectedError`. sqlglot fails on hostile input with
     far more than `ParseError`: the tokenizer's `TokenError` (an
     unterminated literal), a bare `re.error` for some `UESCAPE` clauses,
-    and plain `ValueError` / `TypeError` / `IndexError` / `KeyError` /
-    `decimal.InvalidOperation` from its function builders
-    (`date_part('', d)`, `var_map('')`, a `1e400` argument, ...). Every
-    exception other than our own rejection becomes a `PARSE_ERROR`, so
-    `run_query` audits it like any other rejection instead of letting it
-    escape unaudited.
+    and (before `FaithfulPostgres` kept calls as written) plain
+    `ValueError` / `TypeError` / `IndexError` / `KeyError` /
+    `decimal.InvalidOperation` from its function builders. Every exception
+    other than our own rejection becomes a `PARSE_ERROR`, so `run_query`
+    audits it like any other rejection instead of letting it escape
+    unaudited.
     """
     return _checked(
         raw_sql,
@@ -409,13 +725,15 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
       every sqlglot version, by its source text: the `U` / `u` adjacent to
       `&` adjacent to a quote, or (newer sqlglot) one `UNICODE_STRING`
       token. `U & 'x'` with spaces is a real operator and stays allowed.
-    - A double-quoted function name (`"Lower"(...)`): Postgres resolves it
-      case-sensitively (`Lower` does not exist), but sqlglot folds it onto
-      its builtin and re-emits `LOWER(...)`, a different function. Rejected
-      wherever a double-quoted name is followed by `(` in call position
-      (`_is_call_position`) — not as an alias's or CTE's column list
-      (`AS "s"(c1)`, `) "s"(c1)`, `t "s"(c1)`, `WITH "q"(c1) AS (...)`) or a
-      type's modifiers (`::"numeric"(10, 2)`).
+    - A double-quoted name followed by `(` that sqlglot does not keep as
+      written: Postgres resolves `"Count"(x)` / `"Extract"(...)`
+      case-sensitively (no such function), but sqlglot folds the few names
+      it still builds into its own nodes (`FaithfulPostgres`) onto the
+      builtin. Judged on the parsed tree: the quoted name is fine where the
+      tree keeps it — a function sqlglot keeps as written
+      (`"lower"(x)`, `public."Lower"(x)`), an alias's or CTE's column list
+      (`AS "s"(c1)`, `WITH "q"(c1) AS (...)`), a quoted type with modifiers
+      (`::"numeric"(10, 2)`) — and refused anywhere else.
     - Adjacent string constants (`'a' 'b'`): sqlglot always reads them as
       `CONCAT('a', 'b')`; Postgres joins them only across a newline (on one
       line it is a syntax error) and names the column differently.
@@ -427,8 +745,14 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
     backstop for anything else of this class.
     """
     tokens = FaithfulPostgres().tokenize(raw_sql)
+    # Where the tree keeps a quoted name as written (see above).
+    kept_names = {
+        ident.meta.get("start")
+        for ident in ast.find_all(exp.Identifier)
+        if isinstance(ident.parent, (exp.Anonymous, exp.DataType, exp.TableAlias))
+    }
     for i in range(len(tokens)):
-        problem = _token_problem(raw_sql, tokens, i)
+        problem = _token_problem(raw_sql, tokens, i, kept_names)
         if problem is not None:
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem)
     for ident in ast.find_all(exp.Identifier):
@@ -470,24 +794,15 @@ _STRING_TOKENS = frozenset(
 # A Postgres dollar-quote opener: `$$` or `$tag$`, the tag an identifier
 # without `$` (sqlglot also accepts `$u&$...$u&$`, which Postgres rejects).
 _DOLLAR_TAG_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
-# Tokens after which a quoted name followed by `(` is NOT a function call:
-# `AS "s"(c1)` / `) "s"(c1)` / `t "s"(c1)` (an alias with a column list),
-# `::"numeric"(10, 2)` (a type with modifiers), `WITH "q"(c1) AS (...)`.
-_NON_CALL_PREDECESSORS = frozenset(
-    {
-        TokenType.ALIAS,
-        TokenType.R_PAREN,
-        TokenType.VAR,
-        TokenType.IDENTIFIER,
-        TokenType.DCOLON,
-        TokenType.WITH,
-    }
-)
 
 
-def _token_problem(raw_sql: str, tokens: list[Token], i: int) -> str | None:
+def _token_problem(
+    raw_sql: str, tokens: list[Token], i: int, kept_names: set[int | None]
+) -> str | None:
     """Why `tokens[i]` (with its neighbours) is a source form sqlglot and
-    Postgres read differently, or `None`. See `_check_lexical_fidelity`."""
+    Postgres read differently, or `None`. `kept_names`: the source offsets
+    of the quoted names the parsed tree keeps as written. See
+    `_check_lexical_fidelity`."""
 
     def source(token: Token) -> str:
         return raw_sql[token.start : token.end + 1]
@@ -516,11 +831,15 @@ def _token_problem(raw_sql: str, tokens: list[Token], i: int) -> str | None:
             "Unicode-escape literals and identifiers (U&'...', U&\"...\") "
             "are not supported; write the characters directly"
         )
-    if text.startswith('"') and _is_call_position(tokens, i):
+    if (
+        text.startswith('"')
+        and nxt
+        and nxt[0].token_type == TokenType.L_PAREN
+        and token.start not in kept_names
+    ):
         return (
-            f"{text}(...) reads as a function call with a quoted name, which "
-            "is not supported: write function names unquoted (a quoted alias "
-            "with a column list is fine)"
+            f"{text}(...) reads as a quoted call of a built-in that would run "
+            "unquoted; write the function name unquoted"
         )
     if token.token_type == TokenType.HEREDOC_STRING and not _DOLLAR_TAG_RE.match(text):
         return (
@@ -537,34 +856,6 @@ def _token_problem(raw_sql: str, tokens: list[Token], i: int) -> str | None:
             "only across a newline, sqlglot always); concatenate with ||"
         )
     return None
-
-
-def _is_call_position(tokens: list[Token], i: int) -> bool:
-    """True if `tokens[i]` (a quoted name) is followed by `(` as a function
-    call would be — not as an alias's or CTE's column list or a type's
-    modifiers."""
-    if i + 1 >= len(tokens) or tokens[i + 1].token_type != TokenType.L_PAREN:
-        return False
-    if i > 0 and tokens[i - 1].token_type in _NON_CALL_PREDECESSORS:
-        return False
-    # A later CTE in a WITH list: `, "q"(c1) AS [NOT] [MATERIALIZED] (`.
-    depth, j = 0, i + 1
-    while j < len(tokens):
-        kind = tokens[j].token_type
-        depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
-        j += 1
-        if depth == 0:
-            break
-    rest = tokens[j : j + 4]
-    if rest and rest[0].token_type == TokenType.ALIAS:
-        k = 1
-        if k < len(rest) and rest[k].token_type == TokenType.NOT:
-            k += 1
-        if k < len(rest) and rest[k].text.upper() == "MATERIALIZED":
-            k += 1
-        if k < len(rest) and rest[k].token_type == TokenType.L_PAREN:
-            return False
-    return True
 
 
 def inject_limit(ast: exp.Query, n: int) -> exp.Query:
@@ -613,12 +904,12 @@ def render_for_execution(
 
     Any failure is `QueryRejectedError(ROUNDTRIP_MISMATCH)` naming the
     step; nothing runs. That includes a construct sqlglot cannot express in
-    Postgres (it would otherwise drop it — `IGNORE NULLS`, `initcap`'s
-    delimiter — see `_render`). Rewrites that keep the meaning — sqlglot's
-    `CAST` in `ROUND(AVG(x), 2)`, an expanded window frame, `SOME` → `ANY` —
-    validate and run; the ones that do not are switched off in
-    `FaithfulPostgres`. `tests/test_sql_functional_corpus.py` pins that
-    ordinary analytics return what Postgres returns for the original text.
+    Postgres (it would otherwise drop it — `IGNORE NULLS` — see `_render`).
+    Respellings that keep the meaning — an expanded window frame, `SOME` →
+    `ANY`, `x::int` → `CAST(x AS INT)` — validate and run; everything else
+    is rendered as written by `FaithfulPostgres`.
+    `tests/test_sql_functional_corpus.py` pins that ordinary analytics
+    return what Postgres returns for the original text.
 
     The residual: the checks prove what sqlglot reads in the executed text,
     not what Postgres's lexer reads, and the result values are only as
@@ -665,7 +956,7 @@ _MAX_RENDER_ROUNDS = 3
 def _render(tree: exp.Query) -> str:
     """The tree as Postgres SQL. `unsupported_level=RAISE`: where sqlglot
     knows it cannot express something in Postgres it would otherwise drop it
-    with a warning (`IGNORE NULLS`, `initcap`'s delimiter) and run something
+    with a warning (`IGNORE NULLS` / `RESPECT NULLS`) and run something
     else; that is a `ROUNDTRIP_MISMATCH` instead. Any other generator failure
     is one too; only `RecursionError` propagates (the caller audits it)."""
     try:

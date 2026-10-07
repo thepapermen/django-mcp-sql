@@ -13,25 +13,35 @@ test tables, and must:
 
 Both sides run inside the test's transaction, so `now()` is the same value.
 Rows are compared in order when the query has a top-level ORDER BY, and as a
-multiset otherwise. The executor's per-cell coercion (`_cap_cell`) is
-applied to the direct rows too, since `run_query` returns JSON-ready cells.
+multiset otherwise. The executor's
+per-cell coercion (`_cap_cell`) is applied to the direct rows too, since
+`run_query` returns JSON-ready cells. Entries in `MIN_SERVER_VERSION` are
+skipped on an older Postgres.
 
-`sql_functional_corpus.REFUSED` pins the queries from the same corpora the
-package refuses, with the reason, so the boundary stays visible.
+`sql_functional_corpus.POSTGRES_REJECTS` must fail in Postgres through
+`run_query` as they do when run directly (run as written, not translated
+into something that runs). `sql_functional_corpus.REFUSED` pins the queries
+from the same corpora the package refuses, with the reason, so the boundary
+stays visible.
 """
 
 import pytest
 import sqlglot
+from django.db import DatabaseError
 from django.db import connection
 from django.db import transaction
 from mcp_sql.executor import _cap_cell
 from mcp_sql.executor import run_query
+from mcp_sql.parser import FaithfulPostgres
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import parse_and_validate
 from mcp_sql.parser import render_for_execution
+from mcp_sql.schemas import OutcomeReason
 from mcp_sql.session import enter_readonly_session
 from mcp_sql.tests.factories import UserFactory
 from mcp_sql.tests.sql_functional_corpus import FUNCTIONAL
+from mcp_sql.tests.sql_functional_corpus import MIN_SERVER_VERSION
+from mcp_sql.tests.sql_functional_corpus import POSTGRES_REJECTS
 from mcp_sql.tests.sql_functional_corpus import REFUSED
 from mcp_sql.tests.sql_functional_corpus import SETUP_SQL
 from mcp_sql.tests.test_executor import _DEFAULT_PROFILE
@@ -80,7 +90,9 @@ def _direct(sql: str) -> tuple[list[str], list[list[object]]]:
 
 
 def _is_ordered(sql: str) -> bool:
-    return sqlglot.parse_one(sql, dialect="postgres").args.get("order") is not None
+    return (
+        sqlglot.parse_one(sql, dialect=FaithfulPostgres).args.get("order") is not None
+    )
 
 
 @pytest.mark.django_db
@@ -89,6 +101,7 @@ def _is_ordered(sql: str) -> bool:
     "sql", [sql for _category, sql in FUNCTIONAL], ids=[c for c, _ in FUNCTIONAL]
 )
 def test_query_runs_unchanged(sql):
+    _skip_if_server_too_old(sql)
     result = run_query(
         user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=sql, limit=_ROW_LIMIT
     )
@@ -100,6 +113,27 @@ def test_query_runs_unchanged(sql):
         assert result.rows == rows
     else:
         assert sorted(map(repr, result.rows)) == sorted(map(repr, rows))
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("executor_on_corpus")
+@pytest.mark.parametrize("sql", POSTGRES_REJECTS)
+def test_query_postgres_rejects_fails_in_postgres(sql):
+    result = run_query(
+        user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=sql, limit=_ROW_LIMIT
+    )
+    assert result.rejection_reason == OutcomeReason.EXECUTION_ERROR, (
+        result.rejection_reason,
+        result.error,
+    )
+    with pytest.raises(DatabaseError):
+        _direct(sql)
+
+
+def _skip_if_server_too_old(sql: str) -> None:
+    needed = MIN_SERVER_VERSION.get(sql)
+    if needed is not None and connection.pg_version < needed:
+        pytest.skip(f"needs PostgreSQL {needed // 10000}+")
 
 
 @pytest.mark.parametrize(

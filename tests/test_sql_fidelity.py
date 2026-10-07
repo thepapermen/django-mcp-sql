@@ -101,10 +101,11 @@ class TestPostgresReadsTheSourceDifferently:
     @pytest.mark.parametrize(
         "sql",
         [
-            # sqlglot folds a quoted name onto its builtin `LOWER`; Postgres
-            # looks up the case-sensitive "Lower", which does not exist.
-            "SELECT \"Lower\"('AbC') AS v",
-            "SELECT \"Upper\"('AbC') AS v",
+            # sqlglot folds these quoted names onto its builtin (`COUNT`,
+            # `EXTRACT`); Postgres looks up the case-sensitive name, which
+            # does not exist.
+            'SELECT "Count"(1) AS v',
+            "SELECT \"Extract\"(year FROM DATE '2024-01-01') AS v",
         ],
     )
     def test_quoted_function_name(self, sql):
@@ -113,6 +114,23 @@ class TestPostgresReadsTheSourceDifferently:
         with pytest.raises(QueryRejectedError) as exc:
             parse_and_validate(sql, allowed_tables=set())
         assert exc.value.reason == OutcomeReason.UNSAFE_LITERAL
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Stock sqlglot folds both onto `LOWER`; kept as written, the
+            # first is Postgres's own error and the second its `lower`.
+            "SELECT \"Lower\"('AbC') AS v",
+            "SELECT \"lower\"('AbC') AS v",
+            "SELECT pg_catalog.\"lower\"('AbC') AS v",
+        ],
+    )
+    def test_quoted_function_name_kept_as_written(self, sql):
+        naive = sqlglot.parse_one(sql, dialect="postgres").sql(dialect="postgres")
+        assert _pg_or_error(_rendered(sql)) == _pg_or_error(sql)
+        assert sql.split()[1] in _rendered(sql)
+        if "Lower" in sql:
+            assert _pg_or_error(naive) != _pg_or_error(sql)
 
     @pytest.mark.parametrize(
         "sql",
@@ -262,13 +280,10 @@ class TestRenderedTextIsValidated:
             # drop the clause with a warning and run something else.
             "SELECT first_value(x) IGNORE NULLS OVER (ORDER BY x) AS f "
             "FROM (SELECT 1 AS x) s",
-            "SELECT initcap('a-b', '-') AS v",
-            # Not Postgres SQL: sqlglot rewrites QUALIFY into a subquery with
-            # the LIMIT applied before the window filter.
-            "SELECT x FROM (SELECT 1 AS x) s QUALIFY row_number() OVER "
-            "(ORDER BY x) = 1",
+            "SELECT last_value(x) RESPECT NULLS OVER (ORDER BY x) AS f "
+            "FROM (SELECT 1 AS x) s",
         ],
-        ids=["ignore-nulls", "initcap-delimiter", "qualify"],
+        ids=["ignore-nulls", "respect-nulls"],
     )
     def test_a_rendering_that_drops_meaning_is_refused(self, sql):
         parsed = parse_and_validate(sql, allowed_tables=set())
@@ -298,9 +313,8 @@ class TestRenderedTextIsValidated:
 # Common analytic shapes over an inline VALUES table. Each must be accepted on
 # both supported sqlglot versions, and its rendered SQL must return exactly
 # what Postgres returns for the original text. Several are rewritten by
-# sqlglot on the way (a CAST in ROUND(AVG(..), n), an expanded window frame,
-# SOME -> ANY, date_part -> EXTRACT on 30.7), which the earlier exact-tree
-# gate refused.
+# sqlglot on the way (an expanded window frame, SOME -> ANY), which the
+# earlier exact-tree gate refused.
 _DATA = (
     "WITH t AS ("
     "SELECT 1.5 AS x, 2 AS y, 'a' AS g, DATE '2024-01-01' AS d, "
@@ -345,3 +359,53 @@ class TestAnalyticCorpus:
     def test_accepted_and_returns_what_postgres_reads(self, body):
         sql = _DATA + body
         assert _pg(_rendered(sql)) == _pg(sql)
+
+
+# Calls of these catalog functions render in Postgres's keyword syntax (or
+# are not calls to Postgres at all), so the sweep below exempts them:
+_SYNTAX_RENDERED = {
+    # Same function, same column name: `overlay(a, b, 2)` ->
+    # `OVERLAY(a PLACING b FROM 2)`, `substring(s, 2)` -> `SUBSTRING(s FROM 2)`.
+    "overlay",
+    "substring",
+    # Postgres rejects the comma form (a syntax error) and sqlglot reads it
+    # as the keyword form: a query Postgres refuses runs (documented
+    # residual, "not Postgres SQL").
+    "extract",
+    "position",
+    "interval",
+}
+
+
+@pytest.mark.django_db
+def test_every_catalog_function_call_is_rendered_as_written():
+    """Review round 4: stock sqlglot rewrote calls to hundreds of Postgres
+    functions into its own spelling (`like(a, b)` -> `b LIKE a`, `log10(x)`
+    -> `LOG(10, x)`, `strpos` -> `POSITION`, `now()` -> `CURRENT_TIMESTAMP`,
+    format strings in `to_char`, ...) — different results or column names.
+    Every function in this server's `pg_catalog`, called with plain
+    arguments, must now render exactly as written (case aside), so a newer
+    sqlglot cannot bring a rewrite back unnoticed."""
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT proname, pronargs, pronargdefaults FROM pg_proc "
+            "WHERE pronamespace = 'pg_catalog'::regnamespace "
+            "AND prokind IN ('f', 'a', 'w') AND proname ~ '^[a-z_][a-z0-9_]*$'"
+        )
+        functions = cur.fetchall()
+    changed, seen = [], set()
+    for name, nargs, ndefaults in functions:
+        for arity in range(nargs - ndefaults, nargs + 1):
+            if name in _SYNTAX_RENDERED or (name, arity) in seen:
+                continue
+            seen.add((name, arity))
+            args = ", ".join(f"'m{i}'" for i in range(arity))
+            sql = f"SELECT {name}({args}) AS r"
+            try:
+                rendered = _rendered(sql)
+            except QueryRejectedError:
+                continue  # deny-listed, set-returning, not parseable: refused
+            if rendered.lower() != f"{sql} LIMIT 11".lower():
+                changed.append((sql, rendered))
+    assert changed == []
+    assert len(seen) > 2000  # the sweep really ran over the catalog
