@@ -1206,6 +1206,32 @@ class TestOperatorSigns:
     @pytest.mark.parametrize(
         ("sql", "rendered"),
         [
+            # Review round 10: `^@` (starts with) was read as `^ (@ b)`; `!!`
+            # (tsquery negation) and `!` were read as `NOT`.
+            ("SELECT '10' ^@ '1' AS v", "'10' ^@ '1' AS v"),
+            (
+                "SELECT codename ^@'a'::text AS v FROM auth_permission",
+                "codename ^@ CAST",
+            ),
+            ("SELECT 'x' || 'abc' ^@ 'a' AS v", "'x' || 'abc' ^@ 'a' AS v"),
+            ("SELECT NOT 'abc' ^@ 'b' AS v", "NOT 'abc' ^@ 'b' AS v"),
+            ("SELECT 2 ^ @ -3 AS v", "2 ^ @ -3 AS v"),
+            (
+                "SELECT !! to_tsquery('simple', 'a') AS v",
+                "!! to_tsquery('simple', 'a')",
+            ),
+            ("SELECT !!'a'::tsquery AS v", "!! CAST('a' AS tsquery)"),
+            ("SELECT ! true AS v", "! TRUE AS v"),
+            ("SELECT NOT true AS v", "NOT TRUE AS v"),
+        ],
+    )
+    def test_operator_kept_as_written(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
             # Review round 9: a parameter stays one (Postgres: "there is no
             # parameter $1"); it was read as the prefix operator `@ 1`.
             ("SELECT id FROM auth_permission WHERE id = $1", "id = $1"),

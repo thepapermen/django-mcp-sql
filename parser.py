@@ -274,10 +274,17 @@ _INTERVAL_FIELDS = frozenset({"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"
 
 
 class _PrefixOperator(exp.Expression):
-    """A Postgres prefix operator sqlglot has no node for (`@ x`, `@-@ x`),
-    rendered as written."""
+    """A Postgres prefix operator sqlglot has no node for (`@ x`, `@-@ x`,
+    `!! q`, `! x`), rendered as written."""
 
     arg_types = {"this": True, "op": True}
+
+
+class _InfixOperator(exp.Expression):
+    """A Postgres binary operator sqlglot has no node for (`a ^@ b`),
+    rendered as written."""
+
+    arg_types = {"this": True, "expression": True, "op": True}
 
 
 class _QualifiedInterval(exp.Expression):
@@ -341,6 +348,8 @@ _SYNTAX_NO_PAREN_FUNCTIONS = frozenset({"ANY", "CASE", "VARIADIC"})
 
 # Postgres's own reading of a parameter token (`$1`), kept for `$`.
 _STOCK_PARAMETER_PARSER = Postgres.Parser.PLACEHOLDER_PARSERS[TokenType.PARAMETER]
+# sqlglot's reading of a prefix `NOT`, kept for the keyword.
+_STOCK_NOT_PARSER = Postgres.Parser.UNARY_PARSERS[TokenType.NOT]
 
 
 class FaithfulPostgres(Postgres):
@@ -381,6 +390,9 @@ class FaithfulPostgres(Postgres):
       the text it would have read from the agent.
     - `x IS NOT NULL` / `x NOTNULL` stay as written on sqlglot versions that
       build `NOT x IS NULL` (different for a row value).
+    - The operators `@ x`, `@-@ x`, `a ^@ b`, `!! q` and `! x` stay as
+      written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` and `!` as
+      `NOT`. A parameter `$1` stays a parameter.
     - `current_timestamp` / `current_time` keep the precision written.
 
     Used for every parse, tokenization and rendering in this module. The
@@ -434,6 +446,10 @@ class FaithfulPostgres(Postgres):
         # operators sqlglot read as a parameter `$x` (invalid SQL). The
         # operand is the next unary expression; the text is kept, so
         # Postgres groups it as it would have (`@ y - 5` is `@ (y - 5)`).
+        UNARY_PARSERS = {
+            **Postgres.Parser.UNARY_PARSERS,
+            TokenType.NOT: lambda self: self._parse_not_or_bang(),
+        }
         PLACEHOLDER_PARSERS = {
             **Postgres.Parser.PLACEHOLDER_PARSERS,
             TokenType.PARAMETER: lambda self: self._parse_at_operator(),
@@ -638,6 +654,74 @@ class FaithfulPostgres(Postgres):
                 _PrefixOperator(this=operand, op=symbol)
             )
             return prefixed
+
+        def _parse_not_or_bang(self) -> exp.Expression | None:
+            """`NOT x`, or Postgres's prefix operators `!! q` (tsquery
+            negation) and `! x` (none: Postgres's error), as written; sqlglot
+            read `!` as `NOT`."""
+            if self._prev is None or self._prev.text != "!":
+                negated: exp.Expression | None = _STOCK_NOT_PARSER(self)
+                return negated
+            symbol = "!"
+            if self._adjacent(self._prev, TokenType.NOT, "!"):
+                self._advance()
+                symbol = "!!"
+            operand = self._parse_unary()
+            if operand is None:
+                return None
+            prefixed: exp.Expression = self.expression(
+                _PrefixOperator(this=operand, op=symbol)
+            )
+            return prefixed
+
+        def _adjacent(self, before: Token, kind: TokenType, text: str) -> bool:
+            """The current token is `text` of `kind`, written right after
+            `before` (no space)."""
+            token = self._curr
+            return (
+                token is not None
+                and token.token_type == kind
+                and token.text == text
+                and token.start == before.end + 1
+            )
+
+        def _starts_with_operator(self) -> bool:
+            """`^@` (starts with) at the current token: `^` and `@` written
+            together, which sqlglot reads as `^ (@ x)`."""
+            token = self._curr
+            return (
+                token is not None
+                and token.token_type == TokenType.CARET
+                and self._index + 1 < len(self._tokens)
+                and self._tokens[self._index + 1].token_type == TokenType.PARAMETER
+                and self._tokens[self._index + 1].text == "@"
+                and self._tokens[self._index + 1].start == token.end + 1
+            )
+
+        def _parse_exponent(self) -> exp.Expression | None:
+            # sqlglot's own loop, plus `a ^@ b` (starts with), which it read
+            # as `a ^ (@ b)`. The node binds tighter than Postgres's "any
+            # other operator" level; the rendering keeps the text, so
+            # Postgres groups it as written.
+            this: exp.Expression | None = self._parse_unary()
+            while True:
+                if self._starts_with_operator():
+                    self._advance(2)
+                    this = self.expression(
+                        _InfixOperator(
+                            this=this, expression=self._parse_unary(), op="^@"
+                        )
+                    )
+                elif self._match_set(self.EXPONENT):
+                    comments = self._prev_comments
+                    this = self.expression(
+                        self.EXPONENT[self._prev.token_type](
+                            this=this, expression=self._parse_unary()
+                        ),
+                        comments=comments,
+                    )
+                else:
+                    return this
 
         def _parse_bracket(
             self, this: exp.Expression | None = None
@@ -870,6 +954,10 @@ class FaithfulPostgres(Postgres):
             _PrefixOperator: lambda self, node: (
                 f"{node.args['op']} {self.sql(node, 'this')}"
             ),
+            _InfixOperator: lambda self, node: (
+                f"{self.sql(node, 'this')} {node.args['op']} "
+                f"{self.sql(node, 'expression')}"
+            ),
             _QualifiedInterval: lambda self, node: (
                 f"INTERVAL({self.sql(node, 'precision')}) {self.sql(node, 'this')}"
                 if node.args.get("precision") is not None
@@ -951,14 +1039,18 @@ def parse_and_validate(
     """Parse `raw_sql` and run every AST-layer check.
 
     `allowed_tables` is the set of `db_table` names the agent may read,
-    pre-resolved by the caller (`mcp_sql.grants.declared_tables`).
-    Matching is case-insensitive on the table name only (schema is rejected
-    unconditionally when it's a system schema).
+    pre-resolved by the caller (`mcp_sql.grants.declared_tables`), each
+    spelled exactly as the relation is named. A table reference matches the
+    way Postgres matches it: a quoted name exactly, an unquoted one folded
+    to lowercase (`_check_tables`); the schema is not part of the match,
+    and a system schema is rejected unconditionally.
 
-    `table_columns` maps a whitelisted `db_table` (lowercase) to its column
-    names as spelled in the database, so that `t.name` is known to be a
-    column when `t` has one (`_attribute_calls`); a table missing from it
-    is treated as having no columns of a denied function's name.
+    `table_columns` maps a whitelisted `db_table` (spelled exactly, as in
+    `allowed_tables`) to its column names as spelled in the database, so
+    that `t.name` is known to be a column when `t` has one
+    (`_attribute_calls`); a table missing from it is treated as having no
+    known columns, so its qualified names that spell a denied function are
+    refused as calls.
 
     Raises only `QueryRejectedError`. sqlglot fails on hostile input with
     far more than `ParseError`: the tokenizer's `TokenError` (an
@@ -1214,10 +1306,10 @@ _DOLLAR_TAG_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 
 # Postgres operators sqlglot reads from several tokens and puts back
 # together (`!~` is `!` and `~` to its tokenizer, a negated regex match to
-# its parser). `^@` (starts with) is not put back together — it renders as
-# invalid SQL and fails at execution, as before — but it is not refused.
+# its parser; `^@`, `@-@` and `!!` are put back together by
+# `FaithfulPostgres` and rendered as written).
 _REASSEMBLED_OPERATORS = frozenset(
-    {"!~", "!~*", "!~~", "!~~*", "<<", ">>", "^@", "@-@"}
+    {"!~", "!~*", "!~~", "!~~*", "<<", ">>", "^@", "@-@", "!!"}
 )
 # Operators sqlglot reads (and renders as something else) that Postgres
 # does not have: `a == b` ran as `a = b` where Postgres errors.

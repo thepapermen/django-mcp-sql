@@ -2913,6 +2913,18 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT (ARRAY(SELECT y FROM t ORDER BY id))[2] AS a, (ARRAY[[1, 2], [3, 4]])[2][1] AS b, json_object((ARRAY['a', 'b', 'c', 'd'])[1:2]) AS c",
     ),
     (
+        "operators",
+        "SELECT '10' ^@ '1' AS a, '4' ^@ '2' AS b, 'x' || 'abc' ^@ 'a' AS c",
+    ),
+    (
+        "operators",
+        "SELECT id, g ^@ 'a' AS a, NOT g ^@ 'A' AS b FROM t ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT !! to_tsquery('simple', 'a') AS a, !!'b'::tsquery && 'c'::tsquery AS b",
+    ),
+    (
         "attribute-columns",
         "SELECT (s).copy AS v FROM (SELECT 1 AS copy) s",
     ),
@@ -3259,6 +3271,8 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id, x IS NOT DISTINCT FROM y IS TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",
     "SELECT id FROM t ORDER BY id LIMIT 'Infinity'::float8",
+    "SELECT 4 ^@ 2 AS v",
+    "SELECT ! true AS v",
     "SELECT id FROM t WHERE id = $1",
     "SELECT id FROM t WHERE id = $1::int",
     "SELECT id FROM t WHERE g = $name",
