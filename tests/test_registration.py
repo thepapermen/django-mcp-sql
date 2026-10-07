@@ -593,8 +593,9 @@ class TestRedirectUriLengthBound:
         assert response.status_code == HTTPStatus.CREATED
         assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
 
-    def test_a_null_entry_is_filtered_not_fatal(self, client):
-        # `null` in the array is discarded like any other non-loopback entry.
+    def test_a_null_entry_refuses_the_request(self, client):
+        # A non-string member is a malformed request, not an unsupported URI:
+        # it is refused rather than dropped (`TestNonStringRedirectUriMembers`).
         response = client.post(
             reverse("oauth_dynamic_client_registration"),
             data=json.dumps(
@@ -602,8 +603,8 @@ class TestRedirectUriLengthBound:
             ),
             content_type="application/json",
         )
-        assert response.status_code == HTTPStatus.CREATED
-        assert response.json()["redirect_uris"] == ["http://localhost:8787/callback"]
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
 
     @pytest.mark.parametrize(
         ("length", "status"),
@@ -994,21 +995,58 @@ _MALFORMED_URIS = [
 @pytest.mark.usefixtures("_isolated_mcp_cache")
 class TestMalformedRedirectUris:
     """A redirect URI that `urllib` cannot parse (a bad bracketed host, a netloc
-    invalid under NFKC normalisation, a port that is not a valid number) is a
-    whole-request 400 `invalid_redirect_uri`, alone or beside a clean URI.
-    `urlparse` raised `ValueError` inside the loopback filter: an anonymous 500
-    before the per-IP `register` counter."""
+    invalid under NFKC normalisation, a port that is not a valid number) is
+    never registered: it drops out of the loopback subset like any other URI
+    we do not support. Alone, that leaves nothing to register (400); beside a
+    clean loopback URI, the clean one is registered and echoed (201).
+
+    Before: the bracketed-host and NFKC kinds made `urlparse` raise inside the
+    loopback filter (an anonymous 500 before the per-IP `register` counter),
+    and a loopback URI with a bad port, whose port the filter never read, was
+    registered verbatim.
+    """
 
     @pytest.mark.parametrize("uri", _MALFORMED_URIS)
-    @pytest.mark.parametrize("beside_clean", [False, True])
-    def test_refused(self, client, uri, beside_clean):
-        uris = ["http://localhost:8787/callback", uri] if beside_clean else [uri]
+    def test_alone_is_a_400(self, client, uri):
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [uri]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert response.json()["error_description"].startswith(
+            "none of the requested redirect_uris is a valid loopback URI"
+        )
+        assert Application.objects.count() == before
+
+    @pytest.mark.parametrize("uri", _MALFORMED_URIS)
+    def test_beside_a_clean_uri_drops_out(self, client, uri):
+        clean = "http://localhost:8787/callback"
+        response = _post(client, {"redirect_uris": [clean, uri]})
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == [clean]
+        app = Application.objects.get(client_id=response.json()["client_id"])
+        assert app.redirect_uris == clean
+
+
+@pytest.mark.django_db
+class TestNonStringRedirectUriMembers:
+    """Every `redirect_uris` member must be a string, as with `grant_types`;
+    a non-string member was silently dropped (or, alone, reported as "not a
+    loopback URI")."""
+
+    @pytest.mark.parametrize(
+        "uris",
+        [[5], [None], [{"uri": "x"}], [5, "http://localhost:8787/callback"]],
+        ids=["int", "null", "object", "beside-clean"],
+    )
+    def test_refused(self, client, uris):
         before = Application.objects.count()
         response = _post(client, {"redirect_uris": uris})
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json() == {
             "error": "invalid_redirect_uri",
-            "error_description": "redirect_uris must be valid URIs",
+            "error_description": (
+                "redirect_uris must be a non-empty array of URI strings"
+            ),
         }
         assert Application.objects.count() == before
 

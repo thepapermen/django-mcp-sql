@@ -436,17 +436,25 @@ announce themselves.
     INSERT (`DataError` under psycopg 3);
   - a lone surrogate there (`\ud800`, a legal JSON escape): the driver
     cannot encode it as UTF-8 (`UnicodeEncodeError`);
-  - a redirect URI `urllib` cannot parse (`http://[::1`,
-    `http://[127.0.0.1]/cb`, a fullwidth solidus in the host, a port that is
-    not a number in range): `ValueError` inside the loopback filter, even
-    when a clean URI rode alongside;
+  - a redirect URI with a malformed bracketed host (`http://[::1`,
+    `http://[127.0.0.1]/cb`) or a host invalid under NFKC normalisation (a
+    fullwidth solidus): `ValueError` inside the loopback filter, even when a
+    clean URI rode alongside;
   - a body that is not UTF-8, JSON nested past the recursion limit, or an
     integer longer than Python's digit limit;
   - a `grant_types` or `response_types` that is not a list (`null`, a
     number); a string there also turned the "must include
     `authorization_code`" check into a substring test.
 
-  All are now RFC 7591 400s, for the whole request even beside a clean URI.
+  None of these is a 500 any more. A URI that does not parse is now never
+  registered: like any other URI that is not a valid loopback callback, it
+  drops out of the registered subset (a 400 if nothing else is left). That
+  also covers a loopback URI with a port that is not a number in range
+  (`http://127.0.0.1:99999/cb`): the filter never read the port, so such a URI
+  used to be registered verbatim (a 201), unusable. The rest are RFC 7591
+  400s for the whole request, even beside a clean URI: the body and type
+  cases above, a `redirect_uris` member that is not a string (it used to be
+  dropped silently), and the characters below.
   A requested `redirect_uris` entry is refused (`invalid_redirect_uri`) if it
   holds a control (Unicode `Cc`), surrogate (`Cs`), format (`Cf`), line /
   paragraph separator (`Zl`, `Zp`) or any Default_Ignorable_Code_Point

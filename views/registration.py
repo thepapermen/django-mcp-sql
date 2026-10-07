@@ -251,8 +251,12 @@ def _is_parseable_uri(uri: str) -> bool:
     `urlsplit` raises `ValueError` for a malformed bracketed host
     (`http://[::1`, `http://[127.0.0.1]/cb`) and for a netloc that changes
     under NFKC normalisation (a fullwidth solidus, U+2100); `.port` raises for a
-    port that is not a number in range. Every attribute the loopback filter
-    reads is touched here, so a URI that passes cannot raise there.
+    port that is not a number in range. A URI that fails this is not
+    registered (it drops out of the loopback subset like any other URI we do
+    not support). Before, the first two kinds raised inside the loopback
+    filter (an anonymous 500), and a loopback URI with a bad port
+    (`http://127.0.0.1:99999/cb`), whose port the filter never read, was
+    registered verbatim.
     """
     try:
         parsed = urlsplit(uri)
@@ -263,12 +267,9 @@ def _is_parseable_uri(uri: str) -> bool:
 
 
 def _is_loopback_redirect(uri: str) -> bool:
-    try:
-        parsed = urlparse(uri)
-    except ValueError:
-        # Unreachable after `_is_parseable_uri`; kept so this predicate is
-        # fail-closed on its own.
+    if not _is_parseable_uri(uri):
         return False
+    parsed = urlparse(uri)
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False
@@ -376,18 +377,20 @@ def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
 def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
     """The whole-request refusals of `redirect_uris`, before the subset filter.
 
-    Returns an `invalid_redirect_uri` error response, or None. Malformed, not
-    merely unsupported, input refuses the whole request (even beside a clean
-    URI) rather than dropping out of the loopback subset, so it can never
-    reach the INSERT and is never silently ignored:
+    Returns an `invalid_redirect_uri` error response, or None. Two kinds of
+    input refuse the whole request, even beside a clean URI, instead of
+    dropping out of the loopback subset:
 
-    - not a non-empty array, or longer than `_MAX_REDIRECT_URIS`;
-    - a character `_has_unacceptable_character` names (a NUL or lone
-      surrogate failed at the INSERT, an anonymous 500);
-    - a URI `urllib` cannot parse (`_is_parseable_uri`: a bad bracketed host,
-      a netloc invalid under NFKC normalisation, a non-numeric or
-      out-of-range port), which raised `ValueError` inside the loopback
-      filter, the same 500.
+    - a request of the wrong shape: not a non-empty array, longer than
+      `_MAX_REDIRECT_URIS`, or a member that is not a string (the same
+      strictness `grant_types` / `response_types` get);
+    - a character `_has_unacceptable_character` names, which must never be
+      stored, echoed or logged (a NUL or lone surrogate failed at the
+      INSERT, an anonymous 500; invisible ones would spoof the audit trail).
+
+    Everything else is judged per URI by the subset filter: a URI that is
+    well-formed text but not a valid loopback callback (non-loopback,
+    unparseable, over-long) is not registered, and the 201 echoes what was.
     """
     if not isinstance(requested_uris, list) or not requested_uris:
         return _error(
@@ -399,15 +402,17 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
             "invalid_redirect_uri",
             f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
         )
-    strings = [uri for uri in requested_uris if isinstance(uri, str)]
-    if any(_has_unacceptable_character(uri) for uri in strings):
+    if not all(isinstance(uri, str) for uri in requested_uris):
+        return _error(
+            "invalid_redirect_uri",
+            "redirect_uris must be a non-empty array of URI strings",
+        )
+    if any(_has_unacceptable_character(uri) for uri in requested_uris):
         return _error(
             "invalid_redirect_uri",
             "redirect_uris must not contain control, separator, surrogate, "
             "format or other invisible characters",
         )
-    if not all(_is_parseable_uri(uri) for uri in strings):
-        return _error("invalid_redirect_uri", "redirect_uris must be valid URIs")
     return None
 
 
@@ -441,12 +446,14 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     # request outright would lock those clients out of DCR entirely; taking
     # the loopback URIs and echoing only those tells the client exactly what
     # it may use. Nothing is widened — a non-loopback URI is still never
-    # registered, and a client that sends none at all is still refused.
+    # registered, and a client that sends none at all is still refused. The
+    # same goes for a URI `urllib` cannot parse (`_is_loopback_redirect` calls
+    # `_is_parseable_uri` first): it is not a loopback callback we could
+    # register, so it drops out like any other unsupported URI.
     redirect_uris = list(
         dict.fromkeys(
             uri
             for uri in requested_uris
-            if isinstance(uri, str)
             # Length is bounded HERE, inside the filter, not over the whole
             # request. The bound exists to cap what gets persisted, and only
             # this subset is persisted — checking it earlier would let a URI
@@ -454,14 +461,13 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             # exactly the all-or-nothing behaviour this filter replaced.
             # Cursor sends a hosted callback alongside its loopback one, and
             # that hosted URL can carry a long `state` query.
-            and len(uri) <= _MAX_REDIRECT_URI_LENGTH
-            and _is_loopback_redirect(uri)
+            if len(uri) <= _MAX_REDIRECT_URI_LENGTH and _is_loopback_redirect(uri)
         )
     )
     if not redirect_uris:
         return _error(
             "invalid_redirect_uri",
-            "none of the requested redirect_uris is a loopback URI "
+            "none of the requested redirect_uris is a valid loopback URI "
             "(must be http://127.0.0.1, http://[::1], or http://localhost "
             "with an optional port and path)",
         )
