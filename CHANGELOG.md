@@ -425,6 +425,20 @@ announce themselves.
   page, as does a `client_id` containing a NUL byte on either the GET or the
   POST (DOT handed it to Postgres, which raised `DataError`: a 500). All
   inherited from DOT; also affects 0.1.0b5.
+- **`/o/register` answered a NUL in a redirect URI with a 500.** The loopback
+  filter refused whitespace but not NUL, so `http://127.0.0.1:8761/cb\u0000`
+  passed it and Postgres rejected the INSERT with `DataError`: an anonymous
+  500 on every retry, which also skipped the per-IP `register` counter.
+  A control character (C0, DEL or C1) in any requested `redirect_uris` entry
+  or in `client_name` is now an RFC 7591 400 (`invalid_redirect_uri` /
+  `invalid_client_metadata`) for the whole request, even beside a clean URI;
+  nothing reaches the database. Also affects 0.1.0b5.
+- **Known, fixed by the 0.1.0b6 OAuth rework (merged before this release):** a
+  NUL byte in `client_id` at `/o/token/` or `/o/revoke_token/`, and in
+  `code_challenge` or `nonce` on an `/o/authorize/` GET that issues a code
+  without consent, still reaches Postgres on this branch alone and answers
+  500. 0.1.0b6's control-character refusal on those endpoints covers them;
+  nothing here duplicates it.
 
 ## 0.1.0b5 - 2026-07-01
 

@@ -59,6 +59,21 @@ _MAX_REDIRECT_URI_LENGTH = 1024
 _MAX_CLIENT_NAME = 200
 
 
+# C0 controls are below 0x20; DEL is 0x7F and the C1 controls follow it.
+_FIRST_PRINTABLE, _DEL, _LAST_C1 = 0x20, 0x7F, 0x9F
+
+
+def _has_control_character(value: str) -> bool:
+    """True if `value` holds a C0 control, DEL, or a C1 control character.
+
+    None of them belongs in a callback URI or a client name. A NUL is the one
+    that bites: Postgres refuses it in a text column, so a NUL that reached
+    `Application.objects.create` raised `DataError`, an anonymous 500 on every
+    retry that also skipped the per-IP `register` counter.
+    """
+    return any(ord(c) < _FIRST_PRINTABLE or _DEL <= ord(c) <= _LAST_C1 for c in value)
+
+
 def _error(
     code: str, description: str, status: int = HTTPStatus.BAD_REQUEST
 ) -> JsonResponse:
@@ -190,6 +205,16 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             "invalid_redirect_uri",
             f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
         )
+    # Malformed, not merely unsupported: a control character in ANY requested
+    # URI refuses the whole request, before the subset filter, so a NUL can
+    # never reach the INSERT (and is never silently dropped either).
+    if any(
+        isinstance(uri, str) and _has_control_character(uri) for uri in requested_uris
+    ):
+        return _error(
+            "invalid_redirect_uri",
+            "redirect_uris must not contain control characters",
+        )
     # Register the loopback SUBSET rather than refusing the whole request.
     # RFC 7591 §3.2.1 already has us registering the subset of requested
     # metadata we support and echoing back what we actually registered, and
@@ -229,14 +254,21 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         return metadata_error
 
     client_name = body.get("client_name") or "Unnamed MCP client"
-    if not isinstance(client_name, str) or len(client_name) > _MAX_CLIENT_NAME:
+    if (
+        not isinstance(client_name, str)
+        or len(client_name) > _MAX_CLIENT_NAME
+        or _has_control_character(client_name)
+    ):
         # Bounded and typed before it is echoed in the 201 or written to the
         # log line below. The body cap is 64 KiB, so an unbounded name would
         # otherwise put ~64 KiB of caller-chosen text into both — and a
-        # non-string (a nested object) would be reflected verbatim.
+        # non-string (a nested object) would be reflected verbatim. Control
+        # characters are refused too: the name is never stored, but it is
+        # echoed and logged, and no real client name carries one.
         return _error(
             "invalid_client_metadata",
-            f"client_name must be a string of at most {_MAX_CLIENT_NAME} characters",
+            f"client_name must be a string of at most {_MAX_CLIENT_NAME} "
+            "characters, without control characters",
         )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).

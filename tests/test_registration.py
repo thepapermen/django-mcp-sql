@@ -700,3 +700,47 @@ class TestWhitespaceSmuggling:
         assert app.redirect_uris.split() == [clean]
         assert app.redirect_uri_allowed(clean)
         assert not app.redirect_uri_allowed("http://evil.example/steal")
+
+
+@pytest.mark.django_db
+class TestControlCharactersAreA400:
+    """A control character anywhere in the stored or echoed metadata is a 400.
+
+    A NUL inside a loopback `redirect_uri` passed the loopback filter (it is
+    not whitespace, and `urlparse` still reports the loopback host), reached
+    `Application.objects.create`, and Postgres refused the text with
+    `DataError`: an anonymous 500 on every retry, before the per-IP
+    `register` counter was ever incremented. Control characters have no place
+    in a callback URI or a client name, so the whole request is refused with
+    the RFC 7591 error, even when a clean URI rides alongside.
+    """
+
+    @pytest.mark.parametrize("char", ["\x00", "\x01", "\x1b", "\x7f", "\x85"])
+    @pytest.mark.parametrize(
+        "uris",
+        [
+            ["http://127.0.0.1:8761/cb{c}"],
+            ["http://localhost:8787/callback", "http://127.0.0.1:8761/c{c}b"],
+            ["http://localhost:8787/callback", "https://cursor.com/cb{c}"],
+        ],
+    )
+    def test_redirect_uri_with_control_character(self, client, char, uris):
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": [u.format(c=char) for u in uris]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_redirect_uri"
+        assert Application.objects.count() == before
+
+    @pytest.mark.parametrize("char", ["\x00", "\n", "\x1b"])
+    def test_client_name_with_control_character(self, client, char):
+        before = Application.objects.count()
+        response = _post(
+            client,
+            {
+                "redirect_uris": ["http://localhost:8787/callback"],
+                "client_name": f"Claude{char}Code",
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_client_metadata"
+        assert Application.objects.count() == before
