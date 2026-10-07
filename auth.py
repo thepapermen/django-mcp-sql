@@ -81,6 +81,24 @@ _AMBIGUOUS_WARN_DEDUP_SECONDS = 3600
 MCP_REQUEST_BODY_MAX_BYTES = 1024 * 1024
 
 
+class GateUnavailable(APIException):
+    """503 for a per-request gate that RAISED instead of deciding.
+
+    Still a denial (fail-closed, audited as `GATE_ERROR`), but deliberately
+    not a 401: a 401 carries the `WWW-Authenticate` challenge, and MCP
+    clients answer any 401 with a full OAuth re-authorization (the
+    TypeScript SDK does so unconditionally) that would hit the same failing
+    MFA backend or session store, and leave a hosted connector needing a
+    manual reconnect. A 503 says "the server cannot verify you right now,
+    retry", which is what happened. DRF adds `WWW-Authenticate` only to
+    `NotAuthenticated` / `AuthenticationFailed`, so this response has none.
+    """
+
+    status_code = 503
+    default_detail = "MCP access could not be verified; try again later."
+    default_code = "gate_unavailable"
+
+
 class PayloadTooLarge(APIException):
     """413 response for oversize bodies on `/mcp/sql/`.
 
@@ -287,9 +305,10 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # invalidates outstanding tokens immediately (without waiting for
         # the next 6h expiry). A gate that RAISES (a consumer MFA checker
         # failing, a DB blip in profile resolution, a bad SESSION_MODEL) is a
-        # denial too: audited as GATE_ERROR and answered 401, never an
-        # unaudited 500. Deliberately broad: whatever the failure, the only
-        # safe answer is "not verified", and the traceback goes to the log.
+        # denial too: audited as GATE_ERROR and answered 503 (see
+        # `GateUnavailable` for why not 401), never an unaudited 500.
+        # Deliberately broad: whatever the failure, the only safe answer is
+        # "not verified", and the traceback goes to the log.
         try:
             verdict = self._evaluate_gates(user, token)
         except Exception:
@@ -298,8 +317,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 user.pk,
             )
             verdict = _Denial(
-                AuthRejectionReason.GATE_ERROR,
-                "MCP access could not be verified; try again later.",
+                AuthRejectionReason.GATE_ERROR, str(GateUnavailable.default_detail)
             )
         if isinstance(verdict, _Denial):
             self._audit_rejection(
@@ -311,6 +329,8 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             )
             if verdict.reason == AuthRejectionReason.AMBIGUOUS_PROFILE:
                 _warn_ambiguous_once(user)
+            if verdict.reason == AuthRejectionReason.GATE_ERROR:
+                raise GateUnavailable
             raise exceptions.AuthenticationFailed(verdict.message)
 
         # All gates passed — bind the resolved profile for the view's tool

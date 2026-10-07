@@ -16,6 +16,7 @@ import pytest
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql.auth import MCP_REQUEST_BODY_MAX_BYTES
+from mcp_sql.auth import GateUnavailable
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.auth import PayloadTooLarge
 from mcp_sql.schemas import AuthRejectionReason
@@ -432,18 +433,49 @@ class TestAuthRejectionAuditLog:
 
 @pytest.mark.django_db
 class TestGateFailuresAreAuditedDenials:
-    """A gate that raises is a denial: 401 plus a `gate_error` row, never a
+    """A gate that raises is a denial: 503 plus a `gate_error` row, never a
     500 with no trace. Fails closed either way, but the unaudited 500 left
-    no record of who was refused and doubled as an oracle (500 != 401)."""
+    no record of who was refused. 503 rather than 401 so clients do not
+    start an OAuth re-authorization that would fail the same way."""
 
     def _assert_gate_error(self, token, user):
         from mcp_sql.models import MCPAuthRejectionLog
 
-        with pytest.raises(AuthenticationFailed, match="could not be verified"):
+        with pytest.raises(GateUnavailable, match="could not be verified"):
             MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
         row = MCPAuthRejectionLog.objects.get()
         assert row.reason == AuthRejectionReason.GATE_ERROR
         assert row.user_id == user.pk
+
+    def test_endpoint_answers_503_without_a_challenge(  # noqa: PLR0913 — fixtures
+        self, client, mcp_user, mcp_access_token, gate_posture, settings, monkeypatch
+    ):
+        """Owner decision: a raising gate is a 503, not a 401. A 401 carries
+        `WWW-Authenticate`, which sends MCP clients into a full OAuth
+        re-authorization that would fail the same way during an MFA-backend
+        or session-store outage. Still a denial, still audited."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "MFA_CHECKER": "mcp_sql.tests.conftest._mfa_checker_raises",
+        }
+        reached = []
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app",
+            lambda *args, **kwargs: reached.append(1),
+        )
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert "WWW-Authenticate" not in response
+        assert reached == []
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.GATE_ERROR
 
     def test_raising_mfa_checker(
         self, mcp_user, mcp_access_token, gate_posture, settings, caplog
