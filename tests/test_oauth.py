@@ -1074,6 +1074,32 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         )
         self._assert_error_page(response)
 
+    def test_client_deleted_mid_request_renders_error_page_not_500(
+        self, client, mcp_user, gate_posture, monkeypatch
+    ):
+        """The `invalid_target` path loads the Application after the
+        unknown-client check; a client deleted in between (an operator
+        removing it while a consent POST is in flight) was a `DoesNotExist`
+        500. Now the same error page as an unknown client."""
+        from mcp_sql.views.oauth_authorize import MCPAuthorizationView
+        from oauth2_provider.models import get_application_model
+
+        known = MCPAuthorizationView._is_known_client_id
+
+        def known_then_deleted(client_id):
+            result = known(client_id)
+            get_application_model().objects.filter(client_id=client_id).delete()
+            return result
+
+        monkeypatch.setattr(
+            MCPAuthorizationView,
+            "_is_known_client_id",
+            staticmethod(known_then_deleted),
+        )
+        response = self._post(client, mcp_user, resource="not a uri", allow="Authorize")
+        self._assert_error_page(response)
+        assert b"Invalid client_id" in response.content
+
 
 class TestOauthAdminUnregistered:
     """DOT ModelAdmin classes must not be reachable via Django admin.

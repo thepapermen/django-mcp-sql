@@ -131,10 +131,7 @@ class MCPAuthorizationView(AuthorizationView):
         # `dispatch` refuses it before that.)
         client_id = form.cleaned_data.get("client_id") or ""
         if not self._is_known_client_id(client_id):
-            return super().error_response(
-                FatalClientError(error=oauth2_errors.InvalidClientIdError()),
-                application=None,
-            )
+            return self._unknown_client_response()
         # The RFC 8707 `resource` check of the GET (see
         # `validate_authorization_request`), again on what the POST carries:
         # the form's hidden field (from DOT 3.4, one whitespace-joined value,
@@ -169,9 +166,24 @@ class MCPAuthorizationView(AuthorizationView):
                 ),
                 redirect_uri=form.cleaned_data.get("redirect_uri"),
             )
-            application = get_application_model().objects.get(client_id=client_id)
+            # `filter().first()`, not `get()`: a client deleted since the
+            # check above (an operator removing it mid-request) would
+            # otherwise be a `DoesNotExist` 500.
+            application = (
+                get_application_model().objects.filter(client_id=client_id).first()
+            )
+            if application is None:
+                return self._unknown_client_response()
             return self.error_response(error, application)
         return super().form_valid(form)
+
+    def _unknown_client_response(self):
+        """The fatal-client error page for a `client_id` that names no
+        Application, as DOT renders it for an unknown client on the GET."""
+        return super().error_response(
+            FatalClientError(error=oauth2_errors.InvalidClientIdError()),
+            application=None,
+        )
 
     def validate_authorization_request(self, request):
         """DOT's validation of the authorization request, then the RFC 8707
