@@ -2868,6 +2868,10 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "as-written",
         "SELECT overlaps(DATE '2001-01-01', DATE '2001-01-02', d, d + 1) AS o FROM t ORDER BY id",
     ),
+    (
+        "attribute-columns",
+        'SELECT s."Pg_Sleep" FROM (SELECT 1 AS "Pg_Sleep") s',
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3080,6 +3084,22 @@ REFUSED: list[tuple[str, str]] = [
     (
         "unsafe_literal",
         "SELECT id FROM t WHERE y <=> 1",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text AS x, 1 AS current_setting) x",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (x).pg_sleep AS v FROM (SELECT 0.1::float8 AS x, 1 AS pg_sleep) x",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (x).current_setting AS v FROM (SELECT 1 AS current_setting) x, (SELECT 'server_version'::text AS x) y",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text AS x, 1 AS current_setting) x(x, current_setting)",
     ),
 ]
 

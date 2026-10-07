@@ -834,9 +834,9 @@ def parse_and_validate(
     unconditionally when it's a system schema).
 
     `table_columns` maps a whitelisted `db_table` (lowercase) to its column
-    names (lowercase), so that `t.name` is known to be a column when `t`
-    has one (`_attribute_calls`); a table missing from it is treated as
-    having no columns of a denied function's name.
+    names as spelled in the database, so that `t.name` is known to be a
+    column when `t` has one (`_attribute_calls`); a table missing from it
+    is treated as having no columns of a denied function's name.
 
     Raises only `QueryRejectedError`. sqlglot fails on hostile input with
     far more than `ParseError`: the tokenizer's `TokenError` (an
@@ -1781,45 +1781,75 @@ def _check_no_denied_functions(
 def _attribute_calls(
     ast: exp.Query, table_columns: Mapping[str, frozenset[str]]
 ) -> list[str]:
-    """The lowercase names Postgres reads as attribute-notation CALLS:
-    `x.f` / `(expr).f` is `f(x)` unless `x` is a FROM item with a column
-    `f`. A qualified name that resolves to a column of its FROM item (a
-    derived table's or CTE's output column, an alias column list, a
-    whitelisted table's column per `table_columns`) is a column and not
-    listed; a name inside a type (`pg_catalog.pg_lsn`) is not a call."""
+    """The lowercase names Postgres may read as attribute-notation CALLS
+    (`x.f` / `(expr).f` is `f(x)` when there is no column to read).
+
+    Strict and fail-closed (review round 8): a name is exempt only where
+    Postgres provably reads a column —
+    - `t.f` where `t` names a FROM item in scope that has a column `f` (a
+      derived table's or CTE's output column, an alias column list, a
+      whitelisted table's column per `table_columns`) and `t` is not also
+      the name of a column of a FROM item in scope (then `t` could be read
+      as that column's value, and `t.f` as `f(value)`);
+    - `(t.*).f` where `t` is such a FROM item with a column `f`.
+    Everything else counts as a call: `(x).f` with a bare name (a column
+    `x` of any FROM item wins over the row), `(expr).f`, `t.c.f`. A name
+    inside a type (`pg_catalog.pg_lsn`) is not a call. Quoted identifiers
+    compare case-sensitively, unquoted ones folded (`_name_key`)."""
     names = []
     for col in ast.find_all(exp.Column):
         qualifier = col.args.get("table")
         if qualifier is None or isinstance(col.this, exp.Star):
             continue
-        name = col.name.lower()
-        if not _is_column_of(col, qualifier.name.lower(), name, table_columns):
-            names.append(name)
+        name = _name_key(col.this)
+        exempt = (
+            col.args.get("db") is None
+            and not _is_column_name_in_scope(col, _name_key(qualifier), table_columns)
+            and _is_column_of(col, _name_key(qualifier), name, table_columns)
+        )
+        if not exempt:
+            names.append(col.name.lower())
     for dot in ast.find_all(exp.Dot):
         if not isinstance(dot.expression, exp.Identifier):
             continue
         if dot.find_ancestor(exp.DataType) is not None:
             continue
-        name = dot.expression.name.lower()
-        row = _row_reference(dot.this)
+        row = _star_row(dot.this)
+        name = _name_key(dot.expression)
         if row is None or not _is_column_of(dot, row, name, table_columns):
-            names.append(name)
+            names.append(dot.expression.name.lower())
     return names
 
 
-def _row_reference(node: exp.Expression) -> str | None:
-    """The FROM-item name `node` denotes as a whole row (`(t)`, `(t.*)`),
-    or None."""
+def _name_key(identifier: exp.Expression) -> str:
+    """An identifier as Postgres compares it: quoted as written, unquoted
+    folded to lowercase."""
+    if isinstance(identifier, exp.Identifier) and identifier.quoted:
+        return str(identifier.name)
+    return str(identifier.name).lower()
+
+
+def _star_row(node: exp.Expression) -> str | None:
+    """The FROM item `node` denotes as `(t.*)`, or None. (A bare `(t)` is
+    not trusted: a column named `t` would be read instead of the row.)"""
     while isinstance(node, exp.Paren):
         node = node.this
-    if not isinstance(node, exp.Column):
+    if not isinstance(node, exp.Column) or not isinstance(node.this, exp.Star):
         return None
-    if isinstance(node.this, exp.Star):
-        table = node.args.get("table")
-        return table.name.lower() if table is not None else None
-    if node.args.get("table") is None:
-        return node.name.lower()
-    return None
+    table = node.args.get("table")
+    if table is None or node.args.get("db") is not None:
+        return None
+    return _name_key(table)
+
+
+def _scopes(node: exp.Expression) -> list[exp.Select]:
+    selects = []
+    scope = node.parent
+    while scope is not None:
+        if isinstance(scope, exp.Select):
+            selects.append(scope)
+        scope = scope.parent
+    return selects
 
 
 def _is_column_of(
@@ -1828,27 +1858,55 @@ def _is_column_of(
     name: str,
     table_columns: Mapping[str, frozenset[str]],
 ) -> bool:
-    """True if the FROM item `item`, in scope at `node`, has a column
-    `name`."""
-    scope = node.parent
-    while scope is not None:
-        if isinstance(scope, exp.Select):
-            source = _from_item(scope, item)
-            if source is not None:
-                return name in _item_columns(source, table_columns)
-        scope = scope.parent
+    """True if the FROM item `item`, in scope at `node` (the innermost
+    match), has a column `name`."""
+    for select in _scopes(node):
+        source = _from_item(select, item)
+        if source is not None:
+            return name in _item_columns(source, table_columns)
     return False
 
 
-def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
+def _is_column_name_in_scope(
+    node: exp.Expression, name: str, table_columns: Mapping[str, frozenset[str]]
+) -> bool:
+    """True if any FROM item in scope at `node` has a column `name` (or its
+    columns cannot be known: a function or other item in FROM)."""
+    for select in _scopes(node):
+        for source in _from_items(select):
+            if not _item_columns_known(source):
+                return True
+            if name in _item_columns(source, table_columns):
+                return True
+    return False
+
+
+def _from_items(select: exp.Select) -> list[exp.Expression]:
     from_ = select.args.get("from_") or select.args.get("from")
     sources = [from_.this] if from_ is not None else []
     sources += [join.this for join in select.args.get("joins") or []]
-    for source in sources:
-        if (source.alias_or_name or "").lower() == item:
+    return sources
+
+
+def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
+    for source in _from_items(select):
+        alias = source.args.get("alias")
+        identifier = (
+            alias.this
+            if isinstance(alias, exp.TableAlias) and alias.this is not None
+            else source.this
+        )
+        if isinstance(identifier, exp.Identifier) and _name_key(identifier) == item:
             found: exp.Expression = source
             return found
     return None
+
+
+def _item_columns_known(source: exp.Expression) -> bool:
+    return isinstance(source, (exp.Subquery, exp.Table)) or (
+        isinstance(source.args.get("alias"), exp.TableAlias)
+        and bool(source.args["alias"].columns)
+    )
 
 
 def _item_columns(
@@ -1856,7 +1914,7 @@ def _item_columns(
 ) -> frozenset[str]:
     alias = source.args.get("alias")
     if isinstance(alias, exp.TableAlias) and alias.columns:
-        return frozenset(column.name.lower() for column in alias.columns)
+        return frozenset(_name_key(column) for column in alias.columns)
     if isinstance(source, exp.Subquery):
         return _output_names(source.this)
     if isinstance(source, exp.Table):
@@ -1864,7 +1922,7 @@ def _item_columns(
         if cte is not None:
             cte_alias = cte.args.get("alias")
             if isinstance(cte_alias, exp.TableAlias) and cte_alias.columns:
-                return frozenset(c.name.lower() for c in cte_alias.columns)
+                return frozenset(_name_key(c) for c in cte_alias.columns)
             return _output_names(cte.this)
         return table_columns.get(source.name.lower(), frozenset())
     return frozenset()
@@ -1884,7 +1942,7 @@ def _cte_named(table: exp.Expression, name: str) -> exp.CTE | None:
 
 def _output_names(query: exp.Expression) -> frozenset[str]:
     """The column names a query produces, as Postgres names them (an alias,
-    a column's name, a function call's name)."""
+    a column's name, a function call's name), each as `_name_key` keys it."""
     while isinstance(query, exp.SetOperation):
         query = query.this
     if not isinstance(query, exp.Select):
@@ -1899,19 +1957,23 @@ def _output_names(query: exp.Expression) -> frozenset[str]:
 
 def _output_name(node: exp.Expression) -> str | None:
     if isinstance(node, exp.Alias):
-        return str(node.alias).lower()
+        alias = node.args.get("alias")
+        return _name_key(alias) if isinstance(alias, exp.Identifier) else None
     while isinstance(
         node, (exp.Paren, exp.Cast, exp.Window, exp.WithinGroup, exp.Filter)
     ):
         node = node.this
-    name = None
-    if (
-        isinstance(node, exp.Column) and not isinstance(node.this, exp.Star)
-    ) or isinstance(node, exp.Anonymous):
-        name = node.name
-    elif isinstance(node, exp.Func):
-        name = node.sql_name()
-    return name.lower() if name else None
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+        return _name_key(node.this)
+    if isinstance(node, exp.Anonymous):
+        return (
+            _name_key(node.this)
+            if isinstance(node.this, exp.Identifier)
+            else str(node.name).lower()
+        )
+    if isinstance(node, exp.Func):
+        return str(node.sql_name()).lower()
+    return None
 
 
 def _check_no_bare_keyword_columns(ast: exp.Query) -> None:

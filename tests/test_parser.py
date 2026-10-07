@@ -903,7 +903,6 @@ class TestAttributeNotation:
             "WITH c(pg_x) AS (SELECT 1) SELECT c.pg_x FROM c",
             "SELECT x.pg_sleep FROM (SELECT 0.1::float8 AS v) AS x(pg_sleep)",
             "SELECT x.pg_sleep FROM auth_permission AS x(pg_sleep)",
-            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
             "SELECT '0/0'::pg_catalog.pg_lsn AS v",
             "SELECT p.id, p.codename FROM auth_permission p",
             # Denied functions attribute notation cannot reach (no argument,
@@ -913,6 +912,45 @@ class TestAttributeNotation:
         ],
     )
     def test_ordinary_qualified_names_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 8 (regression from round 6): a bare `(x)` is the
+            # column `x` when a FROM item has one, so `(x).f` is `f(x)` —
+            # whatever columns the FROM item `x` has.
+            "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text "
+            "AS x, 1 AS current_setting) x",
+            "SELECT (x).pg_sleep AS v FROM (SELECT 0.1::float8 AS x, 1 AS pg_sleep) x",
+            # The column `x` from a sibling FROM item.
+            "SELECT (x).current_setting AS v FROM (SELECT 1 AS current_setting) x, "
+            "(SELECT 'server_version'::text AS x) y",
+            # An alias column list.
+            "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text, "
+            "1) x(x, current_setting)",
+            "SELECT (x).current_setting AS v FROM auth_permission x",
+            # `x` is also a column in scope: not provably the FROM item.
+            "SELECT x.current_setting AS v FROM (SELECT 'server_version'::text "
+            "AS x, 1 AS current_setting) x",
+            # Any bare parenthesised name, as before round 6.
+            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
+            # Quoted names compare case-sensitively: no column `pg_sleep`.
+            'SELECT s.pg_sleep FROM (SELECT 1 AS "Pg_Sleep") s',
+        ],
+    )
+    def test_parenthesised_name_or_undecidable_is_a_call(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT s."Pg_Sleep" FROM (SELECT 1 AS "Pg_Sleep") s',
+            'SELECT s.pg_sleep FROM (SELECT 1 AS "pg_sleep") s',
+            'SELECT s."pg_sleep" FROM (SELECT 1 AS pg_sleep) s',
+        ],
+    )
+    def test_quoted_column_names_match_as_postgres_matches_them(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)
 
     def test_a_base_table_column_is_a_column(self):
