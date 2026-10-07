@@ -755,11 +755,34 @@ class TestInjectLimit:
                 "99999999999999999999",
                 "LIMIT LEAST(CAST(99999999999999999999 AS BIGINT), 11)",
             ),
+            # A scalar subquery selecting a numeric value is numeric as
+            # written: `LEAST` over a float would turn its NaN into n (review
+            # round 9).
+            ("(SELECT 3)", "LIMIT LEAST(CAST((SELECT 3) AS BIGINT), 11)"),
+            (
+                "(SELECT 'NaN'::float8 AS x)",
+                "LIMIT LEAST(CAST((SELECT CAST('NaN' AS DOUBLE PRECISION) AS x) "
+                "AS BIGINT), 11)",
+            ),
+            (
+                "((SELECT 'Infinity'::float8))",
+                "LIMIT LEAST(CAST(((SELECT CAST('Infinity' AS DOUBLE PRECISION))) "
+                "AS BIGINT), 11)",
+            ),
             # Not numeric as written: left to Postgres's type resolution (an
             # explicit cast would run `'3'::text`, an error in a LIMIT).
-            ("(SELECT 3)", "LIMIT LEAST((SELECT 3), 11)"),
+            ("(SELECT '3')", "LIMIT LEAST((SELECT '3'), 11)"),
+            (
+                "((SELECT 1) UNION (SELECT 2))",
+                "LIMIT LEAST(((SELECT 1) UNION (SELECT 2)), 11)",
+            ),
+            (
+                "(SELECT id FROM auth_permission)",
+                "LIMIT LEAST((SELECT id FROM auth_permission), 11)",
+            ),
             ("'3'::text", "LIMIT LEAST(CAST('3' AS TEXT), 11)"),
             ("'3 apples'", "LIMIT LEAST('3 apples', 11)"),
+            ("('3 apples')", "LIMIT LEAST(('3 apples'), 11)"),
         ],
     )
     def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
@@ -771,7 +794,18 @@ class TestInjectLimit:
 
     @pytest.mark.parametrize(
         "limit",
-        ["NULL", "5", "'5'", "' +5 '", "'9223372036854775807'"],
+        [
+            "NULL",
+            "5",
+            "'5'",
+            "' +5 '",
+            "'9223372036854775807'",
+            # Parentheses change nothing: `('5000000000')` is still the
+            # bigint, not an int4 for `LEAST` (review round 9).
+            "(5)",
+            "('5000000000')",
+            "(('5'))",
+        ],
     )
     def test_replaces_no_limit_or_a_plain_integer(self, limit):
         # `LIMIT '5'` is the bigint 5 to Postgres; `LEAST('…', n)` would read
@@ -836,6 +870,9 @@ class TestExtractLimit:
             ("'12'", 12),
             ("' +12 '", 12),
             ("9223372036854775808", None),  # beyond bigint: Postgres's error
+            ("('5000000000')", 5000000000),  # parentheses: the same literal
+            ("((7))", 7),
+            ("(SELECT 7)", None),  # a query: kept for Postgres to evaluate
         ],
     )
     def test_reads_only_what_postgres_reads_as_a_bigint(self, limit, value):
@@ -1276,6 +1313,70 @@ class TestLexicalFidelity:
         # The checked tree cannot be trusted to be what runs, so this names
         # the problem ahead of the table / system-schema checks.
         _expect_reject("SELECT E'\\\\' FROM pg_class", OutcomeReason.UNSAFE_LITERAL)
+
+
+class TestIntervalsAndSubscriptsAsWritten:
+    """Review round 9: interval qualifiers and array subscripts, rendered as
+    Postgres reads them."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # A quoted word is an alias, not a field: 25 hours, not 0 days.
+            ("""SELECT INTERVAL '25 hours' "DAY\"""", 'AS "DAY"'),
+            ("""SELECT INTERVAL '1' DAY "TO\"""", """INTERVAL '1' DAY AS "TO\""""),
+            # The precision of a seconds field (1.23 s, not a parse error).
+            ("SELECT INTERVAL '1.234' SECOND(2)", "INTERVAL '1.234' SECOND(2)"),
+            ("SELECT INTERVAL '1.234' SECOND (2)", "INTERVAL '1.234' SECOND(2)"),
+            ("SELECT INTERVAL '1' DAY TO SECOND(3)", "INTERVAL '1' DAY TO SECOND(3)"),
+            # The precision form: 1.235 s, not `INTERVAL '3' + INTERVAL ...`.
+            ("SELECT INTERVAL(3) '1.23456'", "INTERVAL(3) '1.23456'"),
+            (
+                """SELECT INTERVAL(3) '1.5' "SECOND\"""",
+                """INTERVAL(3) '1.5' AS "SECOND\"""",
+            ),
+        ],
+    )
+    def test_interval(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    def test_interval_precision_form_takes_no_field(self):
+        _expect_reject("SELECT INTERVAL(3) '1.5' SECOND", OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A column named `array` / `list`, subscripted: sqlglot replaced
+            # it with the constructor `ARRAY[1]`.
+            'SELECT s."array"[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            'SELECT "array"[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            'SELECT s.array[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            "SELECT list[1] FROM (SELECT ARRAY[5, 6] AS list) AS s",
+            "SELECT (ARRAY[1, 2])[1]",
+            "SELECT (ARRAY(SELECT 1))[1]",
+        ],
+    )
+    def test_subscript_kept(self, sql):
+        assert self._rendered(sql) == f"{sql} LIMIT 11"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres subscripts an array constructor only in parentheses;
+            # sqlglot added them, or dropped the query of `ARRAY(SELECT ...)`.
+            "SELECT ARRAY[1, 2][1]",
+            "SELECT ARRAY[[1, 2], [3, 4]][1][2]",
+            "SELECT json_object(ARRAY['a', 'b'][1:2]) AS a",
+            "SELECT ARRAY(SELECT 1)[1]",
+        ],
+    )
+    def test_unparenthesised_constructor_subscript_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
 
 
 class TestCheckOrdering:

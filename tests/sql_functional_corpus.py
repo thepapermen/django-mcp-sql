@@ -2872,6 +2872,38 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "attribute-columns",
         'SELECT s."Pg_Sleep" FROM (SELECT 1 AS "Pg_Sleep") s',
     ),
+    (
+        "intervals",
+        "SELECT INTERVAL '25 hours' \"DAY\", INTERVAL '3 months' \"YEAR\", INTERVAL '1' DAY \"TO\"",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '1' DAY TO SECOND(3) AS a, INTERVAL '1.234' SECOND(2) AS b, INTERVAL '1.234' SECOND (2) AS c, INTERVAL '61.5678' MINUTE TO SECOND(1) AS e, INTERVAL '1.5' HOUR TO SECOND(0) AS f",
+    ),
+    (
+        "intervals",
+        "SELECT id, INTERVAL(3) '1.23456' AS a, INTERVAL (0) '2.5 seconds' AS b, iv + INTERVAL(1) '0.25' AS c FROM t ORDER BY id",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT ('5000000000')",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT ((' +3 '))",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT (SELECT 2.5::numeric AS n)",
+    ),
+    (
+        "arrays",
+        'SELECT id, s."array"[1] AS a, "array"[2] AS b, s.array[1:2] AS c, list[1] AS e, s.list[2] AS f FROM (SELECT id, arr AS "array", tags AS list FROM t) s ORDER BY id',
+    ),
+    (
+        "arrays",
+        "SELECT (ARRAY(SELECT y FROM t ORDER BY id))[2] AS a, (ARRAY[[1, 2], [3, 4]])[2][1] AS b, json_object((ARRAY['a', 'b', 'c', 'd'])[1:2]) AS c",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3101,6 +3133,10 @@ REFUSED: list[tuple[str, str]] = [
         "disallowed_function",
         "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text AS x, 1 AS current_setting) x(x, current_setting)",
     ),
+    ("parse_error", "SELECT ARRAY[1, 2][1] AS a"),
+    ("parse_error", "SELECT json_object(ARRAY['a', 'b'][1:2]) AS a"),
+    ("parse_error", "SELECT ARRAY(SELECT y FROM t ORDER BY id)[1] AS a"),
+    ("parse_error", "SELECT INTERVAL(3) '1.5' SECOND AS a"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3166,4 +3202,7 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id, x IS NOT DISTINCT FROM y IS TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",
     "SELECT id FROM t ORDER BY id LIMIT 'Infinity'::float8",
+    "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::float8)",
+    "SELECT id FROM t ORDER BY id LIMIT ((SELECT 'Infinity'::float8 AS i))",
+    "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::numeric FROM t WHERE id = 1)",
 ]

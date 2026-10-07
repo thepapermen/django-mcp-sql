@@ -281,9 +281,10 @@ class _PrefixOperator(exp.Expression):
 
 
 class _QualifiedInterval(exp.Expression):
-    """`INTERVAL '<string>' <field> [TO <field>]` as written."""
+    """`INTERVAL '<string>' <field> [TO <field>]` or `INTERVAL(<p>)
+    '<string>'` as written."""
 
-    arg_types = {"this": True, "unit": True}
+    arg_types = {"this": True, "unit": False, "precision": False}
 
 
 class _IsNot(exp.Expression, exp.Condition):
@@ -621,23 +622,125 @@ class FaithfulPostgres(Postgres):
             )
             return prefixed
 
+        def _parse_bracket(
+            self, this: exp.Expression | None = None
+        ) -> exp.Expression | None:
+            if (
+                this is None
+                or self._curr is None
+                or self._curr.token_type != TokenType.L_BRACKET
+            ):
+                plain: exp.Expression | None = super()._parse_bracket(this)
+                return plain
+            if isinstance(this, exp.Array) or (
+                isinstance(this, exp.Anonymous) and this.name.upper() == "ARRAY"
+            ):
+                # `ARRAY[1, 2][1]`: Postgres subscripts an array constructor
+                # only in parentheses; sqlglot added them (or, for
+                # `ARRAY(SELECT ...)[1]`, dropped the query for `ARRAY[1]`).
+                self.raise_error(
+                    "Subscript an array constructor in parentheses: (ARRAY[...])[i]"
+                )
+            if (
+                this.name.upper() in self.ARRAY_CONSTRUCTORS
+                and not self._array_keyword()
+            ):
+                # `"array"[1]`, `t.array[1]`, `list[1]`: a column subscripted,
+                # which sqlglot replaced with the constructor `ARRAY[1]`. Only
+                # an unquoted, unqualified `ARRAY` is the keyword to Postgres.
+                marker = exp.Paren(this=this)
+                parsed: exp.Expression | None = super()._parse_bracket(marker)
+                marker.replace(this)
+                return parsed
+            subscript: exp.Expression | None = super()._parse_bracket(this)
+            return subscript
+
+        def _array_keyword(self) -> bool:
+            """The token before the current one is Postgres's `ARRAY`
+            keyword: unquoted, not after a `.`."""
+            i = self._index - 1
+            return self._is_unquoted(i, "ARRAY") and not (
+                i > 0 and self._tokens[i - 1].token_type == TokenType.DOT
+            )
+
+        def _parse_interval(self, *args: Any, **kwargs: Any) -> exp.Expression | None:
+            tokens, i = self._tokens, self._index
+            kinds = [token.token_type for token in tokens[i : i + 5]]
+            if (
+                kinds
+                == [
+                    TokenType.INTERVAL,
+                    TokenType.L_PAREN,
+                    TokenType.NUMBER,
+                    TokenType.R_PAREN,
+                    TokenType.STRING,
+                ]
+                and tokens[i + 2].text.isdigit()
+            ):
+                # `INTERVAL(3) '1.23456'`: the precision form, 1.235 seconds.
+                # sqlglot read it as the sum `INTERVAL '3' + INTERVAL '...'`.
+                if self._interval_field(i + 5) is not None:
+                    # Postgres takes no field after the precision form.
+                    self.raise_error("INTERVAL(p) '<string>' takes no field qualifier")
+                self._advance(5)
+                interval: exp.Expression = self.expression(
+                    _QualifiedInterval(
+                        this=exp.Literal.string(tokens[i + 4].text),
+                        precision=exp.Literal.number(tokens[i + 2].text),
+                    )
+                )
+                return interval
+            parsed: exp.Expression | None = super()._parse_interval(*args, **kwargs)
+            return parsed
+
         def _interval_qualifier(self) -> exp.Expression | None:
             """An interval field qualifier right after the string (`DAY`,
-            `HOUR TO SECOND`), consumed, or `None`."""
-            tokens, i = self._tokens, self._index
-            if i >= len(tokens) or tokens[i].text.upper() not in _INTERVAL_FIELDS:
+            `HOUR TO SECOND`, `SECOND(3)`), consumed, or `None`. Only an
+            unquoted word is a field: `INTERVAL '25 hours' "DAY"` is the
+            interval with a column alias, to Postgres as here."""
+            first = self._interval_field(self._index)
+            if first is None:
                 return None
-            first = exp.var(tokens[i].text.upper())
+            name, end = first
             if (
-                i + 2 < len(tokens)
-                and tokens[i + 1].text.upper() == "TO"
-                and tokens[i + 2].text.upper() in _INTERVAL_FIELDS
+                name != "SECOND"
+                and self._is_unquoted(end, "TO")
+                and (last := self._interval_field(end + 1)) is not None
             ):
-                last = exp.var(tokens[i + 2].text.upper())
-                self._advance(3)
-                return exp.IntervalSpan(this=first, expression=last)
-            self._advance()
-            return first
+                self._advance(last[1] - self._index)
+                return exp.IntervalSpan(this=exp.var(name), expression=exp.var(last[0]))
+            self._advance(end - self._index)
+            return exp.var(name)
+
+        def _interval_field(self, i: int) -> tuple[str, int] | None:
+            """The field at token `i` (`SECOND(3)` with its precision) and
+            the index after it, or `None`."""
+            if not self._is_unquoted(i) or self._tokens[i].text.upper() not in (
+                _INTERVAL_FIELDS
+            ):
+                return None
+            name = self._tokens[i].text.upper()
+            precision = self._tokens[i + 1 : i + 4]
+            if (
+                name == "SECOND"
+                and [token.token_type for token in precision]
+                == [TokenType.L_PAREN, TokenType.NUMBER, TokenType.R_PAREN]
+                and precision[1].text.isdigit()
+            ):
+                # `SECOND(2)`: the fractional digits kept (Postgres's
+                # `interval_second`); sqlglot read `(2)` as an alias list.
+                return f"SECOND({precision[1].text})", i + 4
+            return name, i + 1
+
+        def _is_unquoted(self, i: int, word: str | None = None) -> bool:
+            """Token `i` exists, is not a quoted identifier, and (if given)
+            is `word`."""
+            if (
+                i >= len(self._tokens)
+                or self._tokens[i].token_type == TokenType.IDENTIFIER
+            ):
+                return False
+            return word is None or self._tokens[i].text.upper() == word
 
         def _parse_json_object_or_call(self) -> exp.Expression | None:
             """`json_object(...)`: Postgres's function `json_object(text[]
@@ -751,7 +854,9 @@ class FaithfulPostgres(Postgres):
                 f"{node.args['op']} {self.sql(node, 'this')}"
             ),
             _QualifiedInterval: lambda self, node: (
-                f"INTERVAL {self.sql(node, 'this')} {self.sql(node, 'unit')}"
+                f"INTERVAL({self.sql(node, 'precision')}) {self.sql(node, 'this')}"
+                if node.args.get("precision") is not None
+                else f"INTERVAL {self.sql(node, 'this')} {self.sql(node, 'unit')}"
             ),
             _IsNot: lambda self, node: (
                 f"{self.sql(node, 'this')} IS NOT {self.sql(node, 'expression')}"
@@ -1293,12 +1398,13 @@ def inject_limit(ast: exp.Query, n: int) -> exp.Query:
     Postgres evaluates it as it would have (rounding `3.5` to 4, rejecting
     a negative or a `text` value) and the cap still holds. A value that is
     numeric as written (number literals, arithmetic on them, a cast to a
-    numeric type) is first cast to bigint — for those, an explicit cast is
-    exactly Postgres's own LIMIT coercion, and `LEAST` over a float would
-    turn `'NaN'` / `'Infinity'` (an error in a LIMIT) into n. Anything else
-    is left to Postgres's type resolution (an explicit cast would widen it:
-    `'3'::text::bigint` runs where `LIMIT '3'::text` is an error). `LIMIT NULL` / `LIMIT
-    ALL` mean no limit, so they become `LIMIT n`. A query wrapped in
+    numeric type, a scalar subquery selecting one) is first cast to
+    bigint — for those, an explicit cast is exactly Postgres's own LIMIT
+    coercion, and `LEAST` over a float would turn `'NaN'` / `'Infinity'`
+    (an error in a LIMIT) into n. Anything else is left to Postgres's type
+    resolution (an explicit cast would widen it: `'3'::text::bigint` runs
+    where `LIMIT '3'::text` is an error). `LIMIT NULL` / `LIMIT ALL` mean
+    no limit, so they become `LIMIT n`. A query wrapped in
     parentheses as a whole (`(SELECT ... LIMIT 5)`) is unwrapped first:
     Postgres refuses a second LIMIT after the parenthesis.
     """
@@ -1332,13 +1438,29 @@ _NUMERIC_LIMIT_TYPES = frozenset(
 )
 
 
+def _selected(subquery: exp.Subquery) -> exp.Expression:
+    """What a scalar subquery `(SELECT <e> ...)` selects, as written; the
+    subquery itself when that is not one expression of a plain SELECT."""
+    query = subquery.this
+    if isinstance(query, exp.Subquery):  # `((SELECT ...))`
+        return _selected(query)
+    if isinstance(query, exp.Select) and len(query.expressions) == 1:
+        selected: exp.Expression = query.expressions[0]
+        return selected
+    return subquery
+
+
 def _numeric_as_written(node: exp.Expression) -> bool:
     """True if `node` is numeric by how it is written: number literals,
-    arithmetic on them, a cast to a numeric type."""
+    arithmetic on them, a cast to a numeric type, a scalar subquery
+    selecting one of those (`(SELECT 'NaN'::float8)`)."""
     if isinstance(node, exp.Literal):
         return not node.is_string
-    if isinstance(node, (exp.Paren, exp.Neg)):
+    if isinstance(node, (exp.Paren, exp.Neg, exp.Alias)):
         return _numeric_as_written(node.this)
+    if isinstance(node, exp.Subquery):
+        selected = _selected(node)
+        return selected is not node and _numeric_as_written(selected)
     if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)):
         return _numeric_as_written(node.this) and _numeric_as_written(node.expression)
     if isinstance(node, exp.Cast):
@@ -1510,10 +1632,13 @@ def extract_limit(ast: exp.Query) -> int | None:
     A `WITH ... SELECT ... LIMIT N` construct stores the LIMIT on the
     body `Select`, not on the wrapping `With`, and `(SELECT ... LIMIT N)`
     on the query inside the parentheses; both are unwrapped. Any other
-    LIMIT (`3.5`, `2 + 3`, a subquery, `-1`, `0x10`) returns `None`:
+    LIMIT (`3.5`, `2 + 3`, a subquery, `-1`, `0x10`) returns `None`;
+    parentheses around a literal change nothing (`('5000000000')`):
     `inject_limit` keeps it for Postgres to evaluate, capped.
     """
     written = _written_limit(_limit_root(ast))
+    while isinstance(written, exp.Paren):
+        written = written.this  # `LIMIT ('5000000000')` is `LIMIT '5000000000'`
     if not isinstance(written, exp.Literal):
         return None
     # `LIMIT '5'` is the bigint 5 to Postgres (its input syntax: optional
