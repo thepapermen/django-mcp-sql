@@ -206,8 +206,8 @@ class MCPAuthorizationView(AuthorizationView):
         # by opening a link carrying `approval_prompt=auto` (what the provider
         # does with it next is outside this server). `skip_authorization=False` is
         # supposed to make consent an explicit POST every time; this keeps it
-        # so. The curated `skip_authorization=True` row is unaffected (DOT
-        # checks that flag first). The parameter is DOT-specific and no MCP
+        # so, for every client kind (the curated `mcp-sql` row included,
+        # since migration 0015). The parameter is DOT-specific and no MCP
         # client is known to send it; what the pin does take away, on
         # purpose, is a consumer-wide `REQUEST_APPROVAL_PROMPT = "auto"` for
         # this view — same-client re-authorization before the token expires

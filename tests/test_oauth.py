@@ -699,6 +699,127 @@ class TestApprovalPromptCannotSkipConsent:
 
 
 @pytest.mark.django_db
+class TestCuratedClientRequiresConsent:
+    """The curated `mcp-sql` client shows the consent page (ledger F08).
+
+    Its registered redirect is `http://127.0.0.1` and DOT accepts any port on
+    a loopback IP, so with consent skipped a phished link opened by a
+    logged-in, gate-passing user got an immediate 302 with a code to any
+    local port the link named. Now the GET renders the page and only the
+    CSRF-protected consent POST issues a code.
+    """
+
+    PHISHED_REDIRECT = "http://127.0.0.1:31337"
+
+    def _query(self):
+        return {
+            "client_id": "mcp-sql",
+            "redirect_uri": self.PHISHED_REDIRECT,
+            "response_type": "code",
+            "scope": "mcp:sql",
+            "state": "s",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+
+    def test_get_renders_the_consent_page_and_issues_no_code(
+        self, client, mcp_user, mcp_app, gate_posture
+    ):
+        from urllib.parse import urlencode
+
+        from oauth2_provider.models import Grant
+
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + urlencode(self._query()))
+        assert response.status_code == HTTPStatus.OK
+        assert b'id="authorizationForm"' in response.content
+        assert "Location" not in response
+        assert not Grant.objects.exists()
+
+    def test_consent_post_issues_the_code(
+        self, client, mcp_user, mcp_app, gate_posture
+    ):
+        from urllib.parse import parse_qs
+        from urllib.parse import urlparse
+
+        from oauth2_provider.models import Grant
+
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"), data={**self._query(), "allow": "Authorize"}
+        )
+        assert response.status_code == HTTPStatus.FOUND
+        location = urlparse(response["Location"])
+        assert f"{location.scheme}://{location.netloc}" == self.PHISHED_REDIRECT
+        assert "code" in parse_qs(location.query)
+        assert Grant.objects.filter(application=mcp_app, user=mcp_user).count() == 1
+
+
+@pytest.mark.django_db
+def test_provisioning_never_re_enables_skip_on_the_curated_row(mcp_app):
+    """The post_migrate provisioning receivers (profiles, declared clients,
+    grants drift) leave the curated row's consent requirement alone."""
+    from django.apps import apps
+    from mcp_sql import signals
+
+    sender = apps.get_app_config("mcp_sql")
+    signals.provision_mcp_profiles(sender=sender)
+    signals.provision_mcp_clients(sender=sender)
+    mcp_app.refresh_from_db()
+    assert mcp_app.skip_authorization is False
+
+
+class TestCuratedConsentMigration:
+    """Migration 0015 flips the curated row (and only it); 0005 creates new
+    installs' row with consent required. The suite runs `--nomigrations`, so
+    the RunPython functions are called directly against the app registry."""
+
+    @staticmethod
+    def _module(name):
+        import importlib
+
+        return importlib.import_module(f"mcp_sql.migrations.{name}")
+
+    @pytest.mark.django_db
+    def test_forward_requires_consent_and_reverse_restores(self):
+        from django.apps import apps
+        from oauth2_provider.models import Application
+
+        migration = self._module("0015_curated_application_requires_consent")
+        curated = Application.objects.create(
+            name="mcp-sql",
+            client_id="mcp-sql",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=True,
+            redirect_uris="http://127.0.0.1",
+        )
+        other = Application.objects.create(
+            name="unrelated-trusted-app",
+            client_type=Application.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=True,
+            redirect_uris="https://app.example/cb",
+        )
+        migration.require_consent(apps, None)
+        curated.refresh_from_db()
+        other.refresh_from_db()
+        assert curated.skip_authorization is False
+        assert other.skip_authorization is True  # untouched
+        migration.skip_consent(apps, None)
+        curated.refresh_from_db()
+        assert curated.skip_authorization is True
+
+    @pytest.mark.django_db
+    def test_fresh_install_creates_the_row_requiring_consent(self):
+        from django.apps import apps
+        from oauth2_provider.models import Application
+
+        self._module("0005_create_mcp_sql_application").create_application(apps, None)
+        assert Application.objects.get(name="mcp-sql").skip_authorization is False
+
+
+@pytest.mark.django_db
 class TestLogoutKillsPendingCode:
     """Logout must also revoke an authorization code not yet exchanged.
 

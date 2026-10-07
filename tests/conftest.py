@@ -86,9 +86,10 @@ def _isolated_mcp_cache():
 def mcp_app(db):
     """The single canonical OAuth Application row.
 
-    `make test` runs with `--nomigrations`, so the Phase 3 data migration
-    (0005) doesn't execute against the test DB. This fixture mirrors the
-    migration's values exactly so test setup matches production state.
+    `make test` runs with `--nomigrations`, so the data migrations that
+    create it (0005) and flip it to require consent (0015) don't execute
+    against the test DB. This fixture mirrors their combined result exactly
+    so test setup matches production state.
     """
     from oauth2_provider.models import Application
 
@@ -99,7 +100,7 @@ def mcp_app(db):
             "client_secret": "",
             "client_type": Application.CLIENT_PUBLIC,
             "authorization_grant_type": Application.GRANT_AUTHORIZATION_CODE,
-            "skip_authorization": True,
+            "skip_authorization": False,
             "redirect_uris": "http://127.0.0.1",
             "algorithm": "",
         },

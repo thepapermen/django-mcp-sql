@@ -773,9 +773,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         # attacker's PKCE verifier, and ends up with a 6h `mcp:sql` token
         # bound to the victim. The consent screen is CSRF-POST-only, so
         # the same phished GET cannot complete the dance. The curated
-        # `mcp-sql` Application from migration 0005 still has
-        # `skip_authorization=True` — it is operator-provisioned with
-        # known redirect URIs and predates this endpoint.
+        # `mcp-sql` Application requires consent too (migration 0015).
         skip_authorization=False,
         redirect_uris=" ".join(redirect_uris),
         algorithm="",

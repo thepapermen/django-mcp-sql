@@ -89,9 +89,8 @@ class TestDynamicClientRegistrationHappyPath:
         # with a fully-formed authorize link and capture the auth code
         # at the (loopback) `redirect_uri` they registered. The consent
         # screen forces a CSRF-protected POST that a phished GET cannot
-        # complete. The curated migration-0005 `mcp-sql` Application
-        # keeps `skip_authorization=True` because it is operator-
-        # provisioned; see the test below for that invariant.
+        # complete. The curated `mcp-sql` Application requires consent too
+        # (migration 0015); see the test below.
         assert app.skip_authorization is False
         assert "http://127.0.0.1:3456/callback" in app.redirect_uris
         # Public client — the registered "secret" is an opaque hash of an
@@ -101,21 +100,19 @@ class TestDynamicClientRegistrationHappyPath:
         # in `test_returns_201_and_rfc7591_shape`.
         assert "client_secret" not in body
 
-    def test_curated_mcp_sql_application_still_skips_consent(self, mcp_app):
-        """Pin the asymmetry: only DCR-minted clients require consent.
+    def test_curated_mcp_sql_application_requires_consent_too(self, mcp_app):
+        """No asymmetry: the curated `mcp-sql` Application shows the consent
+        page like DCR-minted and declared clients.
 
-        Migration 0005's `mcp-sql` Application is operator-provisioned (its
-        redirect_uri is hardcoded in the migration, no attacker can mint a
-        rogue copy through `/o/register`). Showing a consent screen on the
-        operator-installed client would be friction without security. Pinning
-        the asymmetry here so a future "let's make this consistent" refactor
-        does not silently break the operator install path.
-
-        Uses the `mcp_app` fixture (defined in conftest.py) because
-        `make test` runs with `--nomigrations` and the actual migration
-        does not execute — the fixture mirrors the migration's intent.
+        It used to skip consent ("operator-provisioned, friction without
+        security"), but its registered redirect is `http://127.0.0.1` and DOT
+        accepts any port on a loopback IP, so a phished authorize link sent a
+        code silently to any local port. Migration 0015 flips existing rows;
+        0005 creates new ones with consent required. The `mcp_app` fixture
+        mirrors both (`--nomigrations`); `test_oauth.py::
+        TestCuratedClientRequiresConsent` walks the flow end to end.
         """
-        assert mcp_app.skip_authorization is True
+        assert mcp_app.skip_authorization is False
 
     def test_omitted_client_name_gets_placeholder(self, client):
         response = _post(client, {"redirect_uris": ["http://127.0.0.1:9999"]})

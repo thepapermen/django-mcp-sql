@@ -15,11 +15,11 @@ made the request.
 
 ### Breaking
 
-All but the last two fail loudly at startup, and none require any client to
+All but the last three fail loudly at startup, and none require any client to
 reconnect (client_ids are unchanged, provisioning never deletes rows, and
-tokens are 6-hour anyway). The default-ON flip and the dropped `is_staff`
-requirement are called out separately below precisely because they do **not**
-announce themselves.
+tokens are 6-hour anyway). The default-ON flip, the dropped `is_staff`
+requirement and the curated client's new consent page are called out
+separately below precisely because they do **not** announce themselves.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -110,6 +110,22 @@ announce themselves.
   (migration `0014` adds the new one). Custom user models without an
   `is_staff` field now pass the gates, and `mcp_sql_smoke`'s attribution
   fallback no longer assumes the field.
+
+- **The curated `mcp-sql` client now shows the consent page.** Migration
+  `0015` sets `skip_authorization=False` on the existing row (its reverse
+  restores `True`), and `0005` creates it that way on fresh installs. Every
+  client kind now requires consent. The curated row used to skip it on the
+  reasoning that its redirect is fixed, so no attacker can mint a rogue copy;
+  but its registered redirect is `http://127.0.0.1`, and DOT accepts any port
+  on a loopback IP, so a phished `/o/authorize/?client_id=mcp-sql&
+  redirect_uri=http://127.0.0.1:<port>` link opened by a logged-in cohort
+  user sent a code silently to any local port, where any listening process
+  holding the PKCE verifier it chose could exchange it. Users of the fixed
+  `mcp-sql` client_id (an MCP client configured with it explicitly) now click
+  Authorize once per token, every 6 hours with the recommended token
+  lifetime. Claude Code's `claude mcp add` registers its own client through
+  `/o/register` and already saw the consent page, so it is unaffected. Also
+  affects 0.1.0b5.
 
 ### Added
 
