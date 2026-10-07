@@ -3,14 +3,17 @@ no Django imports). See `docs/architecture.md` for design /
 "Watch out" / parser-check ordering rules."""
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import sqlglot
 import sqlglot.errors
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
-from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.postgres import Postgres
 from sqlglot.errors import ErrorLevel
+from sqlglot.generator import Generator
 from sqlglot.tokens import Token
 from sqlglot.tokens import TokenType
 
@@ -140,6 +143,66 @@ DENIED_SRF_FUNCTIONS: frozenset[str] = frozenset(
 SYSTEM_SCHEMAS: frozenset[str] = frozenset({"pg_catalog", "information_schema"})
 
 
+def _keep_precision(name: str) -> Callable[[Generator, exp.Func], str]:
+    def render(self: Generator, node: exp.Func) -> str:
+        precision = self.sql(node, "this")
+        return f"{name}({precision})" if precision else name
+
+    return render
+
+
+# The postgres dialect's parser / generator classes, as bases (sqlglot types
+# them as class attributes, which mypy will not take as a base class).
+_PostgresParser: Any = Postgres.Parser
+_PostgresGenerator: Any = Postgres.Generator
+
+
+class FaithfulPostgres(Postgres):
+    """sqlglot's postgres dialect minus the rewrites that change what a
+    Postgres query returns. The executor runs sqlglot's rendering of the
+    query, so a "normalising" rewrite that is not exact is a wrong answer:
+
+    - `date_part('year', d)` was rewritten to `EXTRACT(year FROM d)`, which
+      returns `numeric` instead of `double precision` (`2024` instead of
+      `2024.0`). It now stays a plain function call, rendered as written.
+    - `to_hex(n)` was rewritten to `HEX(n)`, which Postgres does not have.
+    - `date_trunc(unit, ts, zone)` lost its time-zone argument on sqlglot
+      30.7 (different rows). It now stays a plain call, rendered as written.
+    - `current_timestamp(0)` lost its precision, and `current_time` was
+      rendered `CURRENT_TIME()`, a syntax error in Postgres. Both now keep
+      exactly the precision written (`now()` still renders
+      `CURRENT_TIMESTAMP`, the same value).
+
+    Used for every parse, tokenization and rendering in this module. The
+    tokenizers are the postgres dialect's own classes, assigned rather than
+    inherited: sqlglot's dialect metaclass derives a fresh tokenizer class
+    for a subclass that does not name one, and that derived class reads
+    `E'\\''` differently (verified on 30.7 and 30.21).
+    """
+
+    Tokenizer = Postgres.Tokenizer
+    JSONPathTokenizer = Postgres.jsonpath_tokenizer_class
+
+    class Parser(_PostgresParser):
+        FUNCTION_PARSERS = {
+            name: build
+            for name, build in Postgres.Parser.FUNCTION_PARSERS.items()
+            if name != "DATE_PART"
+        }
+        FUNCTIONS = {
+            name: build
+            for name, build in Postgres.Parser.FUNCTIONS.items()
+            if name not in {"TO_HEX", "DATE_TRUNC"}
+        }
+
+    class Generator(_PostgresGenerator):
+        TRANSFORMS = {
+            **Postgres.Generator.TRANSFORMS,
+            exp.CurrentTimestamp: _keep_precision("CURRENT_TIMESTAMP"),
+            exp.CurrentTime: _keep_precision("CURRENT_TIME"),
+        }
+
+
 class QueryRejectedError(Exception):
     """Raised by `parse_and_validate` on any AST-layer reject.
 
@@ -227,7 +290,7 @@ def _parse_and_validate(
     normalize: bool,
 ) -> ParsedQuery:
     try:
-        parsed = sqlglot.parse(raw_sql, dialect="postgres")
+        parsed = sqlglot.parse(raw_sql, dialect=FaithfulPostgres)
     except sqlglot.errors.ParseError as exc:
         raise QueryRejectedError(OutcomeReason.PARSE_ERROR, str(exc)) from exc
     except RecursionError as exc:
@@ -298,7 +361,7 @@ def _parse_and_validate(
             ast=ast, normalized_sql="", referenced_tables=referenced_tables
         )
     try:
-        normalized_sql = ast.sql(dialect="postgres", normalize=True)
+        normalized_sql = ast.sql(dialect=FaithfulPostgres, normalize=True)
     except RecursionError as exc:
         msg = "SQL nesting is too deep to serialize"
         raise QueryRejectedError(OutcomeReason.PARSE_ERROR, msg) from exc
@@ -363,7 +426,7 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
     The executor's round-trip check (`parser.render_for_execution`) is the
     backstop for anything else of this class.
     """
-    tokens = Dialect.get_or_raise("postgres").tokenize(raw_sql)
+    tokens = FaithfulPostgres().tokenize(raw_sql)
     for i in range(len(tokens)):
         problem = _token_problem(raw_sql, tokens, i)
         if problem is not None:
@@ -599,7 +662,7 @@ def _render(tree: exp.Query) -> str:
     is one too; only `RecursionError` propagates (the caller audits it)."""
     try:
         return tree.sql(
-            dialect="postgres",
+            dialect=FaithfulPostgres,
             comments=False,
             normalize_functions=False,
             unsupported_level=ErrorLevel.RAISE,

@@ -780,12 +780,12 @@ class TestEveryParserFailureIsAudited:
     @pytest.mark.parametrize(
         "raw_sql",
         [
-            "SELECT date_part('', id) AS v FROM auth_permission",
+            "SELECT J_S_O_N_OBJECT(id) AS v FROM auth_permission",
             "SELECT levenshtein_less_equal() AS v FROM auth_permission",
             "SELECT var_map('') AS v FROM auth_permission",
             "SELECT json_extract_scalar(name, 1e400) AS v FROM auth_permission",
         ],
-        ids=["value-error", "index-error", "index-error-2", "huge-number"],
+        ids=["type-error", "index-error", "index-error-2", "value-error"],
     )
     def test_any_sqlglot_builder_exception_is_a_parse_error(self, monkeypatch, raw_sql):
         # sqlglot's function builders raise plain ValueError / IndexError /
