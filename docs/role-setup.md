@@ -329,8 +329,16 @@ which the package does not grant). The read path pins `search_path` to
 in `public`, and the parser refuses a qualified one in any other schema.
 A SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
 TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
-the check reports it as "granted but not declared" (spelled
-`schema"."name`) and `--apply` revokes it.
+the check reports it as "granted but not declared" (shown quoted,
+`"schema"."name"`) and `--apply` revokes it. The names come from whoever
+owns the relations, so the command quotes each identifier (an embedded
+`"` doubled) in what it prints and runs.
+
+Not in this view, so not checked by `mcp_sql_grants` either: SELECT on a
+materialized view, grants to `PUBLIC`, and grants the profile role holds
+only through membership in another role. Check those by hand
+(`has_table_privilege('mcp_readonly_role', 'schema.relation', 'SELECT')`)
+if the database has them.
 
 A divergence between this query and the profile's `ALLOWED_MODELS` means
 `grants_check` would report drift; the apply step has not run (or has not

@@ -2070,6 +2070,11 @@ def _check_no_whole_row_refs(ast: exp.Query, table_columns: RelationColumns) -> 
     The match is conservative — a real column whose name collides with a
     FROM alias would be a false positive, but in practice curated-view
     columns do not collide with their own FROM aliases.
+
+    Projection lists only: a bare row alias in `WHERE`, `JOIN … ON`,
+    `GROUP BY`, `HAVING` or `ORDER BY` is accepted (it is never returned,
+    and the role's grants bound what it reads). Refusing it there would
+    refuse valid PostgreSQL — an owner decision, not a fidelity fix.
     """
     table_aliases: set[str] = set()
     for table in ast.find_all(exp.Table):

@@ -201,7 +201,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     names compare case-sensitively, as Postgres compares them, and a quoted
     column named like a parenthesis-less built-in (`"user"`,
     `"current_user"`) is the column, not the built-in (it was refused as
-    `disallowed_function`).
+    `disallowed_function`). Scope of the whole-row ban, unchanged: `t.*`
+    and the attribute forms are refused anywhere, a bare row alias (`t`,
+    `to_jsonb(t)`, `CAST(t AS text)`) only in a projection list — in
+    `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING`, `ORDER BY` it is accepted
+    (never returned; the grants bound what it reads).
   - Table names are matched as Postgres matches them (review round 9): a
     quoted name exactly, an unquoted one folded to lowercase (ASCII `A`–`Z`
     only, as Postgres folds in a UTF-8 database) — against the
@@ -257,26 +261,48 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `sql/role_setup.sql`), so an unqualified name is the relation in
     `public`;
   - `mcp_sql_grants` (and the `post_migrate` drift WARNING) lists the
-    profile role's SELECT grants in every schema but the system ones: a
-    grant outside the whitelist in another schema is drift, and `--apply`
-    revokes it, as it does in `public`. GRANT / REVOKE name the relation
-    schema-qualified (`"public"."t"`), not through the app role's
-    `search_path`.
+    profile role's SELECT grants in every schema but the system ones
+    (`pg_catalog`, `information_schema`, `pg_*`, temporary schemas
+    included): a grant outside the whitelist in another schema is drift,
+    and `--apply` revokes it, as it does in `public`. GRANT / REVOKE name
+    the relation schema-qualified (`"public"."t"`), not through the app
+    role's `search_path`; each name quoted as an identifier (every `"`
+    doubled), since the inventory's names are chosen by whoever owns the
+    relations. The inventory reads `information_schema.role_table_grants`,
+    which does not list materialized views, grants to `PUBLIC`, or grants
+    the profile role holds only through membership in another role: those
+    stay invisible to the check (ledger F42 / F64).
   - **Behaviour change:** names in agent queries resolve in `pg_catalog`
     and `public` only. An extension installed in another schema (Django's
     `CreateExtension` installs into the first schema on the app's
     `search_path`, normally `public`) loses its unqualified names: call
-    its functions qualified (`extensions.similarity(...)`); its operators
-    cannot be (`OPERATOR(...)` is refused), so they either fail or resolve
-    to a `pg_catalog` one through a cast (a `citext` column compared with
-    `=` compares as `text`, case-sensitively). Install such extensions in
-    `public` if the agent needs them.
+    its functions qualified (`extensions.similarity(...)`) and its
+    operators with `OPERATOR(schema.op)` (`name OPERATOR(extensions.=)
+    'alice'`, `s OPERATOR(extensions.%) 'cafe'`). Written bare, its
+    operators either fail or resolve to a `pg_catalog` one through a cast
+    (a `citext` column compared with `=` compares as `text`,
+    case-sensitively). Install such extensions in `public` if the agent
+    should not need to qualify them.
     A whitelisted table that lives in another schema through the login's
     `search_path` (and not in its `db_table`) is no longer found; spell the
     schema in `db_table`. **Action:** re-run `sql/role_setup.sql` (or
     `mcp_sql_role_setup`) for the new role default (the per-transaction
     guard applies without it), then `mcp_sql_grants`: a grant it now
     reports in another schema was readable through the parser.
+- **`mcp_sql_grants --apply` could run SQL named by a relation (affects
+  every release up to and including 0.1.0b5).** The drift inventory read
+  relation names from the catalog and interpolated them into GRANT /
+  REVOKE (and the printed statements) without doubling an embedded `"`.
+  Up to 0.1.0b5 any role able to create a table in `public` (every role on
+  PostgreSQL 14 and older, by default), and with this release's
+  every-schema inventory any role owning a schema, could name a table `x" FROM r; CREATE TABLE …; --`, grant SELECT on it to
+  a profile role, and `--apply` ran the rest as the operator's role; a
+  name containing `"."` made the statement invalid, rolling back every
+  revoke of the run. Relations are now `(schema, name)` pairs end to end,
+  and every identifier is quoted (`"` doubled; a name with a non-printing
+  character as a `U&"…"` escape, so a printed statement is one line). The
+  `mcp_sql_smoke` read / write probes name a schema-qualified `db_table`
+  the same way (`"s"."t"` broke them).
 - **The read transaction was not read-only (affects every release up to and
   including 0.1.0b5).** `SET LOCAL default_transaction_read_only = on`
   only affects transactions that start later, and the executor's had
@@ -310,7 +336,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   seen — revoke tokens explicitly there. Logout now
   deletes refresh tokens and pending authorization codes as well as access
   tokens (a code issued just before either event could otherwise still be
-  exchanged for a new token).
+  exchanged for a new token). On a multi-database install the revocation
+  waits for the database the change was written to (logout: the default
+  database) and then commits in a transaction of its own, the audit row
+  inside it: a transaction the request has open on the token or audit
+  database does not undo it when it rolls back (it runs on a separate
+  connection there, waiting at most 5 s for a row lock that transaction
+  holds; a failure is logged, not retried). The three deletes run on the
+  database DOT writes its access tokens to, whatever a router says per
+  model. The cohort-grant alert reads the user on the database the
+  membership change was written to.
 - **The app booted with any DOT validator.** The package's OAuth server is
   built with the install's `OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]`, and
   the client pinning, the `mcp:sql`-only scope, mandatory PKCE and the
