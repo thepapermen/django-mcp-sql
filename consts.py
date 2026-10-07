@@ -74,8 +74,12 @@ def canonical_authority(scheme: str, authority: str) -> str:
     scheme's default left out (§6.2.3; WHATWG URL serialisation does the
     same). Anything that does not end in `:<ASCII digits>` (including a
     bracketed IPv6 literal without a port, or an empty port) keeps its
-    spelling apart from the case. Pure string work, no `int()`: a Host
-    header's port is unbounded digits.
+    spelling apart from the case, and so does one whose part before that
+    port still holds a colon outside a bracketed IPv6 literal: `name:P:443`
+    has two ports, is no `host[:port]` at all, and splitting it at the last
+    colon made it equal `name:P`. Pure string work, no `int()`: a Host
+    header's port is unbounded digits (`audience.foreign_resource` refuses a
+    port no URL parser takes).
 
     Used by `absolute_url` on `request.get_host()` and by
     `audience.foreign_resource` on a client's `resource`, so both sides of
@@ -84,6 +88,8 @@ def canonical_authority(scheme: str, authority: str) -> str:
     authority = authority.lower()
     host, colon, port = authority.rpartition(":")
     if not (colon and port.isascii() and port.isdigit()):
+        return authority
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
         return authority
     port = port.lstrip("0") or "0"
     return host if port == DEFAULT_PORTS.get(scheme) else f"{host}:{port}"

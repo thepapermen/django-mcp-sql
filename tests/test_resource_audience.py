@@ -884,12 +884,83 @@ def test_non_ascii_that_lowercases_to_the_host_is_foreign(settings, rf, value):
         ("https", "[::1]:8443", "[::1]:8443"),
         ("https", "[::FFFF:1.2.3.4]:443", "[::ffff:1.2.3.4]"),
         ("ftp", "example.com:21", "example.com:21"),
+        # Two ports is not `host[:port]`: kept as it is (bar the case), so it
+        # never equals a real authority. Splitting at the last colon made
+        # `example.com:8443:443` the canonical `example.com:8443`.
+        ("https", "example.com:8443:443", "example.com:8443:443"),
+        ("https", "Example.COM:8443:0443", "example.com:8443:0443"),
+        ("https", "example.com:443:443", "example.com:443:443"),
+        ("https", "[::1]:8443:443", "[::1]:8443:443"),
+        ("https", "::1:443", "::1:443"),
     ],
 )
 def test_canonical_authority(scheme, authority, canonical):
     from mcp_sql.consts import canonical_authority
 
     assert canonical_authority(scheme, authority) == canonical
+
+
+# Spellings of a `host[:port]` request's own endpoint that no URL parser
+# takes: two ports, or a port out of range or overlong. DOT (3.4+) refuses
+# such a value at `/o/authorize/` with an `invalid_target` of its own that
+# names the client's value; the package refuses it first, with its own.
+UNPARSEABLE_PORTS = [
+    ("testserver:8443", "https://testserver:8443:443/mcp/sql/"),
+    ("testserver:8443", "https://testserver:8443:0443/mcp/sql"),
+    ("testserver", "https://testserver:443:443/mcp/sql/"),
+    ("testserver", "https://testserver:000443/mcp/sql/"),  # over five digits
+    ("testserver", "https://testserver:" + "0" * 4300 + "443/mcp/sql/"),
+    ("testserver", "https://testserver:65979/mcp/sql/"),
+    ("testserver:99999", "https://testserver:99999/mcp/sql/"),  # its own host
+    ("testserver:65536", "https://testserver:65536/mcp/sql/"),
+]
+
+
+@pytest.mark.parametrize(("host", "value"), UNPARSEABLE_PORTS)
+def test_an_unparseable_port_is_foreign(rf, host, value):
+    from mcp_sql.audience import foreign_resource
+
+    request = rf.get("/", HTTP_HOST=host)
+    assert foreign_resource(request, [value]) == value
+
+
+@pytest.mark.parametrize(
+    ("host", "value"),
+    [
+        ("testserver:8443", "https://testserver:8443/mcp/sql/"),
+        ("testserver:8443", "https://TESTSERVER:08443/mcp/sql"),
+        ("testserver:65535", "https://testserver:65535/mcp/sql/"),
+        ("testserver", "https://testserver:00443/mcp/sql/"),  # five digits
+    ],
+)
+def test_a_parseable_port_is_still_accepted(rf, host, value):
+    from mcp_sql.audience import foreign_resource
+
+    request = rf.get("/", HTTP_HOST=host)
+    assert foreign_resource(request, [value]) is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("host", "value"), UNPARSEABLE_PORTS)
+def test_an_unparseable_port_gets_the_packages_invalid_target(  # noqa: PLR0913 — fixtures + two parameters
+    client, mcp_app, mcp_user, gate_posture, host, value
+):
+    """End to end: the package's own `invalid_target` (the accepted value,
+    not the client's), never DOT's; no grant. Below DOT 3.4 the value was a
+    consent page; from 3.4 DOT's answer named the client's value."""
+    _, challenge = _pkce()
+    query = urlencode(_authorize_params(challenge, [value]))
+    client.force_login(mcp_user)
+    response = client.get(reverse("authorize") + "?" + query, HTTP_HOST=host)
+    advertised = client.get(
+        reverse("mcp_sql_protected_resource_metadata") + "/", HTTP_HOST=host
+    ).json()["resource"]
+    _assert_invalid_target_redirect(response, accepted=advertised)
+    description = parse_qs(urlparse(response["Location"]).query)["error_description"]
+    assert description[0].startswith("resource must be this server's MCP endpoint")
+    if value != advertised:
+        assert value not in unquote(response["Location"])
+    assert _grant_count() == 0
 
 
 def test_token_endpoint_is_the_package_view():

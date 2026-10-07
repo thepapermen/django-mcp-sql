@@ -45,9 +45,26 @@ def mcp_resource_url(request: HttpRequest) -> str:
     return absolute_url(request, reverse("mcp_sql_endpoint"))
 
 
-def _resource_key(value: str) -> tuple[str, str, str]:
+# The longest port spelling accepted (`65535`, or `0443`/`00443`). Python's
+# `urlsplit` (DOT's parser) refuses a port above 65535, and one of more than
+# 4300 digits (`int()`'s string limit) whatever its value.
+_MAX_PORT_DIGITS = 5
+_MAX_PORT = 65535
+
+
+def _has_parseable_port(authority: str) -> bool:
+    """False when `authority` ends in `:<ASCII digits>` that are not a port:
+    more than five digits, or a value above 65535."""
+    _, colon, port = authority.rpartition(":")
+    if not (colon and port.isascii() and port.isdigit()):
+        return True
+    return len(port) <= _MAX_PORT_DIGITS and int(port) <= _MAX_PORT
+
+
+def _resource_key(value: str) -> tuple[str, str, str] | None:
     """`(scheme, authority, path)` of `value` split as an absolute URL, scheme
-    lowercased and authority in `consts.canonical_authority` form.
+    lowercased and authority in `consts.canonical_authority` form; None when
+    the authority's port is not one (`_has_parseable_port`).
 
     Plain slicing at the first `://` and the next `/`, deliberately not
     `urlsplit` (which drops tab / CR / LF and strips leading control
@@ -57,6 +74,8 @@ def _resource_key(value: str) -> tuple[str, str, str]:
     """
     scheme, _, rest = value.partition("://")
     authority, slash, path = rest.partition("/")
+    if not _has_parseable_port(authority):
+        return None
     scheme = scheme.lower()
     return scheme, canonical_authority(scheme, authority), slash + path
 
@@ -76,15 +95,22 @@ def foreign_resource(request: HttpRequest, values: Iterable[str]) -> str | None:
     two spellings discovery serves): no case folding, percent-decoding or
     dot segments. A query or fragment (even empty), userinfo, an empty
     value, the bare origin, any other path, host, port or scheme is
-    foreign.
+    foreign; so is a port no URL parser takes (two ports, more than five
+    digits, above 65535 — on a request whose own Host carries such a port,
+    every value is foreign).
 
-    Every accepted spelling passes DOT's default bearer audience check
+    Every accepted spelling is one DOT (3.4+) parses as a resource indicator
+    (else DOT would answer an `invalid_target` of its own, naming the
+    client's value) and passes DOT's default bearer audience check
     (`validate_resource_as_url_prefix` compares the parsed scheme, host,
     port and path the same way) against the request URL
     `CanonicalUriOAuthLibCore` builds, which is the canonical one.
     """
-    scheme, authority, path = _resource_key(mcp_resource_url(request))
-    accepted = {(scheme, authority, path), (scheme, authority, path.removesuffix("/"))}
+    endpoint = _resource_key(mcp_resource_url(request))
+    accepted: set[tuple[str, str, str]] = set()
+    if endpoint is not None:
+        scheme, authority, path = endpoint
+        accepted = {endpoint, (scheme, authority, path.removesuffix("/"))}
     return next(
         (
             value
