@@ -21,6 +21,7 @@ from django.utils import timezone
 from mcp_sql.executor import run_query
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.parser import QueryRejectedError
+from mcp_sql.parser import _denial
 from mcp_sql.parser import parse_and_validate
 from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import OutcomeReason
@@ -377,15 +378,25 @@ _SYNTAX_RENDERED = {
 }
 
 
+# Refused by the parser with plain string arguments, as Postgres refuses
+# them: `normalize(s, form)` takes a keyword form (`NFC`), not a string.
+_REJECTED_BY_POSTGRES = {("normalize", 2)}
+
+
 @pytest.mark.django_db
 def test_every_catalog_function_call_is_rendered_as_written():
     """Review round 4: stock sqlglot rewrote calls to hundreds of Postgres
     functions into its own spelling (`like(a, b)` -> `b LIKE a`, `log10(x)`
     -> `LOG(10, x)`, `strpos` -> `POSITION`, `now()` -> `CURRENT_TIMESTAMP`,
     format strings in `to_char`, ...) — different results or column names.
-    Every function in this server's `pg_catalog`, called with plain
-    arguments, must now render exactly as written (case aside), so a newer
-    sqlglot cannot bring a rewrite back unnoticed."""
+    Every function in this server's `pg_catalog` the parser accepts, called
+    with plain string arguments, must now render exactly as written (case
+    aside), so a newer sqlglot cannot bring a rewrite back unnoticed. The
+    ones it refuses are listed, not skipped silently: each must be a denied
+    function (deny list, set-returning) or a known form Postgres rejects
+    too, so a new refusal fails the test (review round 7). Calls with
+    shaped arguments (`json_object(ARRAY[...], ...)`, `INTERVAL '…' DAY`)
+    are pinned in the functional corpus."""
     with connection.cursor() as cur:
         cur.execute(
             "SELECT DISTINCT proname, pronargs, pronargdefaults FROM pg_proc "
@@ -393,7 +404,7 @@ def test_every_catalog_function_call_is_rendered_as_written():
             "AND prokind IN ('f', 'a', 'w') AND proname ~ '^[a-z_][a-z0-9_]*$'"
         )
         functions = cur.fetchall()
-    changed, seen = [], set()
+    changed, seen, refused = [], set(), []
     for name, nargs, ndefaults in functions:
         for arity in range(nargs - ndefaults, nargs + 1):
             if name in _SYNTAX_RENDERED or (name, arity) in seen:
@@ -403,9 +414,12 @@ def test_every_catalog_function_call_is_rendered_as_written():
             sql = f"SELECT {name}({args}) AS r"
             try:
                 rendered = _rendered(sql)
-            except QueryRejectedError:
-                continue  # deny-listed, set-returning, not parseable: refused
+            except QueryRejectedError as exc:
+                if _denial(name) is None and (name, arity) not in _REJECTED_BY_POSTGRES:
+                    refused.append((sql, exc.reason))
+                continue
             if rendered.lower() != f"{sql} LIMIT 11".lower():
                 changed.append((sql, rendered))
     assert changed == []
+    assert refused == []
     assert len(seen) > 2000  # the sweep really ran over the catalog

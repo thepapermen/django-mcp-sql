@@ -2815,6 +2815,59 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "operators",
         "SELECT id, g !~ 'a' AS a, g !~~ 'a%' AS b, g !~* 'A' AS c FROM t ORDER BY id",
     ),
+    # Review round 7.
+    (
+        "json",
+        "SELECT json_object(ARRAY[g], ARRAY[format('%s', id)]) AS o FROM t WHERE id = 1",
+    ),
+    (
+        "json",
+        "SELECT json_object(ARRAY['on', 'x']) AS a, json_object(ARRAY['a', 'b'], ARRAY['on', 'x']) AS b",
+    ),
+    (
+        "json",
+        "SELECT id, json_object(tags[1:2]) AS a FROM t WHERE id < 4 ORDER BY id",
+    ),
+    (
+        "json",
+        "SELECT json_object(ARRAY[s.key], ARRAY[s.value]) AS o FROM (SELECT 'k' AS key, '1' AS value) s",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '25 hours' DAY, INTERVAL '13 months' YEAR AS y, INTERVAL '1 day' DAY AS d",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '1 day 02:03' DAY TO SECOND AS a, INTERVAL '5' DAY AS b, INTERVAL '1:30' HOUR TO MINUTE AS c",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT '9223372036854775807'",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT ' +3 '",
+    ),
+    (
+        "operators",
+        "SELECT id, @ -5 AS a, @ (y - 5) AS b, @ x AS c FROM t ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT @-@ '((0,0),(1,1))'::lseg AS a",
+    ),
+    (
+        "names",
+        "SELECT id qualify FROM t ORDER BY id",
+    ),
+    (
+        "names",
+        "SELECT qualify, count(*) AS n FROM (SELECT y AS qualify FROM t) s GROUP BY qualify ORDER BY qualify",
+    ),
+    (
+        "as-written",
+        "SELECT overlaps(DATE '2001-01-01', DATE '2001-01-02', d, d + 1) AS o FROM t ORDER BY id",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3020,6 +3073,14 @@ REFUSED: list[tuple[str, str]] = [
         "disallowed_function",
         "SELECT s.pg_typeof AS v FROM (SELECT 1 AS a) s",
     ),
+    (
+        "unsafe_literal",
+        "SELECT id FROM t WHERE y ==1",
+    ),
+    (
+        "unsafe_literal",
+        "SELECT id FROM t WHERE y <=> 1",
+    ),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3056,6 +3117,7 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id FROM t ORDER BY id LIMIT 99999999999999999999",
     "SELECT ~2 ^ 2 AS a",
     "SELECT t.text AS v FROM t LIMIT 1",
+    "SELECT json_object(g, value + 1) AS o FROM t WHERE id = 1",
     "SELECT id, x IS NOT DISTINCT FROM 1.37 IS TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NOT TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NULL AS a FROM t ORDER BY id",

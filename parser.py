@@ -270,6 +270,20 @@ def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
 
 
 _IS_NOT_TOKENS = 3  # `IS`, `NOT` and the value
+_INTERVAL_FIELDS = frozenset({"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"})
+
+
+class _PrefixOperator(exp.Expression):
+    """A Postgres prefix operator sqlglot has no node for (`@ x`, `@-@ x`),
+    rendered as written."""
+
+    arg_types = {"this": True, "op": True}
+
+
+class _QualifiedInterval(exp.Expression):
+    """`INTERVAL '<string>' <field> [TO <field>]` as written."""
+
+    arg_types = {"this": True, "unit": True}
 
 
 class _IsNot(exp.Expression, exp.Condition):
@@ -322,12 +336,6 @@ _SYNTAX_FUNCTIONS = frozenset(
     }
 )
 _SYNTAX_NO_PAREN_FUNCTIONS = frozenset({"ANY", "CASE", "VARIADIC"})
-# Words that make a `json_object(...)` call the SQL/JSON constructor
-# (`json_object('a': 1)`, `json_object(KEY 'a' VALUE 1 RETURNING jsonb)`)
-# rather than Postgres's `json_object(text[] [, text[]])` function.
-_SQL_JSON_WORDS = frozenset(
-    {"ABSENT", "FORMAT", "KEY", "ON", "RETURNING", "UNIQUE", "VALUE", "WITH", "WITHOUT"}
-)
 
 
 class FaithfulPostgres(Postgres):
@@ -410,6 +418,21 @@ class FaithfulPostgres(Postgres):
         }
         ID_VAR_TOKENS = Postgres.Parser.ID_VAR_TOKENS | {TokenType.QUALIFY}
         TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.QUALIFY}
+        ALIAS_TOKENS = Postgres.Parser.ALIAS_TOKENS | {TokenType.QUALIFY}
+        # `overlaps(s1, e1, s2, e2)`: Postgres's function form of OVERLAPS.
+        FUNC_TOKENS = Postgres.Parser.FUNC_TOKENS | {TokenType.OVERLAPS}
+        QUERY_MODIFIER_TOKENS = Postgres.Parser.QUERY_MODIFIER_TOKENS - {
+            TokenType.QUALIFY
+        }
+        WINDOW_ALIAS_TOKENS = Postgres.Parser.WINDOW_ALIAS_TOKENS | {TokenType.QUALIFY}
+        # `@ x` (absolute value) and `@-@ x` (length): Postgres prefix
+        # operators sqlglot read as a parameter `$x` (invalid SQL). The
+        # operand is the next unary expression; the text is kept, so
+        # Postgres groups it as it would have (`@ y - 5` is `@ (y - 5)`).
+        PLACEHOLDER_PARSERS = {
+            **Postgres.Parser.PLACEHOLDER_PARSERS,
+            TokenType.PARAMETER: lambda self: self._parse_at_operator(),
+        }
         PRIMARY_PARSERS = {
             **Postgres.Parser.PRIMARY_PARSERS,
             **{
@@ -555,8 +578,17 @@ class FaithfulPostgres(Postgres):
 
         def _parse_interval_span(
             self, this: exp.Expression, *args: Any, **kwargs: Any
-        ) -> exp.Interval:
+        ) -> exp.Expression:
             written = this.name if this is not None and this.is_string else None
+            if written is not None:
+                qualifier = self._interval_qualifier()
+                if qualifier is not None:
+                    # `INTERVAL '25 hours' DAY`: Postgres applies the field
+                    # (0 days); sqlglot dropped it, or read it as an alias.
+                    qualified: exp.Expression = self.expression(
+                        _QualifiedInterval(this=this, unit=qualifier)
+                    )
+                    return qualified
             interval: exp.Interval = super()._parse_interval_span(this, *args, **kwargs)
             if (
                 written is not None
@@ -569,56 +601,107 @@ class FaithfulPostgres(Postgres):
                 interval.set("unit", None)
             return interval
 
+        def _parse_at_operator(self) -> exp.Expression | None:
+            tokens, i = self._tokens, self._index  # the token after `@`
+            symbol = "@"
+            if (
+                i + 1 < len(tokens)
+                and tokens[i].token_type == TokenType.DASH
+                and tokens[i + 1].token_type == TokenType.PARAMETER
+                and tokens[i].start == tokens[i - 1].end + 1
+                and tokens[i + 1].start == tokens[i].end + 1
+            ):
+                symbol = "@-@"
+                self._advance(2)
+            operand = self._parse_unary()
+            if operand is None:
+                return None
+            prefixed: exp.Expression = self.expression(
+                _PrefixOperator(this=operand, op=symbol)
+            )
+            return prefixed
+
+        def _interval_qualifier(self) -> exp.Expression | None:
+            """An interval field qualifier right after the string (`DAY`,
+            `HOUR TO SECOND`), consumed, or `None`."""
+            tokens, i = self._tokens, self._index
+            if i >= len(tokens) or tokens[i].text.upper() not in _INTERVAL_FIELDS:
+                return None
+            first = exp.var(tokens[i].text.upper())
+            if (
+                i + 2 < len(tokens)
+                and tokens[i + 1].text.upper() == "TO"
+                and tokens[i + 2].text.upper() in _INTERVAL_FIELDS
+            ):
+                last = exp.var(tokens[i + 2].text.upper())
+                self._advance(3)
+                return exp.IntervalSpan(this=first, expression=last)
+            self._advance()
+            return first
+
         def _parse_json_object_or_call(self) -> exp.Expression | None:
-            if self._json_key_keyword():
-                # `json_object(KEY 'a' VALUE 1)`: Postgres has no `KEY` here
-                # (it reads `KEY 'a'` as a literal of a type `key`); sqlglot
-                # would run the SQL/JSON constructor.
-                self.raise_error("KEY ... VALUE is not PostgreSQL syntax")
-            if self._plain_call_arguments():
-                args = self._parse_csv(self._parse_assignment)
+            """`json_object(...)`: Postgres's function `json_object(text[]
+            [, text[]])` when the arguments parse as plain expressions up to
+            the closing parenthesis (kept as written, whatever they contain:
+            `format('%s', x)`, `a[1:2]`, a column named `value` or `key`),
+            else the SQL/JSON constructor (`json_object('a': 1)`, `'a' VALUE
+            1`, `RETURNING jsonb`, PG16)."""
+            index = self._index
+            args = self._plain_arguments()
+            if args is not None:
                 call: exp.Expression = self.expression(
                     exp.Anonymous(this="json_object", expressions=args)
                 )
                 return call
+            self._retreat(index)
+            if self._key_keyword_argument():
+                # `json_object(KEY 'a' VALUE 1)`: Postgres has no `KEY` here
+                # (it reads `KEY 'a'` as a literal of a type `key`); sqlglot
+                # would run the SQL/JSON constructor.
+                self.raise_error("KEY ... VALUE is not PostgreSQL syntax")
             constructor: exp.Expression | None = self._parse_json_object()
             return constructor
 
-        def _json_key_keyword(self) -> bool:
+        def _plain_arguments(self) -> list[exp.Expression] | None:
+            """The arguments as plain comma-separated expressions if they
+            end exactly at the call's closing parenthesis, else `None`."""
+            tokens = self._tokens
+            if self._index >= len(tokens) or (
+                tokens[self._index].token_type == TokenType.R_PAREN
+            ):
+                return None  # `json_object()`: the constructor (`{}`)
+            try:
+                args = self._parse_csv(self._parse_assignment)
+            except sqlglot.errors.ParseError:
+                return None
+            closed = (
+                self._index < len(tokens)
+                and tokens[self._index].token_type == TokenType.R_PAREN
+            )
+            return args if closed and all(arg is not None for arg in args) else None
+
+        def _key_keyword_argument(self) -> bool:
+            """An argument starts with the word `KEY` followed by more (the
+            SQL-standard `KEY 'a' VALUE 1`), at the call's own level."""
             tokens, depth, j = self._tokens, 0, self._index
+            start = True
             while j < len(tokens):
                 kind = tokens[j].token_type
-                if kind == TokenType.R_PAREN and depth == 0:
+                if depth == 0 and kind == TokenType.R_PAREN:
                     return False
-                depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
                 if (
                     depth == 0
+                    and start
                     and tokens[j].text.upper() == "KEY"
-                    and not _alone_in_argument(tokens, j, self._index)
+                    and j + 1 < len(tokens)
+                    and tokens[j + 1].token_type
+                    not in {TokenType.COMMA, TokenType.R_PAREN}
                 ):
                     return True
-                j += 1
-            return False
-
-        def _plain_call_arguments(self) -> bool:
-            """True if the tokens up to the closing parenthesis are plain
-            comma-separated arguments (no SQL/JSON key-value syntax)."""
-            tokens, depth, j = self._tokens, 0, self._index
-            if j >= len(tokens) or tokens[j].token_type == TokenType.R_PAREN:
-                return False
-            while j < len(tokens):
-                kind = tokens[j].token_type
-                if kind == TokenType.R_PAREN and depth == 0:
-                    return True
-                depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
-                if depth == 0 and (
-                    kind == TokenType.COLON
-                    or (
-                        tokens[j].text.upper() in _SQL_JSON_WORDS
-                        and not _alone_in_argument(tokens, j, self._index)
-                    )
-                ):
-                    return False
+                depth += (kind in {TokenType.L_PAREN, TokenType.L_BRACKET}) - (
+                    kind in {TokenType.R_PAREN, TokenType.R_BRACKET}
+                )
+                start = depth == 0 and kind == TokenType.COMMA
                 j += 1
             return False
 
@@ -664,6 +747,12 @@ class FaithfulPostgres(Postgres):
             exp.JSONExtractScalar: _json_arrow(
                 "->>", Postgres.Generator.TRANSFORMS[exp.JSONExtractScalar]
             ),
+            _PrefixOperator: lambda self, node: (
+                f"{node.args['op']} {self.sql(node, 'this')}"
+            ),
+            _QualifiedInterval: lambda self, node: (
+                f"INTERVAL {self.sql(node, 'this')} {self.sql(node, 'unit')}"
+            ),
             _IsNot: lambda self, node: (
                 f"{self.sql(node, 'this')} IS NOT {self.sql(node, 'expression')}"
             ),
@@ -686,14 +775,6 @@ class FaithfulPostgres(Postgres):
             exp.BitwiseNot: _prefix_operator("~"),
             exp.Neg: _prefix_operator("-"),
         }
-
-
-def _alone_in_argument(tokens: list[Token], j: int, first: int) -> bool:
-    """True if `tokens[j]` is a whole argument on its own (a column named
-    `value` / `key`), not a keyword inside one."""
-    before = tokens[j - 1].token_type if j > first else TokenType.COMMA
-    after = tokens[j + 1].token_type if j + 1 < len(tokens) else TokenType.R_PAREN
-    return before == TokenType.COMMA and after in {TokenType.COMMA, TokenType.R_PAREN}
 
 
 def _keep_quoted_type(parsed: exp.DataType, token: Token) -> None:
@@ -966,6 +1047,7 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> list[Token]:
         if problem is not None:
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem)
     _check_operator_runs(raw_sql, tokens)
+    _check_sqlglot_only_operators(raw_sql, tokens)
     for ident in ast.find_all(exp.Identifier):
         start, end = ident.meta.get("start"), ident.meta.get("end")
         written = (
@@ -1012,7 +1094,12 @@ _DOLLAR_TAG_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 # together (`!~` is `!` and `~` to its tokenizer, a negated regex match to
 # its parser). `^@` (starts with) is not put back together — it renders as
 # invalid SQL and fails at execution, as before — but it is not refused.
-_REASSEMBLED_OPERATORS = frozenset({"!~", "!~*", "!~~", "!~~*", "<<", ">>", "^@"})
+_REASSEMBLED_OPERATORS = frozenset(
+    {"!~", "!~*", "!~~", "!~~*", "<<", ">>", "^@", "@-@"}
+)
+# Operators sqlglot reads (and renders as something else) that Postgres
+# does not have: `a == b` ran as `a = b` where Postgres errors.
+_NOT_POSTGRES_OPERATORS = frozenset({"==", "<=>", "??", "~~~"})
 
 
 def _check_operator_runs(raw_sql: str, tokens: list[Token]) -> None:
@@ -1036,6 +1123,17 @@ def _check_operator_runs(raw_sql: str, tokens: list[Token]) -> None:
         if j > i:
             _check_operator_run(raw_sql, tokens[i : j + 1])
         i = j + 1
+
+
+def _check_sqlglot_only_operators(raw_sql: str, tokens: list[Token]) -> None:
+    for token in tokens:
+        text = raw_sql[token.start : token.end + 1]
+        if text in _NOT_POSTGRES_OPERATORS:
+            msg = (
+                f"{text!r} is not a PostgreSQL operator (Postgres rejects it; "
+                "sqlglot would run something else)"
+            )
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
 
 
 def _check_operator_run(raw_sql: str, run: list[Token]) -> None:
@@ -1416,14 +1514,14 @@ def extract_limit(ast: exp.Query) -> int | None:
     `inject_limit` keeps it for Postgres to evaluate, capped.
     """
     written = _written_limit(_limit_root(ast))
-    if (
-        isinstance(written, exp.Literal)
-        and not written.is_string
-        and _PLAIN_INTEGER_RE.fullmatch(written.name)
-        and int(written.name) <= _BIGINT_MAX  # beyond: Postgres errors
-    ):
-        return int(written.name)
-    return None
+    if not isinstance(written, exp.Literal):
+        return None
+    # `LIMIT '5'` is the bigint 5 to Postgres (its input syntax: optional
+    # surrounding spaces and `+`); `LEAST('5', n)` would read it as int4.
+    text = written.name.strip().removeprefix("+") if written.is_string else written.name
+    if _PLAIN_INTEGER_RE.fullmatch(text) and int(text) <= _BIGINT_MAX:
+        return int(text)
+    return None  # beyond bigint, negative, ...: Postgres's own error
 
 
 def _check_no_select_into(ast: exp.Query) -> None:

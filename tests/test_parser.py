@@ -17,7 +17,6 @@ from mcp_sql.parser import parse_and_validate
 from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
-from sqlglot import parse_one
 
 ALLOWED = {"auth_permission", "auth_group", "django_content_type"}
 
@@ -759,8 +758,8 @@ class TestInjectLimit:
             # Not numeric as written: left to Postgres's type resolution (an
             # explicit cast would run `'3'::text`, an error in a LIMIT).
             ("(SELECT 3)", "LIMIT LEAST((SELECT 3), 11)"),
-            ("'4'", "LIMIT LEAST('4', 11)"),
             ("'3'::text", "LIMIT LEAST(CAST('3' AS TEXT), 11)"),
+            ("'3 apples'", "LIMIT LEAST('3 apples', 11)"),
         ],
     )
     def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
@@ -768,22 +767,34 @@ class TestInjectLimit:
         # Postgres would (`LIMIT 3.5` is 4 rows), or rows where Postgres
         # raises (`LIMIT -1`). Kept as written and capped, Postgres
         # evaluates it exactly as it would have.
-        ast = parse_one(f"SELECT id FROM auth_permission LIMIT {limit}")  # noqa: S608
-        assert inject_limit(ast, 11).sql(dialect="postgres").endswith(capped)
+        assert _executed(f"LIMIT {limit}").endswith(capped)
 
-    @pytest.mark.parametrize("limit", ["NULL", "5"])
+    @pytest.mark.parametrize(
+        "limit",
+        ["NULL", "5", "'5'", "' +5 '", "'9223372036854775807'"],
+    )
     def test_replaces_no_limit_or_a_plain_integer(self, limit):
-        ast = parse_one(f"SELECT id FROM auth_permission LIMIT {limit}")  # noqa: S608
-        assert inject_limit(ast, 11).sql(dialect="postgres").endswith(" LIMIT 11")
+        # `LIMIT '5'` is the bigint 5 to Postgres; `LEAST('…', n)` would read
+        # the string as int4 and overflow (review round 7).
+        assert _executed(f"LIMIT {limit}").endswith(" LIMIT 11")
 
     def test_unwraps_a_parenthesised_query(self):
         # `(SELECT ... LIMIT 5) LIMIT 11` is an error in Postgres.
-        ast = parse_one(
-            "(SELECT id FROM auth_permission ORDER BY id LIMIT 5)", dialect="postgres"
-        )
+        ast = parse_and_validate(
+            "(SELECT id FROM auth_permission ORDER BY id LIMIT 5)",
+            allowed_tables=ALLOWED,
+        ).ast
         assert extract_limit(ast) == 5
-        sql = inject_limit(ast, 6).sql(dialect="postgres")
+        sql = render_for_execution(ast, 6, allowed_tables=ALLOWED)
         assert sql == "SELECT id FROM auth_permission ORDER BY id LIMIT 6"
+
+
+def _executed(limit: str) -> str:
+    """The SQL the executor would send for `SELECT ... <limit>` with a cap
+    of 11 — through `FaithfulPostgres`, as production does."""
+    sql = f"SELECT id FROM auth_permission {limit}"  # noqa: S608
+    parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+    return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
 
 
 class TestExtractLimit:
@@ -817,17 +828,22 @@ class TestExtractLimit:
         injected = inject_limit(ast, 11)
         assert extract_limit(injected) == 11
 
-    def test_non_integer_literal_limit_gives_up_cleanly(self):
-        # A string-literal LIMIT can't be reasoned about at parse time;
-        # `extract_limit` returns None and the executor falls back to its clamp.
-        ast = parse_one("SELECT id FROM auth_permission LIMIT '3 apples'")
-        assert extract_limit(ast) is None
-
-    def test_non_literal_limit_expression_gives_up_cleanly(self):
-        # A LIMIT that is an expression (not a bare literal) is also opaque at
-        # parse time — same clean give-up path.
-        ast = parse_one("SELECT id FROM auth_permission LIMIT 2 + 3")
-        assert extract_limit(ast) is None
+    @pytest.mark.parametrize(
+        ("limit", "value"),
+        [
+            ("'3 apples'", None),  # Postgres's error: kept for it to raise
+            ("2 + 3", None),  # an expression: kept for Postgres to evaluate
+            ("'12'", 12),
+            ("' +12 '", 12),
+            ("9223372036854775808", None),  # beyond bigint: Postgres's error
+        ],
+    )
+    def test_reads_only_what_postgres_reads_as_a_bigint(self, limit, value):
+        ast = parse_and_validate(
+            f"SELECT id FROM auth_permission LIMIT {limit}",  # noqa: S608
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == value
 
 
 class TestAttributeNotation:
@@ -962,6 +978,9 @@ class TestOperatorSigns:
         [
             "SELECT 2 %-3 AS v",
             "SELECT ~-1 AS v",
+            # Review round 7: operators sqlglot reads that Postgres lacks.
+            "SELECT id FROM auth_permission WHERE id ==1",
+            "SELECT id FROM auth_permission WHERE id <=> 1",
             # Review round 6: `=~`, `-~`, `*~` are one operator to Postgres.
             "SELECT id=~1 AS v FROM auth_permission",
             "SELECT -~id AS v FROM auth_permission",
@@ -1225,6 +1244,19 @@ class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual
     problem, not an incidental one."""
+
+    def test_system_schema_with_qualify_as_a_name(self):
+        # Review round 7: `qualify` is an ordinary name, so the tree is
+        # built and the catalog reference is what the audit row names.
+        _expect_reject("SELECT id FROM pg_class qualify", OutcomeReason.SYSTEM_SCHEMA)
+
+    def test_text_postgres_cannot_parse_is_a_parse_error_first(self):
+        # A QUALIFY clause is a syntax error to Postgres as to the parser:
+        # there is no tree to run the other checks on.
+        _expect_reject(
+            "SELECT id FROM pg_class QUALIFY row_number() OVER () = 1",
+            OutcomeReason.PARSE_ERROR,
+        )
 
     def test_writeable_cte_before_returning(self):
         # DELETE RETURNING inside a CTE: the WRITEABLE_CTE name is the real
