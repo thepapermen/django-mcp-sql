@@ -62,17 +62,42 @@ _MAX_REDIRECT_URI_LENGTH = 1024
 _MAX_CLIENT_NAME = 200
 
 
-# --- Characters refused in client metadata -------------------------------
+# --- Characters allowed in client metadata ---------------------------------
 #
-# Nothing refused here is stored, echoed or logged. Control (`Cc`: C0, DEL,
-# C1) and surrogate (`Cs`) characters fail downstream outright: Postgres
-# refuses a NUL in a text column (`DataError`), the driver's UTF-8 encoder a
-# lone surrogate (`UnicodeEncodeError`), each an anonymous 500. Line /
-# paragraph separators (`Zl`, `Zp`) break the text across lines. And every
-# character Unicode marks Default_Ignorable_Code_Point renders as nothing, so
-# it would let a registrant make a stored callback (copied into every audit
-# row's `client_redirect`) or a logged / echoed client name read as
-# something it is not.
+# One rule, two strictnesses. Nothing refused is stored, echoed or logged.
+#
+# Redirect URI (machine text, strict): every character must be printable
+# (`str.isprintable`: no control, format, surrogate, private-use, unassigned
+# or noncharacter, separator) and visible: not default-ignorable
+# (`_is_default_ignorable`), not a blank (`_BLANKS`) and not a conjoining
+# Hangul jamo.
+#
+# Client name (free text): assigned, visible text. Refused: control,
+# surrogate, private-use, unassigned / noncharacter and line / paragraph
+# separator characters (`_NAME_REFUSED_CATEGORIES`), blanks (`_BLANKS`), a
+# conjoining Hangul vowel or final that does not continue a syllable, and
+# every format or default-ignorable (invisible) character except inside a
+# well-formed sequence (`_name_allows_invisible`):
+# - ZWNJ / ZWJ between two visible non-ASCII characters (Persian and Indic
+#   spelling, emoji ZWJ sequences);
+# - VS15 / VS16 after a base Unicode lists in emoji-variation-sequences.txt
+#   (emoji 15.1, `_EMOJI_VS_BASES`; keycaps included);
+# - a Mongolian free variation selector after a Mongolian letter;
+# - the combining grapheme joiner before a combining mark;
+# - tags spelling a subdivision flag (U+1F3F4, a two-letter region and a
+#   one-to-four letter / digit subdivision in lowercase tags, U+E007F);
+# - the visible "prepended concatenation marks" (`_VISIBLE_FORMAT`).
+# Not allowed: other variation selectors (no ideographic variation sequences:
+# the IVD is too large to embed, and a name does not need glyph variants) and
+# the deprecated Khmer inherent vowels.
+#
+# Why: a NUL is refused by Postgres (`DataError`) and a lone surrogate by the
+# driver's encoder (`UnicodeEncodeError`), each an anonymous 500; and an
+# invisible or reordering character would let a registrant make a stored
+# callback (copied into every audit row's `client_redirect`) or a logged /
+# echoed name read as something it is not. "Assigned" follows the Unicode
+# version of the running Python (3.11 ships 14.0), so a character newer than
+# that is refused as unassigned.
 
 # Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt; stable
 # since Unicode 6.x, the ranges include their unassigned reserves). Python's
@@ -98,6 +123,209 @@ _DEFAULT_IGNORABLE_RANGES = (
 )
 _DI_STARTS = [lo for lo, _ in _DEFAULT_IGNORABLE_RANGES]
 
+# Characters that render as blank space but are neither default-ignorable nor
+# whitespace (the Hangul fillers are default-ignorable already).
+_BLANKS = frozenset({0x2800, 0x13441, 0x13442, 0x16FE4})
+
+# Bases of the emoji variation sequences (emoji-variation-sequences.txt,
+# emoji 15.1: each takes both VS15 and VS16).
+_EMOJI_VS_BASES = (
+    (0x0023, 0x0023),
+    (0x002A, 0x002A),
+    (0x0030, 0x0039),
+    (0x00A9, 0x00A9),
+    (0x00AE, 0x00AE),
+    (0x203C, 0x203C),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x231A, 0x231B),
+    (0x2328, 0x2328),
+    (0x23CF, 0x23CF),
+    (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0),
+    (0x25FB, 0x25FE),
+    (0x2600, 0x2604),
+    (0x260E, 0x260E),
+    (0x2611, 0x2611),
+    (0x2614, 0x2615),
+    (0x2618, 0x2618),
+    (0x261D, 0x261D),
+    (0x2620, 0x2620),
+    (0x2622, 0x2623),
+    (0x2626, 0x2626),
+    (0x262A, 0x262A),
+    (0x262E, 0x262F),
+    (0x2638, 0x263A),
+    (0x2640, 0x2640),
+    (0x2642, 0x2642),
+    (0x2648, 0x2653),
+    (0x265F, 0x2660),
+    (0x2663, 0x2663),
+    (0x2665, 0x2666),
+    (0x2668, 0x2668),
+    (0x267B, 0x267B),
+    (0x267E, 0x267F),
+    (0x2692, 0x2697),
+    (0x2699, 0x2699),
+    (0x269B, 0x269C),
+    (0x26A0, 0x26A1),
+    (0x26A7, 0x26A7),
+    (0x26AA, 0x26AB),
+    (0x26B0, 0x26B1),
+    (0x26BD, 0x26BE),
+    (0x26C4, 0x26C5),
+    (0x26C8, 0x26C8),
+    (0x26CE, 0x26CF),
+    (0x26D1, 0x26D1),
+    (0x26D3, 0x26D4),
+    (0x26E9, 0x26EA),
+    (0x26F0, 0x26F5),
+    (0x26F7, 0x26FA),
+    (0x26FD, 0x26FD),
+    (0x2702, 0x2702),
+    (0x2705, 0x2705),
+    (0x2708, 0x270D),
+    (0x270F, 0x270F),
+    (0x2712, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271D, 0x271D),
+    (0x2721, 0x2721),
+    (0x2728, 0x2728),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2763, 0x2764),
+    (0x2795, 0x2797),
+    (0x27A1, 0x27A1),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1F004, 0x1F004),
+    (0x1F170, 0x1F171),
+    (0x1F17E, 0x1F17F),
+    (0x1F202, 0x1F202),
+    (0x1F21A, 0x1F21A),
+    (0x1F22F, 0x1F22F),
+    (0x1F237, 0x1F237),
+    (0x1F30D, 0x1F30F),
+    (0x1F315, 0x1F315),
+    (0x1F31C, 0x1F31C),
+    (0x1F321, 0x1F321),
+    (0x1F324, 0x1F32C),
+    (0x1F336, 0x1F336),
+    (0x1F378, 0x1F378),
+    (0x1F37D, 0x1F37D),
+    (0x1F393, 0x1F393),
+    (0x1F396, 0x1F397),
+    (0x1F399, 0x1F39B),
+    (0x1F39E, 0x1F39F),
+    (0x1F3A7, 0x1F3A7),
+    (0x1F3AC, 0x1F3AE),
+    (0x1F3C2, 0x1F3C2),
+    (0x1F3C4, 0x1F3C4),
+    (0x1F3C6, 0x1F3C6),
+    (0x1F3CA, 0x1F3CE),
+    (0x1F3D4, 0x1F3E0),
+    (0x1F3ED, 0x1F3ED),
+    (0x1F3F3, 0x1F3F3),
+    (0x1F3F5, 0x1F3F5),
+    (0x1F3F7, 0x1F3F7),
+    (0x1F408, 0x1F408),
+    (0x1F415, 0x1F415),
+    (0x1F41F, 0x1F41F),
+    (0x1F426, 0x1F426),
+    (0x1F43F, 0x1F43F),
+    (0x1F441, 0x1F442),
+    (0x1F446, 0x1F449),
+    (0x1F44D, 0x1F44E),
+    (0x1F453, 0x1F453),
+    (0x1F46A, 0x1F46A),
+    (0x1F47D, 0x1F47D),
+    (0x1F4A3, 0x1F4A3),
+    (0x1F4B0, 0x1F4B0),
+    (0x1F4B3, 0x1F4B3),
+    (0x1F4BB, 0x1F4BB),
+    (0x1F4BF, 0x1F4BF),
+    (0x1F4CB, 0x1F4CB),
+    (0x1F4DA, 0x1F4DA),
+    (0x1F4DF, 0x1F4DF),
+    (0x1F4E4, 0x1F4E6),
+    (0x1F4EA, 0x1F4ED),
+    (0x1F4F7, 0x1F4F7),
+    (0x1F4F9, 0x1F4FB),
+    (0x1F4FD, 0x1F4FD),
+    (0x1F508, 0x1F508),
+    (0x1F50D, 0x1F50D),
+    (0x1F512, 0x1F513),
+    (0x1F549, 0x1F54A),
+    (0x1F550, 0x1F567),
+    (0x1F56F, 0x1F570),
+    (0x1F573, 0x1F579),
+    (0x1F587, 0x1F587),
+    (0x1F58A, 0x1F58D),
+    (0x1F590, 0x1F590),
+    (0x1F5A5, 0x1F5A5),
+    (0x1F5A8, 0x1F5A8),
+    (0x1F5B1, 0x1F5B2),
+    (0x1F5BC, 0x1F5BC),
+    (0x1F5C2, 0x1F5C4),
+    (0x1F5D1, 0x1F5D3),
+    (0x1F5DC, 0x1F5DE),
+    (0x1F5E1, 0x1F5E1),
+    (0x1F5E3, 0x1F5E3),
+    (0x1F5E8, 0x1F5E8),
+    (0x1F5EF, 0x1F5EF),
+    (0x1F5F3, 0x1F5F3),
+    (0x1F5FA, 0x1F5FA),
+    (0x1F610, 0x1F610),
+    (0x1F687, 0x1F687),
+    (0x1F68D, 0x1F68D),
+    (0x1F691, 0x1F691),
+    (0x1F694, 0x1F694),
+    (0x1F698, 0x1F698),
+    (0x1F6AD, 0x1F6AD),
+    (0x1F6B2, 0x1F6B2),
+    (0x1F6B9, 0x1F6BA),
+    (0x1F6BC, 0x1F6BC),
+    (0x1F6CB, 0x1F6CB),
+    (0x1F6CD, 0x1F6CF),
+    (0x1F6E0, 0x1F6E5),
+    (0x1F6E9, 0x1F6E9),
+    (0x1F6F0, 0x1F6F0),
+    (0x1F6F3, 0x1F6F3),
+)
+
+# Format characters that are visible: Prepended_Concatenation_Mark.
+_VISIBLE_FORMAT = (
+    (0x0600, 0x0605),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+)
+
 # Conjoining Hangul jamo. In a name they are ordinary (decomposed, NFD,
 # Korean); a vowel or final standing without its leading consonant renders
 # as blank or as nothing, so only those orphans are refused there.
@@ -106,20 +334,13 @@ _JUNGSEONG = ((0x1161, 0x11A7), (0xD7B0, 0xD7C6))
 _JONGSEONG = ((0x11A8, 0x11FF), (0xD7CB, 0xD7FB))
 _CONJOINING_JAMO = ((0x1100, 0x11FF), (0xA960, 0xA97F), (0xD7B0, 0xD7FF))
 
-_ZWNJ, _ZWJ = 0x200C, 0x200D
+_MONGOLIAN_LETTERS = ((0x1820, 0x1878), (0x1880, 0x18AA))
+_MONGOLIAN_FVS = ((0x180B, 0x180D), (0x180F, 0x180F))
+_ZWNJ, _ZWJ, _CGJ = 0x200C, 0x200D, 0x034F
 _VS15, _VS16 = 0xFE0E, 0xFE0F
-_KEYCAP = 0x20E3
 _BLACK_FLAG, _CANCEL_TAG = 0x1F3F4, 0xE007F
-_TAGS = ((0xE0020, 0xE007E),)
-_IDEOGRAPHIC_VS = ((0xE0100, 0xE01EF),)
-_CJK_IDEOGRAPHS = (
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-    (0x20000, 0x3FFFF),
-)
-_INTERLINEAR_ANNOTATION = ((0xFFF9, 0xFFFB),)
-_ALWAYS_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+_TAG_LETTERS, _TAG_DIGITS = ((0xE0061, 0xE007A),), ((0xE0030, 0xE0039),)
+_NAME_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 
 def _in(cp: int, ranges: tuple[tuple[int, int], ...]) -> bool:
@@ -132,52 +353,74 @@ def _is_default_ignorable(cp: int) -> bool:
     return i >= 0 and cp <= _DEFAULT_IGNORABLE_RANGES[i][1]
 
 
+def _is_invisible(c: str) -> bool:
+    """A format or default-ignorable character (not a visible format mark)."""
+    cp = ord(c)
+    if _in(cp, _VISIBLE_FORMAT):
+        return False
+    return unicodedata.category(c) == "Cf" or _is_default_ignorable(cp)
+
+
 def _is_visible_neighbour(c: str | None) -> bool:
-    """A character a joiner may sit next to in ordinary text: present, not
-    ASCII (no Latin-script word needs a joiner), not whitespace, and not
-    itself invisible (VS16, which ends an emoji presentation, excepted)."""
+    """A character a joiner may sit between: assigned, visible, non-ASCII
+    (no Latin-script word needs a joiner), not whitespace; VS16, which ends
+    an emoji presentation, counts as part of the visible emoji before it."""
     if c is None or c.isascii() or c.isspace():
         return False
-    return not _is_default_ignorable(ord(c)) or ord(c) == _VS16
+    if ord(c) == _VS16:
+        return True
+    return unicodedata.category(c) not in _NAME_REFUSED_CATEGORIES and not (
+        _is_invisible(c)
+    )
 
 
-def _name_allows_ignorable(text: str, i: int) -> bool:  # noqa: PLR0911 — one return per allowance
-    """Whether the default-ignorable character at `text[i]` is part of a
-    visible sequence ordinary text needs, rather than an invisible insert.
+def _flag_tags_well_formed(text: str, i: int) -> bool:
+    """`text[i]` is a tag inside U+1F3F4, a lowercase two-letter region and a
+    one-to-four letter / digit subdivision, U+E007F (UTS #51 tag sequence)."""
+    j = i
+    while (
+        j > 0
+        and ord(text[j - 1]) != _BLACK_FLAG
+        and _in(ord(text[j - 1]), _TAG_LETTERS + _TAG_DIGITS)
+    ):
+        j -= 1
+    if j == 0 or ord(text[j - 1]) != _BLACK_FLAG:
+        return False
+    k = j
+    while k < len(text) and _in(ord(text[k]), _TAG_LETTERS + _TAG_DIGITS):
+        k += 1
+    spec = [ord(c) for c in text[j:k]]
+    return (
+        k < len(text)
+        and ord(text[k]) == _CANCEL_TAG
+        and j <= i <= k
+        and 3 <= len(spec) <= 6  # noqa: PLR2004 — region (2) + subdivision (1-4)
+        and all(_in(cp, _TAG_LETTERS) for cp in spec[:2])
+    )
 
-    Allowed in a client name only:
-    - the zero-width non-joiner / joiner between two visible non-ASCII
-      characters (Persian and Indic spelling, emoji ZWJ sequences);
-    - VS15 / VS16 after a symbol (emoji presentation) or after a keycap base
-      (`0-9`, `#`, `*`) that is followed by U+20E3;
-    - an ideographic variation selector after a CJK ideograph;
-    - tag characters in a subdivision-flag sequence: U+1F3F4, tags, U+E007F.
-    """
+
+def _name_allows_invisible(text: str, i: int) -> bool:  # noqa: PLR0911 — one return per allowed sequence
+    """Whether the invisible character at `text[i]` is part of a well-formed
+    sequence (the list is in the comment heading this section)."""
     cp = ord(text[i])
     before = text[i - 1] if i > 0 else None
     after = text[i + 1] if i + 1 < len(text) else None
     if cp in (_ZWNJ, _ZWJ):
         return _is_visible_neighbour(before) and _is_visible_neighbour(after)
     if cp in (_VS15, _VS16):
-        if before is None:
-            return False
-        if before in "0123456789#*":
-            return after is not None and ord(after) == _KEYCAP
-        return unicodedata.category(before) == "So"
-    if _in(cp, _IDEOGRAPHIC_VS):
-        return before is not None and _in(ord(before), _CJK_IDEOGRAPHS)
-    if _in(cp, _TAGS) or cp == _CANCEL_TAG:
-        # Walk back over the tag run to its base: it must be the black flag,
-        # and the run must end with the cancel tag.
-        j = i
-        while j > 0 and _in(ord(text[j - 1]), _TAGS):
-            j -= 1
-        if j == 0 or ord(text[j - 1]) != _BLACK_FLAG:
-            return False
-        k = i
-        while k < len(text) and _in(ord(text[k]), _TAGS):
-            k += 1
-        return k < len(text) and ord(text[k]) == _CANCEL_TAG and k > j
+        return before is not None and _in(ord(before), _EMOJI_VS_BASES)
+    if _in(cp, _MONGOLIAN_FVS):
+        return before is not None and _in(ord(before), _MONGOLIAN_LETTERS)
+    if cp == _CGJ:
+        return (
+            _is_visible_neighbour(before)
+            and after is not None
+            and unicodedata.category(after).startswith("M")
+        )
+    if _in(cp, _TAG_LETTERS + _TAG_DIGITS) or cp == _CANCEL_TAG:
+        if cp == _CANCEL_TAG:
+            return i > 0 and _flag_tags_well_formed(text, i - 1)
+        return _flag_tags_well_formed(text, i)
     return False
 
 
@@ -195,41 +438,28 @@ def _is_orphan_jamo(text: str, i: int) -> bool:
 
 
 def _has_unacceptable_character(value: str) -> bool:
-    """True if `value` holds a character no redirect URI may carry.
-
-    Strict: any control, surrogate, separator or format (`Cf`) character,
-    any default-ignorable one, and any conjoining Hangul jamo. Nothing
-    legitimate in a callback needs one.
-    """
-    for c in value:
-        cp = ord(c)
-        if (
-            unicodedata.category(c) in _ALWAYS_REFUSED_CATEGORIES
-            or unicodedata.category(c) == "Cf"
-            or _is_default_ignorable(cp)
-            or _in(cp, _CONJOINING_JAMO)
-        ):
-            return True
-    return False
+    """True if `value` holds a character no redirect URI may carry (the strict
+    rule in the comment heading this section)."""
+    return any(
+        not c.isprintable()
+        or _is_default_ignorable(ord(c))
+        or ord(c) in _BLANKS
+        or _in(ord(c), _CONJOINING_JAMO)
+        for c in value
+    )
 
 
 def _has_unacceptable_name_character(value: str) -> bool:
-    """True if `value` holds a character no client name may carry.
-
-    Free text, so narrower than for a URI: control, surrogate and separator
-    characters; default-ignorable (invisible) ones except where
-    `_name_allows_ignorable` finds them part of a visible sequence; the
-    interlinear annotation controls; and orphaned conjoining Hangul jamo.
-    Ordinary letters, combining accents, emoji and their sequences pass. The
-    name is never stored, but it is echoed in the 201 and logged.
-    """
+    """True if `value` holds a character no client name may carry (the
+    free-text rule in the comment heading this section). The name is never
+    stored, but it is echoed in the 201 and logged."""
     for i, c in enumerate(value):
-        cp = ord(c)
-        if unicodedata.category(c) in _ALWAYS_REFUSED_CATEGORIES:
-            return True
-        if _is_default_ignorable(cp) and not _name_allows_ignorable(value, i):
-            return True
-        if _in(cp, _INTERLINEAR_ANNOTATION) or _is_orphan_jamo(value, i):
+        if (
+            unicodedata.category(c) in _NAME_REFUSED_CATEGORIES
+            or ord(c) in _BLANKS
+            or (_is_invisible(c) and not _name_allows_invisible(value, i))
+            or _is_orphan_jamo(value, i)
+        ):
             return True
     return False
 
@@ -496,8 +726,8 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         return _error(
             "invalid_client_metadata",
             f"client_name must be a string of at most {_MAX_CLIENT_NAME} "
-            "characters, without control, separator, surrogate, "
-            "bidirectional-control or invisible characters",
+            "characters of assigned, visible text (no control, separator, "
+            "private-use or stray invisible characters)",
         )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).

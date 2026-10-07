@@ -708,8 +708,9 @@ _URI_REFUSAL = (
     "other invisible characters"
 )
 _NAME_REFUSAL = (
-    "client_name must be a string of at most 200 characters, without control, "
-    "separator, surrogate, bidirectional-control or invisible characters"
+    "client_name must be a string of at most 200 characters of assigned, "
+    "visible text (no control, separator, private-use or stray invisible "
+    "characters)"
 )
 
 
@@ -724,13 +725,17 @@ class TestUnacceptableCharactersAreA400:
       anonymous 500 on every retry, before the per-IP `register` counter.
     - Lone surrogates (`Cs`, a legal JSON escape such as `\\ud800`): the
       driver cannot encode them as UTF-8 (`UnicodeEncodeError`), the same 500.
-    - Format characters (`Cf`: bidi overrides, zero-width space, BOM, ...)
-      and line / paragraph separators (`Zl`, `Zp`): storable, but in a
-      callback stored on the Application (copied into every audit row's
-      `client_redirect`) or in a logged client name they let a registrant
-      make the text read as something else. A redirect URI refuses every
-      `Cf`; a client name only the display-altering ones (joiners, tags and
-      variation selectors are ordinary text there).
+    - Invisible, blank, unassigned and private-use characters, and line /
+      paragraph separators: storable, but in a callback stored on the
+      Application (copied into every audit row's `client_redirect`) or in a
+      logged client name they let a registrant make the text read as
+      something else. The rule is documented once, in the comment heading
+      the character section of `views/registration.py`: a redirect URI must
+      be printable and visible; a name may use invisible characters only
+      inside well-formed sequences (joiners in words and emoji ZWJ
+      sequences, Unicode's emoji variation sequences, Mongolian variation
+      selectors, the combining grapheme joiner before a mark, subdivision
+      flags).
 
     Refused even beside a clean URI, and the error description is asserted so
     that a regression to "drop it from the loopback subset" (which answers a
@@ -752,6 +757,10 @@ class TestUnacceptableCharactersAreA400:
             "\ufeff",  # BOM / zero-width no-break space (Cf)
             "\u2028",  # line separator (Zl)
             "\u2029",  # paragraph separator (Zp)
+            chr(0x2800),  # braille pattern blank
+            chr(0xFDD0),  # noncharacter
+            chr(0xE000),  # private use
+            chr(0x00A0),  # no-break space
         ],
     )
     @pytest.mark.parametrize(
@@ -799,6 +808,12 @@ class TestUnacceptableCharactersAreA400:
             chr(0x1BCA0),  # shorthand format letter overlap (Cf)
             chr(0xFFF9),  # interlinear annotation anchor
             chr(0x1161),  # Hangul vowel jamo with no leading consonant
+            chr(0x17B4),  # Khmer inherent vowel (deprecated, invisible)
+            chr(0x2800),  # braille pattern blank
+            chr(0xFDD0),  # noncharacter
+            chr(0x2FFFE),  # noncharacter (plane 2)
+            chr(0xE000),  # private use
+            chr(0x0378),  # unassigned
         ],
     )
     def test_client_name(self, client, char):
@@ -840,8 +855,17 @@ class TestUnacceptableCharactersAreA400:
             "Room 1" + chr(0xFE0F) + "\u20e3",
             # Decomposed (NFD) Korean "han": conjoining jamo in sequence.
             "\u1112\u1161\u11ab",
-            # Ideographic variation sequence.
-            "\u845b" + chr(0xE0100),
+            # Emoji variation sequences on non-symbol bases.
+            "Swap \u2194" + chr(0xFE0F),  # left-right arrow (Sm)
+            "Wow\u203c" + chr(0xFE0F),  # double exclamation (Po)
+            "\u2139" + chr(0xFE0F) + " Info",  # information source (Ll)
+            "\u3030" + chr(0xFE0F),  # wavy dash (Pd)
+            # Mongolian with a free variation selector.
+            "\u1820" + chr(0x180B) + "\u1821",
+            # Combining grapheme joiner before a combining mark.
+            "a\u00e9" + chr(0x034F) + "\u0301",
+            # Arabic number sign: a visible format character.
+            "\u0600\u0661\u0662",
             # Combining accents (decomposed e-acute).
             "Cafe\u0301",
         ],
@@ -855,7 +879,13 @@ class TestUnacceptableCharactersAreA400:
             "skin-tone-zwj",
             "keycap",
             "nfd-korean",
-            "ideographic-vs",
+            "vs16-arrow",
+            "vs16-exclamation",
+            "vs16-info",
+            "vs16-wavy-dash",
+            "mongolian-fvs",
+            "cgj-before-mark",
+            "arabic-number-sign",
             "combining-accent",
         ],
     )
@@ -869,6 +899,35 @@ class TestUnacceptableCharactersAreA400:
         )
         assert response.status_code == HTTPStatus.CREATED
         assert response.json()["client_name"] == name
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Star \u2605" + chr(0xFE0F),  # VS16 on a base with no variation sequence
+            "\u845b" + chr(0xE0100),  # ideographic variation selector
+            "X\U0001f3f4" + chr(0xE0020) + chr(0xE007F),  # tag space, not a flag
+            "\U0001f3f4" + chr(0xE0067) + chr(0xE0062) + chr(0xE007F),  # region only
+            "\U0001f3f4" + "".join(chr(0xE0000 + ord(c)) for c in "gbsct"),  # no cancel
+            "Trusted" + chr(0x034F) + "Client",  # CGJ not before a mark
+            "\u1780" + chr(0x17B4),  # deprecated Khmer inherent vowel
+        ],
+        ids=[
+            "undefined-vs16",
+            "ivs",
+            "tag-space-flag",
+            "region-only-flag",
+            "unterminated-flag",
+            "cgj-in-word",
+            "khmer-inherent-vowel",
+        ],
+    )
+    def test_invisible_outside_a_well_formed_sequence_is_refused(self, client, name):
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/callback"], "client_name": name},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error_description"] == _NAME_REFUSAL
 
     def test_ordinary_non_ascii_uri_is_not_refused(self, client):
         uri = "http://localhost:8787/callbäck"

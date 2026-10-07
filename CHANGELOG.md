@@ -457,25 +457,30 @@ announce themselves.
   dropped silently), a `client_name` that is not a string (absent, `null` or
   empty still gets the default name; a falsy non-string such as `0` or `[]`
   used to get it silently), and the characters below.
-  A requested `redirect_uris` entry is refused (`invalid_redirect_uri`) if it
-  holds a control (Unicode `Cc`), surrogate (`Cs`), format (`Cf`), line /
-  paragraph separator (`Zl`, `Zp`) or any Default_Ignorable_Code_Point
-  (invisible) character, or a conjoining Hangul jamo. A `client_name`
-  (`invalid_client_metadata`) is held to a narrower rule fit for free text:
-  control, surrogate and separator characters, every default-ignorable
-  character (bidi marks, embeddings, overrides and isolates such as U+202E;
-  zero-width space, word joiner, BOM, soft hyphen, combining grapheme joiner,
-  the blank-rendering Hangul fillers, ...) except where it is part of a
-  visible sequence (a zero-width non-joiner or joiner between two visible
-  non-ASCII characters, as Persian, Indic scripts and emoji ZWJ sequences
-  need; VS15 / VS16 after a symbol or in a keycap; an ideographic variation
-  selector after a CJK ideograph; tag characters in a subdivision-flag
-  sequence), the interlinear annotation controls, and a conjoining Hangul
-  vowel or final that does not continue a syllable. Nothing refused is
-  stored, echoed or logged: a callback is copied into every audit row's
-  `client_redirect`, and an invisible or reordering character there would
-  let a registrant make it read as something else. The soft hyphen is
-  refused as invisible (it shows only at a line break).
+  The character rule (documented once, at the top of the character section
+  of `views/registration.py`): a requested `redirect_uris` entry
+  (`invalid_redirect_uri`) must be printable and visible: no control, format,
+  surrogate, private-use, unassigned or noncharacter, separator,
+  default-ignorable (invisible) or blank character (e.g. U+2800), and no
+  conjoining Hangul jamo. A `client_name` (`invalid_client_metadata`) must be
+  assigned, visible text: no control, surrogate, private-use, unassigned or
+  noncharacter, line / paragraph separator or blank character, no Hangul
+  vowel or final that does not continue a syllable, and no format or
+  default-ignorable (invisible) character except inside a well-formed
+  sequence: a zero-width non-joiner or joiner between two visible non-ASCII
+  characters (Persian and Indic spelling, emoji ZWJ sequences); VS15 / VS16
+  after a base Unicode's emoji-variation-sequences.txt lists (so `↔️`, `‼️`,
+  `ℹ️` and keycaps work, `★` plus VS16 does not); a Mongolian free variation
+  selector after a Mongolian letter; the combining grapheme joiner before a
+  combining mark; a subdivision flag (U+1F3F4, a lowercase two-letter region
+  and a one-to-four letter / digit subdivision in tags, U+E007F). Visible
+  format marks such as the Arabic number sign are ordinary text. Ideographic
+  variation selectors and the deprecated Khmer inherent vowels are refused,
+  as is the soft hyphen (invisible except at a line break). "Assigned"
+  follows the running Python's Unicode version (Python 3.11 ships Unicode
+  14.0). Nothing refused is stored, echoed or logged: a callback is copied
+  into every audit row's `client_redirect`, and an invisible or reordering
+  character there would let a registrant make it read as something else.
   Ordinary non-ASCII text is still accepted. A seeded fuzz of the endpoint
   (malformed hosts, ports, encodings, odd characters) pins that it answers
   only 201 or 400. An unparseable body is `invalid_client_metadata`, and
