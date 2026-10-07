@@ -109,8 +109,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     and `INTERVAL '1' "day"` one second, each with an alias), a seconds
     field keeps its precision (`SECOND(2)`, `DAY TO SECOND(3)`), and a field
     word or `TO` after a complete qualifier (`INTERVAL '1' DAY HOUR`, `...
-    DAY TO`) is a parse error, as in Postgres (it ran with an alias) — and `INTERVAL(3) '1.23456'` (was the sum
-    `INTERVAL '3' + INTERVAL '1.23456'`); a subscripted column named
+    DAY TO`) is a parse error, as in Postgres (it ran with an alias); any
+    other word after the string is an alias, as to Postgres (`INTERVAL '1'
+    WEEK` is 1 second named `week`; sqlglot read `WEEK`, `DAYS`, `q`,
+    `MON`, `hr`, ... as units, 7 days), and the string keeps its spelling
+    (`'1 week'`, not `'1 WEEK'`) — and `INTERVAL(3) '1.23456'` (was the sum
+    `INTERVAL '3' + INTERVAL '1.23456'`); any other `INTERVAL(…)`
+    (`INTERVAL(3.0) '1.2'`, `INTERVAL(-1) '1 day'`, `INTERVAL(1 + 2) '…'`,
+    `INTERVAL(3)` alone) is a parse error, as in Postgres (it ran as a sum
+    or with parts dropped); a subscripted column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
     `json_object(...)` whenever its arguments parse as plain expressions
@@ -122,15 +129,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     errors), `!! q` (tsquery negation, refused before) and `! x` (Postgres's
     error; sqlglot ran it as `NOT x`), `overlaps(a, b, c, d)`, and
     `qualify` as a name everywhere (select alias, `GROUP BY`). `LIMIT
-    '<integer>'` (also in parentheses, `LIMIT ('5000000000')`) is read as
-    the bigint it is to Postgres. An array constructor subscripted without
+    '<integer>'` (also in parentheses, `LIMIT ('5000000000')`; surrounding
+    ASCII whitespace only, as Postgres's input) is read as the bigint it is
+    to Postgres. An array constructor subscripted without
     parentheses (`ARRAY[1, 2][1]`, a syntax error to Postgres, which
     sqlglot parenthesised; `ARRAY(SELECT …)[1]`, which it turned into
     `ARRAY[1]`) and `INTERVAL(p) '<string>' <field>` are `parse_error`. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    877 ordinary analytical queries (over data with NULLs and mixed case)
+    879 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
@@ -145,9 +153,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     list. All are now refused with the deny list's reason
     (`disallowed_function` / `disallowed_construct`); `t.to_jsonb` /
     `t.row_to_json`, `t.concat`, `t.quote_literal`, `t.record_out`, ... (the
-    whole row) as `select_star`. Only actual calls: `t.f` / `(t.*).f` where
-    the FROM item `t` has a column `f` stays a column, whatever it is
-    named —
+    whole row) as `select_star`. Only actual calls: `t.f` (and, with
+    `BAN_SELECT_STAR` off, `(t.*).f` — under the default ban any `t.*` is
+    refused as `select_star`) where the FROM item `t` has a column `f`
+    stays a column, whatever it is named —
     a derived table's or CTE's output column, an alias column list, a
     whitelisted table's column (from its model: the columns of its own
     table — a multi-table-inheritance child's parent fields are not; a
@@ -155,9 +164,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `(tableoid).pg_relation_filepath` stays a call), a schema-qualified type
     name (`'0/0'::pg_catalog.pg_lsn`) — as do names of denied functions
     attribute notation cannot call (`t.version`, `t.user`, `t.has_access`).
-    So does `(t).f` on the same terms, provided no FROM item in scope has,
-    or may have, a column named `t` (a column `t` wins over the row and
-    `(t).f` is then `f(t)`); a FROM item whose column names are not all
+    So does `(t).f` on the same terms for a derived table, a VALUES list or
+    an aliased subquery `t` (a base-table or CTE alias `t` is still refused
+    there, as `select_star`, by the older bare-row check), provided no FROM
+    item in scope has, or may have, a column named `t` (a column `t` wins
+    over the row and `(t).f` is then `f(t)`); a FROM item whose column names are not all
     known — a function, a `SELECT *`, an unaliased expression Postgres
     names after its type (`'x'::text` is the column `text`), a whitelisted
     table without model columns — leaves `(t).f` a call. Output names are
@@ -165,9 +176,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     VALUES list's `column1`, …). Anything not provably a column counts as a
     call, including `t.f` when `t` is also a column name in scope — a
     deliberate over-refusal: Postgres reads the FROM item there. Quoted
-    names compare case-sensitively, as Postgres compares them.
+    names compare case-sensitively, as Postgres compares them, and a quoted
+    column named like a parenthesis-less built-in (`"user"`,
+    `"current_user"`) is the column, not the built-in (it was refused as
+    `disallowed_function`).
   - Table names are matched as Postgres matches them (review round 9): a
-    quoted name exactly, an unquoted one folded to lowercase — against the
+    quoted name exactly, an unquoted one folded to lowercase (ASCII `A`–`Z`
+    only, as Postgres folds in a UTF-8 database) — against the
     whitelist (each entry is a model's exact `db_table`) and against CTE
     names. A quoted CTE `"Shipments"` no longer stands in for the table
     `shipments` (which let an off-whitelist table through and lent the
