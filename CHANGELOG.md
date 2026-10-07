@@ -119,12 +119,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     list. All are now refused with the deny list's reason
     (`disallowed_function` / `disallowed_construct`); `t.to_jsonb` /
     `t.row_to_json`, `t.concat`, `t.quote_literal`, `t.record_out`, ... (the
-    whole row) as `select_star`. Only actual calls: a qualified name that
-    is a column of its FROM item stays a column, whatever it is named —
+    whole row) as `select_star`. Only actual calls: `t.f` / `(t.*).f` where
+    the FROM item `t` has a column `f` stays a column, whatever it is
+    named —
     a derived table's or CTE's output column, an alias column list, a
     whitelisted table's column (from its model), a schema-qualified type
     name (`'0/0'::pg_catalog.pg_lsn`) — as do names of denied functions
     attribute notation cannot call (`t.version`, `t.user`, `t.has_access`).
+    Anything not provably a column counts as a call: a bare parenthesised
+    name `(x).f` (a column `x` of any FROM item wins over the row, so it is
+    `f(x)`), `t.f` when `t` is also a column name in scope. Quoted names
+    compare case-sensitively, as Postgres compares them.
   - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
     `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
