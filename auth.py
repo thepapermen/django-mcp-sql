@@ -12,7 +12,8 @@ contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalD
 Every **resolved-user** rejection in `authenticate` (the defense-in-depth
 gates in `_evaluate_gates`, run once `super().authenticate(...)` returns a
 user/token pair, plus `GATE_ERROR` when one of them raises) writes one
-`MCPAuthRejectionLog` row via `_audit_rejection`.
+`MCPAuthRejectionLog` row via `_audit_rejection`. A token with no user is
+refused before the gates and logged at WARNING (the table needs a user).
 Anonymous / bad-token traffic is deliberately NOT audited at this
 layer — that high-volume noise floor goes through django-axes-on-Redis
 (Phase 4), not the default DB, to avoid write amplification and audit-
@@ -265,6 +266,22 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             return None
         user, token = result
 
+        # A token with no user cannot be put through the per-user gates, and
+        # DOT allows one (`AccessToken.user` is nullable: a `client_credentials`
+        # token from a second OAuth use case on the same install, or a row made
+        # in a shell). Refuse it before any gate dereferences `user`. The
+        # rejection table is keyed to a real user, so the record is a WARNING
+        # (Sentry-visible) naming the token and its client.
+        if user is None:
+            application = getattr(token, "application", None)
+            logger.warning(
+                "MCP token pk=%s (application %r) has no user; refused",
+                token.pk,
+                getattr(application, "name", None),
+            )
+            msg = "Token is not bound to a user."
+            raise exceptions.AuthenticationFailed(msg)
+
         # Defense-in-depth: re-check every gate the issuance flow checked.
         # A revoked permission, removed MFA device, or deactivated account
         # invalidates outstanding tokens immediately (without waiting for
@@ -320,8 +337,10 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # `AccessToken.objects.create()` in a shell, a second OAuth use case
         # ever being added) would bypass that gate. Re-verify on every
         # request — `mcp:sql` scope is necessary but not sufficient; the
-        # token MUST also be tied to an MCP-purpose Application.
-        if not is_mcp_application_name(token.application.name):
+        # token MUST also be tied to an MCP-purpose Application. DOT's FK to
+        # `Application` is nullable, so a token with none is refused here too.
+        application = token.application
+        if application is None or not is_mcp_application_name(application.name):
             return _Denial(
                 AuthRejectionReason.BAD_APPLICATION,
                 "Token was not issued by an mcp-sql Application.",

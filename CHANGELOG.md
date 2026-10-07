@@ -394,6 +394,14 @@ announce themselves.
   migration) and a 401, with the traceback logged. Likewise a cache fault in
   the once-per-hour "ambiguous profile" WARNING dedup no longer turns that
   denial into a 500; the WARNING is emitted instead. Also present in 0.1.0b5.
+- **Tokens with no user or no Application reached gates that assumed them.**
+  DOT allows both to be `NULL` (a `client_credentials` token from another
+  OAuth use case on the same install, a shell-minted row). A userless token on
+  an MCP Application was an unaudited 500; on any other Application a 401
+  whose audit insert failed on the non-null `user` column. A userless token is
+  now refused with a 401 and a WARNING naming the token and its client (the
+  rejection table is keyed to a user); a token with no Application is an
+  audited `bad_application` denial. Also present in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

@@ -512,6 +512,80 @@ class TestGateFailuresAreAuditedDenials:
         assert "MCP profile resolution ambiguous" in caplog.text
 
 
+@pytest.mark.django_db
+class TestTokensMissingUserOrApplication:
+    """DOT allows `AccessToken.user` and `.application` to be NULL (e.g. a
+    `client_credentials` token from a second OAuth use case on the same
+    install, or a shell-minted row). Neither may reach a gate that assumes
+    them: a userless token on an MCP app was an unaudited 500
+    (`None.is_active`), and on another app a 401 whose audit insert failed on
+    the non-null `user` FK."""
+
+    def _token(self, *, user, application):
+        import secrets
+
+        from oauth2_provider.models import AccessToken
+
+        return AccessToken.objects.create(
+            user=user,
+            token="t_" + secrets.token_urlsafe(16),
+            application=application,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+
+    @pytest.mark.parametrize("mcp_named_app", [True, False])
+    def test_userless_token_is_a_logged_401(
+        self, client, mcp_app, gate_posture, caplog, mcp_named_app
+    ):
+        import logging
+
+        from mcp_sql.models import MCPAuthRejectionLog
+        from oauth2_provider.models import Application
+
+        application = (
+            mcp_app
+            if mcp_named_app
+            else Application.objects.create(
+                name="some-other-service",
+                client_type=Application.CLIENT_CONFIDENTIAL,
+                authorization_grant_type=Application.GRANT_CLIENT_CREDENTIALS,
+            )
+        )
+        token = self._token(user=None, application=application)
+        with caplog.at_level(logging.WARNING, logger="mcp_sql.auth"):
+            response = client.post(
+                reverse("mcp_sql_endpoint"),
+                data=b"{}",
+                content_type="application/json",
+                HTTP_AUTHORIZATION=f"Bearer {token.token}",
+            )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+        assert response["WWW-Authenticate"].startswith('Bearer realm="api"')
+        # The rejection table is keyed to a real user, so the record is the
+        # WARNING (Sentry-visible), naming the token and its client.
+        assert MCPAuthRejectionLog.objects.count() == 0
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "no user" in r.getMessage() and str(token.pk) in r.getMessage()
+            for r in warnings
+        )
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_applicationless_token_is_an_audited_bad_application(
+        self, mcp_user, gate_posture
+    ):
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        token = self._token(user=mcp_user, application=None)
+        with pytest.raises(AuthenticationFailed, match="mcp-sql Application"):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.BAD_APPLICATION
+        assert row.user_id == mcp_user.pk
+        assert row.application_name == ""
+
+
 @pytest.mark.django_db(transaction=True)
 class TestRejectionAuditSurvivesAtomicRequests:
     """Rejection rows must outlive DRF's rollback under `ATOMIC_REQUESTS`.
