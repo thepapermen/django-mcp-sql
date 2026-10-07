@@ -161,7 +161,9 @@ class MCPAuthorizationView(AuthorizationView):
         # A NUL never names a client and would make Postgres raise.
         if not client_id or "\x00" in client_id:
             return False
-        return get_application_model().objects.filter(client_id=client_id).exists()
+        return bool(
+            get_application_model().objects.filter(client_id=client_id).exists()
+        )
 
     def _is_registered_redirect(self, client_id: str, redirect_uri: Any) -> bool:
         """True iff oauthlib would accept `redirect_uri` for `client_id`.

@@ -510,7 +510,8 @@ def mcp_endpoint(request: HttpRequest) -> HttpResponse:
     """
     if request.method != "POST":
         return HttpResponseNotAllowed(["POST"])
-    return _mcp_transport(request)
+    response: HttpResponse = _mcp_transport(request)
+    return response
 
 
 @api_view(["POST"])
