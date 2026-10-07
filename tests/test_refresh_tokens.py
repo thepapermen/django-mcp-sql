@@ -324,6 +324,56 @@ class TestPasswordChangeEdgeCases:
         assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
         assert not MCPAuthRejectionLog.objects.exists()
 
+    @pytest.mark.parametrize(
+        "write",
+        ["fresh-instance", "after-set-password-save", "outdated-old-hash"],
+    )
+    def test_direct_hash_write_with_update_fields_revokes(
+        self,
+        settings,
+        mcp_user,
+        mcp_access_token,
+        django_capture_on_commit_callbacks,
+        write,
+    ):
+        """`user.password = make_password(new); save(update_fields=
+        ["password"])` (SSO / LDAP sync, imports, scripted resets) is a real
+        change, though shaped like the hash upgrade (review round 3)."""
+        user_model = type(mcp_user)
+        if write == "after-set-password-save":
+            # `_password` now sits on the instance (as None) from an
+            # earlier, ordinary password change.
+            mcp_user.set_password("first-change")
+            mcp_user.save()
+            AccessToken.objects.filter(pk=mcp_access_token.pk).update(user=mcp_user)
+            target = mcp_user
+        elif write == "outdated-old-hash":
+            # The stored hash even needs an upgrade; the write does not go
+            # through `check_password`'s setter, so it is still a change.
+            mcp_user.password = make_password("old", hasher="md5")
+            mcp_user.save()
+            settings.PASSWORD_HASHERS = [
+                "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+                "django.contrib.auth.hashers.MD5PasswordHasher",
+            ]
+            target = user_model._default_manager.get(pk=mcp_user.pk)
+        else:
+            target = user_model._default_manager.get(pk=mcp_user.pk)
+        token = AccessToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(24),
+            application=mcp_access_token.application,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+        with django_capture_on_commit_callbacks(execute=True):
+            target.password = make_password("a-brand-new-password")
+            target.save(update_fields=["password"])
+        assert not AccessToken.objects.filter(pk=token.pk).exists()
+        assert MCPAuthRejectionLog.objects.filter(
+            user=mcp_user, reason=AuthRejectionReason.PASSWORD_CHANGE
+        ).exists()
+
     def test_unusable_password_with_update_fields_revokes(
         self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
     ):

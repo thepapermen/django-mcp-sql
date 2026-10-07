@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING
 
 from django.apps import AppConfig
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import get_hasher
+from django.contrib.auth.hashers import identify_hasher
+from django.contrib.auth.hashers import is_password_usable
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
 from django.db import DatabaseError
@@ -30,6 +33,8 @@ from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from django.contrib.auth.models import AbstractBaseUser
 
 logger = logging.getLogger(__name__)
@@ -162,18 +167,16 @@ def note_password_change(sender, instance, **kwargs):
     access and refresh tokens and pending authorization codes go too (ledger
     F15) — via model signals, with no dependency on a session table, so it
     holds with `SESSION_MODEL=None`. Bulk `QuerySet.update(password=...)`
-    sends no signals and is not seen; revoke tokens explicitly there.
+    and `QuerySet.bulk_update(users, ["password"])` send no signals and are
+    not seen; revoke tokens explicitly there.
 
     Connected without a `sender` and filtered with `isinstance`: Django sends
     `pre_save` / `post_save` with the class that was saved, so a proxy of the
     user model (e.g. an admin registered on one) would slip past
-    `sender=User`. Not a change, and skipped without a lookup:
+    `sender=User`. Not a change:
     - saves whose `update_fields` omit `password` (e.g. `update_last_login`
-      on every login);
-    - Django's login-time hash upgrade — `check_password`'s setter re-hashes
-      the SAME password and saves with `update_fields=["password"]` after
-      clearing `_password`, which a real `set_password` leaves set (an
-      unusable password is never such an upgrade).
+      on every login), skipped without a lookup;
+    - Django's login-time hash upgrade (`_is_hash_upgrade`).
     The flag is reset first on every save, so one from a save that then
     failed cannot leak into a later save of the same instance.
     """
@@ -185,20 +188,45 @@ def note_password_change(sender, instance, **kwargs):
         return
     if update_fields is not None and "password" not in update_fields:
         return
-    if (
-        update_fields is not None
-        and set(update_fields) == {"password"}
-        and getattr(instance, "_password", None) is None
-        and instance.has_usable_password()
-    ):
-        return  # `check_password`'s hash upgrade, not a password change
     old = (
         User._default_manager.filter(pk=instance.pk)
         .values_list("password", flat=True)
         .first()
     )
-    if old is not None and old != instance.password:
-        setattr(instance, _PENDING_REVOCATION_ATTR, True)
+    if old is None or old == instance.password:
+        return
+    if _is_hash_upgrade(instance, old, update_fields):
+        return
+    setattr(instance, _PENDING_REVOCATION_ATTR, True)
+
+
+def _is_hash_upgrade(
+    instance: "AbstractBaseUser", old: str, update_fields: "Iterable[str] | None"
+) -> bool:
+    """True only for the exact save `AbstractBaseUser.check_password` makes
+    when it re-hashes the SAME password: its setter calls `set_password`,
+    resets `_password` to `None` on the instance, and saves with
+    `update_fields=["password"]` — and it does that only because the stored
+    hash's hasher is not the preferred one, or needs new parameters.
+
+    All three are required. A real change written as `user.password =
+    make_password(new); user.save(update_fields=["password"])` (SSO / LDAP
+    sync, imports, a scripted reset) has the same `update_fields`, but no
+    `_password` on the instance, and normally replaces a hash that did not
+    need upgrading — so it revokes."""
+    if update_fields is None or set(update_fields) != {"password"}:
+        return False
+    attrs = vars(instance)
+    if "_password" not in attrs or attrs["_password"] is not None:
+        return False
+    if not (instance.has_usable_password() and is_password_usable(old)):
+        return False
+    try:
+        old_hasher = identify_hasher(old)
+    except ValueError:
+        return False
+    preferred = get_hasher()
+    return old_hasher.algorithm != preferred.algorithm or preferred.must_update(old)
 
 
 @receiver(post_save)
