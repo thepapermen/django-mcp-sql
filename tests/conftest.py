@@ -36,6 +36,12 @@ def _mfa_checker_falsy(_user, types=None):
     return False
 
 
+def _mfa_checker_raises(_user, types=None):
+    """A consumer checker that fails (DB blip, MFA backend outage)."""
+    msg = "simulated MFA backend outage"
+    raise RuntimeError(msg)
+
+
 def _patch_consumer_mfa(monkeypatch):
     """Patch each consumer-declared MFA symbol to a truthy checker.
 

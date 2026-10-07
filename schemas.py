@@ -35,7 +35,8 @@ class AuthRejectionReason(StrEnum):
     `AXES_COOLOFF_TIME=1h`, `AXES_CACHE='default'`). This table records
     **resolved-user access-ending events** — every row names a real user
     and is one of: a per-request gate denial (revoked perm, removed MFA,
-    dead session, rogue-Application token, scope drift) or a logout-driven
+    dead session, rogue-Application token, scope drift, or a gate that
+    raised: `GATE_ERROR`) or a logout-driven
     token revocation (`SESSION_LOGOUT`). Both answer "when/why did this
     user lose MCP access?"; both are keyed to a real user, so anonymous
     probing stays out of the enum and the table.
@@ -55,6 +56,11 @@ class AuthRejectionReason(StrEnum):
     # once at ASSIGNMENT time (`signals.py`), not per request.
     AMBIGUOUS_PROFILE = "ambiguous_profile"
     NO_SESSION = "no_session"
+    # A per-request gate RAISED instead of deciding (a consumer MFA checker
+    # failing, a DB blip in profile resolution, a bad SESSION_MODEL). Denied
+    # fail-closed; the row records that access could not be verified, the
+    # traceback goes to the log (`auth.MCPOAuth2Authentication.authenticate`).
+    GATE_ERROR = "gate_error"
     # Not a denial: the `user_logged_out` signal's revocation of the user's
     # MCP access tokens and pending authorization codes. The row records the
     # attempt; its `error` text carries the outcome — the counts revoked, and

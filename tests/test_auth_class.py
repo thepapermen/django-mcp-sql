@@ -430,6 +430,88 @@ class TestAuthRejectionAuditLog:
         assert MCPAuthRejectionLog.objects.count() == 0
 
 
+@pytest.mark.django_db
+class TestGateFailuresAreAuditedDenials:
+    """A gate that raises is a denial: 401 plus a `gate_error` row, never a
+    500 with no trace. Fails closed either way, but the unaudited 500 left
+    no record of who was refused and doubled as an oracle (500 != 401)."""
+
+    def _assert_gate_error(self, token, user):
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        with pytest.raises(AuthenticationFailed, match="could not be verified"):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.GATE_ERROR
+        assert row.user_id == user.pk
+
+    def test_raising_mfa_checker(
+        self, mcp_user, mcp_access_token, gate_posture, settings, caplog
+    ):
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "MFA_CHECKER": "mcp_sql.tests.conftest._mfa_checker_raises",
+        }
+        self._assert_gate_error(mcp_access_token, mcp_user)
+        assert "simulated MFA backend outage" in caplog.text
+
+    def test_raising_profile_resolution(
+        self, mcp_user, mcp_access_token, gate_posture, monkeypatch
+    ):
+        from django.db import OperationalError
+
+        def boom(user):
+            msg = "simulated default-DB outage"
+            raise OperationalError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.mcp_sql_settings.resolve_profile", boom)
+        self._assert_gate_error(mcp_access_token, mcp_user)
+
+    def test_raising_session_lookup(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, monkeypatch
+    ):
+        def boom(name):
+            msg = f"No installed app with label {name!r}."
+            raise LookupError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.apps.get_model", boom)
+        self._assert_gate_error(mcp_access_token, mcp_user)
+
+    def test_ambiguous_warning_dedup_cache_fault_still_denies(  # noqa: PLR0913 — fixtures
+        self,
+        two_profiles,
+        mcp_user,
+        mcp_access_token,
+        gate_posture,
+        monkeypatch,
+        caplog,
+    ):
+        """The once-per-hour WARNING dedup is a cache call; a cache fault
+        there must not turn the AMBIGUOUS_PROFILE denial into a 500."""
+        import logging
+
+        from django.contrib.auth.models import Group
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        def boom(*args, **kwargs):
+            msg = "simulated cache timeout"
+            raise TimeoutError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.cache.add", boom)
+        mcp_user.groups.add(Group.objects.get(name=SECOND_PROFILE_GROUP))
+        with (
+            caplog.at_level(logging.WARNING, logger="mcp_sql.auth"),
+            pytest.raises(AuthenticationFailed, match="more than one MCP profile"),
+        ):
+            MCPOAuth2Authentication().authenticate(
+                _bearer_request(mcp_access_token.token)
+            )
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.AMBIGUOUS_PROFILE
+        # Without the dedup the warning is still emitted (signal over silence).
+        assert "MCP profile resolution ambiguous" in caplog.text
+
+
 @pytest.mark.django_db(transaction=True)
 class TestRejectionAuditSurvivesAtomicRequests:
     """Rejection rows must outlive DRF's rollback under `ATOMIC_REQUESTS`.

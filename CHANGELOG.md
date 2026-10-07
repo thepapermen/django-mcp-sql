@@ -385,6 +385,15 @@ announce themselves.
   became 500s with no rejection row. On psycopg2 the rows were dropped
   silently. Every audit writer now stores a normalised address, or `NULL`
   when the value is not one. Also present in 0.1.0b5.
+- **A per-request gate that raised was an unaudited 500.** An exception from
+  the consumer's `MFA_CHECKER`, from profile resolution (a DB blip) or from
+  the `SESSION_MODEL` lookup escaped the auth class: fail-closed, but with no
+  `MCPAuthRejectionLog` row and a status (500, not 401) that told a token
+  holder something went wrong. It is now a denial with the new reason
+  `gate_error` (a choice folded into the unreleased migration `0014`; no new
+  migration) and a 401, with the traceback logged. Likewise a cache fault in
+  the once-per-hour "ambiguous profile" WARNING dedup no longer turns that
+  denial into a 500; the WARNING is emitted instead. Also present in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

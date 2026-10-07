@@ -176,6 +176,10 @@ class MCPAuthRejectionLog(models.Model):
             ),
             (AuthRejectionReason.NO_SESSION, "User has no live Django session"),
             (
+                AuthRejectionReason.GATE_ERROR,
+                "A per-request gate failed; access could not be verified",
+            ),
+            (
                 AuthRejectionReason.SESSION_LOGOUT,
                 "MCP tokens revoked on user logout",
             ),
