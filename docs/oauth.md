@@ -688,6 +688,21 @@ The 6 h hard cap on `access_token` lifetime is the worst-case fallback:
 even with no other action, a leaked or no-longer-needed token expires
 within 6 h.
 
+**What logout cannot revoke.** Revoking on logout needs to know who is
+logging out. A logout from a web session that has already ended
+(`SESSION_COOKIE_AGE` elapsed, swept by `clearsessions`, a cache session store
+restarted) or with no session cookie at all arrives anonymous: Django sends
+`user_logged_out` with `user=None` and django-allauth sends nothing, so no
+token or pending code is deleted and no audit row is written. The stale cookie
+cannot name the user either, since an expired session no longer loads. Those
+tokens live until they expire unless something else ends them: the operator
+rows above, or, with `SESSION_MODEL` set, the per-request session gate, which
+refuses them once the user holds no live session. A user who wants their MCP
+access gone should log in and log out again (a logout from a live session
+revokes every MCP token and pending code they hold, not only that session's),
+or ask an operator. A password change does not revoke MCP tokens in this
+release.
+
 ## Incident playbooks
 
 ### "The agent is hammering the database"

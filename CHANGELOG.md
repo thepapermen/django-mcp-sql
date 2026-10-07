@@ -402,6 +402,12 @@ announce themselves.
   now refused with a 401 and a WARNING naming the token and its client (the
   rejection table is keyed to a user); a token with no Application is an
   audited `bad_application` denial. Also present in 0.1.0b5.
+- **Documented: a logout from an expired session revokes nothing.** Django
+  sends `user_logged_out` with `user=None` when the web session has already
+  ended (and django-allauth sends nothing), so the user's MCP tokens and
+  pending codes survive and no audit row is written. `docs/oauth.md` →
+  "What logout cannot revoke" says so and gives the remedy (log in, then log
+  out). Unchanged behaviour, also in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 
