@@ -89,15 +89,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     (rendered `~-1`, which Postgres reads as the operator `~-`) and, on
     30.7, a cast right after the right operand of `->`, `->>`, `#>`, `#>>`,
     `?` (`j #> '{a}'::text[]` cast the whole expression); `2 %-3`, `y=~1`,
-    `-~y` (one operator to Postgres, `%-`, `=~`, `-~`) and
-    `json_object(KEY 'a' VALUE 1)` (no `KEY` in Postgres) are refused. The guarantee is about what sqlglot reads in the
+    `-~y` (one operator to Postgres, `%-`, `=~`, `-~`), operators sqlglot
+    reads but Postgres does not have (`a == b`, `<=>`, `??`, `~~~`, which
+    ran as `=`, `IS NOT DISTINCT FROM`, ...) and `json_object(KEY 'a' VALUE
+    1)` (no `KEY` in Postgres) are refused. Also as written: `INTERVAL
+    '<string>' <field> [TO <field>]` (`INTERVAL '25 hours' DAY` is 0 days
+    to Postgres; sqlglot dropped the field or read it as an alias),
+    `json_object(...)` whenever its arguments parse as plain expressions
+    (array slices, `format(...)`, columns named `value` / `key` / `on` had
+    turned it into the SQL/JSON constructor), the prefix operators `@ x`
+    and `@-@ x` (read as a parameter `$x`), `overlaps(a, b, c, d)`, and
+    `qualify` as a name everywhere (select alias, `GROUP BY`). `LIMIT
+    '<integer>'` is read as the bigint it is to Postgres. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    844 ordinary analytical queries (over data with NULLs and mixed case)
+    857 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
-    call to every function in `pg_catalog` and requires it unchanged.
+    call (with plain string arguments) to every `pg_catalog` function the
+    parser accepts and requires it unchanged; the functions it refuses must
+    be denied ones or forms Postgres rejects too.
   - Denied functions could be reached in ways the deny list did not see
     (review round 5): Postgres's attribute notation calls `f(x)` for
     `x.f` / `(expr).f` (`('server_version'::text).current_setting`,

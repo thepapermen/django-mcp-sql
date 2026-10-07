@@ -540,8 +540,12 @@ The load-bearing invariants and footguns, grouped by layer:
      `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), `DISTINCT` over
      several aggregate arguments, `current_*` precision.
      `test_sql_fidelity.test_every_catalog_function_call_is_rendered_as_written`
-     renders a call to every `pg_catalog` function and requires it
-     unchanged, so a newer sqlglot cannot bring a rewrite back unnoticed.
+     renders a call (plain string arguments) to every `pg_catalog`
+     function the parser accepts and requires it unchanged, so a newer
+     sqlglot cannot bring a rewrite back unnoticed; the ones refused must be
+     denied functions or forms Postgres rejects too (a new refusal fails
+     it). Shaped arguments (`json_object(ARRAY[...])`, `INTERVAL '…' DAY`)
+     are pinned in the functional corpus.
      When subclassing a sqlglot dialect, assign the parent's tokenizer
      classes: a derived one reads `E'\''` differently.
   The guarantee is about what **sqlglot** reads in the executed text: it
@@ -549,22 +553,22 @@ The load-bearing invariants and footguns, grouped by layer:
   about Postgres's lexer, and values are only as faithful as sqlglot's
   generator. Where the two are known to disagree, the form is refused in
   layer 1 or rendered as written in layer 3; a disagreement nobody has
-  found yet is the residual risk. Known, accepted: some operators render to
-  invalid SQL (`@ x` → `$x`, `^@`, so those queries fail at execution —
-  fail-closed) or another spelling (`|/ x` → `SQRT(x)`, a different column
-  name); syntax Postgres rejects that sqlglot still understands (`REGEXP`,
+  found yet is the residual risk. Known, accepted: `^@` renders to invalid
+  SQL (fails at execution — fail-closed), `|/ x` / `||/ x` render as
+  `SQRT(x)` / `CBRT(x)` (another column name), a generic typed literal of a
+  type sqlglot does not know (`lseg '…'`) is refused; syntax Postgres rejects that sqlglot still understands (`REGEXP`,
   `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+) is
   translated rather than failing as in Postgres; and a few valid forms
   sqlglot cannot parse are refused (`ORDER BY … USING`, `bit varying '…'`,
-  `j @? path` on 30.7). Also accepted: `SELECT 123abc` / `1e3x` keep
-  sqlglot's reading `123 AS abc` (Postgres 14's; 15+ reject "trailing
-  junk"), unary `+x` loses its `+` (column name `x` instead of
+  `j @? path` on 30.7). Also accepted: `SELECT 123abc` / `1e3x` /
+  `1_000abc` keep sqlglot's reading `123 AS abc` (Postgres 14's; 15+
+  reject "trailing junk"), unary `+x` loses its `+` (column name `x` instead of
   `?column?`), and a quoted call of a
   set-returning builtin (`"unnest"(...)`) is refused as `UNSAFE_LITERAL`,
   the lexical check running first. Pre-existing and tracked separately: a later CTE
   masking an earlier CTE's table reference in the whitelist check,
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 844
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 857
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must
