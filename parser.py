@@ -660,6 +660,7 @@ def _parse_and_validate(
     _check_no_offset(ast)
     _check_no_fetch(ast)
     _check_no_locking_reads(ast)
+    _check_no_qualify(ast)
     referenced_tables = _check_tables(ast, allowed_tables=allowed_tables)
     _check_no_denied_functions(ast)
     _check_no_bare_keyword_columns(ast)
@@ -859,12 +860,64 @@ def _token_problem(
 
 
 def inject_limit(ast: exp.Query, n: int) -> exp.Query:
-    """Replace any LIMIT on the root with `n`. Returns the modified AST.
+    """`ast` with `LIMIT n` on its root. Returns a modified copy.
 
-    Uses sqlglot's `Expression.limit(n)`, which clobbers an existing LIMIT
-    rather than appending. Idempotent; safe to re-emit via `.sql()`.
+    A plain integer LIMIT the agent wrote is replaced (the executor has
+    already folded it into `n`: see `extract_limit`). Any other LIMIT
+    expression (`LIMIT 3.5`, `LIMIT 2 + 3`, `LIMIT (SELECT ...)`,
+    `LIMIT -1`) is kept and capped: `LIMIT LEAST(<as written>, n)`, so
+    Postgres evaluates it exactly as it would have (rounding `3.5` to 4,
+    rejecting a negative) and the cap still holds. `LIMIT NULL` / `LIMIT
+    ALL` mean no limit, so they become `LIMIT n`. A query wrapped in
+    parentheses as a whole (`(SELECT ... LIMIT 5)`) is unwrapped first:
+    Postgres refuses a second LIMIT after the parenthesis.
     """
-    return ast.limit(n)
+    root = _limit_root(ast)
+    written = _written_limit(root)
+    if (
+        written is None
+        or extract_limit(root) is not None
+        or isinstance(written, exp.Null)
+        or (isinstance(written, exp.Column) and written.sql().upper() == "ALL")
+    ):
+        return root.limit(n)
+    capped = exp.Anonymous(
+        this="LEAST", expressions=[written.copy(), exp.Literal.number(n)]
+    )
+    return root.limit(capped)
+
+
+def _limit_root(ast: exp.Query) -> exp.Query:
+    """`ast` without the parentheses around a whole query (`(SELECT ...)`)."""
+    while (
+        isinstance(ast, exp.Subquery)
+        and isinstance(ast.this, exp.Query)
+        and not any(value for key, value in ast.args.items() if key != "this")
+    ):
+        ast = ast.this
+    return ast
+
+
+def _written_limit(ast: exp.Query) -> exp.Expression | None:
+    """The expression of the root's LIMIT, or `None`."""
+    body = ast.this if isinstance(ast, exp.With) else ast
+    limit_node = body.args.get("limit") if hasattr(body, "args") else None
+    return getattr(limit_node, "expression", None)
+
+
+def _injected_limit(ast: exp.Query) -> int | None:
+    """The cap `inject_limit` put on the root (`LIMIT n` or
+    `LIMIT LEAST(..., n)`), or `None`."""
+    written = _written_limit(ast)
+    if (
+        isinstance(written, exp.Anonymous)
+        and written.name.upper() == "LEAST"
+        and written.expressions
+    ):
+        written = written.expressions[-1]
+    if isinstance(written, exp.Literal) and _PLAIN_INTEGER_RE.fullmatch(written.name):
+        return int(written.name)
+    return None
 
 
 def render_for_execution(
@@ -938,9 +991,9 @@ def render_for_execution(
             raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
         again = _render(rendered.ast)
         if again == sql:
-            if extract_limit(rendered.ast) != limit:
-                # e.g. `QUALIFY` (not Postgres SQL): sqlglot moves the
-                # LIMIT into a subquery, applied before the window filter.
+            if _injected_limit(rendered.ast) != limit:
+                # The cap must apply to the whole query (sqlglot once moved
+                # it into a subquery for `QUALIFY`, now refused up front).
                 msg = f"The rendered SQL does not end in LIMIT {limit}: {sql}"
                 raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg)
             return sql
@@ -976,9 +1029,12 @@ def _render(tree: exp.Query) -> str:
         raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
 
 
+_PLAIN_INTEGER_RE = re.compile(r"[0-9]+")
+
+
 def extract_limit(ast: exp.Query) -> int | None:
-    """Return the integer LIMIT on the root expression, or `None` if absent
-    or non-integer-literal.
+    """Return the root's LIMIT when the agent wrote a plain integer
+    (`LIMIT 5`), else `None`.
 
     Used by the executor to honor a user-supplied `LIMIT N` smaller than
     the server's `DEFAULT_LIMIT` / `HARD_LIMIT`. Without this, the
@@ -988,21 +1044,18 @@ def extract_limit(ast: exp.Query) -> int | None:
     function just reads what the user wrote.
 
     A `WITH ... SELECT ... LIMIT N` construct stores the LIMIT on the
-    body `Select`, not on the wrapping `With`; this unwraps that case so
-    the executor sees the user's intent. Non-literal LIMITs (parameter
-    placeholders, expressions) return `None` — we can't reason about
-    them at parse time, so the executor falls back to its own clamp.
+    body `Select`, not on the wrapping `With`, and `(SELECT ... LIMIT N)`
+    on the query inside the parentheses; both are unwrapped. Any other
+    LIMIT (`3.5`, `2 + 3`, a subquery, `-1`, `0x10`) returns `None`:
+    `inject_limit` keeps it for Postgres to evaluate, capped.
     """
-    body = ast.this if isinstance(ast, exp.With) else ast
-    limit_node = body.args.get("limit") if hasattr(body, "args") else None
-    if limit_node is None:
-        return None
-    expr = getattr(limit_node, "expression", None)
-    if isinstance(expr, exp.Literal):
-        try:
-            return int(expr.this)
-        except (TypeError, ValueError):
-            return None
+    written = _written_limit(_limit_root(ast))
+    if (
+        isinstance(written, exp.Literal)
+        and not written.is_string
+        and _PLAIN_INTEGER_RE.fullmatch(written.name)
+    ):
+        return int(written.name)
     return None
 
 
@@ -1058,6 +1111,23 @@ def _check_no_locking_reads(ast: exp.Query) -> None:
             "read-only MCP surface."
         )
         raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
+
+
+def _check_no_qualify(ast: exp.Query) -> None:
+    """Reject `QUALIFY` (not Postgres SQL) anywhere in the query.
+
+    sqlglot reads it and rewrites it into a subquery that filters on the
+    window result; a LIMIT in the same query then applies before that
+    filter, not after it (different rows). Postgres itself rejects the
+    statement, so this refuses nothing Postgres would run.
+    """
+    if ast.find(exp.Qualify) is not None:
+        msg = (
+            "QUALIFY is not PostgreSQL syntax; filter on the window function "
+            "in an outer query (SELECT ... FROM (SELECT ..., row_number() "
+            "OVER (...) AS rn ...) s WHERE rn = 1)"
+        )
+        raise QueryRejectedError(OutcomeReason.PARSE_ERROR, msg)
 
 
 def _check_ctes_read_only(ast: exp.Query) -> None:

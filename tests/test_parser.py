@@ -740,6 +740,38 @@ class TestInjectLimit:
         assert "ORDER BY id DESC" in sql
         assert "LIMIT 11" in sql
 
+    @pytest.mark.parametrize(
+        ("limit", "capped"),
+        [
+            ("3.5", "LIMIT LEAST(3.5, 11)"),
+            ("2 + 3", "LIMIT LEAST(2 + 3, 11)"),
+            ("(SELECT 3)", "LIMIT LEAST((SELECT 3), 11)"),
+            ("-1", "LIMIT LEAST(-1, 11)"),
+            ("'4'", "LIMIT LEAST('4', 11)"),
+        ],
+    )
+    def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
+        # Review round 4: replacing it with the cap returned more rows than
+        # Postgres would (`LIMIT 3.5` is 4 rows), or rows where Postgres
+        # raises (`LIMIT -1`). Kept as written and capped, Postgres
+        # evaluates it exactly as it would have.
+        ast = parse_one(f"SELECT id FROM auth_permission LIMIT {limit}")  # noqa: S608
+        assert inject_limit(ast, 11).sql(dialect="postgres").endswith(capped)
+
+    @pytest.mark.parametrize("limit", ["NULL", "5"])
+    def test_replaces_no_limit_or_a_plain_integer(self, limit):
+        ast = parse_one(f"SELECT id FROM auth_permission LIMIT {limit}")  # noqa: S608
+        assert inject_limit(ast, 11).sql(dialect="postgres").endswith(" LIMIT 11")
+
+    def test_unwraps_a_parenthesised_query(self):
+        # `(SELECT ... LIMIT 5) LIMIT 11` is an error in Postgres.
+        ast = parse_one(
+            "(SELECT id FROM auth_permission ORDER BY id LIMIT 5)", dialect="postgres"
+        )
+        assert extract_limit(ast) == 5
+        sql = inject_limit(ast, 6).sql(dialect="postgres")
+        assert sql == "SELECT id FROM auth_permission ORDER BY id LIMIT 6"
+
 
 class TestExtractLimit:
     """`extract_limit` reads the user's `LIMIT N` so the executor can apply
@@ -783,6 +815,27 @@ class TestExtractLimit:
         # parse time — same clean give-up path.
         ast = parse_one("SELECT id FROM auth_permission LIMIT 2 + 3")
         assert extract_limit(ast) is None
+
+
+class TestQualify:
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM auth_permission QUALIFY row_number() OVER "
+            "(ORDER BY id) = 1",
+            # Review round 4: inside a subquery the injected LIMIT does not
+            # reach it, so the old end-of-render check let it through.
+            "SELECT id FROM auth_permission WHERE id IN (SELECT id FROM "
+            "auth_permission QUALIFY row_number() OVER (ORDER BY id) <= 2 "
+            "LIMIT 5)",
+            "WITH c AS (SELECT id FROM auth_permission QUALIFY row_number() "
+            "OVER (ORDER BY id) > 3 LIMIT 2) SELECT id FROM c",
+        ],
+        ids=["root", "subquery", "cte"],
+    )
+    def test_refused_anywhere(self, sql):
+        exc = _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+        assert "QUALIFY" in str(exc)
 
 
 class TestTableValuedFunctionsInFrom:

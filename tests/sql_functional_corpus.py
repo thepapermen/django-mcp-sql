@@ -1385,7 +1385,7 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT id, extract(day FROM ts - TIMESTAMPTZ '2024-01-01') AS dd FROM t ORDER BY id",
     ),
     # Review round 4: rewrites that changed results, now rendered as
-    # written (see `parser.FaithfulPostgres`).
+    # written (see `parser.FaithfulPostgres`), plus LIMIT forms.
     (
         "as-written",
         "SELECT id, like(g, 'b%') AS l, like('abc', 'a%') AS m FROM t ORDER BY id",
@@ -1470,6 +1470,38 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "numbers",
         "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F",
     ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT 3.5",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT 2 + 3",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT (SELECT 3)",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT NULL",
+    ),
+    (
+        "limit",
+        "(SELECT id FROM t ORDER BY id LIMIT 5)",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT '4'",
+    ),
+    (
+        "limit",
+        "WITH a AS (SELECT id FROM t) (SELECT id FROM a ORDER BY id LIMIT 3)",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT 0x3",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -1552,8 +1584,12 @@ REFUSED: list[tuple[str, str]] = [
         "SELECT id, first_value(y) IGNORE NULLS OVER (ORDER BY id) AS l FROM t ORDER BY id",
     ),
     (
-        "roundtrip_mismatch",
+        "parse_error",
         "SELECT id FROM t QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = 1",
+    ),
+    (
+        "parse_error",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id DESC) <= 2 LIMIT 5) ORDER BY id",
     ),
     ("parse_error", "SELECT id, y DIV 2 AS i FROM t ORDER BY id"),
     ("parse_error", "SELECT id FROM t ORDER BY id USING >"),
@@ -1575,10 +1611,12 @@ MIN_SERVER_VERSION: dict[str, int] = {
     "SELECT 0x1F, 0o17, 0b101": 160000,
     "SELECT 1_000": 160000,
     "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F": 160000,
+    "SELECT id FROM t ORDER BY id LIMIT 0x3": 160000,
 }
 
 # Accepted and run as written; Postgres itself rejects them.
 POSTGRES_REJECTS: list[str] = [
+    "SELECT id FROM t ORDER BY id LIMIT -1",
     "SELECT id, initcap(g, '-') AS i FROM t ORDER BY id",
     "SELECT id, to_number(g) AS n FROM t WHERE id = 1",
     'SELECT "Lower"(g) FROM t',
