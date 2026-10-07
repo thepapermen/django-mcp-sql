@@ -886,8 +886,26 @@ class TestRegistrationNeverAnswers500:
     @pytest.mark.parametrize("field", ["grant_types", "response_types"])
     @pytest.mark.parametrize(
         "value",
-        [None, 1, True, "authorization_code", "code", {"authorization_code": 1}],
-        ids=["null", "int", "bool", "string-gt", "string-rt", "object"],
+        [
+            None,
+            1,
+            True,
+            "authorization_code",
+            "code",
+            {"authorization_code": 1},
+            ["authorization_code", "code", 5],
+            ["authorization_code", "code", None],
+        ],
+        ids=[
+            "null",
+            "int",
+            "bool",
+            "string-gt",
+            "string-rt",
+            "object",
+            "list-with-int",
+            "list-with-null",
+        ],
     )
     def test_types_must_be_a_list(self, client, field, value):
         before = Application.objects.count()
