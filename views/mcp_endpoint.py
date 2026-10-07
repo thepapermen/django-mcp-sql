@@ -670,7 +670,8 @@ def _guard_bridge(asgi_app):
 
     async def call(scope, receive, send):
         started = finished = closed = False
-        in_flight: set[asyncio.Task[None]] = set()
+        # In send order, so the failure that surfaces is deterministic.
+        in_flight: list[asyncio.Task[None]] = []
 
         async def deliver(message):
             nonlocal started, finished
@@ -688,7 +689,7 @@ def _guard_bridge(asgi_app):
                 msg = "ASGI send after the MCP bridge exchange ended"
                 raise RuntimeError(msg)
             task = asyncio.ensure_future(deliver(message))
-            in_flight.add(task)
+            in_flight.append(task)
             await asyncio.shield(task)
 
         status = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -711,7 +712,9 @@ def _guard_bridge(asgi_app):
             if in_flight:
                 await asyncio.wait(in_flight)
         for task in in_flight:
-            task.result()  # a failed send is this exchange's failure
+            # A failed send is this exchange's failure; with several, the
+            # earliest send's, every time.
+            task.result()
         if not finished:
             await _complete_response(scope, send, started=started, status=status)
 

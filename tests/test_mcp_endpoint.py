@@ -856,6 +856,35 @@ class TestBridgeGuard:
         assert asyncio.run(scenario()) is False
         assert delivered[1:] == [b"b", b"a"]
 
+    def test_first_failed_send_in_send_order_is_the_one_surfaced(self):
+        """When several sends fail, the exception that surfaces is the one of
+        the earliest send, every time, not whichever a set happens to yield."""
+
+        class SendFailedError(Exception):
+            pass
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                await asyncio.sleep(0)
+                raise SendFailedError(message["body"].decode())
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            pending = [
+                asyncio.ensure_future(
+                    send({"type": "http.response.body", "body": f"{i}".encode()})
+                )
+                for i in range(8)
+            ]
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        async def scenario():
+            with pytest.raises(SendFailedError) as raised:
+                await _guard_bridge(app)({"type": "http"}, None, send)
+            return str(raised.value)
+
+        assert {asyncio.run(scenario()) for _ in range(20)} == {"0"}
+
     def test_send_started_after_the_guard_finished_never_reaches_a2wsgi(self):
         """A send the app scheduled but that had not started when the app
         failed must not slip out to a2wsgi after the guard has let go: it
