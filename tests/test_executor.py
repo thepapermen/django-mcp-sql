@@ -848,3 +848,13 @@ class TestEveryParserFailureIsAudited:
         assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
         cursor.execute.assert_not_called()
         assert MCPQueryLog.objects.get().rejection_reason == "parse_error"
+
+
+def test_table_columns_come_from_the_whitelisted_models():
+    """The parser tells `t.name` (a column) from attribute notation (the call
+    `name(t)`) with these (review round 6)."""
+    from mcp_sql.executor import _table_columns
+
+    columns = _table_columns({"auth.Permission": "auth_permission", "t": "t"})
+    assert {"id", "codename", "content_type_id"} <= columns["auth_permission"]
+    assert "t" not in columns  # no model: no columns known

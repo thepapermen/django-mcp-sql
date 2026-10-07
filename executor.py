@@ -12,6 +12,7 @@ from typing import NotRequired
 from typing import TypedDict
 from typing import Unpack
 
+from django.apps import apps as django_apps
 from django.db import DatabaseError
 from django.db import connections
 from django.db import transaction
@@ -94,13 +95,16 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     cfg = mcp_sql_config()
     limits = cfg["LIMITS"]
     ban_select_star = cfg["BAN_SELECT_STAR"]
-    allowed = set(declared_tables(profile).values())
+    tables = declared_tables(profile)
+    allowed = set(tables.values())
+    table_columns = _table_columns(tables)
 
     try:
         parsed = parse_and_validate(
             raw_sql,
             allowed_tables=allowed,
             ban_select_star=ban_select_star,
+            table_columns=table_columns,
         )
     except Exception as exc:  # noqa: BLE001 — every outcome is audited
         # `parse_and_validate` raises only `QueryRejectedError`; anything else
@@ -177,6 +181,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             effective_limit + 1,
             allowed_tables=allowed,
             ban_select_star=ban_select_star,
+            table_columns=table_columns,
         )
     except RecursionError:
         msg = "SQL nesting is too deep to serialize"
@@ -637,3 +642,21 @@ def _cap_cell(value: object) -> Cell:
     if len(text.encode("utf-8")) > PER_CELL_BYTE_CAP:
         return text[:PER_CELL_BYTE_CAP] + TRUNCATION_MARK
     return text
+
+
+def _table_columns(tables: dict[str, str]) -> dict[str, frozenset[str]]:
+    """Column names of each whitelisted table (`db_table` -> columns, all
+    lowercase), from its model: the parser needs them to tell `t.name` (a
+    column) from attribute notation (`t.name` as the call `name(t)`). A
+    table whose model cannot be loaded gets no entry (its qualified names
+    are then treated as calls when they name a denied function)."""
+    columns: dict[str, frozenset[str]] = {}
+    for label, db_table in tables.items():
+        try:
+            model = django_apps.get_model(label)
+        except (LookupError, ValueError):
+            continue
+        columns[db_table.lower()] = frozenset(
+            field.column.lower() for field in model._meta.concrete_fields
+        )
+    return columns

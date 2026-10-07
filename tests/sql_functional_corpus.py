@@ -1618,6 +1618,1203 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "json",
         "SELECT id, j -> 'a'::text AS a, j -> y::text AS c FROM t ORDER BY id",
     ),
+    # Review round 6.
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT LIKE 'a%' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT ILIKE 'A%' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y NOT BETWEEN 1 AND 3 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT IN ('a', 'b') IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g NOT SIMILAR TO 'a%' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT DISTINCT FROM 1.37 AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT DISTINCT FROM 1.37 OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS DISTINCT FROM 1.37 AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS DISTINCT FROM 1.37 OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT TRUE IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT FALSE IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS NOT UNKNOWN IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x IS NOT NULL IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, x NOTNULL IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, NOT b IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b IS TRUE IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y > 2 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 1 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g ~ 'a' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~ 'a' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' <> false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' AND true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' OR false AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, g !~~ 'a%' IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS NOT TRUE ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS NOT TRUE ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS NOT FALSE ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS NOT FALSE ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS NOT UNKNOWN AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS NOT UNKNOWN ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS NOT UNKNOWN ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS NOT NULL ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS NOT NULL ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS NOT DISTINCT FROM NULL ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS NOT DISTINCT FROM NULL ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b = true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y = 3 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b <> true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y <> 3 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b < true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y < 3 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b >= true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, y >= 3 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b AND b IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR true IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id, b OR b IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT b IS DISTINCT FROM true ORDER BY id",
+    ),
+    (
+        "is-chains",
+        "SELECT id FROM t WHERE NOT NOT b IS DISTINCT FROM true ORDER BY id",
+    ),
+    (
+        "attribute-columns",
+        "SELECT s.lo_bound FROM (SELECT min(y) AS lo_bound FROM t) s",
+    ),
+    (
+        "attribute-columns",
+        "SELECT s.array_agg FROM (SELECT g, array_agg(y ORDER BY id) FROM t GROUP BY g) s ORDER BY 1",
+    ),
+    (
+        "attribute-columns",
+        "WITH c AS (SELECT count(*) AS currval FROM t) SELECT c.currval FROM c",
+    ),
+    (
+        "attribute-columns",
+        "SELECT s.copy, s.unnest FROM (SELECT 1 AS copy, 2 AS unnest) s",
+    ),
+    (
+        "attribute-columns",
+        "SELECT x.pg_sleep FROM (SELECT 0.1::float8 AS v) AS x(pg_sleep)",
+    ),
+    (
+        "attribute-columns",
+        "SELECT s.pg_rank FROM (SELECT rank() OVER (ORDER BY y, id) AS pg_rank FROM t) s ORDER BY 1 LIMIT 1",
+    ),
+    (
+        "attribute-columns",
+        "SELECT '0/0'::pg_catalog.pg_lsn AS v",
+    ),
+    (
+        "json",
+        "SELECT id, j #> '{n,m}'::text[] AS a, j #>> '{n,m}'::text[] AS b, j ? 'k'::text AS c FROM t ORDER BY id",
+    ),
+    (
+        "json",
+        "SELECT id FROM t WHERE j #>> '{n,m}'::text[] = '1' ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT 2 ^ 3, (2 ^ 3) ^ 2, 2 ^ 3 ^ 2",
+    ),
+    (
+        "operators",
+        "SELECT id, g !~ 'a' AS a, g !~~ 'a%' AS b, g !~* 'A' AS c FROM t ORDER BY id",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -1787,6 +2984,42 @@ REFUSED: list[tuple[str, str]] = [
         "parse_error",
         "SELECT json_object(KEY 'a' VALUE 1) AS a",
     ),
+    (
+        "unsafe_literal",
+        "SELECT id, y=~1 AS a FROM t ORDER BY id",
+    ),
+    (
+        "unsafe_literal",
+        "SELECT id, -~y AS a FROM t ORDER BY id",
+    ),
+    (
+        "select_star",
+        "SELECT t.concat AS v FROM t LIMIT 1",
+    ),
+    (
+        "select_star",
+        "SELECT t.quote_literal AS v FROM t LIMIT 1",
+    ),
+    (
+        "select_star",
+        "SELECT t.record_out AS v FROM t LIMIT 1",
+    ),
+    (
+        "select_star",
+        "SELECT t.record_send AS v FROM t LIMIT 1",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (1).pg_typeof AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT u.pg_typeof AS v FROM t AS u LIMIT 1",
+    ),
+    (
+        "disallowed_function",
+        "SELECT s.pg_typeof AS v FROM (SELECT 1 AS a) s",
+    ),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -1819,6 +3052,34 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT percentile_cont(x, 0.5) FROM t",
     "SELECT g, string_agg(g, ',') WITHIN GROUP (ORDER BY g) FROM t GROUP BY g",
     "SELECT id FROM t ORDER BY id LIMIT 'NaN'::float8",
+    "SELECT id FROM t ORDER BY id LIMIT '3'::text",
+    "SELECT id FROM t ORDER BY id LIMIT 99999999999999999999",
+    "SELECT ~2 ^ 2 AS a",
+    "SELECT t.text AS v FROM t LIMIT 1",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS TRUE AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NOT TRUE AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NULL AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NOT NULL AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS FALSE AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NOT FALSE AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 = true AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 <> false AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    "SELECT id, x IS NOT DISTINCT FROM 1.37 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS TRUE AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS NOT TRUE AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS NULL AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS NOT NULL AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS FALSE AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS NOT FALSE AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 = true AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 <> false AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS DISTINCT FROM true AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM 1.37 IS NOT DISTINCT FROM NULL AS a FROM t ORDER BY id",
+    "SELECT id, y > 2 = true AS a FROM t ORDER BY id",
+    "SELECT id, y > 2 <> false AS a FROM t ORDER BY id",
+    "SELECT id, y = 1 = true AS a FROM t ORDER BY id",
+    "SELECT id, y = 1 <> false AS a FROM t ORDER BY id",
     "SELECT id, j ->> 'k'::int AS a FROM t WHERE id = 99",
     "SELECT id, x IS NOT DISTINCT FROM y IS TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",

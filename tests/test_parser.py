@@ -7,6 +7,8 @@ UNION, and qualified column references to prove the validator doesn't
 over-reject normal SELECT shapes.
 """
 
+import re
+
 import pytest
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
@@ -745,9 +747,20 @@ class TestInjectLimit:
         [
             ("3.5", "LIMIT LEAST(CAST(3.5 AS BIGINT), 11)"),
             ("2 + 3", "LIMIT LEAST(CAST(2 + 3 AS BIGINT), 11)"),
-            ("(SELECT 3)", "LIMIT LEAST(CAST((SELECT 3) AS BIGINT), 11)"),
             ("-1", "LIMIT LEAST(CAST(-1 AS BIGINT), 11)"),
-            ("'4'", "LIMIT LEAST(CAST('4' AS BIGINT), 11)"),
+            (
+                "'NaN'::float8",
+                "LIMIT LEAST(CAST(CAST('NaN' AS DOUBLE PRECISION) AS BIGINT), 11)",
+            ),
+            (
+                "99999999999999999999",
+                "LIMIT LEAST(CAST(99999999999999999999 AS BIGINT), 11)",
+            ),
+            # Not numeric as written: left to Postgres's type resolution (an
+            # explicit cast would run `'3'::text`, an error in a LIMIT).
+            ("(SELECT 3)", "LIMIT LEAST((SELECT 3), 11)"),
+            ("'4'", "LIMIT LEAST('4', 11)"),
+            ("'3'::text", "LIMIT LEAST(CAST('3' AS TEXT), 11)"),
         ],
     )
     def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
@@ -863,6 +876,19 @@ class TestAttributeNotation:
     @pytest.mark.parametrize(
         "sql",
         [
+            # Review round 6: qualified names that ARE columns are columns,
+            # whatever function they are named like (owner rule: never
+            # refuse a column that exists).
+            "SELECT s.lo_bound FROM (SELECT min(id) AS lo_bound "
+            "FROM auth_permission) s",
+            "SELECT s.array_agg FROM (SELECT array_agg(id) FROM auth_permission) s",
+            "WITH c AS (SELECT count(*) AS currval FROM auth_permission) "
+            "SELECT c.currval FROM c",
+            "WITH c(pg_x) AS (SELECT 1) SELECT c.pg_x FROM c",
+            "SELECT x.pg_sleep FROM (SELECT 0.1::float8 AS v) AS x(pg_sleep)",
+            "SELECT x.pg_sleep FROM auth_permission AS x(pg_sleep)",
+            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
+            "SELECT '0/0'::pg_catalog.pg_lsn AS v",
             "SELECT p.id, p.codename FROM auth_permission p",
             # Denied functions attribute notation cannot reach (no argument,
             # or two or more): ordinary column names.
@@ -872,6 +898,26 @@ class TestAttributeNotation:
     )
     def test_ordinary_qualified_names_are_accepted(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    def test_a_base_table_column_is_a_column(self):
+        # The executor passes each whitelisted table's columns.
+        sql = "SELECT p.pg_x, p.to_jsonb FROM auth_permission p"
+        columns = {"auth_permission": frozenset({"id", "pg_x", "to_jsonb"})}
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=columns)
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION)  # columns unknown
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT p.concat FROM auth_permission p",
+            "SELECT p.quote_literal FROM auth_permission p",
+            "SELECT p.quote_nullable FROM auth_permission p",
+            "SELECT p.record_out FROM auth_permission p",
+            "SELECT p.record_send FROM auth_permission p",
+        ],
+    )
+    def test_whole_row_through_attribute_notation(self, sql):
+        _expect_reject(sql, OutcomeReason.SELECT_STAR)
 
 
 class TestDeniedCallsTheTreeDoesNotShow:
@@ -911,14 +957,29 @@ class TestDeniedCallsTheTreeDoesNotShow:
 
 
 class TestOperatorSigns:
-    @pytest.mark.parametrize("sql", ["SELECT 2 %-3 AS v", "SELECT ~-1 AS v"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 2 %-3 AS v",
+            "SELECT ~-1 AS v",
+            # Review round 6: `=~`, `-~`, `*~` are one operator to Postgres.
+            "SELECT id=~1 AS v FROM auth_permission",
+            "SELECT -~id AS v FROM auth_permission",
+            "SELECT id*~1 AS v FROM auth_permission",
+        ],
+    )
     def test_sign_postgres_reads_into_the_operator(self, sql):
         # Postgres: the operators `%-` / `~-` (none exist); sqlglot: `% -3`.
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
 
     @pytest.mark.parametrize(
         "sql",
-        ["SELECT id >=-1 AS v FROM auth_permission", "SELECT 1 <<-1 AS v"],
+        [
+            "SELECT id >=-1 AS v FROM auth_permission",
+            "SELECT 1 <<-1 AS v",
+            # sqlglot reads these from several tokens, as one operator.
+            "SELECT codename !~ 'a' AS v, codename !~~ 'a%' AS w FROM auth_permission",
+        ],
     )
     def test_sign_postgres_reads_apart_is_accepted(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)
@@ -941,8 +1002,15 @@ class TestQualify:
         ids=["root", "subquery", "cte"],
     )
     def test_refused_anywhere(self, sql):
-        exc = _expect_reject(sql, OutcomeReason.PARSE_ERROR)
-        assert "QUALIFY" in str(exc)
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+        # The clause is what is refused: the same query without it passes.
+        without = re.sub(
+            r" ?QUALIFY row_number\(\) OVER \(ORDER BY id( DESC)?\) [<>=]+ \d+",
+            "",
+            sql,
+        )
+        assert "QUALIFY" not in without
+        parse_and_validate(without, allowed_tables=ALLOWED)
 
     def test_qualify_is_an_ordinary_name(self):
         # Review round 5: `qualify` is a name to Postgres (`FROM t qualify`).
