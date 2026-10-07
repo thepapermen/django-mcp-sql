@@ -133,9 +133,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     a name, so a column `interval` is read as the column (`interval + 1`
     ran as `INTERVAL '1'`, one second; `interval - y` and `interval[1]`
     lost the operand; `interval * 2` was refused as `SELECT *`,
-    `interval / 2` was a parse error), and `INTERVAL 5`, `INTERVAL 5 DAY`,
-    `INTERVAL N'1' week`, `interval day '1'` are parse errors, as in
-    Postgres (they ran). Also as written: a subscripted
+    `interval / 2` was a parse error; a slice, `interval[:1]`, runs), and
+    `INTERVAL 5`, `INTERVAL 5 DAY`, `INTERVAL N'1' week`, `interval day
+    '1'` are parse errors, as in Postgres (they ran). Left: a bare field
+    word after the column is read as its alias (`SELECT interval day` runs
+    as `interval AS day`; Postgres requires `AS` there, as for any
+    column). Also as written: a subscripted
     column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
@@ -157,7 +160,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    902 ordinary analytical queries (over data with NULLs and mixed case)
+    908 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
@@ -231,6 +234,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     of the ordinary analytical queries. **Action:** re-run
     `sql/role_setup.sql` (or `mcp_sql_role_setup`) to pick up the new role
     default; the per-transaction guard applies without it.
+- **The table whitelist ignored the schema (affects every release up to and
+  including 0.1.0b5).** A whitelist entry matched a table reference by its
+  bare name, so `SELECT secret FROM analytics.<whitelisted name>` read a
+  same-named relation in any other schema the profile role could SELECT
+  (an accidental `GRANT SELECT ON ALL TABLES IN SCHEMA analytics`, an
+  archived copy) — every column of it, past the reviewed whitelist and any
+  curated view; and an unqualified name resolved through the login's
+  `search_path` (a `"$user"` schema, which under `SET ROLE` is one named
+  after the profile role; a database- or role-level setting; a temporary
+  table, searched first). The grants drift check listed `public` only, so
+  it never reported such a grant. Now:
+  - an entry is a relation in a schema: `public`, or the schema a
+    `db_table` written `schema"."name` (or `"schema"."name"`) names. A
+    reference matches it only there — the schema and the name each
+    compared as Postgres compares them (quoted exactly, unquoted folded) —
+    so `analytics.t` beside a whitelisted `t` is `disallowed_table`;
+    `public.t` and `t` still read it. System schemas are refused as before,
+    three-part `db.pg_catalog.x` included;
+  - the read transaction pins `search_path` to `public, pg_temp` (`SET
+    LOCAL`, one of the per-transaction guards; also a role default in
+    `sql/role_setup.sql`), so an unqualified name is the relation in
+    `public`;
+  - `mcp_sql_grants` (and the `post_migrate` drift WARNING) lists the
+    profile role's SELECT grants in every schema but the system ones: a
+    grant outside the whitelist in another schema is drift, and `--apply`
+    revokes it, as it does in `public`. GRANT / REVOKE name the relation
+    schema-qualified (`"public"."t"`), not through the app role's
+    `search_path`.
+  - **Behaviour change:** names in agent queries resolve in `pg_catalog`
+    and `public` only. An extension installed in another schema (Django's
+    `CreateExtension` installs into the first schema on the app's
+    `search_path`, normally `public`) loses its unqualified names: call
+    its functions qualified (`extensions.similarity(...)`); its operators
+    cannot be (`OPERATOR(...)` is refused), so they either fail or resolve
+    to a `pg_catalog` one through a cast (a `citext` column compared with
+    `=` compares as `text`, case-sensitively). Install such extensions in
+    `public` if the agent needs them.
+    A whitelisted table that lives in another schema through the login's
+    `search_path` (and not in its `db_table`) is no longer found; spell the
+    schema in `db_table`. **Action:** re-run `sql/role_setup.sql` (or
+    `mcp_sql_role_setup`) for the new role default (the per-transaction
+    guard applies without it), then `mcp_sql_grants`: a grant it now
+    reports in another schema was readable through the parser.
 - **The read transaction was not read-only (affects every release up to and
   including 0.1.0b5).** `SET LOCAL default_transaction_read_only = on`
   only affects transactions that start later, and the executor's had
@@ -246,7 +292,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   of the user model) now revokes the user's MCP access and refresh tokens
   and pending authorization codes after the change commits, with an
   `MCPAuthRejectionLog` row (new reason `password_change`; migration
-  0013). Done with model signals, so it needs no session table and holds
+  0013) when it deleted any (no row for a user who held none, as for
+  logout). Done with model signals, so it needs no session table and holds
   with `SESSION_MODEL=None`. The stored hash is read through the user
   model's base manager on the database being written, so a default manager
   that filters rows (active users only, soft delete) cannot hide the user —

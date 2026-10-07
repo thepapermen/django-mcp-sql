@@ -90,7 +90,9 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event):
     one left behind would mint new access tokens) and pending authorization
     codes (`Grant` rows: a code issued just before would otherwise still
     exchange for a fresh token) in one transaction, then writes one
-    `MCPAuthRejectionLog` row with `reason`.
+    `MCPAuthRejectionLog` row with `reason` — only when something was
+    deleted: the table records access that ended, and a logout or password
+    change of a user who held no MCP token or code ended none.
     Runs after the triggering transaction (logout, password change)
     commits. Both the delete and the audit write are wrapped so a DB blip
     is logged (Sentry via `logger.exception`) rather than surfacing as a

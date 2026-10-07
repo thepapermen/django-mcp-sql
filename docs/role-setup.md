@@ -174,12 +174,12 @@ docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> 
     -c "SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'mcp_readonly_role';"
 ```
 
-Expected (one row, five GUCs):
+Expected (one row, six GUCs):
 
 ```
       rolname      |                              rolconfig
 -------------------+----------------------------------------------------------------------
- mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on}
+ mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on,"search_path=public, pg_temp"}
 ```
 
 **3. App role is a member of `mcp_readonly_role`:**
@@ -240,7 +240,7 @@ Grants already in sync; no action.
 Or, after adding `auth.Permission` to the whitelist:
 
 ```
-GRANT SELECT ON "auth_permission" TO mcp_readonly_role;
+GRANT SELECT ON "public"."auth_permission" TO mcp_readonly_role;
 Applied: +1 grant(s), -0 revoke(s).
 ```
 
@@ -301,25 +301,36 @@ echo "exit: $?"
 **3. DB-side ground truth** — `information_schema.role_table_grants`
 lists every grant on `mcp_readonly_role`, sourced directly from PG's
 catalog. The set of tables here must match the `default` profile's
-`ALLOWED_MODELS` `_meta.db_table` resolutions exactly (substitute the role
-name for another profile):
+`ALLOWED_MODELS` `_meta.db_table` resolutions exactly — in every schema,
+not only `public` (substitute the role name for another profile):
 
 ```sh
 docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> -d <db_name> -c "
-SELECT table_name, privilege_type
+SELECT table_schema, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'mcp_readonly_role'
-ORDER BY table_name;
+ORDER BY table_schema, table_name;
 "
 ```
 
 Expected (with `auth.Permission` whitelisted):
 
 ```
-   table_name    | privilege_type
------------------+----------------
- auth_permission | SELECT
+ table_schema |   table_name    | privilege_type
+--------------+-----------------+----------------
+ public       | auth_permission | SELECT
 ```
+
+A whitelisted `db_table` is the relation in `public`, unless the
+`db_table` names a schema (`schema"."name`, Django's spelling of a
+schema-qualified table; the role then also needs `USAGE` on that schema,
+which the package does not grant). The read path pins `search_path` to
+`public, pg_temp`, so an agent's unqualified name is always the relation
+in `public`, and the parser refuses a qualified one in any other schema.
+A SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
+TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
+the check reports it as "granted but not declared" (spelled
+`schema"."name`) and `--apply` revokes it.
 
 A divergence between this query and the profile's `ALLOWED_MODELS` means
 `grants_check` would report drift; the apply step has not run (or has not

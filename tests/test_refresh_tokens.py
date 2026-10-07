@@ -261,6 +261,16 @@ class TestPasswordChangeRevokes:
         assert row.reason == AuthRejectionReason.PASSWORD_CHANGE
         assert "on password change" in row.error
 
+    def test_password_change_with_nothing_to_revoke_writes_no_row(
+        self, mcp_user, django_capture_on_commit_callbacks
+    ):
+        # As for logout: the table records access that ended (review round
+        # 16 corrected the docs, which said the row was unconditional).
+        with django_capture_on_commit_callbacks(execute=True):
+            mcp_user.set_password("a-new-password-123")
+            mcp_user.save()
+        assert not MCPAuthRejectionLog.objects.exists()
+
     @pytest.mark.parametrize(
         "save",
         [

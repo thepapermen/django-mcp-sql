@@ -3354,6 +3354,11 @@ REFUSED: list[tuple[str, str]] = [
         "parse_error",
         "SELECT interval y '1' AS v FROM (SELECT id AS interval, y FROM t) s",
     ),
+    # Infix `@` (no built-in operator since PostgreSQL 14): sqlglot cannot
+    # read it beside an alias or in a condition. Without an alias, see
+    # POSTGRES_REJECTS.
+    ("parse_error", "SELECT y @ id AS v FROM t"),
+    ("parse_error", "SELECT id FROM t WHERE y @ id"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3434,4 +3439,7 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::numeric FROM t WHERE id = 1)",
     "SELECT INTERVAL '1 day'', g, ''b' FROM t",
     "SELECT INTERVAL '1 day' + 2 AS v",
+    # sqlglot reads `y` with the alias `@ id` and renders `y AS @ id`, a
+    # syntax error; Postgres has no `integer @ integer`.
+    "SELECT y @ id FROM t",
 ]
