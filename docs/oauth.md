@@ -135,7 +135,7 @@ Application named `mcp-sql-<urlsafe-token>`.
 3. claude POSTs to /o/register with its loopback redirect_uri
    ← 201 with a fresh client_id
 4. claude redirects the browser to /o/authorize/?client_id=<fresh>&...
-5. user completes login + MFA + (skipped consent)
+5. user completes login + MFA + the consent click
 6. /o/authorize/ → 302 to claude's loopback callback with ?code=...
 7. claude POSTs code + code_verifier to /o/token/ with the fresh client_id
    ← 200 with bearer
@@ -257,7 +257,7 @@ full threat-model analysis.
    FAQ"), so Claude Code re-OAuths whenever the token expires; DOT's
    default consent template has no "remember my choice" mechanism, so
    the user sees the page each time. This is deliberate: see
-   "DCR-minted clients require consent" below.
+   "Every client requires consent" below.
 
 ### Run the connecting client safely (untrusted data)
 
@@ -291,20 +291,27 @@ annotations, so a client may auto-approve `list_tables` / `describe_table` /
 The annotations say nothing about the agent's other tools, which is exactly
 why the two mitigations above matter.
 
-### DCR-minted clients require consent
+### Every client requires consent
 
-Every Application created via `/o/register` (i.e. every Claude Code
-install) has `skip_authorization=False`. This forces the OAuth consent
-screen on every `/o/authorize/` call for these clients — including repeat
-visits by a user who already holds a live token for the client, because
+Every Application this package creates has `skip_authorization=False`: each
+one created via `/o/register` (every Claude Code install), each declared
+client, and, since migration 0015, the curated `mcp-sql` row. This forces the
+OAuth consent screen on every `/o/authorize/` call — including repeat visits
+by a user who already holds a live token for the client, because
 `MCPAuthorizationView` pins DOT's `approval_prompt` to `force` (on `auto`, DOT
-skips consent for such a user). The curated
-`mcp-sql` Application from migration 0005 keeps `skip_authorization=True`
-because operators provisioned its redirect URI in the migration — there
-is no rogue-client path to that row.
+skips consent for such a user).
 
-The asymmetry exists because of the attack chain the consent screen
-breaks:
+The curated row used to skip consent, on the reasoning that its redirect URI
+is fixed in the migration so no attacker can mint a rogue copy. That does not
+hold: its registered redirect is `http://127.0.0.1`, and DOT accepts any port
+on a loopback IP at request time, so the attacker does not need a rogue
+client at all. A phished `/o/authorize/?client_id=mcp-sql&redirect_uri=
+http://127.0.0.1:31337&...` link gets the same silent code delivery as step 5
+below. Migration 0015 flips existing rows (its reverse restores the old
+posture); 0005 creates new ones requiring consent.
+
+The consent page exists because of the attack chain it breaks (shown with a
+DCR client; with the curated client, skip steps 1–2):
 
 1. Attacker discovers `/o/register` from the public `/.well-known/...`
    discovery doc (RFC 8414 requires the field — anonymous-readable by
@@ -344,7 +351,7 @@ which one did:
 
 | Kind | `client_id` | How it gets registered | Consent |
 |---|---|---|---|
-| `curated` | `mcp-sql` | migration 0005, by the operator | skipped |
+| `curated` | `mcp-sql` | migration 0005, by the operator | forced (since migration 0015) |
 | `dcr` | `mcp-sql-<22 chars>` | anonymous RFC 7591 self-registration at `/o/register`, loopback callbacks only | forced |
 | `cloud` | `mcp-sql-cloud.<slug>` | `MCP_SQL["CLIENTS"]`, https callback | forced |
 | `local` | `mcp-sql-local.<slug>` | `MCP_SQL["CLIENTS"]`, `http://localhost:<port>` callback | forced |
@@ -399,10 +406,9 @@ key replaces its default wholesale) — `"CLIENTS": {}` runs loopback-only.
 **What each entry does.** On `migrate`, a `post_migrate` receiver
 (`provision_mcp_clients`, mirroring `provision_mcp_profiles`) materializes one
 curated `Application` per entry: public / PKCE, `authorization_code`, **no
-secret**, every rule's URI in `redirect_uris`, and — unlike the canonical
-`mcp-sql` row but like every DCR client — `skip_authorization=False` (consent
-required; the callback is fixed and shared, so the same phishing surface that
-motivates DCR consent applies). The `mcp-sql-` prefix on the `client_id` means
+secret**, every rule's URI in `redirect_uris`, and — like every other
+client — `skip_authorization=False` (consent required; the callback is fixed
+and shared, so the same phishing surface applies). The `mcp-sql-` prefix on the `client_id` means
 logout revocation already covers these tokens; the `.` after the kind keeps
 the id disjoint from DCR's `mcp-sql-<22 url-safe chars>` shape (a `.` is not
 in the url-safe-base64 alphabet).
@@ -550,7 +556,7 @@ that public `https` origin (if a proxy terminates TLS, set
    TTL is 6 h and refresh tokens are disabled, so the user re-consents each
    time the token expires. There is no "remember me"; this is deliberate (same
    rationale as [DCR-minted clients require
-   consent](#dcr-minted-clients-require-consent)).
+   consent](#every-client-requires-consent)).
 
 **Strongly recommended: a cloud-tolerant `SESSION_MODEL`.** A cloud client's
 token lives in the provider's cloud, and a tool call can arrive minutes after
@@ -963,10 +969,9 @@ claude
 
 If the flow stalls at the browser redirect, check the
 `oauth2_provider_application` row matches the migration's expected
-values (`mcp-sql`, public, PKCE, `skip_authorization=True` **for the
-curated row only** — DCR-minted `mcp-sql-<token>` rows have
-`skip_authorization=False`, see "DCR-minted clients require consent"
-above), loopback redirect URIs:
+values (`mcp-sql`, public, PKCE, `skip_authorization=False` — like every
+other client, see "Every client requires consent" above), loopback redirect
+URIs:
 
 ```sql
 SELECT name, client_id, client_type, authorization_grant_type,
@@ -975,16 +980,17 @@ FROM oauth2_provider_application
 WHERE name LIKE 'mcp-sql%';
 ```
 
-Expected: exactly one row with `name='mcp-sql'` and
-`skip_authorization=true`, plus zero or more `name='mcp-sql-<token>'`
-rows with `skip_authorization=false` (one per `claude mcp add`
-invocation across all developers).
+Expected: exactly one row with `name='mcp-sql'`, plus zero or more
+`name='mcp-sql-<token>'` rows (one per `claude mcp add` invocation across
+all developers) and one `mcp-sql-{cloud,local}.<slug>` row per declared
+client, every one with `skip_authorization=false`.
 
 If the curated row is missing, the `0005_create_mcp_sql_application`
-migration did not run — re-apply with `python manage.py migrate mcp_sql`.
-If a DCR-minted row has `skip_authorization=true` despite this guidance,
-it predates the security fix; delete it and have the developer
-re-register via `claude mcp add`.
+migration did not run — re-apply with `python manage.py migrate mcp_sql`. If
+it still has `skip_authorization=true`, migration
+`0015_curated_application_requires_consent` has not run. If a DCR-minted row
+has `skip_authorization=true`, it predates the security fix; delete it and
+have the developer re-register via `claude mcp add`.
 
 ## Post-incident notes
 
@@ -1026,8 +1032,8 @@ control so none is a live exposure:
   expiry and old `MCPQueryLog` / `MCPAuthRejectionLog` rows are not
   auto-pruned. Negligible DB load until the cohort grows substantially.
 - **"Application bound to creating user" (full anti-phishing defense).** The
-  consent-screen asymmetry (see [DCR-minted clients require
-  consent](#dcr-minted-clients-require-consent)) converts the silent-GET
+  consent screen (see [Every client requires
+  consent](#every-client-requires-consent)) converts the silent-GET
   phishing attack into one needing the victim's active click; binding each
   DCR client to its creator would close the gap fully, at the cost of a
   schema change on `oauth2_provider_application`.
