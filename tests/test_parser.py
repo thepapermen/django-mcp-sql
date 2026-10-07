@@ -2001,6 +2001,26 @@ class TestReviewRound15:
     def test_interval_syntax_postgres_rejects(self, sql):
         _expect_reject(sql, OutcomeReason.PARSE_ERROR)
 
+    # Review round 16: left to sqlglot's `_parse_type`, `interval[` was read
+    # as an array type, so a slice of a column `interval` was a parse error
+    # (Postgres reads the column; A15 regression).
+    @pytest.mark.parametrize(
+        ("expression", "rendered"),
+        [
+            ("interval[:]", "interval[:]"),
+            ("interval[:1]", "interval[:1]"),
+            ("INTERVAL[:1]", "INTERVAL[:1]"),
+            ("interval [:1]", "interval[:1]"),
+            ("interval[ :1]", "interval[:1]"),
+            ("interval[1:]", "interval[1:]"),
+        ],
+    )
+    def test_a_slice_of_a_column_interval(self, expression, rendered):
+        source = "(SELECT ARRAY[5, 6] AS interval)"
+        sql = f"SELECT {expression} AS v FROM {source} s"  # noqa: S608
+        expected = f"SELECT {rendered} AS v FROM {source} AS s LIMIT 11"  # noqa: S608
+        assert self._rendered(sql) == expected
+
     @pytest.mark.parametrize(
         "sql", ["SELECT interval(1) '1.23' AS v", "SELECT interval (1) '1.23' AS v"]
     )

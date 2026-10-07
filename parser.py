@@ -857,9 +857,12 @@ class FaithfulPostgres(Postgres):
                 # only before a string constant or `(`. sqlglot took the next
                 # operand as the interval's value (`interval + 1` ran as
                 # `INTERVAL '1'`, `interval - y` lost the `- y`, `interval *
-                # 2` was refused as `SELECT *`). Nothing is consumed.
+                # 2` was refused as `SELECT *`). It is read here as the column
+                # it is: left to sqlglot's `_parse_type`, `INTERVAL[` was
+                # read as an array type (`interval[:1]` refused).
                 self._no_interval_constant()
-                return None
+                column: exp.Expression | None = self._parse_column()
+                return column
             parsed: exp.Expression | None = super()._parse_interval(*args, **kwargs)
             return parsed
 

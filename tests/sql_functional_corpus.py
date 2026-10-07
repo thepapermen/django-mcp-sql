@@ -3037,6 +3037,30 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT id, interval ^ 2 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
     ),
     (
+        "intervals",
+        "SELECT id, interval[:] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval[:1] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, INTERVAL[:1] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval [:1] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval[ :1] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval[2:] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
         "patterns",
         "SELECT id, g ILIKE 'A%' ESCAPE E'#' AS v FROM t ORDER BY id",
     ),
