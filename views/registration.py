@@ -476,7 +476,13 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     if metadata_error is not None:
         return metadata_error
 
-    client_name = body.get("client_name") or "Unnamed MCP client"
+    # Optional (RFC 7591 §2). Absent, `null` or empty gets the default; any
+    # other non-string is refused below. A falsy non-string (`0`, `false`,
+    # `[]`) used to be swapped for the default silently while a truthy one
+    # was refused.
+    client_name = body.get("client_name")
+    if client_name is None or client_name == "":
+        client_name = "Unnamed MCP client"
     if (
         not isinstance(client_name, str)
         or len(client_name) > _MAX_CLIENT_NAME

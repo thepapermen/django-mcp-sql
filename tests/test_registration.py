@@ -1147,3 +1147,47 @@ class TestRegistrationFuzz:
                     "invalid_redirect_uri",
                     "invalid_client_metadata",
                 }
+
+
+@pytest.mark.django_db
+class TestClientNameType:
+    """`client_name` is optional free text. Absent, `null` or empty gets the
+    default name; any other non-string is a 400. A falsy non-string (`0`,
+    `false`, `[]`) used to be replaced by the default silently while a truthy
+    one (`1`, `["x"]`) was refused."""
+
+    @pytest.mark.parametrize(
+        "value", ["absent", None, ""], ids=["absent", "null", "empty"]
+    )
+    def test_defaulted(self, client, value):
+        body = {"redirect_uris": ["http://localhost:8787/callback"]}
+        if value != "absent":
+            body["client_name"] = value
+        response = _post(client, body)
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["client_name"] == "Unnamed MCP client"
+
+    @pytest.mark.parametrize(
+        "value",
+        [0, False, [], {}, 1, True, 1.5, ["x"], {"name": "x"}],
+        ids=[
+            "zero",
+            "false",
+            "empty-list",
+            "empty-object",
+            "one",
+            "true",
+            "float",
+            "list",
+            "object",
+        ],
+    )
+    def test_non_string_is_a_400(self, client, value):
+        before = Application.objects.count()
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/callback"], "client_name": value},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_client_metadata"
+        assert Application.objects.count() == before

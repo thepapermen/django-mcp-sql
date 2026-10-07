@@ -454,7 +454,9 @@ announce themselves.
   used to be registered verbatim (a 201), unusable. The rest are RFC 7591
   400s for the whole request, even beside a clean URI: the body and type
   cases above, a `redirect_uris` member that is not a string (it used to be
-  dropped silently), and the characters below.
+  dropped silently), a `client_name` that is not a string (absent, `null` or
+  empty still gets the default name; a falsy non-string such as `0` or `[]`
+  used to get it silently), and the characters below.
   A requested `redirect_uris` entry is refused (`invalid_redirect_uri`) if it
   holds a control (Unicode `Cc`), surrogate (`Cs`), format (`Cf`), line /
   paragraph separator (`Zl`, `Zp`) or any Default_Ignorable_Code_Point
