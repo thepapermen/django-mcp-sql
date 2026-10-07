@@ -134,10 +134,17 @@ test = [
 # representative Django line (5.2); the package's annotations are
 # Django/DRF-version-agnostic, so it does not re-validate every supported
 # Django × DRF pair (those are exercised by the runtime test matrix instead).
+# psycopg: the django-stubs plugin loads `[tool.django-stubs]`'s settings
+# module, whose PostgreSQL engine imports a driver at setup; without one the
+# plugin fails to construct ("Error constructing plugin instance of
+# NewSemanalDjangoPlugin") before checking anything. CI and `make typecheck`
+# also install `[test]`, which carries it; this keeps `.[typecheck]` alone
+# working too.
 typecheck = [
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=6",
     "djangorestframework-stubs[compatible-mypy]>=3.15",
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.setuptools]
