@@ -63,7 +63,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 | `management/commands/mcp_sql_smoke.py` | Smoke check, two modes. Default: role/grants contract — opens `mcp_readonly`, enters the read-only session, verifies guard GUCs, asserts the audit table is unreadable, asserts a write is rejected. `--run-query "<sql>"`: drives the executor end-to-end (parser → LIMIT N+1 → readonly tx → row caps → audit). |
 | `schemas.py` | `QueryResult` dataclass + `OutcomeReason` short-code vocabulary + `HINTS` map (agent-facing text per reason + truncation hint). Reused by the MCP transport layer. |
 | `fencing.py` | `fence_query_result(payload)` — wraps `run_query`'s untrusted, DB-sourced fields (`rows`, and `error` when set) in a per-response random-UUID `<untrusted-data-…>` XML fence plus a `data_handling` instruction, so injected DB content (email subjects, contact names, comments, …) can't forge the boundary and be read as agent instructions. Pure-Python / Django-free (travels with the package); called from the `run_query` tool closure in `views/mcp_endpoint.py`. |
-| `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery`, `inject_limit(ast, n) -> Expression` and `render_for_execution(ast, n, *, allowed_tables, ...) -> str` (the LIMIT-wrapped SQL the executor sends, itself validated and stable under re-rendering — see "Watch out: the executed SQL is the text that was validated"). Parse failures of every kind (sqlglot's `TokenError`, its `re.error` on `UESCAPE`, the plain Python exceptions its function builders raise) become `PARSE_ERROR`, and `run_query` audits anything unexpected from parsing or rendering. Parsing and rendering use `FaithfulPostgres`, sqlglot's postgres dialect minus the rewrites that change results (`date_part` → `EXTRACT`, `date_trunc` losing its zone, `to_hex` → `HEX`, `current_*` precision). sqlglot-backed AST validators: lexical fidelity first (no `E'…'` escape string with a backslash, no `U&` escape, no identifier written as a string constant, no double-quoted function name in call position, no adjacent string constants, no dollar-quote tag Postgres rejects — `UNSAFE_LITERAL`), single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *`, no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte`; a flat global CTE-name set let an inner CTE shadow an outer-scope real table), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`). Raises `QueryRejectedError(reason, detail)`. |
+| `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery`, `inject_limit(ast, n) -> Expression` and `render_for_execution(ast, n, *, allowed_tables, ...) -> str` (the LIMIT-wrapped SQL the executor sends, itself validated and stable under re-rendering — see "Watch out: the executed SQL is the text that was validated"). Parse failures of every kind (sqlglot's `TokenError`, its `re.error` on `UESCAPE`, any plain Python exception from inside sqlglot) become `PARSE_ERROR`, and `run_query` audits anything unexpected from parsing or rendering. Parsing and rendering use `FaithfulPostgres`, sqlglot's postgres dialect reading and rendering SQL as written (function calls, interval strings, JSON keys, quoted types, numeric constants, ...; see "Watch out: the executed SQL is the text that was validated"). sqlglot-backed AST validators: lexical fidelity first (no `E'…'` escape string with a backslash, no `U&` escape, no identifier written as a string constant, no double-quoted function name sqlglot would fold onto a builtin, no adjacent string constants, no dollar-quote tag Postgres rejects — `UNSAFE_LITERAL`), single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *`, no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte`; a flat global CTE-name set let an inner CTE shadow an outer-scope real table), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`). Raises `QueryRejectedError(reason, detail)`. |
 | `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → `render_for_execution` (inject `LIMIT N+1`, render without comments, validate the rendered text and require a stable re-render, else `ROUNDTRIP_MISMATCH`) → open `mcp_readonly` tx → `enter_readonly_session` → execute → fetch → mark the tx for rollback (it is never committed) → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, and `rejection_reason` — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
 | `observability.py` | `record_query_volume(*, user_id, decision, user_label="")` — per-(user, decision, window) fixed-window cache counters (mirrors `throttle`'s `cache.add`+`incr` primitive), called from `executor._audit_safely` on every audited row. Emits ONE `logger.error` (Sentry event) at each crossing of `MCP_SQL["VOLUME_ALERT_THRESHOLDS"][decision][window]` (hour + day, allowed + rejected). ALERTS, never blocks; fail-open on cache trouble. The alert names the user (pk + `get_username()`); it never logs SQL. |
 | `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't the `mcp-sql` Application and any scope set that isn't `{"mcp:sql"}`. Its `validate_redirect_uri` / `get_default_redirect_uri` also re-apply the `/o/register` predicate (`views/registration.py::_is_loopback_redirect`) to the requested redirect and to the stored default of every client that is not a declared cloud client (see "Watch out: DOT stores redirect URIs whitespace-joined"). It must be the install's `OAUTH2_VALIDATOR_CLASS` (or a subclass; `validation.validate_oauth2_validator_class` refuses to boot otherwise), so it also keeps backstops for any stock DOT view on DOT's stock server: `is_pkce_required` always `True`, `get_code_challenge_method` refuses to redeem a stored non-S256 grant (`invalid_grant`, on any server), `validate_user` refuses every password grant, `_load_application` never looks up a `client_id` carrying a control character. It also owns the refresh policy on every server: with refresh off `save_bearer_token` drops any refresh token and `validate_refresh_token` refuses; with `REFRESH_TOKEN_MAX_AGE_SECONDS` on, `save_bearer_token` records each chain's consent (`MCPRefreshTokenFamily`), `validate_refresh_token` enforces the hard cap from it and `rotate_refresh_token` is always on (see "Watch out: the OAuth server is narrowed on the package's views"). |
@@ -76,7 +76,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 | `throttle.py` | Shared per-IP fixed-window block backed by the Django cache (use a SHARED backend — Redis, Memcached — in production: with a per-process backend like LocMem the counters, and therefore the block, are per-worker). One primitive, two surfaces: `auth` (`bad_token` scope, silent 401) and `views/registration` (`register` scope, silent inert 201). Both share `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]` / `["BAD_TOKEN_IP_WINDOW_SECONDS"]`; keys are scope-namespaced so one surface never depletes the other's budget. Keys on `REMOTE_ADDR` — sound only behind a hardened edge proxy (see "Watch out: the per-IP throttle trusts the proxy's IP handling"). |
 | `decorators.py` | `cap_request_body(max_bytes)` — the body-size cap on the OAuth endpoints, applied in `urls.py` (64 KiB; `OAUTH_REQUEST_BODY_MAX_BYTES`). Header-only `CONTENT_LENGTH` check (Django's `LimitedStream` truncates an under-declared body to the lie, so the header is the only gate needed), returning a plain 413 before the view reads the body; `functools.wraps` preserves each view's `csrf_exempt` flag. `/mcp/sql/` is capped separately and higher (1 MiB) in `auth.py`, since its body carries the SQL query. |
 | `views/registration.py` | RFC 7591 OAuth 2.0 Dynamic Client Registration endpoint at `/o/register`. Anonymous JSON POST that creates a new `Application` row with the curated public-client / PKCE-required posture and a `mcp-sql-<token>` name (so the prefix-based validator/auth/signal recognise it). Enforces RFC 8252 §7.3 loopback-only `redirect_uris` server-side and applies a **silent** per-IP block via `throttle` — once an IP crosses the threshold it gets an inert 201 (no `Application` row persisted) indistinguishable from success. Request-body size is capped at 64 KiB by `decorators.cap_request_body`, applied to all four OAuth endpoints in `urls.py`; periodic cleanup of stale dynamically-registered Applications is deferred until a concrete abuse pattern names the threat. |
-| `signals.py` | Receivers. (1) `user_logged_out` → deletes the user's `AccessToken`, `RefreshToken` and pending `Grant` (authorization-code) rows scoped to BOTH the canonical `mcp-sql` Application AND every dynamically-registered `mcp-sql-*` Application (`Q \| Q`) — the `mcp-sql-` prefix also covers settings-declared `mcp-sql-cloud.<name>` clients. (1b) `pre_save` / `post_save` (connected without a sender, filtered with `isinstance`, so proxies of the user model count) → the same deletion after a password change commits (`password_change` audit row; no session table needed); only the exact save of Django's login-time hash upgrade (`check_password`'s setter re-hashing an outdated hash) is exempt — a hash written directly with `update_fields=["password"]` revokes — and bulk `QuerySet.update(password=...)` / `bulk_update` are not seen. (2) `post_migrate` `provision_mcp_profiles` → idempotently `get_or_create`s one Permission (content_type `mcpquerylog`) + one Group per `MCP_SQL["PROFILES"]` entry (config-derived, replaces static `Meta.permissions` + migration 0004). (2b) `post_migrate` `provision_mcp_cloud_clients` → idempotently `update_or_create`s one curated `Application` (`mcp-sql-cloud.<name>`, public/PKCE, no secret, `skip_authorization=False`, per-entry `redirect_uris`) per `MCP_SQL["CLOUD_CLIENTS"]` entry; create/update only (never deletes — settings-gated recognition is the off-switch). (3) `post_migrate` `audit_grants_drift_after_migrate` → calls `reconcile_grants(strict=False, apply=False)` and logs a WARNING when any profile's grants drift from its whitelist. **Read-only on the signal path.** Apply happens explicitly via `python manage.py mcp_sql_grants --apply` (`reconcile_grants(strict=True, apply=True)`) as a deploy step. Lenient mode: a fresh env whose DBA has not yet created the roles logs a WARNING and skips. (4) `m2m_changed` on `User.groups.through` → `logger.error` (Sentry event) when a user is ADDED to ANY MCP profile group; layered on top, a second ERROR when the addition leaves the user in >1 MCP profile group (ambiguous → denied until fixed). Gain-only, group-only by design (no defense without a named threat): losing a group, direct `user_permissions` grants, and group-permission-set changes are deliberately out of scope. Names the affected user(s) + profile(s); None-safe before provisioning (fresh DB). |
+| `signals.py` | Receivers. (1) `user_logged_out` → deletes the user's `AccessToken`, `RefreshToken` and pending `Grant` (authorization-code) rows scoped to BOTH the canonical `mcp-sql` Application AND every dynamically-registered `mcp-sql-*` Application (`Q \| Q`) — the `mcp-sql-` prefix also covers settings-declared `mcp-sql-cloud.<name>` clients. (1b) `pre_save` / `post_save` (connected without a sender, filtered with `isinstance`, so proxies of the user model count) → the same deletion after a password change commits (`password_change` audit row; no session table needed); only Django's login-time hash upgrade is exempt — the save `check_password` / `acheck_password` makes while it runs, which `install_password_check_marker` (called from `ready()`) marks by wrapping those two `AbstractBaseUser` methods with a context variable; any other new hash revokes, however it is saved — and bulk `QuerySet.update(password=...)` / `bulk_update` are not seen. (2) `post_migrate` `provision_mcp_profiles` → idempotently `get_or_create`s one Permission (content_type `mcpquerylog`) + one Group per `MCP_SQL["PROFILES"]` entry (config-derived, replaces static `Meta.permissions` + migration 0004). (2b) `post_migrate` `provision_mcp_cloud_clients` → idempotently `update_or_create`s one curated `Application` (`mcp-sql-cloud.<name>`, public/PKCE, no secret, `skip_authorization=False`, per-entry `redirect_uris`) per `MCP_SQL["CLOUD_CLIENTS"]` entry; create/update only (never deletes — settings-gated recognition is the off-switch). (3) `post_migrate` `audit_grants_drift_after_migrate` → calls `reconcile_grants(strict=False, apply=False)` and logs a WARNING when any profile's grants drift from its whitelist. **Read-only on the signal path.** Apply happens explicitly via `python manage.py mcp_sql_grants --apply` (`reconcile_grants(strict=True, apply=True)`) as a deploy step. Lenient mode: a fresh env whose DBA has not yet created the roles logs a WARNING and skips. (4) `m2m_changed` on `User.groups.through` → `logger.error` (Sentry event) when a user is ADDED to ANY MCP profile group; layered on top, a second ERROR when the addition leaves the user in >1 MCP profile group (ambiguous → denied until fixed). Gain-only, group-only by design (no defense without a named threat): losing a group, direct `user_permissions` grants, and group-permission-set changes are deliberately out of scope. Names the affected user(s) + profile(s); None-safe before provisioning (fresh DB). |
 | `admin.py` | Unregisters django-oauth-toolkit's ModelAdmins (single-Application invariant), AND registers READ-ONLY admins for `MCPQueryLog` / `MCPAuthRejectionLog` (browse-only — `has_add/change/delete_permission` all False, via a LOCAL mixin, deliberately not a consumer-provided read-only mixin) plus a per-user **usage-summary** view at `/admin/mcp_sql/mcpquerylog/usage-summary/` aggregating allowed/rejected query + auth-rejection counts per rolling window (1h/24h/7d) — the `VOLUME_ALERT_THRESHOLDS` tuning instrument. `search_fields`/`ordering`/summary labels traverse the consumer user model's `USERNAME_FIELD`; the `user_email` display stays `get_username()`-generic — no email-keyed assumption. |
 | `migrations/0004_create_mcp_sql_users_group.py` | Retained **no-op**. Originally created the `mcp_sql_users` group + `mcp_sql.use_mcp_session` permission; provisioning moved to the config-derived `provision_mcp_profiles` `post_migrate` receiver (signals.py) because the package can't enumerate consumer profile names in a migration. Kept so the graph stays intact for environments that already applied it. |
 | `management/commands/mcp_sql_role_setup.py` | `--emit-sql`: generates the N-role bootstrap SQL (one `CREATE ROLE … NOLOGIN` + GUC defaults + membership `GRANT … TO <app_role>` per distinct profile role) from `MCP_SQL["PROFILES"]`, mirroring `sql/role_setup.sql`. Read-only — prints to stdout for a DBA to review/run (`… --emit-sql \| psql … -v app_role=<role>`); never connects or applies. |
@@ -500,43 +500,68 @@ The load-bearing invariants and footguns, grouped by layer:
   1. The parser refuses source forms that sqlglot and Postgres read
      differently (`UNSAFE_LITERAL`, checked first): escape strings with a
      backslash, `U&'…'` / `U&"…"` (sqlglot 30.7 reads `U & '…'`),
-     identifiers written as string constants, double-quoted function names
-     in call position (sqlglot folds `"Lower"(x)` onto `LOWER(x)`; quoted
-     aliases / CTEs with a column list and `::"type"(n)` are fine),
-     adjacent string constants (sqlglot: `CONCAT`; Postgres: an error on
-     one line, a differently named column across a newline), dollar-quote
-     tags Postgres rejects.
+     identifiers written as string constants, a double-quoted name called
+     as a function where the parsed tree does not keep the quoted name
+     (`"Count"(x)`, `"Extract"(...)` fold onto the builtin; `"Lower"(x)`,
+     quoted aliases / CTEs with a column list and `::"type"(n)` are kept
+     as written), adjacent string constants (sqlglot: `CONCAT`; Postgres:
+     an error on one line, a differently named column across a newline),
+     dollar-quote tags Postgres rejects.
   2. `parser.render_for_execution` renders the LIMIT-wrapped tree WITHOUT
      comments (their text is not in the tree), with function-name case
      kept and `unsupported_level=RAISE` (a construct sqlglot cannot express
-     in Postgres — `IGNORE NULLS`, `initcap`'s delimiter — is refused, not
+     in Postgres — `IGNORE NULLS` / `RESPECT NULLS` — is refused, not
      silently dropped), runs the FULL `parse_and_validate` on that text with
      the same whitelist, and requires it to re-render to the identical
-     string and still end in exactly the injected LIMIT (`QUALIFY` moved it
-     into a subquery). If the first re-render only respells, that text is
+     string and still end in exactly the injected LIMIT (or
+     `LIMIT LEAST(<as written>, n)` for a LIMIT that is not a plain
+     integer). If the first re-render only respells, that text is
      validated and re-rendered in turn, up to three rounds. Otherwise
-     `ROUNDTRIP_MISMATCH`: audited, nothing executed. Faithful rewrites
-     (`ROUND(AVG(x), 2)` gaining a CAST, `SOME` → `ANY`) validate and run;
-     a rendering that smuggles in a statement, a table or a denied function
-     fails the checks (a harmless extra projection would run — as checked).
-  3. Rewrites that change results are switched off in `FaithfulPostgres`
-     (sqlglot's postgres dialect minus them): `date_part` → `EXTRACT`
-     (numeric instead of float), `date_trunc` losing its zone (30.7),
-     `to_hex` → `HEX`, `current_timestamp(0)` / `current_time` precision.
+     `ROUNDTRIP_MISMATCH`: audited, nothing executed. Respellings that keep
+     the meaning (`SOME` → `ANY`, `x::int` → `CAST(x AS INT)`, an expanded
+     window frame) validate and run; a rendering that smuggles in a
+     statement, a table or a denied function fails the checks (a harmless
+     extra projection would run — as checked).
+  3. `FaithfulPostgres` reads and renders Postgres SQL as written. Stock
+     sqlglot maps function calls onto its own nodes and renders them in its
+     own spelling, and much of that is not the same to Postgres (`like(a,
+     b)` → `b LIKE a`; `log10` / `date_part` → numeric instead of double
+     precision; `to_char` formats "translated"; zones dropped; `strpos` →
+     `POSITION`, `now()` → `CURRENT_TIMESTAMP`, other column names). So
+     every plain call `name(args)` is kept as written (`exp.Anonymous`),
+     except the three the checks match structurally (`count`,
+     `generate_series`, `unnest`) and Postgres's keyword-syntax functions
+     (`EXTRACT`, `SUBSTRING`, `TRIM`, `POSITION`, `OVERLAY`, `CAST`, the
+     SQL/JSON constructors). It also keeps as written: multi-part interval
+     strings, the right operand of `->` / `->>`, quoted type names, `bit` /
+     `char` typed literals, numeric constants (incl. the PG16 forms `0x1F`,
+     `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), `DISTINCT` over
+     several aggregate arguments, `current_*` precision.
+     `test_sql_fidelity.test_every_catalog_function_call_is_rendered_as_written`
+     renders a call to every `pg_catalog` function and requires it
+     unchanged, so a newer sqlglot cannot bring a rewrite back unnoticed.
      When subclassing a sqlglot dialect, assign the parent's tokenizer
      classes: a derived one reads `E'\''` differently.
   The guarantee is about what **sqlglot** reads in the executed text: it
   passed every check and re-parses (by sqlglot) to itself. It is not a proof
   about Postgres's lexer, and values are only as faithful as sqlglot's
   generator. Where the two are known to disagree, the form is refused in
-  layer 1 or the rewrite switched off in layer 3; a disagreement nobody has
+  layer 1 or rendered as written in layer 3; a disagreement nobody has
   found yet is the residual risk. Known, accepted: some operators render to
-  invalid SQL (`@ x` → `$x`, `^@`), so those queries fail at execution
-  (fail-closed), and non-Postgres syntax sqlglot understands (`nvl`, `IF`,
-  `REGEXP`, ...) is translated into Postgres rather than refused.
-  `tests/test_sql_functional_corpus.py` runs 488 ordinary analytical
-  queries end to end and checks each returns exactly what Postgres returns
-  for the original text.
+  invalid SQL (`@ x` → `$x`, `^@`, so those queries fail at execution —
+  fail-closed) or another spelling (`|/ x` → `SQRT(x)`, a different column
+  name); syntax Postgres rejects that sqlglot still understands (`REGEXP`,
+  `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+) is
+  translated rather than failing as in Postgres; and a few valid forms
+  sqlglot cannot parse are refused (`ORDER BY … USING`, `bit varying '…'`,
+  `j @? path` on 30.7). Pre-existing and tracked separately: a later CTE
+  masking an earlier CTE's table reference in the whitelist check,
+  psycopg2's type-cast errors escaping the audit, `reg*` casts as an
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 517
+  ordinary analytical queries (over data with NULLs and mixed case) end to
+  end and checks each returns exactly what Postgres returns for the
+  original text (`repr`-exact), plus queries Postgres rejects that must
+  fail in Postgres through `run_query` too.
   Never send `ast.sql()` to the database directly. Pinned by
   `tests/test_sql_fidelity.py` (values and column names checked against
   Postgres itself on a corpus of analytic shapes, on the sqlglot floor and
@@ -544,9 +569,11 @@ The load-bearing invariants and footguns, grouped by layer:
 - **Row cap is most-restrictive-wins across three sources.** `run_query`'s
   effective row cap is `min(tool_kwarg, sql_LIMIT_N, HARD_LIMIT)`, falling
   back to `DEFAULT_LIMIT` when neither tool kwarg nor SQL LIMIT is set.
-  `parser.extract_limit` reads what the user wrote in SQL so the executor
-  can honor a small `LIMIT N`; `parser.inject_limit` then clobbers with
-  `clamped+1` for the N+1 truncation-detection trick. Without
+  `parser.extract_limit` reads a plain integer `LIMIT N` the user wrote so
+  the executor can honor it; `parser.inject_limit` then clobbers it with
+  `clamped+1` for the N+1 truncation-detection trick. Any other LIMIT
+  (`3.5`, `2 + 3`, a subquery, `-1`, `0x10`) is kept for Postgres to
+  evaluate and capped: `LIMIT LEAST(<as written>, clamped+1)`. Without
   most-restrictive, the executor would silently *raise* a user's `LIMIT 3`
   to `LIMIT 10+1` and return 10 rows + `truncated=True` — confusing the
   caller about both the row count and the truncation reason.

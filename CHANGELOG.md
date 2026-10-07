@@ -30,9 +30,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `U&'…'` / `U&"…"` Unicode escape (sqlglot 30.7 read it as `U & '…'`,
     which then ran and could match different rows), any identifier written
     as a string constant (`AS $$…$$`, `AS 'x'`, `AS E'x'`), a
-    double-quoted function name in call position (sqlglot folded
-    `"Lower"(x)` onto `LOWER(x)`; quoted aliases and CTEs with a column
-    list, and `::"type"(n)`, stay accepted), adjacent string constants
+    double-quoted name called as a function that sqlglot would fold onto
+    its builtin (`"Count"(x)`, `"Extract"(...)`; every other quoted call,
+    such as `"Lower"(x)`, now runs as written, quotes included, and quoted
+    aliases and CTEs with a column list stay accepted), adjacent string constants
     (`'a' 'b'`, which sqlglot always read as `CONCAT`) and a dollar-quote
     tag Postgres rejects (`$u&$…$u&$`). `E'…'` without a backslash, standard
     strings with backslashes, `$$…$$` values and `U & 'x'` with spaces stay
@@ -46,26 +47,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     with the new reason `roundtrip_mismatch`, naming the rendered SQL and
     the failing check. Comments are never sent (sqlglot rewrote `--`
     comments as `/* */`, and their text is not checked). The rendering must
-    still end in exactly the injected LIMIT (sqlglot moved it into a
-    subquery for `QUALIFY`), and a construct sqlglot knows it cannot
-    express in Postgres (`IGNORE NULLS`, `initcap`'s delimiter), which it
-    used to drop with a warning, is refused instead. Faithful rewrites
-    sqlglot makes (`ROUND(AVG(x), 2)` gaining a CAST, an expanded window
-    frame, `SOME` → `ANY`) still run; the rewrites that changed results
-    (`date_part` → `EXTRACT`, numeric instead of float; `date_trunc` losing
-    its time zone on sqlglot 30.7; `to_hex` → `HEX`; `current_timestamp(0)`
-    losing its precision; `current_time` → `CURRENT_TIME()`) are switched
-    off, so those are rendered as written. The guarantee is about what
-    sqlglot reads in the executed text — it passed every check and
-    re-renders to itself — not a proof about Postgres's lexer; forms whose
-    reading by Postgres is known to differ are refused by the parser
-    (above). A new acceptance test runs 488 ordinary analytical queries end
-    to end and checks each returns exactly what Postgres returns for the
-    original text, on both sqlglot versions.
+    still end in exactly the injected LIMIT, and a construct sqlglot knows
+    it cannot express in Postgres (`IGNORE NULLS` / `RESPECT NULLS`), which
+    it used to drop with a warning, is refused instead.
+  - The SQL is rendered as written. sqlglot's postgres dialect rewrote much
+    of what it read into its own spelling, and not all of it meant the
+    same to Postgres: calls to hundreds of functions (`like(a, b)` → `b
+    LIKE a`, arguments swapped; `regexp_like(x, p, 'i')` dropped the flags;
+    `date_part` → `EXTRACT` and `log10(x)` → `LOG(10, x)`, numeric instead
+    of double precision; `to_char(d, '%Y')` "translated" the format;
+    `date_add(t, i, zone)` and, on 30.7, `date_trunc(unit, t, zone)` lost
+    the zone; `strpos` → `POSITION`, `now()` → `CURRENT_TIMESTAMP` and
+    others gave a different column name), multi-part interval strings
+    (`INTERVAL '1 day 02:03:04'` ran as `'1 DAY'`, `'3 days ago'` lost its
+    sign), JSON keys (`j -> ''` dropped the key; on 30.7 a quote in a key
+    was not escaped), quoted type names (`::"char"` became `CHAR`), `bit
+    '011'` / `char 'abc'` (cut to one character), the PG16 numeric
+    constants (`0x1F` became a bit string, `1_000` the number 1 with an
+    alias), `(1, NULL) IS NOT NULL` on 30.7 (became `NOT … IS NULL`, the
+    opposite for a row), and `string_agg(DISTINCT a, ',')` (became a CASE
+    tuple). Each now renders as the agent wrote it (`parser.FaithfulPostgres`);
+    calls Postgres itself rejects (`nvl`, `iif`, `last_day`, 1-argument
+    `to_number`, `initcap(s, '-')`) now fail in Postgres instead of being
+    translated into something that runs. A LIMIT that is not a plain
+    integer (`LIMIT 3.5`, `LIMIT 2 + 3`, `LIMIT (SELECT …)`, `LIMIT -1`) is
+    kept and capped (`LIMIT LEAST(<as written>, n)`) instead of being
+    replaced by the cap, and `(SELECT … LIMIT 5)` no longer fails with a
+    second LIMIT. `QUALIFY` (not Postgres SQL) is refused as `parse_error`
+    wherever it appears. The guarantee is about what sqlglot reads in the
+    executed text — it passed every check and re-renders to itself — not a
+    proof about Postgres's lexer; forms whose reading by Postgres is known
+    to differ are refused by the parser (above). A new acceptance test runs
+    517 ordinary analytical queries (over data with NULLs and mixed case)
+    end to end and checks each returns exactly what Postgres returns for
+    the original text, on both sqlglot versions, and another renders a
+    call to every function in `pg_catalog` and requires it unchanged.
   - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
     `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
-    / `KeyError` / `decimal.InvalidOperation` its function builders raise
+    / `KeyError` / `decimal.InvalidOperation` its function builders raised
     on bad arguments — is now an audited `parse_error`; they escaped
     `run_query` with no `MCPQueryLog` row before. `run_query` also audits
     any unexpected exception from parsing or rendering instead of letting
@@ -76,9 +96,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     strings differently from the parser.
   - **Behaviour change:** the forms above are now refused; rewrite them as
     the hint suggests. A query whose rendering no longer validates is
-    refused as `roundtrip_mismatch` — in the test corpora only non-Postgres
-    SQL (`QUALIFY`, `IGNORE NULLS`, 1-argument `to_number`, ...); none of
-    the 488 ordinary analytical queries. **Action:** re-run
+    refused as `roundtrip_mismatch` — in the test corpora only `IGNORE
+    NULLS` / `RESPECT NULLS`, which Postgres before 19 does not have; none
+    of the ordinary analytical queries. **Action:** re-run
     `sql/role_setup.sql` (or `mcp_sql_role_setup`) to pick up the new role
     default; the per-transaction guard applies without it.
 - **The read transaction was not read-only (affects every release up to and
@@ -98,10 +118,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `MCPAuthRejectionLog` row (new reason `password_change`; migration
   0013). Done with model signals, so it needs no session table and holds
   with `SESSION_MODEL=None`. Django's login-time password-hash upgrade is
-  not treated as a change — only that exact save (`check_password`'s
-  setter re-hashing a hash that needed upgrading); a new hash written
-  directly with `save(update_fields=["password"])` (SSO / LDAP sync,
-  imports) is. Bulk `QuerySet.update(password=...)` and
+  not treated as a change — only the save `check_password` (or
+  `acheck_password`) makes while it runs, which the package marks by
+  wrapping those two methods of `AbstractBaseUser` in `ready()`; any other
+  new hash, even one saved the same way (`set_password(...)`,
+  `save(update_fields=["password"])` — SSO / LDAP sync, imports), is a
+  change. Bulk `QuerySet.update(password=...)` and
   `QuerySet.bulk_update(users, ["password"])` send no signals and are not
   seen — revoke tokens explicitly there. Logout now
   deletes refresh tokens and pending authorization codes as well as access

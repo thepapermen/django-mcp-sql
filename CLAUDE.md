@@ -50,7 +50,8 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   and re-renders (by sqlglot) to the same string — validated as sqlglot
   reads it, not a proof about Postgres's lexer. Never send `ast.sql()` to
   the database directly. Parse and render only with `FaithfulPostgres`
-  (rewrites that change results switched off); source forms sqlglot and
+  (renders SQL as written: function calls stay `exp.Anonymous` unless the
+  checks need sqlglot's node); source forms sqlglot and
   Postgres read differently are refused by the lexical-fidelity check (keep
   that list current). `tests/test_sql_functional_corpus.py` must keep
   passing: ordinary analytics return exactly what Postgres returns.
