@@ -128,7 +128,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     for them were not: `INTERVAL $$1$$ week` and `INTERVAL E'1' week` ran
     as 7 days, `INTERVAL $$25 hours$$ DAY` as 25 hours, `INTERVAL(2)
     $$1.234$$` and `DATE $$2024-01-01$$` were refused, `LIMIT
-    $$5000000000$$` failed as an int4). Also as written: a subscripted
+    $$5000000000$$` failed as an int4). `INTERVAL` is a typed literal only
+    before a string constant or `(`, as in Postgres; anywhere else it is
+    a name, so a column `interval` is read as the column (`interval + 1`
+    ran as `INTERVAL '1'`, one second; `interval - y` and `interval[1]`
+    lost the operand; `interval * 2` was refused as `SELECT *`,
+    `interval / 2` was a parse error), and `INTERVAL 5`, `INTERVAL 5 DAY`,
+    `INTERVAL N'1' week`, `interval day '1'` are parse errors, as in
+    Postgres (they ran). Also as written: a subscripted
     column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
@@ -150,7 +157,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    887 ordinary analytical queries (over data with NULLs and mixed case)
+    902 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the

@@ -491,15 +491,19 @@ The load-bearing invariants and footguns, grouped by layer:
 - **The executed SQL is the text that was validated — as sqlglot reads
   it.** The executor never sends the agent's text; it sends sqlglot's
   rendering of the validated tree, and that is not always faithful (ledger
-  F32 and its variants, on every supported sqlglot): `E'\\'` re-emits as
-  `e'\'` and swallows its closing quote, `E'a\\nb'` becomes a real newline,
-  and an alias written as a dollar-quoted string (`AS $$x, version() AS
-  v$$`, which Postgres itself refuses) is re-emitted unquoted as SQL — extra
-  projections, or `; RESET ROLE; DELETE ...` as further statements. Three
-  layers close it:
+  F32 and its variants, on every supported sqlglot): stock sqlglot re-emits
+  `E'\\'` as `e'\'`, which swallows its closing quote, and `E'a\\nb'` as a
+  real newline, and an alias written as a dollar-quoted string (`AS $$x,
+  version() AS v$$`, which Postgres itself refuses) is re-emitted unquoted
+  as SQL — extra projections, or `; RESET ROLE; DELETE ...` as further
+  statements. Three layers close it:
   1. The parser refuses source forms that sqlglot and Postgres read
      differently (`UNSAFE_LITERAL`, checked first): escape strings with a
-     backslash, `U&'…'` / `U&"…"` (sqlglot 30.7 reads `U & '…'`),
+     backslash (`FaithfulPostgres` renders an E-string as the plain string
+     it was read as, but sqlglot's tokenizer decodes only some escapes —
+     `\\`, `\'`, `\n` — and keeps the rest as written, so `E'\x41'`, `A`
+     to Postgres, would run as `'\x41'`), `U&'…'` / `U&"…"` (sqlglot 30.7
+     reads `U & '…'`),
      identifiers written as string constants, a double-quoted name called
      as a function where the parsed tree does not keep the quoted name
      (`"Count"(x)`, `"Extract"(...)` fold onto the builtin; `"Lower"(x)`,
@@ -545,8 +549,12 @@ The load-bearing invariants and footguns, grouped by layer:
      `+` after it is the operator — and an interval field word is compared
      as Postgres compares keywords, ASCII letters only), every form of
      string constant as the string it is (`E'…'` without a backslash,
-     `$$…$$`, `$tag$…$tag$` — in an interval, a typed literal or a LIMIT
-     exactly like `'…'`), the right operand of `->` / `->>`, quoted type names, `bit` /
+     `$$…$$`, `$tag$…$tag$` — in an interval, a typed literal, an `ESCAPE`
+     clause or a LIMIT exactly like `'…'`), `INTERVAL` as a typed literal
+     only before a string constant or `(` and otherwise an ordinary name (a
+     column `interval`: sqlglot ran `interval + 1` as `INTERVAL '1'`; and
+     `INTERVAL 5`, `INTERVAL 5 DAY`, `interval day '1'` are parse errors, as
+     in Postgres), the right operand of `->` / `->>`, quoted type names, `bit` /
      `char` typed literals, numeric constants (incl. the PG16 forms `0x1F`,
      `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), the operators
      `a ^@ b` (sqlglot read `a ^ (@ b)`), `!! q` and `! x` (read as `NOT`),
@@ -568,8 +576,9 @@ The load-bearing invariants and footguns, grouped by layer:
   found yet is the residual risk. Known, accepted: `|/ x` / `||/ x` render as
   `SQRT(x)` / `CBRT(x)` (another column name), a generic typed literal of a
   type sqlglot does not know (`lseg '…'`) is refused; syntax Postgres rejects that sqlglot still understands (`REGEXP`,
-  `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+) is
-  translated rather than failing as in Postgres (so is a keyword spelled
+  `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+, a
+  typed literal of a number, `text 5` / `date 20240101::text`, which runs
+  as a cast) is translated rather than failing as in Postgres (so is a keyword spelled
   with a non-ASCII letter that Python's `str.upper` folds onto ASCII:
   sqlglot's tokenizer reads `ſelect`, `aſ`, `ınner`, `unıon`, `lımıt` as
   the keywords, where Postgres reads names and raises — or, when a name is
@@ -592,7 +601,8 @@ The load-bearing invariants and footguns, grouped by layer:
   render them); `INTERVAL(3) '…'` (the precision form, with any form of
   string constant) is kept as written,
   and any other `INTERVAL(…)` (`INTERVAL(1 + 2) '…'`, `INTERVAL(3.0) '…'`,
-  `INTERVAL(3)` alone; Postgres rejects them) is a parse error. A LIMIT whose type is not evident from how it is
+  `INTERVAL(3)` alone, `interval(1)` with a column `interval` in scope;
+  Postgres rejects them all) is a parse error. A LIMIT whose type is not evident from how it is
   written (a column, a function call) is capped with `LEAST` uncast, so a
   NaN / infinite float there yields the cap where Postgres raises. Valid
   attribute-notation reads still refused (fail-closed): `(t).f` beside a
@@ -602,7 +612,7 @@ The load-bearing invariants and footguns, grouped by layer:
   `BAN_SELECT_STAR` (any `t.*` is `select_star`), `t.f` when a column `t`
   is also in scope. Pre-existing and tracked separately:
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 887
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 902
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must
