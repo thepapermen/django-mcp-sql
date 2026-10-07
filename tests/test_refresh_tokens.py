@@ -558,8 +558,9 @@ def _install_filtering_default_manager(monkeypatch, user_model, narrow):
     """Make `user_model`'s default manager filter rows, as a consumer's
     `objects = ActiveUserManager()` (or a soft-delete manager) declared
     first on its user model would: a subclass of the model's own manager
-    class whose `get_queryset` narrows. `_base_manager` is untouched, as
-    Django leaves it."""
+    class whose `get_queryset` narrows, installed as `objects` and as the
+    default manager (a lookup through either must not find the row).
+    `_base_manager` is untouched, as Django leaves it."""
     base = type(user_model._default_manager)
 
     class FilteringManager(base):  # type: ignore[misc, valid-type]
@@ -569,8 +570,10 @@ def _install_filtering_default_manager(monkeypatch, user_model, narrow):
     manager = FilteringManager()
     manager.model = user_model
     manager.name = user_model._default_manager.name
+    monkeypatch.setattr(user_model, "objects", manager, raising=False)
     monkeypatch.setattr(user_model._meta, "default_manager", manager)
     assert user_model._default_manager is manager
+    assert user_model.objects is manager
 
 
 _HIDING_MANAGERS = {
@@ -653,6 +656,38 @@ class TestPasswordChangeSeesTheStoredRow:
         assert Grant.objects.filter(user=credentials).exists()
         assert not MCPAuthRejectionLog.objects.exists()
 
+    @pytest.mark.parametrize("narrow", _HIDING_MANAGERS.values(), ids=_HIDING_MANAGERS)
+    def test_login_time_hash_upgrade_of_a_hidden_row_revokes_nothing(
+        self,
+        settings,
+        monkeypatch,
+        credentials,
+        django_capture_on_commit_callbacks,
+        narrow,
+    ):
+        """The base manager finds a row the default manager hides; the
+        login-time hash upgrade exemption must hold for it too."""
+        user_model = type(credentials)
+        # An older hasher's hash, written without signals (not a change).
+        user_model._base_manager.filter(pk=credentials.pk).update(
+            password=make_password("same-password", hasher="md5")
+        )
+        settings.PASSWORD_HASHERS = [
+            "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+            "django.contrib.auth.hashers.MD5PasswordHasher",
+        ]
+        _install_filtering_default_manager(monkeypatch, user_model, narrow)
+        target = user_model._base_manager.get(pk=credentials.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            assert target.check_password("same-password")
+        stored = user_model._base_manager.get(pk=credentials.pk).password
+        assert stored.startswith("pbkdf2_sha256$")  # the upgrade happened ...
+        # ... and is not a password change.
+        assert AccessToken.objects.filter(user=credentials).exists()
+        assert RefreshToken.objects.filter(user=credentials).exists()
+        assert Grant.objects.filter(user=credentials).exists()
+        assert not MCPAuthRejectionLog.objects.exists()
+
     def test_the_stored_hash_is_read_on_the_alias_being_written(self, mcp_user):
         """`pre_save` passes the alias the save writes to; the lookup must
         go there, not to the default database. An alias that does not exist
@@ -690,11 +725,12 @@ class TestPasswordChangeSeesTheStoredRow:
     def test_the_token_deletes_run_in_one_transaction_on_their_database(
         self, monkeypatch, mcp_user, mcp_access_token
     ):
-        """The deletes are routed by the install's routers; the transaction
-        that groups them is opened on the alias they are routed to (the
-        default database's would group nothing on a multi-database install).
-        With one database both are `default`, so the alias is asserted as
-        passed: explicitly the routed one, not left to default."""
+        """The transaction that groups the deletes is opened on the alias
+        DOT writes its tokens to (`db_for_write(AccessToken)`), and the
+        deletes run there (test_multi_db_revocation covers a router that
+        splits the models). With one database that is `default`, so the
+        alias is asserted as passed: explicitly the routed one, not left to
+        default."""
         from django.db import router
         from mcp_sql import signals
 
@@ -712,6 +748,7 @@ class TestPasswordChangeSeesTheStoredRow:
             at=timezone.now(),
             reason=AuthRejectionReason.PASSWORD_CHANGE,
             event="password change",
+            committed="default",
         )
         assert opened[0] == router.db_for_write(AccessToken)
         assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()

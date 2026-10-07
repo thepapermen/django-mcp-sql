@@ -8,6 +8,9 @@ on grants drift after post_migrate (advisory only — apply happens via
 
 import functools
 import logging
+from collections.abc import Iterator
+from contextlib import ExitStack
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 from typing import Any
@@ -17,7 +20,9 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
+from django.db import DEFAULT_DB_ALIAS
 from django.db import DatabaseError
+from django.db import connections
 from django.db import router
 from django.db import transaction
 from django.db.models import Q
@@ -57,17 +62,24 @@ def revoke_mcp_tokens_on_logout(
     # the logout transaction — the user must always be able to log out. The
     # delete + audit run only after the logout commits; if the logout itself
     # rolls back, no tokens are revoked (consistent: the user isn't logged
-    # out either). `request` and the timestamp are read synchronously (the
-    # callback fires outside the request scope); `user` is captured by
-    # reference and stays valid post-commit — logout does not delete the user
-    # row, so its `pk` and the audit FK resolve fine. `started_at` is the
-    # logout moment, not the (marginally later) post-commit callback time.
+    # out either). The signal carries no database alias, so this waits for
+    # the default database's transaction: where a database session backend
+    # writes unless a router sends sessions elsewhere — then a rollback of
+    # the session database's transaction does not hold the revocation back.
+    # A transaction open on the token database does not undo it
+    # (`_revoke_and_audit`). `request` and the timestamp are read
+    # synchronously (the callback fires outside the request scope); `user`
+    # is captured by reference and stays valid post-commit — logout does
+    # not delete the user row, so its `pk` and the audit FK resolve fine.
+    # `started_at` is the logout moment, not the (marginally later)
+    # post-commit callback time.
     client_ip = request.META.get("REMOTE_ADDR") if request is not None else None
     logged_out_at = timezone.now()
     transaction.on_commit(
         lambda: _revoke_and_audit_on_logout(
             user=user, client_ip=client_ip, logged_out_at=logged_out_at
-        )
+        ),
+        using=DEFAULT_DB_ALIAS,
     )
 
 
@@ -79,24 +91,91 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
         at=logged_out_at,
         reason=AuthRejectionReason.SESSION_LOGOUT,
         event="logout",
+        committed=DEFAULT_DB_ALIAS,
     )
 
 
-def _revoke_and_audit(*, user, client_ip, at, reason, event):
+# How long a revocation run on its own connection (see
+# `_outside_open_transaction`) waits for a row lock before giving up. The
+# lock it would wait for may be held by the very transaction it steps
+# around (same thread: it would wait forever), so it must not wait long.
+_OWN_CONNECTION_LOCK_TIMEOUT = "5s"
+
+
+@contextmanager
+def _outside_open_transaction(alias: str, committed: str) -> Iterator[bool]:
+    """Make `connections[alias]` a connection with no transaction of this
+    thread's open on it, for the duration; yield whether it is a new one.
+
+    The revocation runs once the transaction on `committed` (the alias the
+    triggering write went to) has committed. On that alias nothing of ours
+    is open then. On another alias, this thread may be inside an unrelated
+    transaction (`ATOMIC_REQUESTS`, an `atomic()` around the view); work
+    done on that connection would join it and be undone by its rollback,
+    although the password change or logout stands. So, in that case only,
+    the work runs on a new connection to the same database, in its own
+    transaction, and the original connection is put back afterwards.
+    That connection does not see what the open transaction has written
+    and not yet committed, and waits for row locks that transaction holds
+    (bounded: `_OWN_CONNECTION_LOCK_TIMEOUT` on PostgreSQL)."""
+    current = connections[alias]
+    if alias == committed or not current.in_atomic_block:
+        yield False
+        return
+    own = connections.create_connection(alias)
+    connections[alias] = own
+    try:
+        yield True
+    finally:
+        try:
+            own.close()
+        finally:
+            connections[alias] = current
+
+
+@contextmanager
+def _transaction(alias: str, *, own_connection: bool) -> Iterator[None]:
+    """`transaction.atomic(using=alias)`, with a bounded lock wait on a
+    connection `_outside_open_transaction` opened."""
+    with transaction.atomic(using=alias):
+        connection = connections[alias]
+        if own_connection and connection.vendor == "postgresql":
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SET LOCAL lock_timeout = '{_OWN_CONNECTION_LOCK_TIMEOUT}'"
+                )
+        yield
+
+
+def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa: PLR0913
     """Best-effort post-commit MCP token revocation + a forensic audit row.
 
     Deletes the user's MCP-purpose access tokens, refresh tokens (they
     exist only when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables them;
     one left behind would mint new access tokens) and pending authorization
     codes (`Grant` rows: a code issued just before would otherwise still
-    exchange for a fresh token) in one transaction, then writes one
-    `MCPAuthRejectionLog` row with `reason` — only when something was
-    deleted: the table records access that ended, and a logout or password
-    change of a user who held no MCP token or code ended none.
-    Runs after the triggering transaction (logout, password change)
-    commits. Both the delete and the audit write are wrapped so a DB blip
-    is logged (Sentry via `logger.exception`) rather than surfacing as a
-    500 on an already-completed logout / password change.
+    exchange for a fresh token) in one transaction, and in that same
+    transaction writes one `MCPAuthRejectionLog` row with `reason` — only
+    when something was deleted: the table records access that ended, and a
+    logout or password change of a user who held no MCP token or code ended
+    none.
+
+    Runs after the triggering transaction (logout, password change) on the
+    alias `committed` has committed. What is guaranteed from then on:
+    - the deletes and the audit row commit in a transaction of their own,
+      never inside another transaction this thread has open on the token
+      or audit database (`_outside_open_transaction`), so a later rollback
+      there cannot undo them;
+    - the audit row commits only with the deletes (when both live on one
+      database; on two, it commits just before them), and a failure to
+      write it does not undo the deletes (a savepoint);
+    - any database error (a blip, a lock held past the bounded wait) is
+      logged with `logger.exception` (Sentry) and nothing is retried: the
+      tokens then live until they expire, and an operator must delete
+      them. It never surfaces as a 500 on the completed logout / password
+      change.
+    Not covered: tokens the open transaction itself created and has not
+    committed (the own connection cannot see them).
     """
     # Lazy import keeps `apps.ready()` import-graph small.
     from oauth2_provider.models import AccessToken
@@ -110,53 +189,80 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event):
     mcp_apps = Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
         application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
     )
+    # DOT's token models reference each other and their Application by
+    # foreign key, so they live in one database; DOT opens its own token
+    # transactions on `db_for_write(AccessToken)` (`save_bearer_token`,
+    # `RefreshToken.revoke`). All three deletes run there, explicitly, so
+    # they are one transaction whatever a router says per model.
+    tokens = router.db_for_write(AccessToken)
+    audit = router.db_for_write(MCPAuthRejectionLog)
+    audit_failed = False
     try:
-        # One transaction on the database the token deletes are routed to
-        # (as `MCPOAuth2Validator.save_bearer_token` does).
-        with transaction.atomic(using=router.db_for_write(AccessToken)):
-            refresh_deleted, _ = RefreshToken.objects.filter(
-                mcp_apps, user=user
-            ).delete()
-            access_deleted, _ = AccessToken.objects.filter(mcp_apps, user=user).delete()
-            grants_deleted, _ = Grant.objects.filter(mcp_apps, user=user).delete()
+        with ExitStack() as stack:
+            own = {
+                alias: stack.enter_context(_outside_open_transaction(alias, committed))
+                for alias in dict.fromkeys((tokens, audit))
+            }
+            with _transaction(tokens, own_connection=own[tokens]):
+                refresh_deleted, _ = (
+                    RefreshToken.objects.using(tokens)
+                    .filter(mcp_apps, user=user)
+                    .delete()
+                )
+                access_deleted, _ = (
+                    AccessToken.objects.using(tokens)
+                    .filter(mcp_apps, user=user)
+                    .delete()
+                )
+                grants_deleted, _ = (
+                    Grant.objects.using(tokens).filter(mcp_apps, user=user).delete()
+                )
+                deleted = access_deleted + refresh_deleted
+                if not (deleted or grants_deleted):
+                    return
+                # Record the revocation in the access-ending audit table
+                # alongside the per-request gate denials, so the timeline of
+                # why a user lost MCP access is complete.
+                try:
+                    with _transaction(audit, own_connection=own[audit]):
+                        # By pk: the user instance may come from another
+                        # database than the audit table's (a router would
+                        # refuse the cross-database relation).
+                        MCPAuthRejectionLog.objects.using(audit).create(
+                            user_id=user.pk,
+                            token_pk="",
+                            application_name="",
+                            reason=reason,
+                            error=(
+                                f"Revoked {deleted} MCP token(s) and "
+                                f"{grants_deleted} pending authorization "
+                                f"code(s) on {event}"
+                            ),
+                            client_ip=client_ip,
+                            started_at=at,
+                        )
+                except DatabaseError:
+                    audit_failed = True
+                    logger.exception(
+                        "Revoking MCP tokens on %s for user %s: failed to write "
+                        "the audit row",
+                        event,
+                        user.pk,
+                    )
     except DatabaseError:
         logger.exception(
             "Failed to revoke MCP tokens on %s for user %s", event, user.pk
         )
         return
-    deleted = access_deleted + refresh_deleted
-    if not (deleted or grants_deleted):
-        return
     logger.info(
         "Revoked %d MCP token(s) and %d pending authorization code(s) on %s "
-        "for user %s",
+        "for user %s%s",
         deleted,
         grants_deleted,
         event,
         user.pk,
+        " (no audit row)" if audit_failed else "",
     )
-    # Record the revocation in the access-ending audit table alongside the
-    # per-request gate denials, so the timeline of why a user lost MCP
-    # access is complete.
-    try:
-        MCPAuthRejectionLog.objects.create(
-            user=user,
-            token_pk="",
-            application_name="",
-            reason=reason,
-            error=(
-                f"Revoked {deleted} MCP token(s) and {grants_deleted} pending "
-                f"authorization code(s) on {event}"
-            ),
-            client_ip=client_ip,
-            started_at=at,
-        )
-    except DatabaseError:
-        logger.exception(
-            "Revoked MCP tokens on %s for user %s but failed to write the audit row",
-            event,
-            user.pk,
-        )
 
 
 # Per-instance flag from `pre_save` to `post_save` for a pending revocation.
@@ -303,9 +409,11 @@ def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
         return
     setattr(instance, _PENDING_REVOCATION_ATTR, False)
     changed_at = timezone.now()
-    # On the alias the user was saved to: the revocation must wait for THAT
-    # transaction (on another alias's, a rollback there would drop the
-    # revocation of a password change that committed).
+    # On the alias the user was saved to: the revocation waits for THAT
+    # transaction, and runs only if it commits. A transaction open on
+    # another alias does not hold it back or undo it
+    # (`_outside_open_transaction`).
+    using = kwargs.get("using")
     transaction.on_commit(
         lambda: _revoke_and_audit(
             user=instance,
@@ -313,8 +421,9 @@ def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
             at=changed_at,
             reason=AuthRejectionReason.PASSWORD_CHANGE,
             event="password change",
+            committed=using,
         ),
-        using=kwargs.get("using"),
+        using=using,
     )
 
 
@@ -482,8 +591,9 @@ def audit_grants_drift_after_migrate(
         )
 
 
-def _mcp_group_pks() -> dict[int, str]:
-    """Map each existing MCP profile group's pk → its profile name.
+def _mcp_group_pks(using: str) -> dict[int, str]:
+    """Map each existing MCP profile group's pk → its profile name, on the
+    database the membership change was written to (`using`).
 
     Cohort grants are rare (admin actions), so a per-event query is fine.
     Empty on a fresh DB before `provision_mcp_profiles` ran, so the receiver
@@ -494,7 +604,9 @@ def _mcp_group_pks() -> dict[int, str]:
     }
     return {
         g.pk: name_to_profile[g.name]
-        for g in Group.objects.filter(name__in=name_to_profile).only("pk", "name")
+        for g in Group.objects.db_manager(using)
+        .filter(name__in=name_to_profile)
+        .only("pk", "name")
     }
 
 
@@ -507,15 +619,17 @@ def _user_label(user: "AbstractBaseUser") -> str:
 
 
 def _mcp_memberships(
-    user_ids: set[int], mcp_group_pks: dict[int, str]
+    user_ids: set[int], mcp_group_pks: dict[int, str], using: str
 ) -> dict[int, list[str]]:
     """`{user_id: sorted [profile_name, ...]}` — each user's current MCP
     profile-group memberships. Per-user queries; cohort changes are rare."""
     out: dict[int, list[str]] = {}
     for uid in user_ids:
         try:
-            pks = Group.objects.filter(user__pk=uid, pk__in=mcp_group_pks).values_list(
-                "pk", flat=True
+            pks = (
+                Group.objects.db_manager(using)
+                .filter(user__pk=uid, pk__in=mcp_group_pks)
+                .values_list("pk", flat=True)
             )
             out[uid] = sorted(mcp_group_pks[pk] for pk in pks)
         except DatabaseError:
@@ -524,12 +638,21 @@ def _mcp_memberships(
     return out
 
 
-def _alert_mcp_group_grant(user_ids: set[int], mcp_group_pks: dict[int, str]) -> None:
+def _alert_mcp_group_grant(
+    user_ids: set[int], mcp_group_pks: dict[int, str], using: str
+) -> None:
+    """Page once per user who gained an MCP profile group on `using` (the
+    database the membership change was written to: the users, groups and
+    memberships are read there, so a multi-database install names the user
+    the grant was made to, not a same-pk user elsewhere)."""
     if not user_ids:
         return
-    memberships = _mcp_memberships(user_ids, mcp_group_pks)
+    memberships = _mcp_memberships(user_ids, mcp_group_pks, using)
     try:
-        users = {u.pk: u for u in User._base_manager.filter(pk__in=user_ids)}
+        users = {
+            u.pk: u
+            for u in User._base_manager.db_manager(using).filter(pk__in=user_ids)
+        }
     except DatabaseError:
         users = {}
     for uid in user_ids:
@@ -573,14 +696,15 @@ def alert_on_mcp_group_grant(sender, instance, action, pk_set, reverse, **kwargs
     """
     if action != "post_add":
         return
-    mcp_group_pks = _mcp_group_pks()
+    using = kwargs.get("using", DEFAULT_DB_ALIAS)
+    mcp_group_pks = _mcp_group_pks(using)
     if not mcp_group_pks:
         return
     if not reverse:
         # Forward: `instance` is a User, `pk_set` is the Group pks added.
         if set(mcp_group_pks) & (pk_set or set()):
-            _alert_mcp_group_grant({instance.pk}, mcp_group_pks)
+            _alert_mcp_group_grant({instance.pk}, mcp_group_pks, using)
     # Reverse: `instance` is a Group, `pk_set` is the User pks added
     # (e.g. `group.user_set.add(user)`).
     elif instance.pk in mcp_group_pks:
-        _alert_mcp_group_grant(set(pk_set or set()), mcp_group_pks)
+        _alert_mcp_group_grant(set(pk_set or set()), mcp_group_pks, using)

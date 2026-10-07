@@ -26,6 +26,7 @@ Deliberate omissions:
   override it per-test.
 """
 
+import copy
 import os
 
 SECRET_KEY = "mcp-sql-test-suite-not-a-secret"
@@ -82,6 +83,14 @@ DATABASES = {
         "OPTIONS": {"application_name": "mcp-sql-tests"},
     },
 }
+
+# A second database (same server, its own name) for the multi-database tests
+# (`test_multi_db_revocation.py`): a user saved to one database while the
+# tokens live in another. pytest-django creates its test database only when
+# a collected test asks for the alias.
+SECOND_DB_ALIAS = "second"
+DATABASES[SECOND_DB_ALIAS] = copy.deepcopy(DATABASES["default"])
+DATABASES[SECOND_DB_ALIAS]["NAME"] = f"{DATABASES['default']['NAME']}_second"
 
 DATABASE_ROUTERS = ["mcp_sql.db_router.McpSqlRouter"]
 

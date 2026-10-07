@@ -31,6 +31,9 @@ def _mgr(*, filter_delete_return=(0, {}), filter_delete_side_effect=None):
     from unittest.mock import MagicMock
 
     manager = MagicMock()
+    # `.using(alias)` / `.db_manager(alias)` hand back the same stand-in.
+    manager.using.return_value = manager
+    manager.db_manager.return_value = manager
     if filter_delete_side_effect is not None:
         manager.filter.return_value.delete.side_effect = filter_delete_side_effect
     else:
@@ -340,7 +343,7 @@ class TestAlertHelperGuards:
         from mcp_sql.signals import _alert_mcp_group_grant
 
         # Empty user set → returns immediately, no queries.
-        _alert_mcp_group_grant(set(), {1: "default"})
+        _alert_mcp_group_grant(set(), {1: "default"}, "default")
 
 
 @pytest.mark.django_db
@@ -393,6 +396,6 @@ class TestSignalDatabaseErrorResilience:
         group_mgr.filter.side_effect = DatabaseError("groups down")
         monkeypatch.setattr(signals_mod.Group, "objects", group_mgr)
         with caplog.at_level(logging.ERROR):
-            out = _mcp_memberships({7}, {10: "default"})
+            out = _mcp_memberships({7}, {10: "default"}, "default")
         assert out == {7: []}
         assert "MCP membership query failed" in caplog.text
