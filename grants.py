@@ -384,7 +384,7 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
             f"Refusing to reconcile grants for profile {profile.name!r}: "
             f"{too_long!r} name a relation longer than PostgreSQL's "
             f"{MAX_IDENTIFIER_BYTES}-byte identifier limit, which it "
-            "truncates; set a shorter Meta.db_table."
+            "truncates: shorten Meta.db_table."
         )
         raise GrantsReconcileError(msg)
 
