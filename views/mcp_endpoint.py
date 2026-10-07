@@ -662,8 +662,10 @@ def _guard_bridge(asgi_app):
     a cancelled app was in the middle of sending is never half-delivered
     (a2wsgi takes a lock per message that only its WSGI half releases).
 
-    An exception raised by the app is left to a2wsgi, which answers 500 (or
-    re-raises into `_invoke_wsgi_app` if the body had started).
+    An exception raised by the app, a `TimeoutError` of its own included, is
+    left to a2wsgi, which answers 500 (or re-raises into `_invoke_wsgi_app` if
+    the body had started); the guard then logs nothing and sends nothing, but
+    still lets a send in flight finish first.
     """
 
     async def call(scope, receive, send):
@@ -673,12 +675,11 @@ def _guard_bridge(asgi_app):
         async def deliver(message):
             nonlocal started, finished
             await send(message)
-            if message["type"] == "http.response.start":
-                started = True
-            elif message["type"] == "http.response.body" and not message.get(
-                "more_body", False
-            ):
-                finished = True
+            started = started or message["type"] == "http.response.start"
+            finished = finished or (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            )
 
         async def tracked_send(message):
             nonlocal in_flight
@@ -695,25 +696,23 @@ def _guard_bridge(asgi_app):
             if not deadline.expired():
                 raise
             status = HTTPStatus.GATEWAY_TIMEOUT
+        finally:
+            # On EVERY exit, the exception paths included: a send still in
+            # flight is settled before anything else happens, so no message
+            # is left half-delivered on the shared loop (a2wsgi's per-message
+            # lock is released only once its WSGI half has taken the message).
+            if in_flight is not None:
+                await asyncio.wait({in_flight})
         if in_flight is not None:
-            await in_flight
+            in_flight.result()  # a failed send is this exchange's failure
         if not finished:
-            logger.error(
-                "MCP bridge: %s %s %s; answering the client and releasing the thread",
-                scope.get("method"),
-                scope.get("path"),
-                (
-                    f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
-                    if status == HTTPStatus.GATEWAY_TIMEOUT
-                    else "ended without completing its response"
-                ),
-            )
-            await _complete_response(send, started=started, status=status)
+            await _complete_response(scope, send, started=started, status=status)
 
     return call
 
 
 async def _complete_response(
+    scope: dict[str, Any],
     send: Callable[[dict[str, Any]], Awaitable[None]],
     *,
     started: bool,
@@ -721,8 +720,19 @@ async def _complete_response(
 ) -> None:
     """Send what an unfinished response is missing so a2wsgi's WSGI half stops.
 
-    A whole `status` response if none started, else the closing empty chunk.
+    A whole `status` response if none started, else the closing empty chunk;
+    logged at ERROR either way.
     """
+    logger.error(
+        "MCP bridge: %s %s %s; answering the client and releasing the thread",
+        scope.get("method"),
+        scope.get("path"),
+        (
+            f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
+            if status == HTTPStatus.GATEWAY_TIMEOUT
+            else "ended without completing its response"
+        ),
+    )
     if not started:
         await send(
             {

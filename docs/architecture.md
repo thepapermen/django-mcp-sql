@@ -663,8 +663,13 @@ The load-bearing invariants and footguns, grouped by layer:
   loop=..., wait_time=_BRIDGE_WIND_DOWN_SECONDS)`: `_guard_bridge` cancels the
   app after `_BRIDGE_DEADLINE_SECONDS` (30 s, far above one 5 s statement)
   and, whenever the app ends without its final body, sends one (`500` if it
-  ended without a response, `504` if cut off before one started, else the
-  closing chunk), logging at ERROR; `wait_time` caps how long a2wsgi waits for
+  ended without a response, `504` if the deadline cut it off before one
+  started, else the closing chunk), logging at ERROR. An exception the app
+  raises, a `TimeoutError` of its own included (only the guard's own expired
+  deadline is a 504), is left to a2wsgi: a `500`, or re-raised into
+  `_invoke_wsgi_app` once a body chunk was sent, with no guard log line.
+  Either way a send still in flight is settled first, so no message is left
+  half-delivered on the shared loop. `wait_time` caps how long a2wsgi waits for
   the task to wind down after the response. Keep both if the bridge is ever
   rebuilt. Pinned by `TestBridgeGuard` and `TestRealSdkThroughTheBridge`.
 - **DRF pre-reads `request.body` for content negotiation.** By the time

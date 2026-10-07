@@ -366,9 +366,11 @@ announce themselves.
   `Mcp-Session-Id` (a stateless server never does), and the TypeScript SDK's
   post-initialize GET, previously answered `406`, now gets the `405` it treats
   as "no stream offered". Also affects 0.1.0b5. As a backstop the bridge
-  now cancels an exchange after 30 seconds and always completes the response
-  (`504` if cut off before it started, `500` if the app ended without one), so
-  no future path that leaves a response unfinished can pin a thread either.
+  now cancels an exchange after 30 seconds and completes any response the app
+  leaves unfinished (`504` if the deadline cut it off before it started, `500`
+  if the app ended without one), so no future path that leaves a response
+  unfinished can pin a thread either. An exception the app raises itself,
+  including its own `TimeoutError`, stays an ordinary `500`.
 - **Under `ATOMIC_REQUESTS=True` no auth rejection was ever recorded.** DRF
   rolls back the request transaction on every `APIException`, including the
   `AuthenticationFailed` each per-request gate raises right after writing its

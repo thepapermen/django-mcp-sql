@@ -769,6 +769,48 @@ class TestBridgeGuard:
         assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
         assert "did not complete within" not in caplog.text
 
+    def test_app_exception_waits_for_the_in_flight_send(self):
+        """An app that raises while a send is still in flight must not leave
+        that shielded send behind: a2wsgi takes a per-message lock that only
+        its WSGI half releases, so an abandoned send is a half-delivered
+        message on the shared loop. The guard settles it before the
+        exception propagates."""
+        release = asyncio.Event()
+        delivered = []
+
+        async def send(message):
+            if message.get("more_body"):
+                await release.wait()
+            delivered.append(message["type"])
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            pending = asyncio.ensure_future(
+                send({"type": "http.response.body", "body": b"x", "more_body": True})
+            )
+            await asyncio.sleep(0)  # the chunk is now in flight
+            pending.cancel()  # the app's own sender gives up...
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)  # ...and the app fails
+
+        async def scenario():
+            guarded = asyncio.ensure_future(
+                _guard_bridge(app)({"type": "http"}, receive, send)
+            )
+            await asyncio.sleep(0.05)
+            settled_before_release = guarded.done()
+            release.set()
+            with pytest.raises(TimeoutError, match="upstream read timed out"):
+                await guarded
+            return settled_before_release
+
+        settled_before_release = asyncio.run(scenario())
+        assert settled_before_release is False
+        assert delivered == ["http.response.start", "http.response.body"]
+
     def test_endless_stream_is_closed_at_the_deadline(self, monkeypatch):
         monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
 
