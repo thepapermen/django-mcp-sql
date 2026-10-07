@@ -2913,6 +2913,10 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT (ARRAY(SELECT y FROM t ORDER BY id))[2] AS a, (ARRAY[[1, 2], [3, 4]])[2][1] AS b, json_object((ARRAY['a', 'b', 'c', 'd'])[1:2]) AS c",
     ),
     (
+        "json",
+        "SELECT json_object(key VALUE id) AS a, json_object(\"KEY\" VALUE id) AS b, json_object(s.key: s.id) AS c FROM (SELECT 'k' AS key, 'K' AS \"KEY\", id FROM t WHERE id < 3) s ORDER BY id",
+    ),
+    (
         "operators",
         "SELECT '10' ^@ '1' AS a, '4' ^@ '2' AS b, 'x' || 'abc' ^@ 'a' AS c",
     ),
@@ -3204,6 +3208,12 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT ARRAY(SELECT y FROM t ORDER BY id)[1] AS a"),
     ("parse_error", "SELECT INTERVAL(3) '1.5' SECOND AS a"),
     ("parse_error", "SELECT INTERVAL '1' DAY(3) AS a"),
+    ("parse_error", "SELECT INTERVAL '1' DAY TO"),
+    ("parse_error", "SELECT INTERVAL '25 hours' DAY HOUR"),
+    (
+        "disallowed_function",
+        "SELECT (tableoid).pg_relation_filepath AS v FROM t, (SELECT 1 AS pg_relation_filepath) tableoid",
+    ),
     ("parse_error", "SELECT INTERVAL '1' \"Day\" AS v"),
 ]
 
@@ -3218,6 +3228,7 @@ MIN_SERVER_VERSION: dict[str, int] = {
     "SELECT 1_000": 160000,
     "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F": 160000,
     "SELECT id FROM t ORDER BY id LIMIT 0x3": 160000,
+    "SELECT json_object(key VALUE id) AS a, json_object(\"KEY\" VALUE id) AS b, json_object(s.key: s.id) AS c FROM (SELECT 'k' AS key, 'K' AS \"KEY\", id FROM t WHERE id < 3) s ORDER BY id": 160000,
     "SELECT json_object('a' VALUE NULL ABSENT ON NULL) AS a, json_object('a' VALUE 1 RETURNING jsonb) AS b, json_object('k': '{\"x\": 1}' FORMAT JSON) AS c, json_object('a' VALUE id) AS e FROM t WHERE id < 3 ORDER BY id": 160000,
 }
 

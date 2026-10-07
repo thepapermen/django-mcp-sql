@@ -1626,6 +1626,80 @@ class TestPinnedBehaviour:
         )
 
 
+class TestReviewRound11:
+    """Review round 11 (Grok's final pass of A6-A9)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A table's system columns are columns: `(tableoid).f` is
+            # `f(tableoid)`, whatever FROM item is named `tableoid`.
+            "SELECT (tableoid).pg_relation_filepath FROM auth_permission, "
+            "(SELECT 1 AS pg_relation_filepath) tableoid",
+            "SELECT (ctid).pg_sleep FROM auth_permission AS p(a, b, c, d), "
+            "(SELECT 1 AS pg_sleep) ctid",
+            "SELECT (xmin).pg_sleep FROM auth_permission, (SELECT 1 AS pg_sleep) xmin",
+            # ... and the A8 rule for `t.f` sees them too.
+            "SELECT tableoid.pg_relation_size FROM auth_permission, "
+            "(SELECT 1 AS pg_relation_size) tableoid",
+        ],
+    )
+    def test_system_columns_are_in_scope(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION, table_columns=COLUMNS)
+
+    def test_a_row_field_beside_a_table_is_still_a_column(self):
+        parse_and_validate(
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            allowed_tables=ALLOWED,
+            table_columns=COLUMNS,
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres: a syntax error after a complete interval qualifier;
+            # sqlglot read the word as an alias.
+            "SELECT INTERVAL '1' DAY TO",
+            "SELECT INTERVAL '1' DAY HOUR",
+            "SELECT INTERVAL '25 hours' DAY HOUR",
+            "SELECT INTERVAL '1' SECOND TO MINUTE",
+            "SELECT INTERVAL '1' DAY TO SECOND TO",
+            "SELECT INTERVAL '1' SECOND(2) TO",
+        ],
+    )
+    def test_a_field_after_the_qualifier_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            ("""SELECT INTERVAL '1' DAY "HOUR\"""", """INTERVAL '1' DAY AS "HOUR\""""),
+            ("SELECT INTERVAL '1' DAY AS hour", "INTERVAL '1' DAY AS hour"),
+            # A column `key` (PG16: `key_expression VALUE value`); sqlglot
+            # dropped it as the keyword, or the parser refused it.
+            (
+                "SELECT json_object(key VALUE id) FROM (SELECT 'k' AS key, 1 AS id) s",
+                "JSON_OBJECT(key: id)",
+            ),
+            (
+                'SELECT json_object("KEY" VALUE id) '
+                "FROM (SELECT 'k' AS \"KEY\", 1 AS id) s",
+                'JSON_OBJECT("KEY": id)',
+            ),
+        ],
+    )
+    def test_rendered_as_written(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT json_object(KEY 'a' VALUE 1)", "SELECT json_object(KEY a VALUE 1)"],
+    )
+    def test_key_keyword_form_stays_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

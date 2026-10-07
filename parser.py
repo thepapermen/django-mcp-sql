@@ -259,6 +259,16 @@ def _prefix_operator(symbol: str) -> Callable[[Generator, exp.Expression], str]:
     return render
 
 
+def _starts_key_operand(token: Token) -> bool:
+    """`token` after the word `KEY` starts the key of the SQL-standard `KEY
+    'a' VALUE 1` (a constant or a name), not `VALUE` or an operator."""
+    if token.token_type in _STRING_TOKENS or token.token_type == TokenType.NUMBER:
+        return True
+    return token.token_type in {TokenType.VAR, TokenType.IDENTIFIER} and (
+        token.text.upper() != "VALUE"
+    )
+
+
 def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
     """A primary parser for a number / bit-string token: the constant as
     written (`_number_as_written`), else sqlglot's own `base` reading."""
@@ -809,9 +819,20 @@ class FaithfulPostgres(Postgres):
                 and (last := self._interval_field(end + 1)) is not None
             ):
                 self._advance(last[1] - self._index)
+                self._no_more_fields()
                 return exp.IntervalSpan(this=exp.var(name), expression=exp.var(last[0]))
             self._advance(end - self._index)
+            self._no_more_fields()
             return exp.var(name)
+
+        def _no_more_fields(self) -> None:
+            """After a complete qualifier, an unquoted field word or `TO` is
+            Postgres's syntax error (`INTERVAL '1' DAY HOUR`, `... DAY TO`,
+            `... SECOND TO MINUTE`); sqlglot read it as an alias."""
+            if self._interval_field(self._index) is not None or self._is_unquoted(
+                self._index, "TO"
+            ):
+                self.raise_error("Unexpected interval field after the qualifier")
 
         def _interval_field(self, i: int) -> tuple[str, int] | None:
             """The field at token `i` (`SECOND(3)` with its precision) and
@@ -866,6 +887,21 @@ class FaithfulPostgres(Postgres):
             constructor: exp.Expression | None = self._parse_json_object()
             return constructor
 
+        def _parse_json_key_value(self) -> exp.Expression | None:
+            # sqlglot's own, except that the word `KEY` is not skipped: here
+            # it is a column (`json_object(key VALUE x)`), the SQL-standard
+            # `KEY 'a' VALUE 1` having been refused (`_key_keyword_argument`).
+            key = self._parse_column()
+            self._match_set(self.JSON_KEY_VALUE_SEPARATOR_TOKENS)
+            self._match_text_seq("VALUE")
+            value = self._parse_bitwise()
+            if not key and not value:
+                return None
+            pair: exp.Expression = self.expression(
+                exp.JSONKeyValue(this=key, expression=value)
+            )
+            return pair
+
         def _plain_arguments(self) -> list[exp.Expression] | None:
             """The arguments as plain comma-separated expressions if they
             end exactly at the call's closing parenthesis, else `None`."""
@@ -885,8 +921,10 @@ class FaithfulPostgres(Postgres):
             return args if closed and all(arg is not None for arg in args) else None
 
         def _key_keyword_argument(self) -> bool:
-            """An argument starts with the word `KEY` followed by more (the
-            SQL-standard `KEY 'a' VALUE 1`), at the call's own level."""
+            """An argument starts with the unquoted word `KEY` followed by an
+            operand (the SQL-standard `KEY 'a' VALUE 1`, a literal of a type
+            `key` to Postgres), at the call's own level. A column `key`
+            (`key VALUE x`, `"KEY" VALUE x`, `key || 'x'`) is not that."""
             tokens, depth, j = self._tokens, 0, self._index
             start = True
             while j < len(tokens):
@@ -896,10 +934,10 @@ class FaithfulPostgres(Postgres):
                 if (
                     depth == 0
                     and start
+                    and tokens[j].token_type != TokenType.IDENTIFIER
                     and tokens[j].text.upper() == "KEY"
                     and j + 1 < len(tokens)
-                    and tokens[j + 1].token_type
-                    not in {TokenType.COMMA, TokenType.R_PAREN}
+                    and _starts_key_operand(tokens[j + 1])
                 ):
                     return True
                 depth += (kind in {TokenType.L_PAREN, TokenType.L_BRACKET}) - (
