@@ -1059,10 +1059,10 @@ class TestMalformedRedirectUris:
     we do not support. Alone, that leaves nothing to register (400); beside a
     clean loopback URI, the clean one is registered and echoed (201).
 
-    Before: the bracketed-host and NFKC kinds made `urlparse` raise inside the
-    loopback filter (an anonymous 500 before the per-IP `register` counter),
-    and a loopback URI with a bad port, whose port the filter never read, was
-    registered verbatim.
+    In 0.1.0b5 the bracketed-host and NFKC kinds made `urlparse` raise inside
+    the loopback filter (an anonymous 500 before the per-IP `register`
+    counter), and a loopback URI with a bad port, whose port the filter never
+    read, was registered verbatim.
     """
 
     @pytest.mark.parametrize("uri", _MALFORMED_URIS)

@@ -482,7 +482,7 @@ def _is_parseable_uri(uri: str) -> bool:
     under NFKC normalisation (a fullwidth solidus, U+2100); `.port` raises for a
     port that is not a number in range. A URI that fails this is not
     registered (it drops out of the loopback subset like any other URI we do
-    not support). Before, the first two kinds raised inside the loopback
+    not support). In 0.1.0b5 the first two kinds raised inside the loopback
     filter (an anonymous 500), and a loopback URI with a bad port
     (`http://127.0.0.1:99999/cb`), whose port the filter never read, was
     registered verbatim.
@@ -697,8 +697,8 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         return _error(
             "invalid_redirect_uri",
             "none of the requested redirect_uris is a valid loopback URI "
-            "(must be http://127.0.0.1, http://[::1], or http://localhost "
-            "with an optional port and path)",
+            "(must parse, with a numeric port if any, and be http://127.0.0.1, "
+            "http://[::1], or http://localhost with an optional port and path)",
         )
 
     metadata_error = _client_metadata_error(body)
