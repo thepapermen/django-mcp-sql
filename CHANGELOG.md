@@ -279,7 +279,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     relations. The inventory reads `information_schema.role_table_grants`,
     which does not list materialized views, grants to `PUBLIC`, or grants
     the profile role holds only through membership in another role: those
-    stay invisible to the check (ledger F42 / F64).
+    stay invisible to the check (ledger F42 / F64). A whitelisted
+    `db_table` whose schema or table name is longer than 63 bytes is
+    refused (`GrantsReconcileError`, also logged by the `post_migrate`
+    check): PostgreSQL truncates such a name, so the catalog never listed
+    the declared name and every `--apply` re-granted it and revoked the
+    truncated one. Shorten `Meta.db_table`.
   - **Behaviour change:** names in agent queries resolve in `pg_catalog`
     and `public` only. An extension installed in another schema (Django's
     `CreateExtension` installs into the first schema on the app's

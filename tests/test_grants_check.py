@@ -148,6 +148,34 @@ class TestGrantsCheck:
             _run()
         assert "NOT a member" in str(exc.value)
 
+    @pytest.mark.parametrize(
+        "db_table",
+        ["s" * 64 + '"."t', '"' + "s" * 64 + '"."t"', "t" * 64, "ü" * 32],
+    )
+    def test_fails_on_a_name_postgres_truncates(self, patched_grants, db_table):
+        """Review round 18: a schema or table name over 63 bytes (UTF-8) is
+        refused before the role checks, in either mode, and the post-migrate
+        signal logs it (lenient mode raises it too)."""
+        from mcp_sql import grants
+
+        patched_grants["declared_tables"].return_value = {"auth.Permission": db_table}
+        patched_grants["role_exists"].return_value = False
+        with pytest.raises(CommandError) as exc:
+            _run()
+        assert "63-byte identifier limit" in str(exc.value)
+        with pytest.raises(grants.GrantsReconcileError):
+            grants.reconcile_grants(strict=False, apply=False)
+
+    @pytest.mark.parametrize(
+        "db_table", ["s" * 63 + '"."' + "t" * 63, "t" * 63, "ü" * 31 + "x"]
+    )
+    def test_63_bytes_is_not_refused(self, patched_grants, db_table):
+        from mcp_sql.parser import relation_of
+
+        patched_grants["declared_tables"].return_value = {"auth.Permission": db_table}
+        patched_grants["granted_tables"].return_value = {relation_of(db_table)}
+        assert "Grants in sync" in _run()
+
 
 class TestRelationsOutsidePublic:
     """Review round 16: the inventory covers every non-system schema, so a

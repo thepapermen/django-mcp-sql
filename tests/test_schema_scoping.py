@@ -317,3 +317,61 @@ class TestCatalogNamesAreQuoted:
         out = StringIO()
         call_command("mcp_sql_grants", stdout=out)
         assert "Grants in sync" in out.getvalue()
+
+
+class TestOverlongDbTable:
+    """Review round 18: PostgreSQL truncates a name longer than 63 bytes
+    (on a character boundary), so the catalog lists the truncated name.
+    A declared `db_table` that long never matched the inventory: each
+    `--apply` granted the declared name (PostgreSQL granted the truncated
+    relation) and revoked the truncated one, every run. Such a `db_table`
+    is refused instead."""
+
+    @pytest.fixture
+    def declared(self, monkeypatch):
+        def declare(db_table):
+            monkeypatch.setattr(
+                "mcp_sql.grants.declared_tables",
+                lambda _profile: {"mcp_sql_testapp.Widget": db_table},
+            )
+            with connection.cursor() as cur:
+                cur.execute(f'CREATE TABLE public."{db_table}" (id int)')
+                cur.execute(f'GRANT SELECT ON public."{db_table}" TO {_ROLE}')
+                cur.execute(
+                    "SELECT table_name FROM information_schema.role_table_grants"
+                    " WHERE grantee = %s AND table_schema = 'public'",
+                    [_ROLE],
+                )
+                return {name for (name,) in cur.fetchall()}
+
+        return declare
+
+    @pytest.mark.parametrize(
+        "db_table",
+        [
+            "mcp_sql_a18_" + "l" * 52,  # 64 bytes
+            "mcp_sql_a18_" + "é" * 26,  # 38 characters, 64 bytes
+        ],
+    )
+    @pytest.mark.parametrize("apply", [False, True])
+    def test_refused(self, declared, db_table, apply):
+        before = declared(db_table)
+        truncated = db_table.encode()[:63].decode("utf-8", "ignore")
+        assert truncated in before
+        assert db_table not in before
+        args = ["--apply"] if apply else []
+        with pytest.raises(CommandError) as exc:
+            call_command("mcp_sql_grants", *args, stdout=StringIO())
+        assert "63-byte identifier limit" in str(exc.value)
+        assert "mcp_sql_testapp.Widget" in str(exc.value)
+        assert grants.granted_tables(_ROLE) >= {("public", truncated)}
+
+    def test_63_bytes_is_in_sync_after_apply(self, declared):
+        db_table = "mcp_sql_a18_" + "é" * 25 + "x"  # 63 bytes
+        assert db_table in declared(db_table)
+        call_command("mcp_sql_grants", "--apply", stdout=StringIO())
+        for _ in range(2):
+            out = StringIO()
+            call_command("mcp_sql_grants", stdout=out)
+            assert "Grants in sync" in out.getvalue()
+        assert grants.granted_tables(_ROLE) == {("public", db_table)}

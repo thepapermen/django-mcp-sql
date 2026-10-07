@@ -5,13 +5,14 @@ It loops `MCP_SQL["PROFILES"]`, reconciling each profile's role against
 that profile's whitelist independently (per-role drift — never global).
 
 - `strict=True`: preflight failures (role missing, no membership, self-
-  referential whitelist) raise `GrantsReconcileError`. Used by the
-  `mcp_sql_grants` deploy-pipeline command.
+  referential whitelist, overlong `db_table`) raise `GrantsReconcileError`.
+  Used by the `mcp_sql_grants` deploy-pipeline command.
 - `strict=False`: env-level preflight failures (role missing,
   no membership) log a WARNING and return an empty `DriftDiff` with
   `skipped_reason` set. Code-level misconfigs (self-referential
-  whitelist) raise regardless. Used by the `post_migrate` signal so a
-  fresh environment without `role_setup.sql` does not crash `migrate`.
+  whitelist, overlong `db_table`) raise regardless. Used by the
+  `post_migrate` signal so a fresh environment without `role_setup.sql`
+  does not crash `migrate`.
 - `apply=True`: also execute the GRANT / REVOKE statements implied by the
   diff. `apply=False` is read-only; the returned `DriftDiff` describes
   what WOULD have been done.
@@ -40,10 +41,16 @@ logger = logging.getLogger(__name__)
 # A relation as `(schema, name)`, each exactly as the catalog stores it.
 Relation = tuple[str, str]
 
+# PostgreSQL's identifier length limit in bytes (`NAMEDATALEN - 1`, the
+# server's `max_identifier_length`; 63 unless the server was built with
+# another `NAMEDATALEN`). A longer name is truncated wherever it is used.
+MAX_IDENTIFIER_BYTES = 63
+
 
 class GrantsReconcileError(Exception):
     """Strict-mode preflight failure (role missing, no membership) or
-    code-level misconfiguration (self-referential whitelist)."""
+    code-level misconfiguration (self-referential whitelist, a `db_table`
+    longer than PostgreSQL keeps)."""
 
 
 def _verify_default_alias() -> None:
@@ -265,6 +272,25 @@ def self_referential_entries(profile: Profile) -> list[str]:
     ]
 
 
+def overlong_entries(profile: Profile) -> list[str]:
+    """The profile's `ALLOWED_MODELS` entries whose `db_table` has a schema
+    or table name longer than `MAX_IDENTIFIER_BYTES` (UTF-8 bytes).
+
+    PostgreSQL truncates such a name (on a character boundary) wherever it
+    appears, so the catalog lists the truncated name: the inventory never
+    shows the declared relation, and each `--apply` granted it and revoked
+    the truncated one in turn. The reconciler refuses such a whitelist
+    regardless of strict/lenient mode; the fix is a shorter `db_table`."""
+    return [
+        f"{entry} ({table!r})"
+        for entry, table in declared_tables(profile).items()
+        if any(
+            len(part.encode("utf-8")) > MAX_IDENTIFIER_BYTES
+            for part in relation_of(table)
+        )
+    ]
+
+
 def _verify_view_parity(profile: Profile) -> None:
     """Raise on column-list drift between unmanaged whitelist models and their views.
 
@@ -349,6 +375,16 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
         msg = (
             f"Refusing to grant on mcp_sql models for profile {profile.name!r}: "
             f"{bad!r}. Remove these entries from the profile's ALLOWED_MODELS."
+        )
+        raise GrantsReconcileError(msg)
+
+    too_long = overlong_entries(profile)
+    if too_long:
+        msg = (
+            f"Refusing to reconcile grants for profile {profile.name!r}: "
+            f"{too_long!r} name a relation longer than PostgreSQL's "
+            f"{MAX_IDENTIFIER_BYTES}-byte identifier limit, which it "
+            "truncates; set a shorter Meta.db_table."
         )
         raise GrantsReconcileError(msg)
 

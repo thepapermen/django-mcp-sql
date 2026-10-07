@@ -526,7 +526,14 @@ The load-bearing invariants and footguns, grouped by layer:
   revokes, a grant on a relation nothing declares wherever it is. Limits:
   it reads `information_schema.role_table_grants`, which lists neither
   materialized views, nor grants to `PUBLIC`, nor grants the profile role
-  holds only through membership in another role (ledger F42 / F64).
+  holds only through membership in another role (ledger F42 / F64). A
+  whitelisted `db_table` whose schema or table name is longer than 63
+  bytes (UTF-8; `grants.MAX_IDENTIFIER_BYTES`, PostgreSQL's `NAMEDATALEN -
+  1`) is refused by the reconciler in every mode (`overlong_entries`, like
+  a self-referential entry): PostgreSQL truncates such a name, so the
+  catalog lists a name the declared side never matches and each `--apply`
+  granted and revoked it in turn. Queries are unaffected (PostgreSQL
+  truncates the name in the agent's SQL the same way).
 - **Catalog names are untrusted SQL.** Whoever owns a relation names it,
   and a name may hold `"`, `"."`, `;`, newlines. The grants pipeline
   carries relations as `(schema, name)` tuples (inventory rows as read;
