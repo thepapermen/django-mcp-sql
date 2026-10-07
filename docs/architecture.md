@@ -629,6 +629,17 @@ The load-bearing invariants and footguns, grouped by layer:
   `Mcp-Session-Id`, which a stateless server never does). Do not re-add GET
   or DELETE to `_mcp_transport`'s `@api_view`. Pinned by
   `test_mcp_endpoint.py::TestOnlyPostReachesTheTransport`.
+- **The bridge always completes, within a deadline.** a2wsgi's WSGI half
+  blocks until the ASGI app sends its next message and stops only on a final
+  body, so any app path that leaves a response unfinished pins the thread.
+  `_bridge` composes `ASGIMiddleware(_guard_bridge(_wrap_lifespan(app)),
+  loop=..., wait_time=_BRIDGE_WIND_DOWN_SECONDS)`: `_guard_bridge` cancels the
+  app after `_BRIDGE_DEADLINE_SECONDS` (30 s, far above one 5 s statement)
+  and, whenever the app ends without its final body, sends one (`500` if it
+  ended without a response, `504` if cut off before one started, else the
+  closing chunk), logging at ERROR; `wait_time` caps how long a2wsgi waits for
+  the task to wind down after the response. Keep both if the bridge is ever
+  rebuilt. Pinned by `TestBridgeGuard` and `TestRealSdkThroughTheBridge`.
 - **DRF pre-reads `request.body` for content negotiation.** By the time
   we hand the WSGI environ to `a2wsgi.ASGIMiddleware`, `wsgi.input` is at
   EOF. `_invoke_wsgi_app` re-seeds `environ["wsgi.input"]` with

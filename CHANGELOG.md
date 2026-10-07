@@ -365,7 +365,10 @@ announce themselves.
   only opens a GET stream or sends DELETE once the server issued an
   `Mcp-Session-Id` (a stateless server never does), and the TypeScript SDK's
   post-initialize GET, previously answered `406`, now gets the `405` it treats
-  as "no stream offered". Also present in 0.1.0b5.
+  as "no stream offered". Also present in 0.1.0b5. As a backstop the bridge
+  now cancels an exchange after 30 seconds and always completes the response
+  (`504` if cut off before it started, `500` if the app ended without one), so
+  no future path that leaves a response unfinished can pin a thread either.
 
 ## 0.1.0b5 - 2026-07-01
 

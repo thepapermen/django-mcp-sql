@@ -1,12 +1,16 @@
 """Tests for the `/mcp/sql/` view and its tool callables."""
 
+import asyncio
 import io
+import json
 import secrets
+import threading
 from datetime import timedelta
 from http import HTTPStatus
 from unittest.mock import MagicMock
 
 import pytest
+from a2wsgi import ASGIMiddleware
 from asgiref.sync import async_to_sync
 from django.test import override_settings
 from django.urls import resolve
@@ -18,9 +22,12 @@ from mcp_sql.clients import ClientIdentity
 from mcp_sql.clients import ClientKind
 from mcp_sql.conf import Profile
 from mcp_sql.schemas import ToolName
+from mcp_sql.views import mcp_endpoint as mcp_endpoint_module
 from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
+from mcp_sql.views.mcp_endpoint import _bridge
 from mcp_sql.views.mcp_endpoint import _build_mcp_server
 from mcp_sql.views.mcp_endpoint import _get_asgi_loop
+from mcp_sql.views.mcp_endpoint import _guard_bridge
 from mcp_sql.views.mcp_endpoint import _invoke_wsgi_app
 from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from rest_framework.test import APIClient
@@ -454,7 +461,7 @@ class TestMcpEndpointHappyPath:
             return [b'{"ok": true}']
 
         class StubASGIMiddleware:
-            def __init__(self, asgi_app, loop=None):
+            def __init__(self, asgi_app, loop=None, wait_time=None):
                 # `loop=` mirrors the real `a2wsgi.ASGIMiddleware` signature:
                 # the view passes the process-global loop (see C1) so the
                 # bridge stops leaking a loop+thread per request.
@@ -611,6 +618,144 @@ class TestInvokeWsgiApp:
             "HTTP_X_USER_EMAIL",
         ):
             assert key not in environ, f"{key!r} leaked through — allowlist regression"
+
+
+def _bridge_request(method: str = "POST", body: bytes = b"", **headers: str):
+    """A minimal request object carrying what `_invoke_wsgi_app` forwards."""
+    request = MagicMock()
+    request.META = {
+        "REQUEST_METHOD": method,
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "80",
+        "SERVER_PROTOCOL": "HTTP/1.1",
+        "HTTP_HOST": "testserver",
+        "CONTENT_TYPE": "application/json",
+        "HTTP_ACCEPT": "application/json, text/event-stream",
+        "wsgi.url_scheme": "http",
+        **headers,
+    }
+    request.body = body
+    return request
+
+
+def _invoke_bounded(wsgi_app, request, *, limit: float = 10.0):
+    """Run `_invoke_wsgi_app` on a daemon thread and fail if it pins it.
+
+    Without the guard these exchanges never return, so the thread (not the
+    test runner) is what gets stuck; the assertion names the regression.
+    """
+    result = {}
+
+    def target():
+        result["response"] = _invoke_wsgi_app(wsgi_app, request)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(limit)
+    assert not worker.is_alive(), "the bridge pinned the calling thread"
+    return result["response"]
+
+
+def _guarded(asgi_app):
+    """Compose a raw ASGI app the way `_bridge` composes the FastMCP one."""
+    return ASGIMiddleware(
+        _guard_bridge(asgi_app),
+        loop=_get_asgi_loop(),
+        wait_time=mcp_endpoint_module._BRIDGE_WIND_DOWN_SECONDS,
+    )
+
+
+class TestBridgeGuard:
+    """An unfinished ASGI response can never pin the WSGI thread.
+
+    a2wsgi's WSGI half waits for the app's next message and stops only on a
+    final body, so an app that never finishes its response, or ends without
+    starting one, used to block `_invoke_wsgi_app` forever. `_guard_bridge`
+    bounds the app with `_BRIDGE_DEADLINE_SECONDS` and always completes the
+    response.
+    """
+
+    def test_app_that_never_answers_is_cut_off_with_504(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
+
+        async def silent(scope, receive, send):
+            await asyncio.sleep(3600)
+
+        response = _invoke_bounded(_guarded(silent), _bridge_request())
+        assert response.status_code == HTTPStatus.GATEWAY_TIMEOUT
+
+    def test_app_that_returns_without_a_response_gets_500_at_once(self, monkeypatch):
+        # A deadline far beyond the join limit: the 500 must come from the
+        # app having ended, not from the deadline.
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+
+        async def returns_nothing(scope, receive, send):
+            return
+
+        response = _invoke_bounded(_guarded(returns_nothing), _bridge_request())
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+    def test_endless_stream_is_closed_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
+
+        async def endless(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"x", "more_body": True})
+            await asyncio.sleep(3600)
+
+        response = _invoke_bounded(_guarded(endless), _bridge_request())
+        assert response.status_code == HTTPStatus.OK
+        assert response.content == b"x"
+
+    def test_complete_response_passes_through_untouched(self):
+        async def ok(scope, receive, send):
+            await send({"type": "http.response.start", "status": 201, "headers": []})
+            await send({"type": "http.response.body", "body": b"done"})
+
+        response = _invoke_bounded(_guarded(ok), _bridge_request())
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.content == b"done"
+
+
+class TestRealSdkThroughTheBridge:
+    """The real FastMCP app through `_bridge`, the composition the view uses.
+
+    GET never reaches the bridge any more (`TestOnlyPostReachesTheTransport`);
+    these drive it there directly to pin that the guard alone would have
+    stopped both shapes of the original hang.
+    """
+
+    def _server(self):
+        return _build_mcp_server(
+            user=MagicMock(),
+            profile=_DEFAULT_PROFILE,
+            token_id="",
+            client_ip=None,
+        )
+
+    def test_post_ping_round_trips(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode()
+        response = _invoke_bounded(_bridge(self._server()), _bridge_request(body=body))
+        assert response.status_code == HTTPStatus.OK
+        assert json.loads(response.content) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    def test_get_with_last_event_id_no_longer_hangs(self, monkeypatch):
+        # The SDK returns without sending anything (no event store), so the
+        # guard answers at once; the deadline is set out of reach to prove it.
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+        response = _invoke_bounded(
+            _bridge(self._server()),
+            _bridge_request(method="GET", HTTP_LAST_EVENT_ID="0"),
+        )
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+    def test_get_sse_stream_is_closed_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.5)
+        response = _invoke_bounded(
+            _bridge(self._server()), _bridge_request(method="GET")
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert response["Content-Type"].startswith("text/event-stream")
 
 
 @pytest.mark.django_db

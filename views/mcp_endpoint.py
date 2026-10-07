@@ -8,8 +8,10 @@ CSRF/CORS posture."""
 import asyncio
 import functools
 import io
+import logging
 import threading
 from dataclasses import asdict
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 from typing import cast
 from wsgiref.types import WSGIApplication
@@ -47,6 +49,9 @@ from typing_extensions import TypedDict
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
     from mcp_sql.conf import Profile
+
+
+logger = logging.getLogger(__name__)
 
 
 class ColumnInfo(TypedDict):
@@ -552,16 +557,129 @@ def _mcp_transport(request):
         client_ip=client_ip,
         client=client,
     )
+    return _invoke_wsgi_app(_bridge(server), request)
+
+
+def _bridge(server: FastMCP) -> WSGIApplication:
+    """The per-request FastMCP app as a WSGI callable, on the shared loop.
+
+    Layering, outermost first: a2wsgi's `ASGIMiddleware` (with a bounded
+    `wait_time`, so the WSGI side never waits indefinitely for the ASGI task
+    to wind down after the response ended), `_guard_bridge` (deadline +
+    guaranteed complete response), `_wrap_lifespan`, the SDK app.
+    """
     # a2wsgi's `ASGIMiddleware` is a WSGI application by construction, but its
     # stubbed `__call__` is not recognised as the `WSGIApplication` callable
     # shape — assert the contract here rather than loosen `_invoke_wsgi_app`.
-    wsgi_app = cast(
+    return cast(
         "WSGIApplication",
         ASGIMiddleware(
-            _wrap_lifespan(server.streamable_http_app()), loop=_get_asgi_loop()
+            _guard_bridge(_wrap_lifespan(server.streamable_http_app())),
+            loop=_get_asgi_loop(),
+            wait_time=_BRIDGE_WIND_DOWN_SECONDS,
         ),
     )
-    return _invoke_wsgi_app(wsgi_app, request)
+
+
+# Hard ceiling on one bridged MCP exchange. Far above any legitimate request:
+# a tool call is at most one statement under the session's 5 s
+# `statement_timeout` (`session.EXPECTED_SESSION_GUCS`), its 1 s
+# `lock_timeout`, a parse of a <= 1 MiB body and an audit insert. Below
+# gunicorn's default 30 s worker timeout is not the goal (a gthread or ASGI
+# worker has no such timeout at all); never pinning a thread forever is.
+_BRIDGE_DEADLINE_SECONDS = 30.0
+# After the response is complete, how long a2wsgi waits for the ASGI task
+# (lifespan exit, SDK cleanup) before cancelling it and releasing the thread.
+_BRIDGE_WIND_DOWN_SECONDS = 5.0
+
+
+def _guard_bridge(asgi_app):
+    """Guarantee the WSGI side of the bridge always gets a complete response.
+
+    a2wsgi's WSGI half blocks until the ASGI app sends a message, and stops
+    only on a final `http.response.body` (or an exception). An app that never
+    finishes its response, or returns without starting one, therefore pins
+    the calling thread forever: `_invoke_wsgi_app`'s `b"".join` never
+    returns, client disconnects included. That is how a GET once pinned the
+    worker (the SDK's never-ending SSE stream, and its no-response
+    `Last-Event-ID` replay). `mcp_endpoint` now refuses GET outright; this is
+    the bridge-level backstop for any path, present or future, that leaves a
+    response unfinished:
+
+    - the app runs under `_BRIDGE_DEADLINE_SECONDS`, then is cancelled;
+    - whenever it ends (normally, or cut off) without having sent its final
+      body, this sends one: a `500` if it ended on its own without a
+      response, a `504` if the deadline cut it off before one started, or
+      just the closing empty chunk if the response had already started.
+
+    Every send runs as its own task, shielded from the deadline's
+    cancellation, and is awaited before the completion messages go out. So
+    the flags below record only what a2wsgi actually received, and a message
+    a cancelled app was in the middle of sending is never half-delivered
+    (a2wsgi takes a lock per message that only its WSGI half releases).
+
+    An exception raised by the app is left to a2wsgi, which answers 500 (or
+    re-raises into `_invoke_wsgi_app` if the body had started).
+    """
+
+    async def call(scope, receive, send):
+        started = finished = False
+        in_flight: asyncio.Task[None] | None = None
+
+        async def deliver(message):
+            nonlocal started, finished
+            await send(message)
+            if message["type"] == "http.response.start":
+                started = True
+            elif message["type"] == "http.response.body" and not message.get(
+                "more_body", False
+            ):
+                finished = True
+
+        async def tracked_send(message):
+            nonlocal in_flight
+            in_flight = asyncio.ensure_future(deliver(message))
+            await asyncio.shield(in_flight)
+
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+        try:
+            async with asyncio.timeout(_BRIDGE_DEADLINE_SECONDS):
+                await asgi_app(scope, receive, tracked_send)
+        except TimeoutError:
+            status = HTTPStatus.GATEWAY_TIMEOUT
+        if in_flight is not None:
+            await in_flight
+        if finished:
+            return
+        logger.error(
+            "MCP bridge: %s %s %s; answering the client and releasing the thread",
+            scope.get("method"),
+            scope.get("path"),
+            (
+                f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
+                if status == HTTPStatus.GATEWAY_TIMEOUT
+                else "ended without completing its response"
+            ),
+        )
+        if not started:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": status,
+                    "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": status.phrase.encode(),
+                    "more_body": False,
+                }
+            )
+            return
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return call
 
 
 def _wrap_lifespan(asgi_app):
