@@ -235,6 +235,27 @@ class TestRenderedTextIsValidated:
             == "SELECT 1 AS w LIMIT 11"
         )
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # sqlglot cannot express these in Postgres; by default it would
+            # drop the clause with a warning and run something else.
+            "SELECT first_value(x) IGNORE NULLS OVER (ORDER BY x) AS f "
+            "FROM (SELECT 1 AS x) s",
+            "SELECT initcap('a-b', '-') AS v",
+            # Not Postgres SQL: sqlglot rewrites QUALIFY into a subquery with
+            # the LIMIT applied before the window filter.
+            "SELECT x FROM (SELECT 1 AS x) s QUALIFY row_number() OVER "
+            "(ORDER BY x) = 1",
+        ],
+        ids=["ignore-nulls", "initcap-delimiter", "qualify"],
+    )
+    def test_a_rendering_that_drops_meaning_is_refused(self, sql):
+        parsed = parse_and_validate(sql, allowed_tables=set())
+        with pytest.raises(QueryRejectedError) as exc:
+            render_for_execution(parsed.ast, 11, allowed_tables=set())
+        assert exc.value.reason == OutcomeReason.ROUNDTRIP_MISMATCH
+
     @pytest.mark.django_db
     def test_run_query_audits_the_refusal_and_runs_nothing(self, monkeypatch):
         cursor = _stub_readonly_connections(monkeypatch)

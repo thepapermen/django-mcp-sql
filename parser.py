@@ -10,6 +10,7 @@ import sqlglot.errors
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
+from sqlglot.errors import ErrorLevel
 from sqlglot.tokens import Token
 from sqlglot.tokens import TokenType
 
@@ -177,18 +178,44 @@ def parse_and_validate(
     Matching is case-insensitive on the table name only (schema is rejected
     unconditionally when it's a system schema).
 
-    Raises only `QueryRejectedError`. Any other sqlglot failure — the
-    tokenizer's `TokenError` (an unterminated literal), not a `ParseError`
-    subclass — and the `re.error` sqlglot raises for some `UESCAPE` clauses
-    become a `PARSE_ERROR` reject, so `run_query` audits them like every
-    other rejection instead of letting them escape unaudited.
+    Raises only `QueryRejectedError`. sqlglot fails on hostile input with
+    far more than `ParseError`: the tokenizer's `TokenError` (an
+    unterminated literal), a bare `re.error` for some `UESCAPE` clauses,
+    and plain `ValueError` / `TypeError` / `IndexError` / `KeyError` /
+    `decimal.InvalidOperation` from its function builders
+    (`date_part('', d)`, `var_map('')`, a `1e400` argument, ...). Every
+    exception other than our own rejection becomes a `PARSE_ERROR`, so
+    `run_query` audits it like any other rejection instead of letting it
+    escape unaudited.
     """
+    return _checked(
+        raw_sql,
+        allowed_tables=allowed_tables,
+        ban_select_star=ban_select_star,
+        normalize=True,
+    )
+
+
+def _checked(
+    raw_sql: str,
+    *,
+    allowed_tables: set[str],
+    ban_select_star: bool,
+    normalize: bool,
+) -> ParsedQuery:
+    """`_parse_and_validate`, with any non-rejection exception mapped to
+    `PARSE_ERROR` (see `parse_and_validate`)."""
     try:
         return _parse_and_validate(
-            raw_sql, allowed_tables=allowed_tables, ban_select_star=ban_select_star
+            raw_sql,
+            allowed_tables=allowed_tables,
+            ban_select_star=ban_select_star,
+            normalize=normalize,
         )
-    except (sqlglot.errors.SqlglotError, re.error) as exc:
-        msg = f"SQL could not be parsed: {exc}"
+    except QueryRejectedError:
+        raise
+    except Exception as exc:
+        msg = f"SQL could not be parsed ({type(exc).__name__}): {exc}"
         raise QueryRejectedError(OutcomeReason.PARSE_ERROR, msg) from exc
 
 
@@ -197,6 +224,7 @@ def _parse_and_validate(
     *,
     allowed_tables: set[str],
     ban_select_star: bool,
+    normalize: bool,
 ) -> ParsedQuery:
     try:
         parsed = sqlglot.parse(raw_sql, dialect="postgres")
@@ -265,6 +293,10 @@ def _parse_and_validate(
     # tree depth, though — a parseable-but-pathologically-deep AST can survive
     # `sqlglot.parse` yet overflow here. Convert that to a PARSE_ERROR reject
     # so `parse_and_validate` NEVER leaks `RecursionError` to its callers.
+    if not normalize:  # re-validating rendered text: nobody reads it
+        return ParsedQuery(
+            ast=ast, normalized_sql="", referenced_tables=referenced_tables
+        )
     try:
         normalized_sql = ast.sql(dialect="postgres", normalize=True)
     except RecursionError as exc:
@@ -448,8 +480,11 @@ def render_for_execution(
     sql = _render(inject_limit(ast, limit))
     for _ in range(_MAX_RENDER_ROUNDS):
         try:
-            rendered = parse_and_validate(
-                sql, allowed_tables=allowed_tables, ban_select_star=ban_select_star
+            rendered = _checked(
+                sql,
+                allowed_tables=allowed_tables,
+                ban_select_star=ban_select_star,
+                normalize=False,
             )
         except QueryRejectedError as exc:
             msg = (
@@ -459,6 +494,11 @@ def render_for_execution(
             raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
         again = _render(rendered.ast)
         if again == sql:
+            if extract_limit(rendered.ast) != limit:
+                # e.g. `QUALIFY` (not Postgres SQL): sqlglot moves the
+                # LIMIT into a subquery, applied before the window filter.
+                msg = f"The rendered SQL does not end in LIMIT {limit}: {sql}"
+                raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg)
             return sql
         sql = again
     msg = f"The rendered SQL is not stable: it keeps changing, last as {sql!r}"
@@ -470,7 +510,26 @@ _MAX_RENDER_ROUNDS = 3
 
 
 def _render(tree: exp.Query) -> str:
-    return tree.sql(dialect="postgres", comments=False, normalize_functions=False)
+    """The tree as Postgres SQL. `unsupported_level=RAISE`: where sqlglot
+    knows it cannot express something in Postgres it would otherwise drop it
+    with a warning (`IGNORE NULLS`, `initcap`'s delimiter) and run something
+    else; that is a `ROUNDTRIP_MISMATCH` instead. Any other generator failure
+    is one too; only `RecursionError` propagates (the caller audits it)."""
+    try:
+        return tree.sql(
+            dialect="postgres",
+            comments=False,
+            normalize_functions=False,
+            unsupported_level=ErrorLevel.RAISE,
+        )
+    except RecursionError:
+        raise
+    except Exception as exc:
+        msg = (
+            "The query cannot be rendered as Postgres SQL "
+            f"({type(exc).__name__}): {exc}"
+        )
+        raise QueryRejectedError(OutcomeReason.ROUNDTRIP_MISMATCH, msg) from exc
 
 
 def extract_limit(ast: exp.Query) -> int | None:

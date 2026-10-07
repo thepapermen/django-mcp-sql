@@ -102,23 +102,34 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             allowed_tables=allowed,
             ban_select_star=ban_select_star,
         )
-    except QueryRejectedError as exc:
+    except Exception as exc:  # noqa: BLE001 — every outcome is audited
+        # `parse_and_validate` raises only `QueryRejectedError`; anything else
+        # is a parser bug, still audited (as PARSE_ERROR) rather than escaping
+        # `run_query` with no row.
+        rejection = (
+            exc
+            if isinstance(exc, QueryRejectedError)
+            else QueryRejectedError(
+                OutcomeReason.PARSE_ERROR,
+                f"SQL could not be parsed ({type(exc).__name__}): {exc}",
+            )
+        )
         _audit_safely(
             user=user,
             profile=profile.name,
             token_id=token_id,
             decision=MCPQueryLog.DECISION_REJECTED,
-            rejection_reason=exc.reason,
+            rejection_reason=rejection.reason,
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
             client_redirect=client_redirect,
-            error=exc.detail,
+            error=rejection.detail,
         )
         return QueryResult(
-            rejection_reason=exc.reason,
-            hint=HINTS.get(exc.reason, ""),
-            error=exc.detail,
+            rejection_reason=rejection.reason,
+            hint=HINTS.get(rejection.reason, ""),
+            error=rejection.detail,
         )
 
     # Effective row cap = min(kwarg, SQL LIMIT, HARD_LIMIT), defaulting
@@ -167,25 +178,6 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             allowed_tables=allowed,
             ban_select_star=ban_select_star,
         )
-    except QueryRejectedError as exc:
-        _audit_safely(
-            user=user,
-            profile=profile.name,
-            token_id=token_id,
-            decision=MCPQueryLog.DECISION_REJECTED,
-            rejection_reason=exc.reason,
-            raw_sql=raw_sql,
-            normalized_sql=parsed.normalized_sql,
-            started_at=started_at,
-            client_ip=client_ip,
-            client_redirect=client_redirect,
-            error=exc.detail,
-        )
-        return QueryResult(
-            rejection_reason=exc.reason,
-            hint=HINTS.get(exc.reason, ""),
-            error=exc.detail,
-        )
     except RecursionError:
         msg = "SQL nesting is too deep to serialize"
         _audit_safely(
@@ -205,6 +197,35 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             rejection_reason=OutcomeReason.PARSE_ERROR,
             hint=HINTS.get(OutcomeReason.PARSE_ERROR, ""),
             error=msg,
+        )
+    except Exception as exc:  # noqa: BLE001 — every outcome is audited
+        # `QueryRejectedError` (ROUNDTRIP_MISMATCH) as designed; anything
+        # else is a rendering bug, refused the same way rather than escaping.
+        rejection = (
+            exc
+            if isinstance(exc, QueryRejectedError)
+            else QueryRejectedError(
+                OutcomeReason.ROUNDTRIP_MISMATCH,
+                f"SQL could not be rendered ({type(exc).__name__}): {exc}",
+            )
+        )
+        _audit_safely(
+            user=user,
+            profile=profile.name,
+            token_id=token_id,
+            decision=MCPQueryLog.DECISION_REJECTED,
+            rejection_reason=rejection.reason,
+            raw_sql=raw_sql,
+            normalized_sql=parsed.normalized_sql,
+            started_at=started_at,
+            client_ip=client_ip,
+            client_redirect=client_redirect,
+            error=rejection.detail,
+        )
+        return QueryResult(
+            rejection_reason=rejection.reason,
+            hint=HINTS.get(rejection.reason, ""),
+            error=rejection.detail,
         )
 
     # Defense-in-depth alias assertion: the router pins audit writes back to

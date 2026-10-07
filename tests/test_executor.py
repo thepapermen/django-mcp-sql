@@ -763,6 +763,51 @@ class TestEveryParserFailureIsAudited:
         assert log.decision == MCPQueryLog.DECISION_REJECTED
         assert log.rejection_reason == result.rejection_reason
 
+    @pytest.mark.parametrize(
+        "raw_sql",
+        [
+            "SELECT date_part('', id) AS v FROM auth_permission",
+            "SELECT levenshtein_less_equal() AS v FROM auth_permission",
+            "SELECT var_map('') AS v FROM auth_permission",
+            "SELECT json_extract_scalar(name, 1e400) AS v FROM auth_permission",
+        ],
+        ids=["value-error", "index-error", "index-error-2", "huge-number"],
+    )
+    def test_any_sqlglot_builder_exception_is_a_parse_error(self, monkeypatch, raw_sql):
+        # sqlglot's function builders raise plain ValueError / IndexError /
+        # TypeError / KeyError / decimal.InvalidOperation on bad arguments.
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
+        )
+        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == "parse_error"
+
+    @pytest.mark.parametrize(
+        ("target", "reason"),
+        [
+            ("mcp_sql.executor.parse_and_validate", OutcomeReason.PARSE_ERROR),
+            ("mcp_sql.executor.render_for_execution", OutcomeReason.ROUNDTRIP_MISMATCH),
+        ],
+        ids=["parse", "render"],
+    )
+    def test_executor_backstop_audits_any_exception(self, monkeypatch, target, reason):
+        def boom(*_a, **_k):
+            msg = "parser bug"
+            raise KeyError(msg)
+
+        monkeypatch.setattr(target, boom)
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            raw_sql="SELECT id FROM auth_permission",
+        )
+        assert result.rejection_reason == reason.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == reason.value
+
     def test_a_regex_error_inside_sqlglot_is_a_parse_error(self, monkeypatch):
         import re
 
