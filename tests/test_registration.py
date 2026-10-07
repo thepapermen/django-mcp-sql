@@ -703,7 +703,8 @@ class TestWhitespaceSmuggling:
 
 
 _URI_REFUSAL = (
-    "redirect_uris must not contain control, format, separator or surrogate characters"
+    "redirect_uris must not contain control, separator, surrogate, format or "
+    "other invisible characters"
 )
 _NAME_REFUSAL = (
     "client_name must be a string of at most 200 characters, without control, "
@@ -787,6 +788,16 @@ class TestUnacceptableCharactersAreA400:
             chr(0xFEFF),  # BOM
             chr(0x00AD),  # soft hyphen (invisible unless at a line break)
             chr(0x3164),  # Hangul filler (renders blank)
+            chr(0x034F),  # combining grapheme joiner (Mn, invisible)
+            chr(0x180B),  # Mongolian free variation selector (Mn)
+            chr(0xFE0F),  # VS16 after an ASCII letter: no visible effect
+            chr(0x200C),  # ZWNJ between ASCII letters
+            chr(0x200D),  # ZWJ between ASCII letters
+            chr(0xE0067),  # a tag character outside a flag sequence
+            chr(0x1D173),  # musical symbol begin beam (Cf, invisible)
+            chr(0x1BCA0),  # shorthand format letter overlap (Cf)
+            chr(0xFFF9),  # interlinear annotation anchor
+            chr(0x1161),  # Hangul vowel jamo with no leading consonant
         ],
     )
     def test_client_name(self, client, char):
@@ -820,8 +831,32 @@ class TestUnacceptableCharactersAreA400:
             + chr(0xE007F),
             # Variation selector (emoji presentation).
             "Heart \u2764" + chr(0xFE0F),
+            # Heart on fire: VS16 then ZWJ.
+            "\u2764" + chr(0xFE0F) + chr(0x200D) + "\U0001f525",
+            # Woman technologist, medium skin tone.
+            "\U0001f469\U0001f3fd" + chr(0x200D) + "\U0001f4bb",
+            # Keycap one.
+            "Room 1" + chr(0xFE0F) + "\u20e3",
+            # Decomposed (NFD) Korean "han": conjoining jamo in sequence.
+            "\u1112\u1161\u11ab",
+            # Ideographic variation sequence.
+            "\u845b" + chr(0xE0100),
+            # Combining accents (decomposed e-acute).
+            "Cafe\u0301",
         ],
-        ids=["accents-emoji", "zwnj", "zwj-emoji", "flag-tags", "variation-sel"],
+        ids=[
+            "accents-emoji",
+            "zwnj",
+            "zwj-emoji",
+            "flag-tags",
+            "variation-sel",
+            "heart-on-fire",
+            "skin-tone-zwj",
+            "keycap",
+            "nfd-korean",
+            "ideographic-vs",
+            "combining-accent",
+        ],
     )
     def test_ordinary_non_ascii_name_is_not_refused(self, client, name):
         """Letters, punctuation, emoji and the joiners real scripts and emoji
@@ -840,7 +875,22 @@ class TestUnacceptableCharactersAreA400:
         assert response.status_code == HTTPStatus.CREATED
         assert response.json()["redirect_uris"] == [uri]
 
-    @pytest.mark.parametrize("char", [chr(0x200C), chr(0x200D), chr(0xE0067)])
+    @pytest.mark.parametrize(
+        "char",
+        [
+            chr(0x200C),
+            chr(0x200D),
+            chr(0xE0067),
+            chr(0x034F),
+            chr(0xFE0F),
+            chr(0x180B),
+            chr(0x1161),
+            chr(0x1100),
+            chr(0x3164),
+            chr(0xFFA0),
+            chr(0x0600),  # Arabic number sign: Cf, visible, still no place in a URI
+        ],
+    )
     def test_joiners_and_tags_stay_refused_in_a_redirect_uri(self, client, char):
         """Redirect URIs stay strict: every format character, joiners and tag
         characters included, since nothing legitimate in a callback needs one."""

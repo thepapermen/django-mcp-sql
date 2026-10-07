@@ -7,6 +7,7 @@ registered subset echoed back, per RFC 7591 §3.2.1. See
 `docs/architecture.md` "OAuth surface" + the `docs/oauth.md` runbook for the
 full security posture."""
 
+import bisect
 import json
 import logging
 import secrets
@@ -61,73 +62,177 @@ _MAX_REDIRECT_URI_LENGTH = 1024
 _MAX_CLIENT_NAME = 200
 
 
-# Characters that make text display as something it is not, refused in every
-# client-metadata field: bidirectional controls (marks, embeddings,
-# overrides, isolates) and invisible characters (zero-width space, word
-# joiner and invisible operators, BOM, soft hyphen, the Hangul fillers that
-# render blank, interlinear annotation marks, the deprecated format controls).
-# Deliberately NOT here: the zero-width non-joiner and joiner (U+200C/D),
-# which Persian, Indic scripts and emoji sequences need, tag characters
-# (subdivision flags) and variation selectors.
-_DISPLAY_ALTERING = frozenset(
-    {
-        0x00AD,  # soft hyphen
-        0x061C,  # Arabic letter mark
-        0x115F,  # Hangul choseong filler
-        0x1160,  # Hangul jungseong filler
-        0x180E,  # Mongolian vowel separator
-        0x200B,  # zero-width space
-        0x200E,  # left-to-right mark
-        0x200F,  # right-to-left mark
-        *range(0x202A, 0x202F),  # LRE, RLE, PDF, LRO, RLO
-        *range(0x2060, 0x2065),  # word joiner, invisible operators
-        *range(0x2066, 0x2070),  # isolates, deprecated format controls
-        0x3164,  # Hangul filler
-        0xFEFF,  # BOM / zero-width no-break space
-        0xFFA0,  # halfwidth Hangul filler
-        *range(0xFFF9, 0xFFFC),  # interlinear annotation marks
-    }
+# --- Characters refused in client metadata -------------------------------
+#
+# Nothing refused here is stored, echoed or logged. Control (`Cc`: C0, DEL,
+# C1) and surrogate (`Cs`) characters fail downstream outright: Postgres
+# refuses a NUL in a text column (`DataError`), the driver's UTF-8 encoder a
+# lone surrogate (`UnicodeEncodeError`), each an anonymous 500. Line /
+# paragraph separators (`Zl`, `Zp`) break the text across lines. And every
+# character Unicode marks Default_Ignorable_Code_Point renders as nothing, so
+# it would let a registrant make a stored callback (copied into every audit
+# row's `client_redirect`) or a logged / echoed client name read as
+# something it is not.
+
+# Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt; stable
+# since Unicode 6.x, the ranges include their unassigned reserves). Python's
+# `unicodedata` does not expose the property, hence the table.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),  # soft hyphen
+    (0x034F, 0x034F),  # combining grapheme joiner
+    (0x061C, 0x061C),  # Arabic letter mark
+    (0x115F, 0x1160),  # Hangul choseong / jungseong fillers
+    (0x17B4, 0x17B5),  # Khmer inherent vowels
+    (0x180B, 0x180F),  # Mongolian free variation selectors, vowel separator
+    (0x200B, 0x200F),  # zero-width space / non-joiner / joiner, LRM, RLM
+    (0x202A, 0x202E),  # bidi embeddings and overrides
+    (0x2060, 0x206F),  # word joiner, invisible operators, isolates, ...
+    (0x3164, 0x3164),  # Hangul filler
+    (0xFE00, 0xFE0F),  # variation selectors
+    (0xFEFF, 0xFEFF),  # BOM / zero-width no-break space
+    (0xFFA0, 0xFFA0),  # halfwidth Hangul filler
+    (0xFFF0, 0xFFF8),  # unassigned specials
+    (0x1BCA0, 0x1BCA3),  # shorthand format controls
+    (0x1D173, 0x1D17A),  # musical symbol format controls
+    (0xE0000, 0xE0FFF),  # tags, variation selectors supplement, reserves
 )
-# Refused by general category, per field. Control (`Cc`: C0, DEL, C1) and
-# surrogate (`Cs`) fail downstream outright: Postgres refuses a NUL in a text
-# column (`DataError`), the driver's UTF-8 encoder a lone surrogate
-# (`UnicodeEncodeError`), each an anonymous 500. Line / paragraph separators
-# (`Zl`, `Zp`) break a name or URI across lines. A redirect URI is strict and
-# refuses every format character (`Cf`) too: nothing legitimate in a callback
-# needs one. A client name is free text, so only the display-altering ones
-# above are refused there.
-_URI_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
-_NAME_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+_DI_STARTS = [lo for lo, _ in _DEFAULT_IGNORABLE_RANGES]
+
+# Conjoining Hangul jamo. In a name they are ordinary (decomposed, NFD,
+# Korean); a vowel or final standing without its leading consonant renders
+# as blank or as nothing, so only those orphans are refused there.
+_CHOSEONG = ((0x1100, 0x115E), (0xA960, 0xA97C))
+_JUNGSEONG = ((0x1161, 0x11A7), (0xD7B0, 0xD7C6))
+_JONGSEONG = ((0x11A8, 0x11FF), (0xD7CB, 0xD7FB))
+_CONJOINING_JAMO = ((0x1100, 0x11FF), (0xA960, 0xA97F), (0xD7B0, 0xD7FF))
+
+_ZWNJ, _ZWJ = 0x200C, 0x200D
+_VS15, _VS16 = 0xFE0E, 0xFE0F
+_KEYCAP = 0x20E3
+_BLACK_FLAG, _CANCEL_TAG = 0x1F3F4, 0xE007F
+_TAGS = (0xE0020, 0xE007E)
+_IDEOGRAPHIC_VS = (0xE0100, 0xE01EF)
+_CJK_IDEOGRAPHS = (
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x3FFFF),
+)
+_INTERLINEAR_ANNOTATION = (0xFFF9, 0xFFFB)
+_ALWAYS_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+
+
+def _in(cp: int, ranges: Any) -> bool:
+    if isinstance(ranges[0], int):
+        return ranges[0] <= cp <= ranges[1]
+    return any(lo <= cp <= hi for lo, hi in ranges)
+
+
+def _is_default_ignorable(cp: int) -> bool:
+    i = bisect.bisect_right(_DI_STARTS, cp) - 1
+    return i >= 0 and cp <= _DEFAULT_IGNORABLE_RANGES[i][1]
+
+
+def _is_visible_neighbour(c: str | None) -> bool:
+    """A character a joiner may sit next to in ordinary text: present, not
+    ASCII (no Latin-script word needs a joiner), not whitespace, and not
+    itself invisible (VS16, which ends an emoji presentation, excepted)."""
+    if c is None or c.isascii() or c.isspace():
+        return False
+    return not _is_default_ignorable(ord(c)) or ord(c) == _VS16
+
+
+def _name_allows_ignorable(text: str, i: int) -> bool:  # noqa: PLR0911 — one return per allowance
+    """Whether the default-ignorable character at `text[i]` is part of a
+    visible sequence ordinary text needs, rather than an invisible insert.
+
+    Allowed in a client name only:
+    - the zero-width non-joiner / joiner between two visible non-ASCII
+      characters (Persian and Indic spelling, emoji ZWJ sequences);
+    - VS15 / VS16 after a symbol (emoji presentation) or after a keycap base
+      (`0-9`, `#`, `*`) that is followed by U+20E3;
+    - an ideographic variation selector after a CJK ideograph;
+    - tag characters in a subdivision-flag sequence: U+1F3F4, tags, U+E007F.
+    """
+    cp = ord(text[i])
+    before = text[i - 1] if i > 0 else None
+    after = text[i + 1] if i + 1 < len(text) else None
+    if cp in (_ZWNJ, _ZWJ):
+        return _is_visible_neighbour(before) and _is_visible_neighbour(after)
+    if cp in (_VS15, _VS16):
+        if before is None:
+            return False
+        if before in "0123456789#*":
+            return after is not None and ord(after) == _KEYCAP
+        return unicodedata.category(before) == "So"
+    if _in(cp, _IDEOGRAPHIC_VS):
+        return before is not None and _in(ord(before), _CJK_IDEOGRAPHS)
+    if _in(cp, _TAGS) or cp == _CANCEL_TAG:
+        # Walk back over the tag run to its base: it must be the black flag,
+        # and the run must end with the cancel tag.
+        j = i
+        while j > 0 and _in(ord(text[j - 1]), _TAGS):
+            j -= 1
+        if j == 0 or ord(text[j - 1]) != _BLACK_FLAG:
+            return False
+        k = i
+        while k < len(text) and _in(ord(text[k]), _TAGS):
+            k += 1
+        return k < len(text) and ord(text[k]) == _CANCEL_TAG and k > j
+    return False
+
+
+def _is_orphan_jamo(text: str, i: int) -> bool:
+    """A conjoining vowel / final Hangul jamo not continuing a syllable."""
+    cp = ord(text[i])
+    before = ord(text[i - 1]) if i > 0 else None
+    if _in(cp, _JUNGSEONG):
+        return before is None or not (_in(before, _CHOSEONG) or _in(before, _JUNGSEONG))
+    if _in(cp, _JONGSEONG):
+        return before is None or not (
+            _in(before, _JUNGSEONG) or _in(before, _JONGSEONG)
+        )
+    return False
 
 
 def _has_unacceptable_character(value: str) -> bool:
     """True if `value` holds a character no redirect URI may carry.
 
-    A stored callback is copied into every audit row's `client_redirect`, so
-    an invisible or reordering character there would let a registrant make it
-    read as something it is not; NUL and lone surrogates are 500s at the
-    INSERT. See `_URI_REFUSED_CATEGORIES` and `_DISPLAY_ALTERING`.
+    Strict: any control, surrogate, separator or format (`Cf`) character,
+    any default-ignorable one, and any conjoining Hangul jamo. Nothing
+    legitimate in a callback needs one.
     """
-    return any(
-        unicodedata.category(c) in _URI_REFUSED_CATEGORIES
-        or ord(c) in _DISPLAY_ALTERING
-        for c in value
-    )
+    for c in value:
+        cp = ord(c)
+        if (
+            unicodedata.category(c) in _ALWAYS_REFUSED_CATEGORIES
+            or unicodedata.category(c) == "Cf"
+            or _is_default_ignorable(cp)
+            or _in(cp, _CONJOINING_JAMO)
+        ):
+            return True
+    return False
 
 
 def _has_unacceptable_name_character(value: str) -> bool:
     """True if `value` holds a character no client name may carry.
 
-    Narrower than for a URI: ordinary text, joiners and emoji sequences
-    included, is accepted; control, surrogate, separator and display-altering
-    characters (`_DISPLAY_ALTERING`) are not. The name is never stored, but it
-    is echoed in the 201 and logged.
+    Free text, so narrower than for a URI: control, surrogate and separator
+    characters; default-ignorable (invisible) ones except where
+    `_name_allows_ignorable` finds them part of a visible sequence; the
+    interlinear annotation controls; and orphaned conjoining Hangul jamo.
+    Ordinary letters, combining accents, emoji and their sequences pass. The
+    name is never stored, but it is echoed in the 201 and logged.
     """
-    return any(
-        unicodedata.category(c) in _NAME_REFUSED_CATEGORIES
-        or ord(c) in _DISPLAY_ALTERING
-        for c in value
-    )
+    for i, c in enumerate(value):
+        cp = ord(c)
+        if unicodedata.category(c) in _ALWAYS_REFUSED_CATEGORIES:
+            return True
+        if _is_default_ignorable(cp) and not _name_allows_ignorable(value, i):
+            return True
+        if _in(cp, _INTERLINEAR_ANNOTATION) or _is_orphan_jamo(value, i):
+            return True
+    return False
 
 
 def _error(
@@ -298,8 +403,8 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
     if any(_has_unacceptable_character(uri) for uri in strings):
         return _error(
             "invalid_redirect_uri",
-            "redirect_uris must not contain control, format, separator or "
-            "surrogate characters",
+            "redirect_uris must not contain control, separator, surrogate, "
+            "format or other invisible characters",
         )
     if not all(_is_parseable_uri(uri) for uri in strings):
         return _error("invalid_redirect_uri", "redirect_uris must be valid URIs")

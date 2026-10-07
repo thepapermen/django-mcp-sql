@@ -448,22 +448,29 @@ announce themselves.
 
   All are now RFC 7591 400s, for the whole request even beside a clean URI.
   A requested `redirect_uris` entry is refused (`invalid_redirect_uri`) if it
-  holds a control (Unicode `Cc`), surrogate (`Cs`), any format (`Cf`) or a
-  line / paragraph separator (`Zl`, `Zp`) character, or does not parse. A
-  `client_name` (`invalid_client_metadata`) is held to a narrower rule fit for
-  free text: control, surrogate and separator characters, plus the ones that
-  make text display as something it is not (bidi marks, embeddings,
-  overrides and isolates such as U+202E; zero-width space, word joiner, BOM,
-  soft hyphen, the blank-rendering Hangul fillers). The zero-width
-  non-joiner and joiner that Persian, Indic scripts and emoji sequences need,
-  subdivision-flag tag characters and variation selectors stay allowed in a
-  name. Nothing refused is stored, echoed or logged: a callback is copied
-  into every audit row's `client_redirect`, and an invisible or reordering
-  character there would let a registrant make it read as something else.
-  Ordinary non-ASCII text is still accepted. A seeded fuzz of the endpoint (malformed hosts,
-  ports, encodings, odd characters) pins that it answers only 201 or 400. An
-  unparseable body is `invalid_client_metadata`, and `grant_types` /
-  `response_types` must be arrays of strings. Also affects 0.1.0b5.
+  holds a control (Unicode `Cc`), surrogate (`Cs`), format (`Cf`), line /
+  paragraph separator (`Zl`, `Zp`) or any Default_Ignorable_Code_Point
+  (invisible) character, or a conjoining Hangul jamo. A `client_name`
+  (`invalid_client_metadata`) is held to a narrower rule fit for free text:
+  control, surrogate and separator characters, every default-ignorable
+  character (bidi marks, embeddings, overrides and isolates such as U+202E;
+  zero-width space, word joiner, BOM, soft hyphen, combining grapheme joiner,
+  the blank-rendering Hangul fillers, ...) except where it is part of a
+  visible sequence (a zero-width non-joiner or joiner between two visible
+  non-ASCII characters, as Persian, Indic scripts and emoji ZWJ sequences
+  need; VS15 / VS16 after a symbol or in a keycap; an ideographic variation
+  selector after a CJK ideograph; tag characters in a subdivision-flag
+  sequence), the interlinear annotation controls, and a conjoining Hangul
+  vowel or final that does not continue a syllable. Nothing refused is
+  stored, echoed or logged: a callback is copied into every audit row's
+  `client_redirect`, and an invisible or reordering character there would
+  let a registrant make it read as something else. The soft hyphen is
+  refused as invisible (it shows only at a line break).
+  Ordinary non-ASCII text is still accepted. A seeded fuzz of the endpoint
+  (malformed hosts, ports, encodings, odd characters) pins that it answers
+  only 201 or 400. An unparseable body is `invalid_client_metadata`, and
+  `grant_types` / `response_types` must be arrays of strings. Also affects
+  0.1.0b5.
 - **Known on this branch alone, fixed by PR #4 (branch
   `fix/dcr-redirect-whitespace`, 0.1.0b6, which merges first):** a NUL byte
   in a parameter of DOT's own OAuth views still reaches the database. Under
