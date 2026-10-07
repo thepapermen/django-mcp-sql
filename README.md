@@ -109,7 +109,8 @@ Three MCP tools mounted at `/mcp/sql/`:
 | `run_query(sql, limit=None)` | Validates + executes a single SELECT. Returns `{columns, rows, row_count, truncated, duration_ms, hint, rejection_reason, error, data_handling}`. The `rows`/`error` fields come back inside a prompt-injection fence — see [Security model](#security-model--prompt-injection--untrusted-data). |
 
 Every call writes one append-only `MCPQueryLog` audit row. Every auth
-rejection writes one `MCPAuthRejectionLog` row (six resolved-user gates;
+rejection writes one `MCPAuthRejectionLog` row (the resolved-user gates,
+including a gate that fails with an error, which is a denial too;
 anonymous / bad-token probing goes through Django-cache counters with a
 silent per-IP block, not the audit table — use a shared cache backend
 (Redis, Memcached) in production: with a per-process backend like LocMem
