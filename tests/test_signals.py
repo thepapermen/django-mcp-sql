@@ -222,6 +222,21 @@ class TestRevokeMcpTokensOnLogout:
 
         assert not MCPAuthRejectionLog.objects.filter(user=user).exists()
 
+    def test_logout_with_non_ip_remote_addr_is_still_audited(
+        self, mcp_app, django_capture_on_commit_callbacks
+    ):
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        user = UserFactory()
+        self._mint_token(user, mcp_app)
+        request = RequestFactory().get("/logout/", REMOTE_ADDR="not-an-ip")
+        with django_capture_on_commit_callbacks(execute=True):
+            user_logged_out.send(sender=type(user), request=request, user=user)
+
+        row = MCPAuthRejectionLog.objects.get(user=user)
+        assert row.client_ip is None
+        assert "Revoked 1 MCP token(s)" in row.error
+
     def test_anonymous_logout_is_a_noop(self):
         # Sanity: the `if user is None: return` guard fires without raising.
         # Invoking the handler directly bypasses axes (which can't handle

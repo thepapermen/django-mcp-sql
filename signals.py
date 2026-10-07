@@ -23,6 +23,8 @@ from django.utils import timezone
 from mcp_sql.clients import ClientKind
 from mcp_sql.clients import DeclaredClient
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import client_ip
+from mcp_sql.consts import normalize_client_ip
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
 from mcp_sql.models import MCPAuthRejectionLog
@@ -56,11 +58,11 @@ def revoke_mcp_tokens_on_logout(
     # reference and stays valid post-commit — logout does not delete the user
     # row, so its `pk` and the audit FK resolve fine. `started_at` is the
     # logout moment, not the (marginally later) post-commit callback time.
-    client_ip = request.META.get("REMOTE_ADDR") if request is not None else None
+    ip = client_ip(request) if request is not None else None
     logged_out_at = timezone.now()
     transaction.on_commit(
         lambda: _revoke_and_audit_on_logout(
-            user=user, client_ip=client_ip, logged_out_at=logged_out_at
+            user=user, client_ip=ip, logged_out_at=logged_out_at
         )
     )
 
@@ -148,7 +150,7 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
             application_name="",
             reason=AuthRejectionReason.SESSION_LOGOUT,
             error=summary,
-            client_ip=client_ip,
+            client_ip=normalize_client_ip(client_ip),
             started_at=logged_out_at,
         )
     except DatabaseError:

@@ -22,6 +22,7 @@ from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import normalize_client_ip
 from mcp_sql.grants import declared_tables
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.parser import QueryRejectedError
@@ -485,6 +486,9 @@ def _audit_safely(
     No retry: a `default`-DB outage usually lasts longer than any
     reasonable retry budget. The Sentry signal is the actionable channel.
     """
+    # Normalised here, at the single `MCPQueryLog` insert, so no caller can
+    # lose the row to a non-IP value (see `consts.normalize_client_ip`).
+    fields["client_ip"] = normalize_client_ip(fields.get("client_ip"))
     try:
         MCPQueryLog.objects.create(
             application_name=client.name,

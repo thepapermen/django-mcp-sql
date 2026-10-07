@@ -38,6 +38,7 @@ from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import absolute_url
+from mcp_sql.consts import client_ip
 from mcp_sql.consts import identify_application
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
@@ -426,7 +427,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 client_redirect=client.redirect,
                 reason=reason,
                 error=error,
-                client_ip=request.META.get("REMOTE_ADDR"),
+                client_ip=client_ip(request),
                 started_at=timezone.now(),
             )
         except DatabaseError:

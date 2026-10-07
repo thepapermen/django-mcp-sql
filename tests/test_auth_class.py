@@ -232,6 +232,33 @@ class TestAuthRejectionAuditLog:
         assert log.application_name == mcp_app.name
         assert "mcp:sql scope" in log.error
 
+    @pytest.mark.parametrize(
+        ("remote_addr", "stored"),
+        [("not-an-ip", None), ("a:b:zz", None), ("fe80::1%eth0", "fe80::1")],
+    )
+    def test_non_ip_remote_addr_still_writes_the_row(
+        self, mcp_user, mcp_access_token, gate_posture, remote_addr, stored
+    ):
+        """A front end that puts non-IP text into `REMOTE_ADDR` (uvicorn
+        `--forwarded-allow-ips='*'` copying a client's `X-Forwarded-For`)
+        used to turn the denial into a 500 (psycopg 3 `ValueError` at the
+        insert) or silently drop the row (psycopg2 `DataError`)."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        mcp_user.is_active = False
+        mcp_user.save(update_fields=["is_active"])
+        request = APIRequestFactory().post(
+            "/mcp/sql/",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            REMOTE_ADDR=remote_addr,
+        )
+        with pytest.raises(AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(request)
+
+        log = MCPAuthRejectionLog.objects.get()
+        assert log.reason == AuthRejectionReason.INACTIVE
+        assert log.client_ip == stored
+
     def test_legacy_inactive_or_non_staff_reason_stays_valid(self):
         # Rows written by 0.1.x carry `inactive_or_non_staff`; the choice must
         # survive so those rows still validate and display (migration 0014).

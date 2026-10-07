@@ -355,6 +355,53 @@ class TestAuditToolCall:
         assert row.row_count is None
         assert row.truncated is False
 
+    def test_non_ip_client_ip_is_stored_as_null(self, mcp_user):
+        """`_audit_safely` normalises `client_ip` itself, so no caller can
+        lose a row to a non-IP value (psycopg 3 raised `ValueError` out of
+        the audit wrapper, psycopg2 a swallowed `DataError`)."""
+        from mcp_sql import executor
+        from mcp_sql.models import MCPQueryLog
+
+        executor.audit_tool_call(
+            user=mcp_user,
+            profile=_DEFAULT_PROFILE,
+            tool=ToolName.LIST_TABLES,
+            client_ip="not-an-ip, 203.0.113.9",
+        )
+        assert MCPQueryLog.objects.get().client_ip is None
+
+
+@pytest.mark.django_db
+class TestViewNormalisesClientIp:
+    """The view hands the tools a normalised `client_ip` (or None)."""
+
+    def test_non_ip_remote_addr_reaches_the_tools_as_none(
+        self, client, mcp_access_token, mcp_active_session, gate_posture, monkeypatch
+    ):
+        from django.http import HttpResponse
+
+        seen = {}
+
+        def capture(**kwargs):
+            seen.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._build_mcp_server", capture)
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._bridge", lambda server: None)
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app",
+            lambda app, request: HttpResponse(status=200),
+        )
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            REMOTE_ADDR="not-an-ip",
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert seen["client_ip"] is None
+
 
 @pytest.mark.django_db
 class TestMcpEndpointAuthGate:

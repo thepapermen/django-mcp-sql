@@ -762,6 +762,17 @@ The load-bearing invariants and footguns, grouped by layer:
   trusted-proxy list) instead. The same proxy invariant underpins the
   discovery-views bullet above (`ALLOWED_HOSTS` +
   `SECURE_PROXY_SSL_HEADER`).
+- **Audit `client_ip` is normalised, never trusted as-is.** Every audit
+  writer (`executor._audit_safely`, `auth._audit_rejection`, the logout
+  receiver) stores `client_ip` through `consts.normalize_client_ip`, and the
+  view derives it with `consts.client_ip(request)`: a canonical IP string or
+  `None`. A front end that copies an unvalidated `X-Forwarded-For` entry into
+  `REMOTE_ADDR` (uvicorn `--proxy-headers --forwarded-allow-ips='*'`, a
+  hand-rolled `split(",")[0]` middleware) used to break the
+  `GenericIPAddressField` insert: psycopg 3 raised `ValueError` past every
+  audit wrapper (an executed query left no row, a gate denial became a 500),
+  psycopg2 a swallowed `DataError`. A new writer must go through the same
+  helper. The throttle keys are not audit rows and still use the raw value.
 ### OAuth tokens & client identity
 
 - **Logout revokes the user's MCP tokens and pending codes** — both

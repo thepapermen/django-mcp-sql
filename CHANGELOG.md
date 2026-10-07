@@ -376,6 +376,15 @@ announce themselves.
   table stayed empty (the 401 was still sent). `/mcp/sql/` is now
   `non_atomic_requests`: the rows commit as written, and the view no longer
   holds a transaction open for the whole exchange. Also present in 0.1.0b5.
+- **A non-IP `REMOTE_ADDR` broke every audit write.** `client_ip` went
+  straight into a `GenericIPAddressField`. Behind a front end that copies an
+  unvalidated `X-Forwarded-For` entry into `REMOTE_ADDR` (uvicorn with
+  `--forwarded-allow-ips='*'`, for one), a client sending `X-Forwarded-For:
+  not-an-ip` made psycopg 3 raise `ValueError` at the insert: queries still
+  ran but left no `MCPQueryLog` row (nor a tripwire count), and gate denials
+  became 500s with no rejection row. On psycopg2 the rows were dropped
+  silently. Every audit writer now stores a normalised address, or `NULL`
+  when the value is not one. Also present in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 
