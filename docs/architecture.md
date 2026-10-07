@@ -544,7 +544,8 @@ The load-bearing invariants and footguns, grouped by layer:
   positive-control assertion on the same token via the MCP auth class.
 - **The view self-declares its permission contract.**
   `@permission_classes([IsAuthenticated])` sits directly on
-  `mcp_endpoint` so the 401 + RFC 9728 `WWW-Authenticate` response for
+  `_mcp_transport` (the DRF view `mcp_endpoint` hands every POST to) so the
+  401 + RFC 9728 `WWW-Authenticate` response for
   anonymous probes does not depend on the consumer's
   `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]`. Stock DRF defaults to
   `AllowAny` — without the explicit decorator the anonymous request
@@ -630,7 +631,10 @@ The load-bearing invariants and footguns, grouped by layer:
   stream (the TypeScript SDK opens one after `initialize` and treats 405 as
   "none offered"; the Python SDK only does so once the server issued an
   `Mcp-Session-Id`, which a stateless server never does). Do not re-add GET
-  or DELETE to `_mcp_transport`'s `@api_view`. Pinned by
+  or DELETE to `_mcp_transport`'s `@api_view`. One consequence, accepted:
+  an anonymous non-POST gets the 405, not the 401 + `resource_metadata`
+  challenge; no known MCP client discovers OAuth with a GET (they all start
+  with the `initialize` POST, which still gets the challenge). Pinned by
   `test_mcp_endpoint.py::TestOnlyPostReachesTheTransport`.
 - **`/mcp/sql/` is non-atomic on EVERY alias; keep it that way.** DRF's
   exception handler marks every `ATOMIC_REQUESTS` transaction for rollback

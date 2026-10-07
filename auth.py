@@ -288,8 +288,10 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # DOT allows one (`AccessToken.user` is nullable: a `client_credentials`
         # token from a second OAuth use case on the same install, or a row made
         # in a shell). Refuse it before any gate dereferences `user`. The
-        # rejection table is keyed to a real user, so the record is a WARNING
-        # (Sentry-visible) naming the token and its client.
+        # rejection table is keyed to a real user, so the record is a log
+        # line: a WARNING naming the token and its client, one per request
+        # (not deduplicated, and below Sentry's default ERROR event level, so
+        # it shows in the logs, not as a page).
         if user is None:
             application = getattr(token, "application", None)
             logger.warning(

@@ -595,7 +595,7 @@ class TestTokensMissingUserOrApplication:
         assert response.status_code == HTTPStatus.UNAUTHORIZED
         assert response["WWW-Authenticate"].startswith('Bearer realm="api"')
         # The rejection table is keyed to a real user, so the record is the
-        # WARNING (Sentry-visible), naming the token and its client.
+        # WARNING naming the token and its client.
         assert MCPAuthRejectionLog.objects.count() == 0
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any(

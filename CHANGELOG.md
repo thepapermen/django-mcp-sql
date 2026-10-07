@@ -365,7 +365,7 @@ announce themselves.
   only opens a GET stream or sends DELETE once the server issued an
   `Mcp-Session-Id` (a stateless server never does), and the TypeScript SDK's
   post-initialize GET, previously answered `406`, now gets the `405` it treats
-  as "no stream offered". Also present in 0.1.0b5. As a backstop the bridge
+  as "no stream offered". Also affects 0.1.0b5. As a backstop the bridge
   now cancels an exchange after 30 seconds and always completes the response
   (`504` if cut off before it started, `500` if the app ended without one), so
   no future path that leaves a response unfinished can pin a thread either.
@@ -386,7 +386,7 @@ announce themselves.
   ran but left no `MCPQueryLog` row (nor a tripwire count), and gate denials
   became 500s with no rejection row. On psycopg2 the rows were dropped
   silently. Every audit writer now stores a normalised address, or `NULL`
-  when the value is not one. Also present in 0.1.0b5.
+  when the value is not one. Also affects 0.1.0b5.
 - **A per-request gate that raised was an unaudited 500.** An exception from
   the consumer's `MFA_CHECKER`, from profile resolution (a DB blip) or from
   the `SESSION_MODEL` lookup escaped the auth class: fail-closed, but with no
@@ -406,13 +406,13 @@ announce themselves.
   whose audit insert failed on the non-null `user` column. A userless token is
   now refused with a 401 and a WARNING naming the token and its client (the
   rejection table is keyed to a user); a token with no Application is an
-  audited `bad_application` denial. Also present in 0.1.0b5.
+  audited `bad_application` denial. Also affects 0.1.0b5.
 - **Documented: a logout from an expired session revokes nothing.** Django
   sends `user_logged_out` with `user=None` when the web session has already
   ended (and django-allauth sends nothing), so the user's MCP tokens and
   pending codes survive and no audit row is written. `docs/oauth.md` →
   "What logout cannot revoke" says so and gives the remedy (log in, then log
-  out). Unchanged behaviour, also in 0.1.0b5.
+  out). Unchanged behaviour; also affects 0.1.0b5.
 - **A consent POST's error redirect trusted the form's hidden `redirect_uri`.**
   DOT raises Cancel's `access_denied` and (DOT 3.4 and later) an invalid
   `resource`'s `invalid_target` before oauthlib validates that field, then
