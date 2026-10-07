@@ -10,6 +10,7 @@ import functools
 import io
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import asdict
 from http import HTTPStatus
 from typing import TYPE_CHECKING
@@ -20,7 +21,6 @@ from a2wsgi import ASGIMiddleware
 from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.db import close_old_connections
-from django.db import transaction
 from django.http import HttpRequest
 from django.http import HttpResponse
 from django.http import HttpResponseNotAllowed
@@ -477,7 +477,34 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     return response
 
 
-@transaction.non_atomic_requests
+class _EveryAlias(set[str]):
+    """A `_non_atomic_requests` set that contains every database alias.
+
+    Django's `non_atomic_requests` records one alias per application (the
+    bare decorator: only `default`), and `BaseHandler.make_view_atomic`
+    wraps the view in `transaction.atomic(using=alias)` for every
+    `ATOMIC_REQUESTS` alias NOT in the set. A consumer whose router sends
+    `mcp_sql`'s audit tables to another `ATOMIC_REQUESTS` alias would so keep
+    losing rejection rows (DRF's `set_rollback()` marks every such
+    connection). Listing the aliases at import would miss any configured
+    later; answering "yes" for any alias covers them all, whenever and
+    however `DATABASES` is read. Django only ever tests membership on, or
+    `add`s to, this attribute.
+    """
+
+    def __contains__(self, alias: object) -> bool:
+        return True
+
+
+def _non_atomic_for_every_alias(
+    view: Callable[[HttpRequest], HttpResponse],
+) -> Callable[[HttpRequest], HttpResponse]:
+    """`@transaction.non_atomic_requests`, for every alias (`_EveryAlias`)."""
+    view._non_atomic_requests = _EveryAlias()  # type: ignore[attr-defined]
+    return view
+
+
+@_non_atomic_for_every_alias
 @csrf_exempt
 def mcp_endpoint(request: HttpRequest) -> HttpResponse:
     """The /mcp/sql/ entry point: POST only, refused before DRF otherwise.
@@ -499,8 +526,9 @@ def mcp_endpoint(request: HttpRequest) -> HttpResponse:
 
     POST goes on to `_mcp_transport`, the DRF view that authenticates.
 
-    `non_atomic_requests`: the view never runs inside a consumer's
-    `ATOMIC_REQUESTS` transaction. Nothing here needs one (the tools run on
+    Non-atomic for EVERY alias (`_EveryAlias`, below): the view never runs
+    inside a consumer's `ATOMIC_REQUESTS` transaction, whichever alias holds
+    the audit tables. Nothing here needs one (the tools run on
     pool threads with their own connections and write their audit rows in
     autocommit), and inside one the gates' `MCPAuthRejectionLog` rows were
     lost: DRF's exception handler marks every `ATOMIC_REQUESTS` transaction

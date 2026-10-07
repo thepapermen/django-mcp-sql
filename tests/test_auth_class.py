@@ -665,6 +665,34 @@ class TestRejectionAuditSurvivesAtomicRequests:
         assert "default" in mcp_endpoint._non_atomic_requests
 
 
+class TestEveryAliasIsNonAtomic:
+    """The opt-out covers every alias, not only `default`.
+
+    DRF's `set_rollback()` marks every `ATOMIC_REQUESTS` connection, so a
+    consumer whose router sends `mcp_sql`'s audit tables to another alias
+    with `ATOMIC_REQUESTS=True` lost every rejection row to the 401 while a
+    bare `@non_atomic_requests` (which records only `default`) let Django
+    wrap the view in that alias's transaction. No DB needed: this asks
+    Django's own handler what it would wrap.
+    """
+
+    def test_handler_wraps_the_view_in_no_alias_transaction(self, monkeypatch):
+        from django.core.handlers.base import BaseHandler
+        from django.db import connections
+        from mcp_sql.views.mcp_endpoint import mcp_endpoint
+
+        for alias in ("audit", "reporting"):
+            monkeypatch.setitem(
+                connections.settings,
+                alias,
+                {**connections.settings["default"], "ATOMIC_REQUESTS": True},
+            )
+        monkeypatch.setitem(
+            connections.settings["default"], "ATOMIC_REQUESTS", value=True
+        )
+        assert BaseHandler().make_view_atomic(mcp_endpoint) is mcp_endpoint
+
+
 def _bearer_request_from_ip(token: str, ip: str):
     """Build a DRF request carrying `Authorization: Bearer <token>` + REMOTE_ADDR.
 

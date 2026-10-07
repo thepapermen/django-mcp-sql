@@ -373,9 +373,11 @@ announce themselves.
   rolls back the request transaction on every `APIException`, including the
   `AuthenticationFailed` each per-request gate raises right after writing its
   `MCPAuthRejectionLog` row, so with the documented default-alias setting the
-  table stayed empty (the 401 was still sent). `/mcp/sql/` is now
-  `non_atomic_requests`: the rows commit as written, and the view no longer
-  holds a transaction open for the whole exchange. Also present in 0.1.0b5.
+  table stayed empty (the 401 was still sent). `/mcp/sql/` now opts out of
+  `ATOMIC_REQUESTS` on every database alias (not just `default`, so audit
+  tables routed to another alias are covered too): the rows commit as
+  written, and the view no longer holds a transaction open for the whole
+  exchange. Also affects 0.1.0b5.
 - **A non-IP `REMOTE_ADDR` broke every audit write.** `client_ip` went
   straight into a `GenericIPAddressField`. Behind a front end that copies an
   unvalidated `X-Forwarded-For` entry into `REMOTE_ADDR` (uvicorn with
