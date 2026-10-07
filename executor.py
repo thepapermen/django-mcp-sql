@@ -645,8 +645,8 @@ def _cap_cell(value: object) -> Cell:
 
 
 def _table_columns(tables: dict[str, str]) -> dict[str, frozenset[str]]:
-    """Column names of each whitelisted table (`db_table`, lowercase ->
-    columns, as spelled), from its model: the parser needs them to tell `t.name` (a
+    """Column names of each whitelisted table (`db_table` -> columns, both
+    as spelled), from its model: the parser needs them to tell `t.name` (a
     column) from attribute notation (`t.name` as the call `name(t)`). A
     table whose model cannot be loaded gets no entry (its qualified names
     are then treated as calls when they name a denied function)."""
@@ -658,7 +658,7 @@ def _table_columns(tables: dict[str, str]) -> dict[str, frozenset[str]]:
             continue
         # Django quotes its column names, so this is their exact spelling
         # (the parser compares quoted names case-sensitively).
-        columns[db_table.lower()] = frozenset(
+        columns[db_table] = frozenset(
             field.column for field in model._meta.concrete_fields
         )
     return columns

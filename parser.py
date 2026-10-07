@@ -1909,28 +1909,29 @@ def _attribute_calls(
     """The lowercase names Postgres may read as attribute-notation CALLS
     (`x.f` / `(expr).f` is `f(x)` when there is no column to read).
 
-    Strict and fail-closed (review round 8): a name is exempt only where
-    Postgres provably reads a column —
-    - `t.f` where `t` names a FROM item in scope that has a column `f` (a
-      derived table's or CTE's output column, an alias column list, a
-      whitelisted table's column per `table_columns`) and `t` is not also
-      the name of a column of a FROM item in scope (then `t` could be read
-      as that column's value, and `t.f` as `f(value)`);
+    Strict and fail-closed (review rounds 8 and 9): a name is exempt only
+    where Postgres provably reads a column —
+    - `t.f` where `t` names a FROM item in scope that provably has a column
+      `f` (a derived table's, CTE's or VALUES list's output column, an alias
+      column list, a whitelisted table's column per `table_columns`) and no
+      FROM item in scope has, or may have, a column named `t`. (For `t.f`
+      Postgres prefers the FROM item, so that last condition refuses
+      a column read too: an accepted over-refusal.)
+    - `(t).f` on the same two conditions: here a column `t` would win over
+      the row, and `f(t)` be called on it, so a FROM item whose column
+      names are not all known (a function, `SELECT *`, an unaliased
+      expression whose name Postgres derives from a type) leaves it a call;
     - `(t.*).f` where `t` is such a FROM item with a column `f`.
-    Everything else counts as a call: `(x).f` with a bare name (a column
-    `x` of any FROM item wins over the row), `(expr).f`, `t.c.f`. A name
-    inside a type (`pg_catalog.pg_lsn`) is not a call. Quoted identifiers
-    compare case-sensitively, unquoted ones folded (`_name_key`)."""
+    Everything else counts as a call: `(expr).f`, `t.c.f`. A name inside a
+    type (`pg_catalog.pg_lsn`) is not a call. Quoted identifiers compare
+    case-sensitively, unquoted ones folded (`_name_key`)."""
     names = []
     for col in ast.find_all(exp.Column):
         qualifier = col.args.get("table")
         if qualifier is None or isinstance(col.this, exp.Star):
             continue
-        name = _name_key(col.this)
-        exempt = (
-            col.args.get("db") is None
-            and not _is_column_name_in_scope(col, _name_key(qualifier), table_columns)
-            and _is_column_of(col, _name_key(qualifier), name, table_columns)
+        exempt = col.args.get("db") is None and _is_row_field(
+            col, _name_key(qualifier), _name_key(col.this), table_columns, strict=False
         )
         if not exempt:
             names.append(col.name.lower())
@@ -1939,11 +1940,43 @@ def _attribute_calls(
             continue
         if dot.find_ancestor(exp.DataType) is not None:
             continue
-        row = _star_row(dot.this)
-        name = _name_key(dot.expression)
-        if row is None or not _is_column_of(dot, row, name, table_columns):
+        if not _is_field_read(dot, table_columns):
             names.append(dot.expression.name.lower())
     return names
+
+
+def _is_field_read(dot: exp.Dot, table_columns: Mapping[str, frozenset[str]]) -> bool:
+    """`(t.*).f` / `(t).f` that Postgres provably reads as the column `f`
+    of the FROM item `t` (see `_attribute_calls`)."""
+    node = dot.this
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if not isinstance(node, exp.Column) or node.args.get("db") is not None:
+        return False
+    name = _name_key(dot.expression)
+    table = node.args.get("table")
+    if isinstance(node.this, exp.Star):
+        return table is not None and _is_column_of(
+            dot, _name_key(table), name, table_columns
+        )
+    if table is not None or not isinstance(node.this, exp.Identifier):
+        return False
+    return _is_row_field(dot, _name_key(node.this), name, table_columns)
+
+
+def _is_row_field(
+    node: exp.Expression,
+    item: str,
+    name: str,
+    table_columns: Mapping[str, frozenset[str]],
+    *,
+    strict: bool = True,
+) -> bool:
+    """The FROM item `item` provably has a column `name`, and no column
+    named `item` is in scope at `node` (`strict`: nor may be)."""
+    return not _is_column_name_in_scope(
+        node, item, table_columns, strict=strict
+    ) and _is_column_of(node, item, name, table_columns)
 
 
 def _name_key(identifier: exp.Expression) -> str:
@@ -1952,19 +1985,6 @@ def _name_key(identifier: exp.Expression) -> str:
     if isinstance(identifier, exp.Identifier) and identifier.quoted:
         return str(identifier.name)
     return str(identifier.name).lower()
-
-
-def _star_row(node: exp.Expression) -> str | None:
-    """The FROM item `node` denotes as `(t.*)`, or None. (A bare `(t)` is
-    not trusted: a column named `t` would be read instead of the row.)"""
-    while isinstance(node, exp.Paren):
-        node = node.this
-    if not isinstance(node, exp.Column) or not isinstance(node.this, exp.Star):
-        return None
-    table = node.args.get("table")
-    if table is None or node.args.get("db") is not None:
-        return None
-    return _name_key(table)
 
 
 def _scopes(node: exp.Expression) -> list[exp.Select]:
@@ -1984,24 +2004,36 @@ def _is_column_of(
     table_columns: Mapping[str, frozenset[str]],
 ) -> bool:
     """True if the FROM item `item`, in scope at `node` (the innermost
-    match), has a column `name`."""
+    match), provably has a column `name`."""
     for select in _scopes(node):
         source = _from_item(select, item)
         if source is not None:
-            return name in _item_columns(source, table_columns)
+            certain, _possible = _item_columns(source, table_columns)
+            return name in certain
     return False
 
 
 def _is_column_name_in_scope(
-    node: exp.Expression, name: str, table_columns: Mapping[str, frozenset[str]]
+    node: exp.Expression,
+    name: str,
+    table_columns: Mapping[str, frozenset[str]],
+    *,
+    strict: bool,
 ) -> bool:
-    """True if any FROM item in scope at `node` has a column `name` (or its
-    columns cannot be known: a function or other item in FROM)."""
+    """True if any FROM item in scope at `node` has a column `name`.
+    `strict` (for `(t).f`, where such a column is what Postgres reads): or
+    may have one, its column names not all known. Otherwise (for `t.f`,
+    where Postgres reads the FROM item `t` anyway) only an item whose
+    columns cannot be listed at all (a function in FROM) counts."""
     for select in _scopes(node):
         for source in _from_items(select):
-            if not _item_columns_known(source):
-                return True
-            if name in _item_columns(source, table_columns):
+            certain, possible = _item_columns(source, table_columns)
+            if strict:
+                if possible is None or name in possible:
+                    return True
+            elif name in certain or not isinstance(
+                source, (exp.Subquery, exp.Table, exp.Values)
+            ):
                 return True
     return False
 
@@ -2027,77 +2059,165 @@ def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
     return None
 
 
-def _item_columns_known(source: exp.Expression) -> bool:
-    return isinstance(source, (exp.Subquery, exp.Table)) or (
-        isinstance(source.args.get("alias"), exp.TableAlias)
-        and bool(source.args["alias"].columns)
-    )
+# A FROM item's columns: the names it provably has, and a superset of the
+# names it may have (`None`: not known).
+_ItemColumns = tuple[frozenset[str], frozenset[str] | None]
 
 
 def _item_columns(
     source: exp.Expression, table_columns: Mapping[str, frozenset[str]]
-) -> frozenset[str]:
+) -> _ItemColumns:
     alias = source.args.get("alias")
-    if isinstance(alias, exp.TableAlias) and alias.columns:
-        return frozenset(_name_key(column) for column in alias.columns)
+    renamed = (
+        [_name_key(column) for column in alias.columns]
+        if isinstance(alias, exp.TableAlias)
+        else []
+    )
     if isinstance(source, exp.Subquery):
-        return _output_names(source.this)
-    if isinstance(source, exp.Table):
-        cte = _cte_named(source, source.name.lower())
+        return _renamed(renamed, _output_columns(source.this))
+    if isinstance(source, exp.Values):
+        return _renamed(renamed, _values_columns(source))
+    if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+        cte = _cte_named(source)
         if cte is not None:
-            cte_alias = cte.args.get("alias")
-            if isinstance(cte_alias, exp.TableAlias) and cte_alias.columns:
-                return frozenset(_name_key(c) for c in cte_alias.columns)
-            return _output_names(cte.this)
-        return table_columns.get(source.name.lower(), frozenset())
-    return frozenset()
+            return _renamed(renamed, _cte_columns(cte))
+        return _base_table_columns(table_columns.get(_name_key(source.this)), renamed)
+    return frozenset(renamed), None
 
 
-def _cte_named(table: exp.Expression, name: str) -> exp.CTE | None:
-    """The CTE `name` in scope for `table` (see `_resolves_to_cte`)."""
+def _base_table_columns(
+    base: frozenset[str] | None, renamed: list[str]
+) -> _ItemColumns:
+    """A whitelisted table's columns (`None`: not known) after an alias
+    column list."""
+    if base is None:
+        return frozenset(renamed), None
+    if not renamed:
+        return base, base
+    if len(renamed) >= len(base):
+        return frozenset(renamed), frozenset(renamed)
+    # An alias list renames the first columns by position, which this map
+    # does not keep: only the new names are certain.
+    return frozenset(renamed), base | frozenset(renamed)
+
+
+def _renamed(renamed: list[str], columns: list[str | None] | None) -> _ItemColumns:
+    """Columns after an alias column list (`AS x(a, b)`) renames the first
+    ones; `None` in `columns` is a name not known."""
+    if columns is None:
+        return frozenset(renamed), None
+    names = renamed + columns[len(renamed) :]
+    certain = frozenset(name for name in names if name is not None)
+    return certain, None if None in names else certain
+
+
+def _cte_columns(cte: exp.CTE) -> list[str | None] | None:
+    alias = cte.args.get("alias")
+    renamed: list[str | None] = (
+        [_name_key(column) for column in alias.columns]
+        if isinstance(alias, exp.TableAlias)
+        else []
+    )
+    columns = _output_columns(cte.this)
+    if columns is None:
+        return None
+    return renamed + columns[len(renamed) :]
+
+
+def _values_columns(values: exp.Values) -> list[str | None] | None:
+    """`column1`, `column2`, ...: Postgres's names for a VALUES list's."""
+    rows = values.expressions
+    if not rows or not isinstance(rows[0], exp.Tuple):
+        return None
+    return [f"column{i}" for i in range(1, len(rows[0].expressions) + 1)]
+
+
+def _cte_key(cte: exp.CTE) -> str | None:
+    alias = cte.args.get("alias")
+    if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+        return _name_key(alias.this)
+    return None
+
+
+def _cte_named(table: exp.Table) -> exp.CTE | None:
+    """The CTE an unqualified `table` names, in scope for it (see
+    `_resolves_to_cte`); names compare as Postgres compares them."""
+    if table.args.get("db") is not None or table.args.get("catalog") is not None:
+        return None  # `public.t` is the table, whatever CTE `t` exists
+    key = _name_key(table.this)
+    inside: exp.Expression | None = None
     node = table.parent
     while node is not None:
-        for cte in getattr(node, "ctes", ()):
-            if cte.alias and cte.alias.lower() == name:
+        ctes = list(getattr(node, "ctes", ()))
+        position = next((i for i, cte in enumerate(ctes) if cte is inside), None)
+        if position is not None:
+            # Inside a (non-recursive) CTE's body only the CTEs before it are
+            # visible: `WITH t AS (SELECT ... FROM t)` reads the table `t`.
+            ctes = ctes[:position]
+        for cte in ctes:
+            if _cte_key(cte) == key:
                 found: exp.CTE = cte
                 return found
+        if isinstance(node, exp.CTE):
+            inside = node
         node = node.parent
     return None
 
 
-def _output_names(query: exp.Expression) -> frozenset[str]:
-    """The column names a query produces, as Postgres names them (an alias,
-    a column's name, a function call's name), each as `_name_key` keys it."""
-    while isinstance(query, exp.SetOperation):
+def _output_columns(query: exp.Expression) -> list[str | None] | None:
+    """The names of a query's output columns, in order, as Postgres names
+    them and `_name_key` keys them; `None` for a name this cannot tell, or
+    for the whole list when it has a `*`. A set operation's columns are
+    named by its leftmost query."""
+    while isinstance(query, (exp.SetOperation, exp.Subquery)):
         query = query.this
     if not isinstance(query, exp.Select):
-        return frozenset()
-    names = set()
+        return None
+    names: list[str | None] = []
     for projection in query.expressions:
-        name = _output_name(projection)
-        if name:
-            names.add(name)
-    return frozenset(names)
+        if isinstance(projection, exp.Star) or (
+            isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+        ):
+            return None
+        names.append(_output_name(projection))
+    return names
 
 
 def _output_name(node: exp.Expression) -> str | None:
+    """The name Postgres gives an output column (`FigureColname`), where it
+    is the expression's own: an alias, a column's name, a field's, a
+    function's, a scalar subquery's column, through casts and subscripts.
+    `None` otherwise (a literal's `?column?`, a cast's type name, a keyword
+    expression's own name)."""
     if isinstance(node, exp.Alias):
         alias = node.args.get("alias")
         return _name_key(alias) if isinstance(alias, exp.Identifier) else None
     while isinstance(
-        node, (exp.Paren, exp.Cast, exp.Window, exp.WithinGroup, exp.Filter)
+        node,
+        (exp.Paren, exp.Cast, exp.Bracket, exp.Window, exp.WithinGroup, exp.Filter),
     ):
         node = node.this
     if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
         return _name_key(node.this)
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        return _name_key(node.expression)
+    return _call_name(node)
+
+
+def _call_name(node: exp.Expression) -> str | None:
+    """The output name of a function call or scalar subquery (`None`: not
+    one, or a name this cannot tell)."""
     if isinstance(node, exp.Anonymous):
         return (
             _name_key(node.this)
             if isinstance(node.this, exp.Identifier)
             else str(node.name).lower()
         )
-    if isinstance(node, exp.Func):
-        return str(node.sql_name()).lower()
+    if isinstance(node, exp.Count):
+        return "count"
+    if isinstance(node, exp.Subquery):
+        columns = _output_columns(node.this)
+        return columns[0] if columns else None
     return None
 
 
@@ -2152,7 +2272,7 @@ def _check_no_recursive_cte(ast: exp.Query) -> None:
             raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
 
 
-def _resolves_to_cte(table: exp.Expression, name: str) -> bool:
+def _resolves_to_cte(table: exp.Table) -> bool:
     """True if `table`'s name resolves to a CTE that is IN SCOPE for it.
 
     CTE names are lexically scoped, so a flat "is this name a CTE anywhere
@@ -2177,13 +2297,7 @@ def _resolves_to_cte(table: exp.Expression, name: str) -> bool:
     query also covers a table inside a later CTE body referencing an earlier
     sibling CTE, since the owning query's `.ctes` lists both.
     """
-    node = table.parent
-    while node is not None:
-        for cte in getattr(node, "ctes", ()):
-            if cte.alias and cte.alias.lower() == name:
-                return True
-        node = node.parent
-    return False
+    return _cte_named(table) is not None
 
 
 def _check_tables(
@@ -2193,13 +2307,14 @@ def _check_tables(
 ) -> set[str]:
     """Validate every table reference and return the set of touched tables.
 
+    A reference matches a whitelist entry (a `db_table`) the way Postgres
+    matches it to a relation: quoted exactly, unquoted folded to lowercase.
     References that resolve to an IN-SCOPE CTE are skipped (they look like
     `exp.Table(name='q')` but resolve to the CTE body, which has already
     been walked) — see `_resolves_to_cte` for why scope matters. System
     catalogs (`pg_catalog`, `information_schema`, anything in the `pg_*`
     namespace) are rejected even when nominally on the whitelist.
     """
-    allowed_lower = {t.lower() for t in allowed_tables}
     referenced: set[str] = set()
 
     for table in ast.find_all(exp.Table):
@@ -2229,10 +2344,13 @@ def _check_tables(
         if not schema and name.startswith("pg_"):
             msg = f"Table '{name}' is in the pg_* namespace"
             raise QueryRejectedError(OutcomeReason.SYSTEM_SCHEMA, msg)
-        if _resolves_to_cte(table, name):
+        if _resolves_to_cte(table):
             continue
-        if name not in allowed_lower:
-            msg = f"Table '{name}' is not on the MCP whitelist"
+        # The relation Postgres opens: a quoted name as written, an unquoted
+        # one folded; a whitelist entry is a `db_table`, the exact name.
+        key = _name_key(table.this)
+        if key not in allowed_tables:
+            msg = f"Table '{key}' is not on the MCP whitelist"
             raise QueryRejectedError(OutcomeReason.DISALLOWED_TABLE, msg)
-        referenced.add(name)
+        referenced.add(key)
     return referenced

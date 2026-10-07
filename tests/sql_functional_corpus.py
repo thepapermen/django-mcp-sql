@@ -2904,6 +2904,26 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "arrays",
         "SELECT (ARRAY(SELECT y FROM t ORDER BY id))[2] AS a, (ARRAY[[1, 2], [3, 4]])[2][1] AS b, json_object((ARRAY['a', 'b', 'c', 'd'])[1:2]) AS c",
     ),
+    (
+        "attribute-columns",
+        "SELECT (s).copy AS v FROM (SELECT 1 AS copy) s",
+    ),
+    (
+        "attribute-columns",
+        "SELECT (s).pg_sleep AS a, s.pg_column_size AS b FROM (SELECT 1 AS pg_sleep, (SELECT 2 AS pg_column_size)) s",
+    ),
+    (
+        "attribute-columns",
+        "SELECT p.pg_sleep AS a, (v).column2 AS b FROM (SELECT 9 AS pg_sleep) p, (VALUES (1, 'a'), (2, 'b')) v ORDER BY 2",
+    ),
+    (
+        "cte-names",
+        "WITH u AS (SELECT id, amount FROM u WHERE id < 4) SELECT id, amount FROM u ORDER BY id",
+    ),
+    (
+        "cte-names",
+        'WITH x AS (SELECT id FROM t WHERE id < 3), "X" AS (SELECT 5 AS id) SELECT id FROM x UNION ALL SELECT id FROM "X" ORDER BY id',
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3132,6 +3152,32 @@ REFUSED: list[tuple[str, str]] = [
     (
         "disallowed_function",
         "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text AS x, 1 AS current_setting) x(x, current_setting)",
+    ),
+    (
+        "select_star",
+        'SELECT s.to_jsonb FROM (SELECT id, g AS "To_Jsonb" FROM t) s',
+    ),
+    (
+        "select_star",
+        'SELECT s.to_jsonb FROM t AS s("To_Jsonb")',
+    ),
+    (
+        "disallowed_function",
+        'SELECT s.pg_typeof FROM t AS s("Pg_Typeof")',
+    ),
+    ("disallowed_table", 'WITH "Secret" AS (SELECT 1 AS id) SELECT id FROM secret'),
+    (
+        "disallowed_table",
+        "WITH secret AS (SELECT id FROM secret) SELECT id FROM secret",
+    ),
+    (
+        "disallowed_table",
+        "WITH secret AS (SELECT 1 AS id) SELECT id FROM public.secret",
+    ),
+    ("select_star", 'WITH "T" AS (SELECT 1 AS to_jsonb) SELECT t.to_jsonb FROM t'),
+    (
+        "disallowed_function",
+        "SELECT (s).pg_sleep AS v FROM (SELECT 1 AS pg_sleep, 0.01 AS s) s",
     ),
     ("parse_error", "SELECT ARRAY[1, 2][1] AS a"),
     ("parse_error", "SELECT json_object(ARRAY['a', 'b'][1:2]) AS a"),

@@ -19,6 +19,12 @@ from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
 
 ALLOWED = {"auth_permission", "auth_group", "django_content_type"}
+# What the executor passes for those tables (`executor._table_columns`).
+COLUMNS = {
+    "auth_permission": frozenset({"id", "name", "content_type_id", "codename"}),
+    "auth_group": frozenset({"id", "name"}),
+    "django_content_type": frozenset({"id", "app_label", "model"}),
+}
 
 
 def _expect_reject(sql: str, reason: OutcomeReason, **kwargs) -> QueryRejectedError:
@@ -586,6 +592,43 @@ class TestDisallowedTable:
             allowed_tables=ALLOWED,
         )
 
+    # Review round 9: names match as Postgres matches them — a quoted name
+    # exactly, an unquoted one folded to lowercase — for whitelist entries
+    # (exact `db_table` spellings) and CTE names alike.
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT id FROM "auth_permission"',
+            'SELECT id FROM "Mixed_Table"',
+            "SELECT id FROM public.auth_permission",
+            'WITH "Users_User" AS (SELECT 1 AS id) SELECT id FROM "Users_User"',
+            "WITH users_user AS (SELECT 1 AS id) SELECT id FROM Users_User",
+            "WITH b AS (SELECT 1 AS id), a AS (SELECT id FROM b) SELECT id FROM a",
+        ],
+    )
+    def test_names_match_as_postgres_matches_them(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED | {"Mixed_Table"})
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Not the relations on the whitelist.
+            'SELECT id FROM "Auth_Permission"',
+            "SELECT id FROM mixed_table",
+            "SELECT id FROM Mixed_Table",
+            # A quoted CTE name is not the folded table name.
+            'WITH "Users_User" AS (SELECT 1 AS id) SELECT id FROM users_user',
+            # A CTE body sees only the CTEs before it, never itself.
+            "WITH users_user AS (SELECT id FROM users_user) SELECT id FROM users_user",
+            "WITH a AS (SELECT id FROM users_user), users_user AS (SELECT 1 AS id) "
+            "SELECT id FROM a",
+            # A schema-qualified name is the table, not the CTE.
+            "WITH users_user AS (SELECT 1 AS id) SELECT id FROM public.users_user",
+        ],
+    )
+    def test_a_name_postgres_resolves_elsewhere_is_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE)
+
 
 class TestDisallowedFunction:
     @pytest.mark.parametrize(
@@ -949,7 +992,7 @@ class TestAttributeNotation:
         ],
     )
     def test_ordinary_qualified_names_are_accepted(self, sql):
-        parse_and_validate(sql, allowed_tables=ALLOWED)
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=COLUMNS)
 
     @pytest.mark.parametrize(
         "sql",
@@ -970,8 +1013,23 @@ class TestAttributeNotation:
             # `x` is also a column in scope: not provably the FROM item.
             "SELECT x.current_setting AS v FROM (SELECT 'server_version'::text "
             "AS x, 1 AS current_setting) x",
-            # Any bare parenthesised name, as before round 6.
-            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
+            # A FROM item whose column names are not all known may have a
+            # column `s` (here `'x'::text` is named `text` by its type).
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 'x'::text) q",
+            "SELECT (text).current_setting FROM (SELECT 'server_version'::text) q, "
+            "(SELECT 1 AS current_setting) text",
+            "SELECT (s).pg_sleep FROM (SELECT * FROM (SELECT 1 AS pg_sleep) z) s",
+            # (A whitelisted table whose columns the caller did not pass.)
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            # A column `s` in scope wins over the row: `pg_sleep(s)`.
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep, 2 AS s) s",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2 AS S) q",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2) q(s)",
+            "SELECT (SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s) "
+            "FROM (SELECT 1 AS s) o",
+            # A scalar subquery's column is named by its own: `x`, not
+            # `pg_column_size`.
+            "SELECT s.pg_column_size FROM (SELECT (SELECT 1 AS x)) s",
             # Quoted names compare case-sensitively: no column `pg_sleep`.
             'SELECT s.pg_sleep FROM (SELECT 1 AS "Pg_Sleep") s',
         ],
@@ -989,6 +1047,71 @@ class TestAttributeNotation:
     )
     def test_quoted_column_names_match_as_postgres_matches_them(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 9: Postgres reads these as the column, provably.
+            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s",
+            'SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2 AS "S") q',
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep UNION SELECT 2) s",
+            "SELECT (s).pg_sleep FROM (VALUES (1, 2)) s(pg_sleep)",
+            "SELECT (s).column1 FROM (VALUES (1, 2)) s",
+            # A VALUES list's columns are `column1`, ...: no column `p`.
+            "SELECT p.pg_sleep FROM (SELECT 9 AS pg_sleep) p, (VALUES (1)) v",
+            # A scalar subquery's column is named by its own.
+            "SELECT s.pg_column_size FROM (SELECT (SELECT 1 AS pg_column_size)) s",
+        ],
+    )
+    def test_provable_field_reads_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=COLUMNS)
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            # Review round 9 (fixed in round 8): a quoted alias is no column
+            # `to_jsonb` / `pg_typeof`, so `s.to_jsonb` is `to_jsonb(s)`.
+            (
+                'SELECT s.to_jsonb FROM (SELECT id, name AS "To_Jsonb" '
+                "FROM auth_permission) s",
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                'SELECT s.to_jsonb FROM auth_permission AS s("To_Jsonb")',
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                'SELECT s.pg_typeof FROM auth_permission AS s("Pg_Typeof")',
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            # A quoted CTE is not the table: `to_jsonb(auth_permission)`.
+            (
+                'WITH "Auth_Permission" AS (SELECT 1 AS to_jsonb) '
+                "SELECT auth_permission.to_jsonb FROM auth_permission",
+                OutcomeReason.SELECT_STAR,
+            ),
+        ],
+    )
+    def test_a_quoted_alias_is_not_the_folded_name(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    def test_a_mixed_case_base_column_is_kept_exact(self):
+        # `p.to_jsonb` is the row when the table's column is `"To_Jsonb"`.
+        columns = {"auth_permission": frozenset({"id", "To_Jsonb"})}
+        parse_and_validate(
+            'SELECT p."To_Jsonb" FROM auth_permission p',
+            allowed_tables=ALLOWED,
+            table_columns=columns,
+        )
+        with pytest.raises(QueryRejectedError) as exc:
+            parse_and_validate(
+                "SELECT p.to_jsonb FROM auth_permission p",
+                allowed_tables=ALLOWED,
+                table_columns=columns,
+            )
+        assert exc.value.reason == OutcomeReason.SELECT_STAR
 
     def test_a_base_table_column_is_a_column(self):
         # The executor passes each whitelisted table's columns.
