@@ -161,8 +161,8 @@ the package itself never imports `sentry_sdk`.
 
 The package depends on Postgres features that don't port: `SET LOCAL ROLE`
 into a NOLOGIN role, `statement_timeout` / `lock_timeout` /
-`idle_in_transaction_session_timeout` / `default_transaction_read_only`
-GUCs, PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
+`idle_in_transaction_session_timeout` / `default_transaction_read_only` /
+`standard_conforming_strings` / `search_path` GUCs, PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
 semantics, sqlglot's `dialect='postgres'`. There is no design path to
 MySQL / SQLite without a parallel implementation — hence `django-mcp-sql`
 not `django-mcp-mysql` etc.
@@ -444,8 +444,9 @@ the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14.
 Once per environment, a DBA with PG superuser rights applies
 `sql/role_setup.sql` to create the `mcp_readonly_role` role + the
 role-level guard GUCs (`statement_timeout`, `lock_timeout`,
-`idle_in_transaction_session_timeout`, `default_transaction_read_only`)
-and grant the role membership to the consuming app's PG user. The script
+`idle_in_transaction_session_timeout`, `default_transaction_read_only`,
+`standard_conforming_strings`, `search_path = public, pg_temp` — the
+executor also sets each per transaction with `SET LOCAL`) and grant the role membership to the consuming app's PG user. The script
 is idempotent and is parameterised by a `-v app_role=<role>` psql
 variable so a single SQL file works across deployments whose app role
 differs.
