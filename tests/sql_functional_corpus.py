@@ -3072,6 +3072,24 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "typed-literals",
         "SELECT time(1) E'10:00:00.66' AS a",
     ),
+    # Review round 17: interval type modifiers in a cast (sqlglot rendered
+    # `interval(1)` as `INTERVAL 1`, and read `second(2)` as an alias list).
+    (
+        "intervals",
+        "SELECT id, '12.345'::interval(1) AS a, CAST('1.2345' AS interval(3)) AS b, iv::interval(0) AS c FROM t ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT '1 day 12:00:00.123'::interval day to second(2) AS a, '1.234'::interval second(2) AS b, CAST('1.234' AS interval second(1)) AS c, '61.5'::interval minute to second(0) AS d",
+    ),
+    (
+        "intervals",
+        "SELECT '{1.234}'::interval(1)[] AS a, ARRAY['1.25']::interval(1)[] AS b, '{1.234}'::interval second(1)[] AS c, '{1.234}'::interval day to second(2)[] AS d",
+    ),
+    (
+        "intervals",
+        "SELECT '1.25'::INTERVAL ( 1 ) + '1' AS a, '1.25'::interval(1)::text AS b, '7.5'::interval(0) AS c",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3359,6 +3377,16 @@ REFUSED: list[tuple[str, str]] = [
     # POSTGRES_REJECTS.
     ("parse_error", "SELECT y @ id AS v FROM t"),
     ("parse_error", "SELECT id FROM t WHERE y @ id"),
+    # Review round 17: a precision before a field, a precision on a field
+    # other than SECOND (Postgres's syntax errors), an empty subscript.
+    ("parse_error", "SELECT '1.234'::interval(1) day to second AS a"),
+    ("parse_error", "SELECT '1.234'::interval(1) day AS a"),
+    ("parse_error", "SELECT '1'::interval minute(2) AS a"),
+    ("parse_error", "SELECT interval[] AS v FROM (SELECT ARRAY[5] AS interval) s"),
+    # The refused escape literal is the reason, though the text does not
+    # parse either (`interval day '…'` is Postgres's syntax error).
+    ("unsafe_literal", "SELECT interval day E'a\\b' AS v"),
+    ("unsafe_literal", "SELECT interval U&'1' AS v"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3442,4 +3470,7 @@ POSTGRES_REJECTS: list[str] = [
     # sqlglot reads `y` with the alias `@ id` and renders `y AS @ id`, a
     # syntax error; Postgres has no `integer @ integer`.
     "SELECT y @ id FROM t",
+    # A subscript with a stride (Postgres has none), as written.
+    "SELECT x[1:2:3] AS v FROM (SELECT ARRAY[5] AS x) s",
+    "SELECT interval[1:2:3] AS v FROM (SELECT ARRAY[5] AS interval) s",
 ]

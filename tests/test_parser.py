@@ -2148,10 +2148,73 @@ class TestReviewRound15:
         assert "SELECT INTERVAL(1) '1.23' AS v LIMIT" in self._rendered(sql)
 
 
+class TestReviewRound17:
+    """Interval type modifiers in a cast: `interval(p)` (sqlglot rendered
+    `INTERVAL p`, refused as `roundtrip_mismatch`) and `second(p)` after a
+    field (read as an alias list, a parse error) are kept as written; a
+    precision before a field stays Postgres's syntax error."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            ("'12.345'::interval(1)", "CAST('12.345' AS INTERVAL(1))"),
+            ("CAST('1' AS interval(3))", "CAST('1' AS INTERVAL(3))"),
+            ("'1'::INTERVAL ( 1 )", "CAST('1' AS INTERVAL(1))"),
+            ("'{1}'::interval(1)[]", "CAST('{1}' AS INTERVAL(1)[])"),
+            ("'1'::interval second(2)", "CAST('1' AS INTERVAL SECOND(2))"),
+            ("'1'::interval second (2)", "CAST('1' AS INTERVAL SECOND(2))"),
+            (
+                "'1'::interval day to second(3)",
+                "CAST('1' AS INTERVAL DAY TO SECOND(3))",
+            ),
+            ("'{1}'::interval second(1)[]", "CAST('{1}' AS INTERVAL SECOND(1)[])"),
+            (
+                "'{{1}}'::interval second(1)[][]",
+                "CAST('{{1}}' AS INTERVAL SECOND(1)[][])",
+            ),
+        ],
+    )
+    def test_kept_as_written(self, written, rendered):
+        assert self._rendered(f"SELECT {written} AS v") == (
+            f"SELECT {rendered} AS v LIMIT 11"
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT '1'::interval(1) day to second AS v",
+            "SELECT '1'::interval(1) day AS v",
+            "SELECT '1'::interval minute(2) AS v",
+            "SELECT '1'::interval(1.0) AS v",
+        ],
+    )
+    def test_postgres_syntax_errors_stay_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual
     problem, not an incidental one."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 17: since round 15 these fail to parse (a field
+            # before the string), which hid the refused escape literal.
+            "SELECT interval day E'a\\b' AS v",
+            "SELECT interval U&'1' AS v",
+            "SELECT E'a\\b' FROM t QUALIFY 1",
+        ],
+    )
+    def test_unsafe_literal_before_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
 
     def test_system_schema_with_qualify_as_a_name(self):
         # Review round 7: `qualify` is an ordinary name, so the tree is

@@ -556,7 +556,9 @@ The load-bearing invariants and footguns, grouped by layer:
      differently (`UNSAFE_LITERAL`, checked first): escape strings with a
      backslash (`FaithfulPostgres` renders an E-string as the plain string
      it was read as, but sqlglot's tokenizer decodes only some escapes —
-     `\\`, `\'`, `\n` — and keeps the rest as written, so `E'\x41'`, `A`
+     `\n`, `\t`, `\b`, `\r`, `\f`, `\\`, `\'`, and `\v` / `\a`, which
+     Postgres reads as the letters — and keeps the rest as written (`\x…`,
+     octal, `\u…`, `\0`), so `E'\x41'`, `A`
      to Postgres, would run as `'\x41'`), `U&'…'` / `U&"…"` (sqlglot 30.7
      reads `U & '…'`),
      identifiers written as string constants, a double-quoted name called
@@ -606,7 +608,9 @@ The load-bearing invariants and footguns, grouped by layer:
      string constant as the string it is (`E'…'` without a backslash,
      `$$…$$`, `$tag$…$tag$` — in an interval, a typed literal, an `ESCAPE`
      clause or a LIMIT exactly like `'…'`), `INTERVAL` as a typed literal
-     only before a string constant or `(` and otherwise an ordinary name (a
+     only before a string constant (a `U&'…'` one is refused,
+     `UNSAFE_LITERAL`, where Postgres reads the literal) or `(` and
+     otherwise an ordinary name (a
      column `interval`, sliced too, `interval[:1]`: sqlglot ran `interval +
      1` as `INTERVAL '1'`; and `INTERVAL 5`, `INTERVAL 5 DAY`, `interval
      day '1'` are parse errors, as in Postgres — but a bare field word
@@ -656,10 +660,15 @@ The load-bearing invariants and footguns, grouped by layer:
   for a boolean `x`; for any other type Postgres raises "argument of IS
   UNKNOWN must be type boolean" and the rendering runs), and a quoted call of a
   set-returning builtin (`"unnest"(...)`) is refused as `UNSAFE_LITERAL`,
-  the lexical check running first. Interval types with a precision in a
-  cast (`'1.5'::interval(3)`, `interval second(2)`) and a subscript after
-  an array type (`'{1,2}'::int[][1]`) are refused (sqlglot cannot read or
-  render them); `INTERVAL(3) '…'` (the precision form, with any form of
+  the lexical check running first (also when the text does not parse:
+  `interval day E'a\b'` is `UNSAFE_LITERAL`, review round 17). Interval
+  types with a precision in a cast are kept as written (`'1.5'::interval(3)`,
+  `interval second(2)`, `interval day to second(3)`, as arrays too; sqlglot
+  rendered `INTERVAL 3` and read `second(2)` as an alias list — refused
+  before round 17); a precision before a field (`interval(1) day`) or on a
+  field other than `SECOND` is a parse error, as in Postgres. A subscript
+  after an array type (`'{1,2}'::int[][1]`) is refused (sqlglot cannot
+  read it); `INTERVAL(3) '…'` (the precision form, with any form of
   string constant) is kept as written,
   and any other `INTERVAL(…)` (`INTERVAL(1 + 2) '…'`, `INTERVAL(3.0) '…'`,
   `INTERVAL(3)` alone, `interval(1)` with a column `interval` in scope;
@@ -673,7 +682,7 @@ The load-bearing invariants and footguns, grouped by layer:
   `BAN_SELECT_STAR` (any `t.*` is `select_star`), `t.f` when a column `t`
   is also in scope. Pre-existing and tracked separately:
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 908
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 912
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must

@@ -649,6 +649,40 @@ class FaithfulPostgres(Postgres):
                 and isinstance(parsed, exp.DataType)
             ):
                 _keep_quoted_type(parsed, token)
+            if isinstance(parsed, exp.DataType):
+                return self._second_precision(parsed)
+            return parsed
+
+        def _second_precision(self, parsed: exp.DataType) -> exp.DataType:
+            """`interval second(2)` / `interval day to second(3)`: the
+            fractional digits of a field-qualified interval type (Postgres's
+            `interval_second`, the last field only), which sqlglot left for
+            an alias list (a parse error). Kept as the field `SECOND(<p>)`,
+            as `_interval_field` keeps it in a typed literal; `[]` after it
+            makes the array type, as after any type. `interval(1) day`
+            (precision before a field) is Postgres's syntax error, which
+            sqlglot read as `interval day(1)`."""
+            if not isinstance(parsed.this, exp.Interval):
+                return parsed
+            if parsed.expressions:
+                self.raise_error("interval(p) takes no field qualifier in a type")
+            unit = parsed.this.args.get("unit")
+            last = unit.expression if isinstance(unit, exp.IntervalSpan) else unit
+            precision = self._tokens[self._index : self._index + 3]
+            if not (
+                isinstance(last, exp.Var)
+                and last.name == "SECOND"
+                and [token.token_type for token in precision]
+                == [TokenType.L_PAREN, TokenType.NUMBER, TokenType.R_PAREN]
+                and precision[1].text.isdigit()
+            ):
+                return parsed
+            self._advance(3)
+            last.set("this", f"SECOND({precision[1].text})")
+            while self._match_pair(TokenType.L_BRACKET, TokenType.R_BRACKET):
+                parsed = exp.DataType(
+                    this=exp.DType.ARRAY, expressions=[parsed], nested=True
+                )
             return parsed
 
         def _parse_interval_span(
@@ -1109,6 +1143,21 @@ class FaithfulPostgres(Postgres):
             exp.Neg: _prefix_operator("-"),
         }
 
+        def datatype_sql(self, expression: exp.DataType) -> str:
+            # `interval(3)` (a cast's typmod: 3 fractional digits): sqlglot
+            # renders the parameter as `INTERVAL 3`, which no parser reads.
+            params = expression.expressions
+            if (
+                expression.this == exp.DType.INTERVAL
+                and len(params) == 1
+                and isinstance(params[0], exp.DataTypeParam)
+                and isinstance(params[0].this, exp.Literal)
+                and params[0].this.name.isdigit()
+            ):
+                return f"INTERVAL({params[0].this.name})"
+            rendered: str = super().datatype_sql(expression)
+            return rendered
+
         def interval_sql(self, expression: exp.Interval) -> str:
             # `INTERVAL '<string>'` (no unit: the parser keeps the string
             # as written) with the string rendered as a string constant.
@@ -1250,6 +1299,12 @@ def _parse_and_validate(
     try:
         parsed = sqlglot.parse(raw_sql, dialect=FaithfulPostgres)
     except sqlglot.errors.ParseError as exc:
+        # An escape literal the lexical check refuses is the reason, though
+        # the text does not parse either (`interval day E'a\b'`, `interval
+        # U&'1'`): the security reason wins, as it does for text that parses.
+        problem = _escape_problem_in(raw_sql)
+        if problem is not None:
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem) from exc
         raise QueryRejectedError(OutcomeReason.PARSE_ERROR, str(exc)) from exc
     except RecursionError as exc:
         # sqlglot's parser is recursive descent; a deeply-nested SELECT
@@ -1352,8 +1407,10 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> list[Token]:
     - An escape-string literal (`E'…'`, any case — sqlglot's `BYTE_STRING`
       token in the postgres dialect) with a backslash. `FaithfulPostgres`
       reads an E-string as the plain string and renders it as `'…'`, but
-      sqlglot's tokenizer decodes only some escapes (`\\\\`, `\\'`, `\\n`,
-      ...) and keeps the others as written: `E'\\x41'` (`A` to Postgres)
+      sqlglot's tokenizer decodes only some escapes (`\\n`, `\\t`, `\\b`,
+      `\\r`, `\\f`, `\\\\`, `\\'`; and `\\v`, `\\a`, which Postgres reads
+      as the letters) and keeps the others as written: `E'\\x41'` (`A` to
+      Postgres)
       would run as `'\\x41'`, four characters; so would `E'\\101'`,
       `E'\\u0041'`. (Stock sqlglot re-emitted the decoded value un-escaped:
       `E'\\\\'` came back as `e'\\'`, which swallows its closing quote and
@@ -1586,13 +1643,24 @@ def _check_no_denied_calls(tokens: list[Token], ast: exp.Query) -> None:
             raise QueryRejectedError(*denial)
 
 
-def _token_problem(
-    raw_sql: str, tokens: list[Token], i: int, kept_names: set[int | None]
-) -> str | None:
-    """Why `tokens[i]` (with its neighbours) is a source form sqlglot and
-    Postgres read differently, or `None`. `kept_names`: the source offsets
-    of the quoted names the parsed tree keeps as written. See
-    `_check_lexical_fidelity`."""
+def _escape_problem_in(raw_sql: str) -> str | None:
+    """`_escape_problem` for the first token of `raw_sql` that has one, or
+    `None` (also when the text does not tokenize)."""
+    try:
+        tokens = FaithfulPostgres().tokenize(raw_sql)
+    except Exception:  # noqa: BLE001 — the caller reports the parse error
+        return None
+    for i in range(len(tokens)):
+        problem = _escape_problem(raw_sql, tokens, i)
+        if problem is not None:
+            return problem
+    return None
+
+
+def _escape_problem(raw_sql: str, tokens: list[Token], i: int) -> str | None:
+    """Why `tokens[i]` is an escape literal the parser refuses (an `E'…'`
+    with a backslash, a `U&'…'` / `U&"…"`), or `None`; needs no tree, so
+    it is also the reason for text that does not parse."""
 
     def source(token: Token) -> str:
         return raw_sql[token.start : token.end + 1]
@@ -1621,6 +1689,26 @@ def _token_problem(
             "Unicode-escape literals and identifiers (U&'...', U&\"...\") "
             "are not supported; write the characters directly"
         )
+    return None
+
+
+def _token_problem(
+    raw_sql: str, tokens: list[Token], i: int, kept_names: set[int | None]
+) -> str | None:
+    """Why `tokens[i]` (with its neighbours) is a source form sqlglot and
+    Postgres read differently, or `None`. `kept_names`: the source offsets
+    of the quoted names the parsed tree keeps as written. See
+    `_check_lexical_fidelity`."""
+
+    def source(token: Token) -> str:
+        return raw_sql[token.start : token.end + 1]
+
+    token = tokens[i]
+    text = source(token)
+    nxt = tokens[i + 1 : i + 3]
+    escape = _escape_problem(raw_sql, tokens, i)
+    if escape is not None:
+        return escape
     if (
         text.startswith('"')
         and nxt

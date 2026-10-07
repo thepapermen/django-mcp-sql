@@ -129,7 +129,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     as 7 days, `INTERVAL $$25 hours$$ DAY` as 25 hours, `INTERVAL(2)
     $$1.234$$` and `DATE $$2024-01-01$$` were refused, `LIMIT
     $$5000000000$$` failed as an int4). `INTERVAL` is a typed literal only
-    before a string constant or `(`, as in Postgres; anywhere else it is
+    before a string constant or `(`, as in Postgres (a `U&'…'` constant is
+    refused as an unsafe literal, here as anywhere); anywhere else it is
     a name, so a column `interval` is read as the column (`interval + 1`
     ran as `INTERVAL '1'`, one second; `interval - y` and `interval[1]`
     lost the operand; `interval * 2` was refused as `SELECT *`,
@@ -138,7 +139,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     '1'` are parse errors, as in Postgres (they ran). Left: a bare field
     word after the column is read as its alias (`SELECT interval day` runs
     as `interval AS day`; Postgres requires `AS` there, as for any
-    column). Also as written: a subscripted
+    column). Interval type modifiers in a cast run as written
+    (`'12.345'::interval(1)`, `CAST(x AS interval(3))`, `interval
+    second(2)`, `interval day to second(3)`, their arrays; refused before
+    as `roundtrip_mismatch` / `parse_error`); `interval(1) day` and
+    `interval minute(2)` stay parse errors, as in Postgres. A refused
+    escape literal is the audit reason (`unsafe_literal`) also when the
+    text fails to parse (`interval day E'a\b'` had become `parse_error`).
+    Also as written: a subscripted
     column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
@@ -160,7 +168,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    908 ordinary analytical queries (over data with NULLs and mixed case)
+    912 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
