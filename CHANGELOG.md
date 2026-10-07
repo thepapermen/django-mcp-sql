@@ -436,6 +436,10 @@ announce themselves.
     INSERT (`DataError` under psycopg 3);
   - a lone surrogate there (`\ud800`, a legal JSON escape): the driver
     cannot encode it as UTF-8 (`UnicodeEncodeError`);
+  - a redirect URI `urllib` cannot parse (`http://[::1`,
+    `http://[127.0.0.1]/cb`, a fullwidth solidus in the host, a port that is
+    not a number in range): `ValueError` inside the loopback filter, even
+    when a clean URI rode alongside;
   - a body that is not UTF-8, JSON nested past the recursion limit, or an
     integer longer than Python's digit limit;
   - a `grant_types` or `response_types` that is not a list (`null`, a
@@ -450,9 +454,11 @@ announce themselves.
   URI, so nothing of the kind is stored, echoed or logged; a callback is
   copied into every audit row's `client_redirect`, and an invisible or
   reordering character there would let a registrant make it read as something
-  else. Ordinary non-ASCII text is still accepted. An unparseable body is
-  `invalid_client_metadata`, and `grant_types` / `response_types` must be
-  arrays of strings. Also affects 0.1.0b5.
+  else. A URI that does not parse is refused the same way. Ordinary non-ASCII
+  text is still accepted. A seeded fuzz of the endpoint (malformed hosts,
+  ports, encodings, odd characters) pins that it answers only 201 or 400. An
+  unparseable body is `invalid_client_metadata`, and `grant_types` /
+  `response_types` must be arrays of strings. Also affects 0.1.0b5.
 - **Known on this branch alone, fixed by PR #4 (branch
   `fix/dcr-redirect-whitespace`, 0.1.0b6, which merges first):** a NUL byte
   in a parameter of DOT's own OAuth views still reaches the database. Under

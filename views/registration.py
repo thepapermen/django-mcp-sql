@@ -14,6 +14,7 @@ import unicodedata
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from django.http import HttpRequest
 from django.http import JsonResponse
@@ -93,8 +94,30 @@ def _error(
     )
 
 
+def _is_parseable_uri(uri: str) -> bool:
+    """True if `urllib` parses `uri`, port and host included, without raising.
+
+    `urlsplit` raises `ValueError` for a malformed bracketed host
+    (`http://[::1`, `http://[127.0.0.1]/cb`) and for a netloc that changes
+    under NFKC normalisation (a fullwidth solidus, U+2100); `.port` raises for a
+    port that is not a number in range. Every attribute the loopback filter
+    reads is touched here, so a URI that passes cannot raise there.
+    """
+    try:
+        parsed = urlsplit(uri)
+        _ = parsed.port, parsed.hostname, parsed.username, parsed.password
+    except ValueError:
+        return False
+    return True
+
+
 def _is_loopback_redirect(uri: str) -> bool:
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        # Unreachable after `_is_parseable_uri`; kept so this predicate is
+        # fail-closed on its own.
+        return False
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False
@@ -199,6 +222,44 @@ def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
     return None
 
 
+def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
+    """The whole-request refusals of `redirect_uris`, before the subset filter.
+
+    Returns an `invalid_redirect_uri` error response, or None. Malformed, not
+    merely unsupported, input refuses the whole request (even beside a clean
+    URI) rather than dropping out of the loopback subset, so it can never
+    reach the INSERT and is never silently ignored:
+
+    - not a non-empty array, or longer than `_MAX_REDIRECT_URIS`;
+    - a character `_has_unacceptable_character` names (a NUL or lone
+      surrogate failed at the INSERT, an anonymous 500);
+    - a URI `urllib` cannot parse (`_is_parseable_uri`: a bad bracketed host,
+      a netloc invalid under NFKC normalisation, a non-numeric or
+      out-of-range port), which raised `ValueError` inside the loopback
+      filter, the same 500.
+    """
+    if not isinstance(requested_uris, list) or not requested_uris:
+        return _error(
+            "invalid_redirect_uri",
+            "redirect_uris must be a non-empty array of URI strings",
+        )
+    if len(requested_uris) > _MAX_REDIRECT_URIS:
+        return _error(
+            "invalid_redirect_uri",
+            f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
+        )
+    strings = [uri for uri in requested_uris if isinstance(uri, str)]
+    if any(_has_unacceptable_character(uri) for uri in strings):
+        return _error(
+            "invalid_redirect_uri",
+            "redirect_uris must not contain control, format, separator or "
+            "surrogate characters",
+        )
+    if not all(_is_parseable_uri(uri) for uri in strings):
+        return _error("invalid_redirect_uri", "redirect_uris must be valid URIs")
+    return None
+
+
 @csrf_exempt
 @require_POST
 def register_client(request):  # noqa: PLR0911 — each validation produces a distinct RFC 7591 error code; consolidating would obscure the spec mapping.
@@ -216,28 +277,9 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         return _error("invalid_client_metadata", "Request body must be a JSON object")
 
     requested_uris = body.get("redirect_uris")
-    if not isinstance(requested_uris, list) or not requested_uris:
-        return _error(
-            "invalid_redirect_uri",
-            "redirect_uris must be a non-empty array of URI strings",
-        )
-    if len(requested_uris) > _MAX_REDIRECT_URIS:
-        return _error(
-            "invalid_redirect_uri",
-            f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
-        )
-    # Malformed, not merely unsupported: an unacceptable character in ANY
-    # requested URI refuses the whole request, before the subset filter, so it
-    # can never reach the INSERT (and is never silently dropped either).
-    if any(
-        isinstance(uri, str) and _has_unacceptable_character(uri)
-        for uri in requested_uris
-    ):
-        return _error(
-            "invalid_redirect_uri",
-            "redirect_uris must not contain control, format, separator or "
-            "surrogate characters",
-        )
+    uris_error = _requested_uris_error(requested_uris)
+    if uris_error is not None:
+        return uris_error
     # Register the loopback SUBSET rather than refusing the whole request.
     # RFC 7591 §3.2.1 already has us registering the subset of requested
     # metadata we support and echoing back what we actually registered, and

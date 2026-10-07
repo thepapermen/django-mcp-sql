@@ -851,3 +851,143 @@ class TestRegistrationNeverAnswers500:
             "error_description": f"{field} must be an array of strings",
         }
         assert Application.objects.count() == before
+
+
+_MALFORMED_URIS = [
+    "http://[::1",
+    "http://[::1]]/cb",
+    "http://[::1]x/cb",
+    "http://[zz]/cb",
+    "http://[1:2:3]:80/cb",
+    "http://[v.foo]/cb",
+    "http://[127.0.0.1]/cb",
+    "http://[gggg::1]/cb",
+    "http://127.0.0.1[/cb",
+    f"http://127.0.0.1{chr(0x2100)}/cb",  # NFKC-invalid netloc
+    f"http://127.0.0.1{chr(0xFF0F)}evil.example/cb",  # fullwidth solidus
+    "http://127.0.0.1:99999/cb",  # port out of range
+    "http://127.0.0.1:-1/cb",
+    "http://127.0.0.1:abc/cb",
+    "https://cursor.com:0x50/cb",
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("_isolated_mcp_cache")
+class TestMalformedRedirectUris:
+    """A redirect URI that `urllib` cannot parse (a bad bracketed host, a netloc
+    invalid under NFKC normalisation, a port that is not a valid number) is a
+    whole-request 400 `invalid_redirect_uri`, alone or beside a clean URI.
+    `urlparse` raised `ValueError` inside the loopback filter: an anonymous 500
+    before the per-IP `register` counter."""
+
+    @pytest.mark.parametrize("uri", _MALFORMED_URIS)
+    @pytest.mark.parametrize("beside_clean", [False, True])
+    def test_refused(self, client, uri, beside_clean):
+        uris = ["http://localhost:8787/callback", uri] if beside_clean else [uri]
+        before = Application.objects.count()
+        response = _post(client, {"redirect_uris": uris})
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json() == {
+            "error": "invalid_redirect_uri",
+            "error_description": "redirect_uris must be valid URIs",
+        }
+        assert Application.objects.count() == before
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("_isolated_mcp_cache")
+class TestRegistrationFuzz:
+    """Seeded fuzz of the anonymous endpoint: no generated redirect URI or
+    client name, however malformed, may make it answer anything but a 201 or
+    an RFC 7591 400. The test client re-raises any exception, so a 500 path
+    fails loudly with its traceback."""
+
+    _PIECES = [
+        "http://",
+        "https://",
+        "HTTP://",
+        "http:/",
+        "http:\\\\",
+        "//",
+        "",
+        "127.0.0.1",
+        "[::1]",
+        "[::1",
+        "::1]",
+        "localhost",
+        "LOCALHOST",
+        "0x7f.1",
+        "2130706433",
+        "[::ffff:127.0.0.1]",
+        "[fe80::1%25eth0]",
+        "evil.example",
+        "xn--n3h.example",
+        chr(0x131) + ".example",  # dotless i
+        ":",
+        ":0",
+        ":8787",
+        ":99999",
+        ":-1",
+        ":abc",
+        ":" + chr(0xFF18),  # fullwidth digit
+        "@",
+        "user:pw@",
+        "%",
+        "%00",
+        "%zz",
+        "%2e%2e",
+        "/",
+        "\\",
+        "/cb",
+        "/../",
+        "?",
+        "?a=b",
+        "#",
+        "#frag",
+        "[",
+        "]",
+        chr(0x2100),
+        chr(0xFF0F),
+        chr(0xFF20),
+        chr(0x3002),
+        "é",
+        "\U0001f600",
+        " ",
+        "\t",
+        "\x00",
+        chr(0x202E),
+        chr(0x200B),
+        chr(0xFEFF),
+        chr(0xD800),
+    ]
+
+    def test_no_generated_input_answers_500(self, client):
+        import random
+
+        rng = random.Random(20261007)  # noqa: S311 — reproducible fuzz, not crypto
+        for _ in range(400):
+            uris = [
+                "".join(rng.choice(self._PIECES) for _ in range(rng.randint(1, 6)))
+                for _ in range(rng.randint(1, 3))
+            ]
+            if rng.random() < 0.5:
+                uris.append("http://localhost:8787/callback")
+            body = {"redirect_uris": uris}
+            if rng.random() < 0.3:
+                body["client_name"] = "".join(
+                    rng.choice(self._PIECES) for _ in range(rng.randint(1, 4))
+                )
+            response = _post(client, body)
+            assert response.status_code in {
+                HTTPStatus.CREATED,
+                HTTPStatus.BAD_REQUEST,
+            }, (
+                body,
+                response.status_code,
+            )
+            if response.status_code == HTTPStatus.BAD_REQUEST:
+                assert response.json()["error"] in {
+                    "invalid_redirect_uri",
+                    "invalid_client_metadata",
+                }
