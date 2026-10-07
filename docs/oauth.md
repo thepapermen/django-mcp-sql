@@ -893,7 +893,8 @@ volume.
 ## Error-message verbosity
 
 `MCPOAuth2Authentication.authenticate` raises distinct
-`AuthenticationFailed` messages for each gate it fails:
+`AuthenticationFailed` messages (a 401 carrying the `WWW-Authenticate`
+challenge) for each gate it fails:
 
 - `"Token was not issued by an mcp-sql Application."`
 - `"Token does not carry the mcp:sql scope."`
@@ -904,15 +905,25 @@ volume.
   (ambiguous — resolves to >1 profile)
 - `"No active web session — re-login at the Django UI to re-issue MCP
   access."` (only when the opt-in `SESSION_MODEL` gate is enabled)
+- `"Token is not bound to a user."` (a token with no user, refused before
+  the gates; logged at WARNING, no audit row)
 
-These reach the MCP client (typically Claude Code) as the body of a 401
-response, and from there the user sees them. The verbosity is **deliberate**:
+and one that is not a 401: when a gate raises instead of deciding (the
+`MFA_CHECKER` failing, a DB blip, a bad `SESSION_MODEL`), the response is a
+**503** with `"MCP access could not be verified; try again later."` and no
+`WWW-Authenticate` challenge (`auth.GateUnavailable`, audited as
+`gate_error`), so clients retry instead of starting an OAuth
+re-authorization that would fail the same way.
+
+The 401 messages reach the MCP client (typically Claude Code) as the body of
+the response, and from there the user sees them. The verbosity is **deliberate**:
 the consumers are internal users onboarding to the surface, and
 "your MFA device was removed, re-set it up" is faster to act on than a
 generic "Token is no longer valid." If the threat model ever changes —
 the surface gets opened to external partners, or token-holders need to be
-treated as potential attackers — collapse the five branches into a single
-generic message and rely on server logs for the granular reason.
+treated as potential attackers — collapse the 401 branches into a single
+generic message and rely on server logs (and `MCPAuthRejectionLog`) for the
+granular reason.
 
 ## Token isolation contract
 

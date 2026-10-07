@@ -22,8 +22,10 @@ table bloat under sustained probing. Separate audit table from
 evaluated, and conflating them would pollute Phase 4's daily-volume
 "queries per user" aggregation with rejection counts. The audit write
 is best-effort: a DB failure during `MCPAuthRejectionLog.objects.create`
-is `logger.exception`-logged but does not mask the underlying
-`AuthenticationFailed` — the agent always sees the rejection.
+is `logger.exception`-logged but does not mask the underlying denial —
+`AuthenticationFailed` (401 with the `WWW-Authenticate` challenge) for a
+gate that decided, `GateUnavailable` (503, no challenge) for `GATE_ERROR` —
+so the agent always sees the rejection.
 """
 
 import logging
@@ -132,7 +134,11 @@ def _enforce_body_size_cap(django_request: HttpRequest) -> None:
 
 @dataclass(frozen=True)
 class _Denial:
-    """A per-request gate's refusal: the audit reason and the 401 message."""
+    """A per-request gate's refusal: the audit reason and the denial message.
+
+    The message is the 401 detail (`AuthenticationFailed`), or for
+    `GATE_ERROR` the 503's (`GateUnavailable`).
+    """
 
     reason: AuthRejectionReason
     message: str
@@ -457,11 +463,12 @@ class MCPOAuth2Authentication(OAuth2Authentication):
 
         Must NOT run inside a transaction that the rejection rolls back.
         DRF's exception handler calls `set_rollback()` for every
-        `APIException` — the `AuthenticationFailed` raised right after this
-        write included — on any `ATOMIC_REQUESTS` connection, so inside the
-        request transaction the row would be discarded while the 401 still
-        goes out. `views.mcp_endpoint.mcp_endpoint` is therefore non-atomic
-        for every alias (`_EveryAlias`): no request transaction exists on
+        `APIException` — the `AuthenticationFailed` (or, for `GATE_ERROR`,
+        `GateUnavailable`) raised right after this write included — on any
+        `ATOMIC_REQUESTS` connection, so inside the request transaction the
+        row would be discarded while the 401 (or 503) still goes out.
+        `views.mcp_endpoint.mcp_endpoint` is therefore non-atomic for every
+        alias (`_EveryAlias`): no request transaction exists on
         whichever alias holds this table, and the row commits on insert
         (autocommit). Pinned by `test_auth_class.py`'s
         `TestRejectionAuditSurvivesAtomicRequests` and

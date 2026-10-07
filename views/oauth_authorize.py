@@ -124,7 +124,8 @@ class MCPAuthorizationView(AuthorizationView):
         # <hidden field>)`, so a consent POST naming a client that does not
         # exist was a 500 (`DoesNotExist`). Render the fatal-client error
         # page instead, as DOT does for an unknown client on the GET. (A NUL
-        # never gets here: `dispatch` refuses it first.)
+        # never gets here: Django's form validation rejects it, and
+        # `dispatch` refuses it before that.)
         client_id = form.cleaned_data.get("client_id") or ""
         if not self._is_known_client_id(client_id):
             return super().error_response(
@@ -214,11 +215,14 @@ class MCPAuthorizationView(AuthorizationView):
         query = request.GET.copy()
         query["approval_prompt"] = "force"  # replaces every value, if repeated
         request.GET = query
-        # A NUL never names a client, and DOT would hand it to Postgres in
-        # its client lookup (`validate_authorization_request` on the GET,
-        # `form_valid` on the POST), which raises `DataError`: a 500 on every
-        # retry. Refuse it here with the fatal-client error page, before any
-        # lookup (and before the gate, which queries the DB too).
+        # A NUL never names a client. On the GET, DOT hands it to Postgres in
+        # its client lookup (`validate_authorization_request`), which raises
+        # `DataError`: a 500 on every retry. Refuse it here with the
+        # fatal-client error page, before any lookup (and before the gate,
+        # which queries the DB too). On the consent POST Django's form
+        # validation already rejects a NUL (the page is re-rendered, a 200);
+        # checking the POST too is defence in depth, and gives both methods
+        # the same answer.
         client_ids = request.GET.getlist("client_id")
         if request.method == "POST":
             client_ids += request.POST.getlist("client_id")

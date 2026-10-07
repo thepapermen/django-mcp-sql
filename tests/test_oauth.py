@@ -956,6 +956,9 @@ class TestConsentPostErrorsNeverRedirectOffClient:
     def test_nul_client_id_on_the_post_renders_error_page(
         self, client, mcp_user, gate_posture
     ):
+        # Defence in depth: without `dispatch`'s check this was not a 500 but
+        # a 200 re-render (Django's form validation rejects the NUL first);
+        # with it, both methods get the same fatal-client error page.
         response = self._post(
             client, mcp_user, client_id="mcp-sql-cloud.claude\x00", allow="Authorize"
         )

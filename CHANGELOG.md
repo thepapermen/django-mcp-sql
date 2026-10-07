@@ -424,9 +424,11 @@ announce themselves.
   re-validates the target against the client before every error redirect and
   shows the error page when it does not belong to the client. A consent POST
   naming a `client_id` that does not exist was a 500; it shows the same error
-  page, as does a `client_id` containing a NUL byte on either the GET or the
-  POST (DOT handed it to Postgres, which raised `DataError`: a 500). All
-  inherited from DOT; also affects 0.1.0b5.
+  page. So does a `client_id` containing a NUL byte: on the GET, DOT handed it
+  to Postgres, which raised `DataError` (a 500); on the consent POST, Django's
+  form validation already rejected it and the consent page was re-rendered
+  (a 200), so the POST check is defence in depth. All inherited from DOT; also
+  affects 0.1.0b5.
 - **`/o/register` answered a NUL in a redirect URI with a 500.** The loopback
   filter refused whitespace but not NUL, so `http://127.0.0.1:8761/cb\u0000`
   passed it and Postgres rejected the INSERT with `DataError`: an anonymous
