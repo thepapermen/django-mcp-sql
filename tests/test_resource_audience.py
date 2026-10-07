@@ -729,6 +729,66 @@ class TestBearerAudienceCheck:
         assert _ping(client, token.token).status_code == HTTPStatus.UNAUTHORIZED
 
 
+@pytest.mark.django_db
+@pytest.mark.filterwarnings("ignore:JSONOAuthLibCore:DeprecationWarning")
+def test_the_token_view_ignores_a_json_backend(settings, client, mcp_app, mcp_user):
+    """`MCPTokenView` reads the form body, and so must DOT under it: with a
+    consumer's `OAUTH2_BACKEND_CLASS = JSONOAuthLibCore` a JSON body (never
+    seen by the `resource` check) was parsed by DOT and its `resource` put
+    on the token. Also with a core already cached on DOT's stock
+    `TokenView`, which DOT's class-level cache would otherwise hand down."""
+    from mcp_sql.views.oauth_token import MCPTokenView
+    from oauth2_provider.models import AccessToken
+    from oauth2_provider.models import Grant
+    from oauth2_provider.views import TokenView
+
+    def clear_cached_cores() -> None:
+        for view in (TokenView, MCPTokenView):
+            if "_oauthlib_core" in view.__dict__:
+                delattr(view, "_oauthlib_core")
+
+    settings.OAUTH2_PROVIDER = {
+        **settings.OAUTH2_PROVIDER,
+        "OAUTH2_BACKEND_CLASS": "oauth2_provider.oauth2_backends.JSONOAuthLibCore",
+    }
+    # As in a process started with these settings: no core cached yet,
+    # then the stock view serves a request first.
+    clear_cached_cores()
+    TokenView.get_oauthlib_core()
+    try:
+        verifier, challenge = _pkce()
+        code = secrets.token_urlsafe(32)
+        Grant.objects.create(
+            user=mcp_user,
+            code=code,
+            application=mcp_app,
+            expires=timezone.now() + timedelta(minutes=1),
+            redirect_uri=REDIRECT,
+            scope="mcp:sql",
+            code_challenge=challenge,
+            code_challenge_method="S256",
+        )
+        body = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT,
+            "client_id": "mcp-sql",
+            "code_verifier": verifier,
+            "resource": "https://somewhere.example/api",
+        }
+        response = client.post(
+            reverse("token"), data=json.dumps(body), content_type="application/json"
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert not AccessToken.objects.exists()
+        # The form-encoded exchange is unaffected.
+        del body["resource"]
+        response = client.post(reverse("token"), data=body)
+        assert response.status_code == HTTPStatus.OK, response.content
+    finally:
+        clear_cached_cores()
+
+
 @pytest.mark.parametrize(
     "value",
     [

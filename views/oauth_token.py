@@ -1,9 +1,12 @@
 """DOT's `TokenView` plus the RFC 8707 `resource` check at `/o/token/`.
 See `audience.py` for why a `resource` must name this server's MCP endpoint."""
 
+from typing import Any
+
 from django.http import HttpResponse
 from mcp_sql.audience import foreign_resource
 from mcp_sql.audience import invalid_target_error
+from oauth2_provider.oauth2_backends import OAuthLibCore
 from oauth2_provider.views import TokenView
 from oauthlib.oauth2.rfc6749 import errors
 
@@ -20,7 +23,26 @@ def _error_response(error: errors.OAuth2Error) -> HttpResponse:
 
 
 class MCPTokenView(TokenView):
-    """`/o/token/`: DOT's token endpoint, refusing a foreign `resource`."""
+    """`/o/token/`: DOT's token endpoint, refusing a foreign `resource`.
+
+    The oauthlib backend is pinned to DOT's form-body `OAuthLibCore`, which
+    reads the parameters from `request.POST` — what `post`'s check reads. A
+    consumer's `OAUTH2_BACKEND_CLASS` (e.g. DOT's deprecated
+    `JSONOAuthLibCore`) would otherwise parse a JSON body the check never
+    saw, and its `resource` would reach the token. The core is built per
+    call: DOT caches it on the view class behind `hasattr(cls,
+    "_oauthlib_core")`, which a core cached on the stock `TokenView` (a
+    consumer may mount DOT's URLs too) also satisfies, so setting
+    `oauthlib_backend_class` alone would not be enough. The server and
+    validator are still the configured `OAUTH2_SERVER_CLASS` /
+    `OAUTH2_VALIDATOR_CLASS`.
+    """
+
+    oauthlib_backend_class = OAuthLibCore
+
+    @classmethod
+    def get_oauthlib_core(cls) -> Any:
+        return cls.get_oauthlib_backend_class()(cls.get_server())
 
     def post(self, request, *args, **kwargs):
         """Answer `invalid_target` unless every `resource` (query or form
