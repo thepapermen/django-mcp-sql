@@ -30,8 +30,12 @@ COLUMNS = {
 def _expect_reject(sql: str, reason: OutcomeReason, **kwargs) -> QueryRejectedError:
     allowed = kwargs.pop("allowed", ALLOWED)
     ban = kwargs.pop("ban_select_star", True)
+    columns = kwargs.pop("table_columns", None)
+    assert not kwargs, kwargs
     with pytest.raises(QueryRejectedError) as exc:
-        parse_and_validate(sql, allowed_tables=allowed, ban_select_star=ban)
+        parse_and_validate(
+            sql, allowed_tables=allowed, ban_select_star=ban, table_columns=columns
+        )
     assert exc.value.reason == reason, (
         f"expected {reason.value} got {exc.value.reason.value} for: {sql!r}"
     )
@@ -1554,6 +1558,72 @@ class TestIntervalsAndSubscriptsAsWritten:
     )
     def test_unparenthesised_constructor_subscript_is_a_parse_error(self, sql):
         _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+
+class TestPinnedBehaviour:
+    """Review round 10: behaviour no test pinned (its mutant survived)."""
+
+    _PG_SLEEP_COLUMN = {"auth_permission": frozenset({"pg_sleep", "id"})}
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            # An alias column list renames the first columns; the old name
+            # is gone, so `s.pg_sleep` is `pg_sleep(s)` to Postgres.
+            ("SELECT s.pg_sleep FROM (SELECT 1 AS pg_sleep) s(a)", None),
+            # The same for a whitelisted table's model columns.
+            ("SELECT x.pg_sleep FROM auth_permission AS x(a)", _PG_SLEEP_COLUMN),
+            ("SELECT x.pg_sleep FROM auth_permission AS x(a, b)", _PG_SLEEP_COLUMN),
+        ],
+    )
+    def test_a_renamed_column_is_gone(self, sql, columns):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION, table_columns=columns)
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            ("SELECT s.a FROM (SELECT 1 AS pg_sleep) s(a)", None),
+            ("SELECT x.pg_sleep FROM auth_permission AS x", _PG_SLEEP_COLUMN),
+            # Output names through a cast and a subscript.
+            (
+                "SELECT s.pg_sleep FROM (SELECT x.pg_sleep::text "
+                "FROM (SELECT 1 AS pg_sleep) x) s",
+                None,
+            ),
+            (
+                "SELECT s.pg_sleep FROM (SELECT (x.pg_sleep)[1] "
+                "FROM (SELECT ARRAY[1] AS pg_sleep) x) s",
+                None,
+            ),
+            # Postgres ends an operator at `--` / `/*`.
+            ("SELECT 2 +-- c\n3 AS v", None),
+            ("SELECT 2 */*c*/3 AS v", None),
+            # `qualify` as a window name.
+            (
+                "SELECT sum(id) OVER qualify AS s FROM auth_permission "
+                "WINDOW qualify AS (ORDER BY id)",
+                None,
+            ),
+        ],
+    )
+    def test_accepted(self, sql, columns):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=columns)
+
+    def test_select_star_columns_are_not_known(self):
+        # With the `SELECT *` ban off, a `*` item's columns are unknown, so
+        # `(s).pg_sleep` may be `pg_sleep(s)` on a column `s`.
+        _expect_reject(
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep, * FROM auth_permission) s",
+            OutcomeReason.DISALLOWED_FUNCTION,
+            ban_select_star=False,
+        )
+
+    def test_star_field_is_a_column(self):
+        parse_and_validate(
+            "SELECT (s.*).pg_sleep FROM (SELECT 1 AS pg_sleep) s",
+            allowed_tables=ALLOWED,
+            ban_select_star=False,
+        )
 
 
 class TestCheckOrdering:

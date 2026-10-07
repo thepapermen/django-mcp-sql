@@ -151,3 +151,30 @@ def test_refused_query_stays_refused(reason, sql):
 def _parse_and_render(sql: str) -> str:
     parsed = parse_and_validate(sql, allowed_tables=set(_TABLES))
     return render_for_execution(parsed.ast, _ROW_LIMIT, allowed_tables=set(_TABLES))
+
+
+@pytest.mark.django_db
+def test_a_model_column_named_like_a_denied_function_is_read(settings, monkeypatch):
+    """`g.current_setting` is the model's column, not `current_setting(g)`:
+    the executor passes the whitelisted models' columns to the parser, for
+    the agent's text and for the rendered SQL alike (review round 10)."""
+    from mcp_sql.tests.testapp.models import Gauge
+
+    settings.MCP_SQL = {**settings.MCP_SQL, "DB_ALIAS": "default"}
+    table = Gauge._meta.db_table
+    monkeypatch.setattr(
+        "mcp_sql.executor.declared_tables",
+        lambda _profile: {"mcp_sql_testapp.Gauge": table},
+    )
+    Gauge.objects.create(current_setting=7)
+    with connection.cursor() as cur:
+        cur.execute(f"GRANT SELECT ON {table} TO {_DEFAULT_PROFILE.role}")
+    result = run_query(
+        user=UserFactory(),
+        profile=_DEFAULT_PROFILE,
+        raw_sql=f"SELECT g.current_setting FROM {table} g",  # noqa: S608
+        limit=10,
+    )
+    assert result.rejection_reason == "", (result.rejection_reason, result.error)
+    assert result.columns == ["current_setting"]
+    assert result.rows == [[7]]
