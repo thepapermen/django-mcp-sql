@@ -702,20 +702,54 @@ class TestWhitespaceSmuggling:
         assert not app.redirect_uri_allowed("http://evil.example/steal")
 
 
-@pytest.mark.django_db
-class TestControlCharactersAreA400:
-    """A control character anywhere in the stored or echoed metadata is a 400.
+_URI_REFUSAL = (
+    "redirect_uris must not contain control, format, separator or surrogate characters"
+)
+_NAME_REFUSAL = (
+    "client_name must be a string of at most 200 characters, without control, "
+    "format, separator or surrogate characters"
+)
 
-    A NUL inside a loopback `redirect_uri` passed the loopback filter (it is
-    not whitespace, and `urlparse` still reports the loopback host), reached
-    `Application.objects.create`, and Postgres refused the text with
-    `DataError`: an anonymous 500 on every retry, before the per-IP
-    `register` counter was ever incremented. Control characters have no place
-    in a callback URI or a client name, so the whole request is refused with
-    the RFC 7591 error, even when a clean URI rides alongside.
+
+@pytest.mark.django_db
+class TestUnacceptableCharactersAreA400:
+    """No character the database, the encoder or a reader would mishandle is
+    stored or echoed: such a request is a whole-request 400.
+
+    - Control characters (Unicode `Cc`: C0, DEL, C1). A NUL inside a loopback
+      `redirect_uri` passed the loopback filter, reached
+      `Application.objects.create`, and Postgres refused it (`DataError`): an
+      anonymous 500 on every retry, before the per-IP `register` counter.
+    - Lone surrogates (`Cs`, a legal JSON escape such as `\\ud800`): the
+      driver cannot encode them as UTF-8 (`UnicodeEncodeError`), the same 500.
+    - Format characters (`Cf`: bidi overrides, zero-width space, BOM, ...)
+      and line / paragraph separators (`Zl`, `Zp`): storable, but in a
+      callback stored on the Application (copied into every audit row's
+      `client_redirect`) or in a logged client name they let a registrant
+      make the text read as something else.
+
+    Refused even beside a clean URI, and the error description is asserted so
+    that a regression to "drop it from the loopback subset" (which answers a
+    different 400 for a lone URI) cannot pass.
     """
 
-    @pytest.mark.parametrize("char", ["\x00", "\x01", "\x1b", "\x7f", "\x85"])
+    @pytest.mark.parametrize(
+        "char",
+        [
+            "\x00",  # NUL (Cc)
+            "\x01",  # C0
+            "\x1b",  # ESC
+            "\x7f",  # DEL
+            "\x85",  # C1 NEL
+            chr(0xD800),  # lone high surrogate (Cs)
+            chr(0xDFFF),  # lone low surrogate (Cs)
+            "\u202e",  # right-to-left override (Cf)
+            "\u200b",  # zero-width space (Cf)
+            "\ufeff",  # BOM / zero-width no-break space (Cf)
+            "\u2028",  # line separator (Zl)
+            "\u2029",  # paragraph separator (Zp)
+        ],
+    )
     @pytest.mark.parametrize(
         "uris",
         [
@@ -724,15 +758,20 @@ class TestControlCharactersAreA400:
             ["http://localhost:8787/callback", "https://cursor.com/cb{c}"],
         ],
     )
-    def test_redirect_uri_with_control_character(self, client, char, uris):
+    def test_redirect_uri(self, client, char, uris):
         before = Application.objects.count()
         response = _post(client, {"redirect_uris": [u.format(c=char) for u in uris]})
         assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert response.json()["error"] == "invalid_redirect_uri"
+        assert response.json() == {
+            "error": "invalid_redirect_uri",
+            "error_description": _URI_REFUSAL,
+        }
         assert Application.objects.count() == before
 
-    @pytest.mark.parametrize("char", ["\x00", "\n", "\x1b"])
-    def test_client_name_with_control_character(self, client, char):
+    @pytest.mark.parametrize(
+        "char", ["\x00", "\n", "\x1b", chr(0xD800), "\u202e", "\u200b", "\u2028"]
+    )
+    def test_client_name(self, client, char):
         before = Application.objects.count()
         response = _post(
             client,
@@ -742,5 +781,73 @@ class TestControlCharactersAreA400:
             },
         )
         assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json() == {
+            "error": "invalid_client_metadata",
+            "error_description": _NAME_REFUSAL,
+        }
+        assert Application.objects.count() == before
+
+    def test_ordinary_non_ascii_is_not_refused(self, client):
+        """Letters, punctuation and symbols outside ASCII are fine: the refusal
+        is for invisible and unencodable characters, not for non-English."""
+        uri = "http://localhost:8787/callbäck"
+        name = "Café — Kód ✓ 😀"
+        response = _post(client, {"redirect_uris": [uri], "client_name": name})
+        assert response.status_code == HTTPStatus.CREATED
+        body = response.json()
+        assert body["redirect_uris"] == [uri]
+        assert body["client_name"] == name
+
+
+@pytest.mark.django_db
+class TestRegistrationNeverAnswers500:
+    """`/o/register` is anonymous: no input may raise past the view.
+
+    Each of these used to escape as a 500 (a traceback per request, before
+    the per-IP `register` counter): a body that is not UTF-8
+    (`UnicodeDecodeError` is not a `JSONDecodeError`), JSON nested past the
+    recursion limit, an integer longer than Python's digit limit, and a
+    `grant_types` / `response_types` that is not a list (`"x" in None` raises,
+    and a string made `in` a substring test).
+    """
+
+    def _raw(self, client, raw: bytes):
+        return client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=raw,
+            content_type="application/json",
+        )
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"redirect_uris": ["http://127.0.0.1:1/cb\xff\xfe"]}',
+            b"\x80\x81\x82",
+            b"[" * 60000,
+            b'{"redirect_uris": ["http://127.0.0.1:1/cb"], "n": ' + b"1" * 5000 + b"}",
+        ],
+        ids=["invalid-utf8-in-string", "invalid-utf8", "deep-nesting", "huge-int"],
+    )
+    def test_unparseable_body(self, client, raw):
+        response = self._raw(client, raw)
+        assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"] == "invalid_client_metadata"
+
+    @pytest.mark.parametrize("field", ["grant_types", "response_types"])
+    @pytest.mark.parametrize(
+        "value",
+        [None, 1, True, "authorization_code", "code", {"authorization_code": 1}],
+        ids=["null", "int", "bool", "string-gt", "string-rt", "object"],
+    )
+    def test_types_must_be_a_list(self, client, field, value):
+        before = Application.objects.count()
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/callback"], field: value},
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json() == {
+            "error": "invalid_client_metadata",
+            "error_description": f"{field} must be an array of strings",
+        }
         assert Application.objects.count() == before

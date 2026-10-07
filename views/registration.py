@@ -10,6 +10,7 @@ full security posture."""
 import json
 import logging
 import secrets
+import unicodedata
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlparse
@@ -59,19 +60,27 @@ _MAX_REDIRECT_URI_LENGTH = 1024
 _MAX_CLIENT_NAME = 200
 
 
-# C0 controls are below 0x20; DEL is 0x7F and the C1 controls follow it.
-_FIRST_PRINTABLE, _DEL, _LAST_C1 = 0x20, 0x7F, 0x9F
+# Unicode general categories refused anywhere in client metadata we store,
+# echo or log: control (`Cc`: C0, DEL, C1), surrogate (`Cs`), format (`Cf`:
+# bidi overrides, zero-width space, BOM, ...), line / paragraph separator
+# (`Zl`, `Zp`).
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
 
 
-def _has_control_character(value: str) -> bool:
-    """True if `value` holds a C0 control, DEL, or a C1 control character.
+def _has_unacceptable_character(value: str) -> bool:
+    """True if `value` holds a character no client metadata may carry.
 
-    None of them belongs in a callback URI or a client name. A NUL is the one
-    that bites: Postgres refuses it in a text column, so a NUL that reached
-    `Application.objects.create` raised `DataError`, an anonymous 500 on every
-    retry that also skipped the per-IP `register` counter.
+    Two of the categories fail outright downstream: a NUL (`Cc`) is refused
+    by Postgres in a text column (`DataError`), a lone surrogate (`Cs`, a
+    legal JSON escape) by the driver's UTF-8 encoder (`UnicodeEncodeError`),
+    each an anonymous 500 that also skipped the per-IP `register` counter.
+    The rest are storable but invisible or reordering (U+202E, U+200B,
+    U+FEFF, U+2028, ...): a callback is stored on the Application and copied
+    into every audit row's `client_redirect`, and the client name is logged,
+    so a registrant could make either read as something it is not. None has
+    a place in a callback URI or a client name.
     """
-    return any(ord(c) < _FIRST_PRINTABLE or _DEL <= ord(c) <= _LAST_C1 for c in value)
+    return any(unicodedata.category(c) in _REFUSED_CATEGORIES for c in value)
 
 
 def _error(
@@ -161,6 +170,14 @@ def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
     asking for ONLY `client_credentials` — i.e. not the OAuth 2.1 native-app
     pattern — is refused outright rather than silently downgraded.
     """
+    for field in ("grant_types", "response_types"):
+        # A list of strings, or absent. `"x" in None` raised (a 500), and a
+        # string turned the membership test below into a substring test.
+        value = body.get(field, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return _error(
+                "invalid_client_metadata", f"{field} must be an array of strings"
+            )
     if "authorization_code" not in body.get("grant_types", ["authorization_code"]):
         return _error(
             "invalid_client_metadata",
@@ -188,7 +205,11 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     """RFC 7591 §3 client registration endpoint."""
     try:
         body = json.loads(request.body)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # `ValueError` covers `JSONDecodeError`, a body that is not UTF-8
+        # (`UnicodeDecodeError`) and an integer past Python's digit limit;
+        # `RecursionError` JSON nested past the recursion limit (the 64 KiB
+        # body cap allows ~65k levels). Each used to be an anonymous 500.
         return _error("invalid_client_metadata", "Request body is not valid JSON")
 
     if not isinstance(body, dict):
@@ -205,15 +226,17 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             "invalid_redirect_uri",
             f"redirect_uris must list at most {_MAX_REDIRECT_URIS} URIs",
         )
-    # Malformed, not merely unsupported: a control character in ANY requested
-    # URI refuses the whole request, before the subset filter, so a NUL can
-    # never reach the INSERT (and is never silently dropped either).
+    # Malformed, not merely unsupported: an unacceptable character in ANY
+    # requested URI refuses the whole request, before the subset filter, so it
+    # can never reach the INSERT (and is never silently dropped either).
     if any(
-        isinstance(uri, str) and _has_control_character(uri) for uri in requested_uris
+        isinstance(uri, str) and _has_unacceptable_character(uri)
+        for uri in requested_uris
     ):
         return _error(
             "invalid_redirect_uri",
-            "redirect_uris must not contain control characters",
+            "redirect_uris must not contain control, format, separator or "
+            "surrogate characters",
         )
     # Register the loopback SUBSET rather than refusing the whole request.
     # RFC 7591 §3.2.1 already has us registering the subset of requested
@@ -257,18 +280,20 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     if (
         not isinstance(client_name, str)
         or len(client_name) > _MAX_CLIENT_NAME
-        or _has_control_character(client_name)
+        or _has_unacceptable_character(client_name)
     ):
         # Bounded and typed before it is echoed in the 201 or written to the
         # log line below. The body cap is 64 KiB, so an unbounded name would
         # otherwise put ~64 KiB of caller-chosen text into both — and a
-        # non-string (a nested object) would be reflected verbatim. Control
-        # characters are refused too: the name is never stored, but it is
-        # echoed and logged, and no real client name carries one.
+        # non-string (a nested object) would be reflected verbatim. The
+        # characters `_has_unacceptable_character` names are refused too: the
+        # name is never stored, but it is echoed and logged, and no real
+        # client name carries one.
         return _error(
             "invalid_client_metadata",
             f"client_name must be a string of at most {_MAX_CLIENT_NAME} "
-            "characters, without control characters",
+            "characters, without control, format, separator or surrogate "
+            "characters",
         )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).

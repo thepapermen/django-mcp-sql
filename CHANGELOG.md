@@ -429,14 +429,30 @@ announce themselves.
   form validation already rejected it and the consent page was re-rendered
   (a 200), so the POST check is defence in depth. All inherited from DOT; also
   affects 0.1.0b5.
-- **`/o/register` answered a NUL in a redirect URI with a 500.** The loopback
-  filter refused whitespace but not NUL, so `http://127.0.0.1:8761/cb\u0000`
-  passed it and Postgres rejected the INSERT with `DataError`: an anonymous
-  500 on every retry, which also skipped the per-IP `register` counter.
-  A control character (C0, DEL or C1) in any requested `redirect_uris` entry
-  or in `client_name` is now an RFC 7591 400 (`invalid_redirect_uri` /
-  `invalid_client_metadata`) for the whole request, even beside a clean URI;
-  nothing reaches the database. Also affects 0.1.0b5.
+- **`/o/register` could answer an anonymous 500.** Each of these escaped the
+  view as a 500 on every retry, before the per-IP `register` counter:
+  - a NUL in a loopback redirect URI (`http://127.0.0.1:8761/cb\u0000`): the
+    loopback filter refused whitespace but not NUL, and Postgres rejected the
+    INSERT (`DataError` under psycopg 3);
+  - a lone surrogate there (`\ud800`, a legal JSON escape): the driver
+    cannot encode it as UTF-8 (`UnicodeEncodeError`);
+  - a body that is not UTF-8, JSON nested past the recursion limit, or an
+    integer longer than Python's digit limit;
+  - a `grant_types` or `response_types` that is not a list (`null`, a
+    number); a string there also turned the "must include
+    `authorization_code`" check into a substring test.
+
+  All are now RFC 7591 400s. Any requested `redirect_uris` entry or a
+  `client_name` containing a control (Unicode `Cc`), surrogate (`Cs`), format
+  (`Cf`: bidi overrides such as U+202E, zero-width space, BOM) or line /
+  paragraph separator (`Zl`, `Zp`) character refuses the whole request
+  (`invalid_redirect_uri` / `invalid_client_metadata`), even beside a clean
+  URI, so nothing of the kind is stored, echoed or logged; a callback is
+  copied into every audit row's `client_redirect`, and an invisible or
+  reordering character there would let a registrant make it read as something
+  else. Ordinary non-ASCII text is still accepted. An unparseable body is
+  `invalid_client_metadata`, and `grant_types` / `response_types` must be
+  arrays of strings. Also affects 0.1.0b5.
 - **Known, fixed by the 0.1.0b6 OAuth rework (merged before this release):** a
   NUL byte in `client_id` at `/o/token/` or `/o/revoke_token/`, and in
   `code_challenge` or `nonce` on an `/o/authorize/` GET that issues a code
