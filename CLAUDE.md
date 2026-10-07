@@ -47,10 +47,13 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   runs before DOT's own handling.
 - **The executor sends only `parser.render_for_execution` output**: the
   rendered text (no comments) itself passes the full `parse_and_validate`
-  and re-renders (by sqlglot) to the same string. Never send `ast.sql()` to
-  the database directly — sqlglot's re-emission is not faithful for every
-  input; source forms its lexer and Postgres's read differently are refused
-  by the parser's lexical-fidelity check (keep that list current).
+  and re-renders (by sqlglot) to the same string — validated as sqlglot
+  reads it, not a proof about Postgres's lexer. Never send `ast.sql()` to
+  the database directly. Parse and render only with `FaithfulPostgres`
+  (rewrites that change results switched off); source forms sqlglot and
+  Postgres read differently are refused by the lexical-fidelity check (keep
+  that list current). `tests/test_sql_functional_corpus.py` must keep
+  passing: ordinary analytics return exactly what Postgres returns.
 - **The read transaction is read-only while it runs and always rolled
   back** (`SET LOCAL transaction_read_only = on` in
   `session.enter_readonly_session`; `default_transaction_read_only` alone

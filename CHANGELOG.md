@@ -29,11 +29,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     check: an `E'…'` escape-string literal containing a backslash, a
     `U&'…'` / `U&"…"` Unicode escape (sqlglot 30.7 read it as `U & '…'`,
     which then ran and could match different rows), any identifier written
-    as a string constant (`AS $$…$$`, `AS 'x'`, `AS E'x'`), and a
-    double-quoted function name (sqlglot folded `"Lower"(x)` onto
-    `LOWER(x)`). `E'…'` without a backslash, standard strings with
-    backslashes, `$$…$$` values and `U & 'x'` with spaces stay accepted;
-    the hint shows the replacement for each (`chr(10)` for a newline, ...).
+    as a string constant (`AS $$…$$`, `AS 'x'`, `AS E'x'`), a
+    double-quoted function name in call position (sqlglot folded
+    `"Lower"(x)` onto `LOWER(x)`; quoted aliases and CTEs with a column
+    list, and `::"type"(n)`, stay accepted), adjacent string constants
+    (`'a' 'b'`, which sqlglot always read as `CONCAT`) and a dollar-quote
+    tag Postgres rejects (`$u&$…$u&$`). `E'…'` without a backslash, standard
+    strings with backslashes, `$$…$$` values and `U & 'x'` with spaces stay
+    accepted; the hint shows the replacement for each (`chr(10)` for a
+    newline, `||` for adjacent strings, ...).
   - The executor validates the SQL it is about to send, not only the
     agent's text: the LIMIT-wrapped query is rendered without comments,
     the rendered text goes through the full validation again (same
@@ -41,23 +45,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     identical string. Otherwise nothing runs and the attempt is audited
     with the new reason `roundtrip_mismatch`, naming the rendered SQL and
     the failing check. Comments are never sent (sqlglot rewrote `--`
-    comments as `/* */`, and their text is not checked). Faithful rewrites
+    comments as `/* */`, and their text is not checked). The rendering must
+    still end in exactly the injected LIMIT (sqlglot moved it into a
+    subquery for `QUALIFY`), and a construct sqlglot knows it cannot
+    express in Postgres (`IGNORE NULLS`, `initcap`'s delimiter), which it
+    used to drop with a warning, is refused instead. Faithful rewrites
     sqlglot makes (`ROUND(AVG(x), 2)` gaining a CAST, an expanded window
-    frame, `SOME` → `ANY`, `date_part` → `EXTRACT`) still run. The
-    guarantee is about what sqlglot reads in the executed text; forms whose
-    reading by Postgres is known to differ are refused by the parser (above).
-  - Any sqlglot failure while parsing — the tokenizer's `TokenError` for an
+    frame, `SOME` → `ANY`) still run; the rewrites that changed results
+    (`date_part` → `EXTRACT`, numeric instead of float; `date_trunc` losing
+    its time zone on sqlglot 30.7; `to_hex` → `HEX`; `current_timestamp(0)`
+    losing its precision; `current_time` → `CURRENT_TIME()`) are switched
+    off, so those are rendered as written. The guarantee is about what
+    sqlglot reads in the executed text — it passed every check and
+    re-renders to itself — not a proof about Postgres's lexer; forms whose
+    reading by Postgres is known to differ are refused by the parser
+    (above). A new acceptance test runs 488 ordinary analytical queries end
+    to end and checks each returns exactly what Postgres returns for the
+    original text, on both sqlglot versions.
+  - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
-    `UESCAPE` clauses — is now an audited `parse_error`; both escaped
-    `run_query` with no `MCPQueryLog` row before.
+    `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
+    / `KeyError` / `decimal.InvalidOperation` its function builders raise
+    on bad arguments — is now an audited `parse_error`; they escaped
+    `run_query` with no `MCPQueryLog` row before. `run_query` also audits
+    any unexpected exception from parsing or rendering instead of letting
+    it escape.
   - `standard_conforming_strings = on` joins the per-transaction guards
     (and the role defaults in `sql/role_setup.sql`): a database- or
     login-role-level `off` would make Postgres read backslashes in standard
     strings differently from the parser.
   - **Behaviour change:** the forms above are now refused; rewrite them as
-    the hint suggests (a few queries whose rendering no longer validates
-    are refused as `roundtrip_mismatch`; none of 23 common analytic shapes
-    in the test corpus is). **Action:** re-run
+    the hint suggests. A query whose rendering no longer validates is
+    refused as `roundtrip_mismatch` — in the test corpora only non-Postgres
+    SQL (`QUALIFY`, `IGNORE NULLS`, 1-argument `to_number`, ...); none of
+    the 488 ordinary analytical queries. **Action:** re-run
     `sql/role_setup.sql` (or `mcp_sql_role_setup`) to pick up the new role
     default; the per-transaction guard applies without it.
 - **The read transaction was not read-only (affects every release up to and
@@ -76,9 +97,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and pending authorization codes after the change commits, with an
   `MCPAuthRejectionLog` row (new reason `password_change`; migration
   0013). Done with model signals, so it needs no session table and holds
-  with `SESSION_MODEL=None`; Django's login-time password-hash upgrade is
-  not treated as a change. Bulk `QuerySet.update(password=...)` sends no
-  signals and is not seen — revoke tokens explicitly there. Logout now
+  with `SESSION_MODEL=None`. Django's login-time password-hash upgrade is
+  not treated as a change — only that exact save (`check_password`'s
+  setter re-hashing a hash that needed upgrading); a new hash written
+  directly with `save(update_fields=["password"])` (SSO / LDAP sync,
+  imports) is. Bulk `QuerySet.update(password=...)` and
+  `QuerySet.bulk_update(users, ["password"])` send no signals and are not
+  seen — revoke tokens explicitly there. Logout now
   deletes refresh tokens and pending authorization codes as well as access
   tokens (a code issued just before either event could otherwise still be
   exchanged for a new token).
