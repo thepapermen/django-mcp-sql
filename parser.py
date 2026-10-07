@@ -339,6 +339,10 @@ _SYNTAX_FUNCTIONS = frozenset(
 _SYNTAX_NO_PAREN_FUNCTIONS = frozenset({"ANY", "CASE", "VARIADIC"})
 
 
+# Postgres's own reading of a parameter token (`$1`), kept for `$`.
+_STOCK_PARAMETER_PARSER = Postgres.Parser.PLACEHOLDER_PARSERS[TokenType.PARAMETER]
+
+
 class FaithfulPostgres(Postgres):
     """sqlglot's postgres dialect, reading and rendering Postgres SQL as
     written. The executor runs sqlglot's rendering of the query, so any
@@ -590,6 +594,13 @@ class FaithfulPostgres(Postgres):
                         _QualifiedInterval(this=this, unit=qualifier)
                     )
                     return qualified
+                if self._curr is not None and self._curr.token_type == (
+                    TokenType.IDENTIFIER
+                ):
+                    # `INTERVAL '1' "day"`: the quoted word is an alias, which
+                    # sqlglot would read as the unit (1 day, not 1 second).
+                    plain: exp.Interval = self.expression(exp.Interval(this=this))
+                    return plain
             interval: exp.Interval = super()._parse_interval_span(this, *args, **kwargs)
             if (
                 written is not None
@@ -603,12 +614,18 @@ class FaithfulPostgres(Postgres):
             return interval
 
         def _parse_at_operator(self) -> exp.Expression | None:
+            if self._prev is None or self._prev.text != "@":
+                # `$1` / `$name`: a parameter, as written (Postgres: "there
+                # is no parameter $1"), never the operator `@`.
+                parameter: exp.Expression | None = _STOCK_PARAMETER_PARSER(self)
+                return parameter
             tokens, i = self._tokens, self._index  # the token after `@`
             symbol = "@"
             if (
                 i + 1 < len(tokens)
                 and tokens[i].token_type == TokenType.DASH
                 and tokens[i + 1].token_type == TokenType.PARAMETER
+                and tokens[i + 1].text == "@"
                 and tokens[i].start == tokens[i - 1].end + 1
                 and tokens[i + 1].start == tokens[i].end + 1
             ):

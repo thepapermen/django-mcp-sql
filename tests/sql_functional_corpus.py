@@ -2881,6 +2881,14 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT INTERVAL '1' DAY TO SECOND(3) AS a, INTERVAL '1.234' SECOND(2) AS b, INTERVAL '1.234' SECOND (2) AS c, INTERVAL '61.5678' MINUTE TO SECOND(1) AS e, INTERVAL '1.5' HOUR TO SECOND(0) AS f",
     ),
     (
+        "json",
+        "SELECT json_object('a' VALUE NULL ABSENT ON NULL) AS a, json_object('a' VALUE 1 RETURNING jsonb) AS b, json_object('k': '{\"x\": 1}' FORMAT JSON) AS c, json_object('a' VALUE id) AS e FROM t WHERE id < 3 ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '1' \"day\", INTERVAL '2' \"Second\", INTERVAL '1.5' SECOND(3) AS v, INTERVAL '1 day 2 hours' \"x\"",
+    ),
+    (
         "intervals",
         "SELECT id, INTERVAL(3) '1.23456' AS a, INTERVAL (0) '2.5 seconds' AS b, iv + INTERVAL(1) '0.25' AS c FROM t ORDER BY id",
     ),
@@ -3183,6 +3191,8 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT json_object(ARRAY['a', 'b'][1:2]) AS a"),
     ("parse_error", "SELECT ARRAY(SELECT y FROM t ORDER BY id)[1] AS a"),
     ("parse_error", "SELECT INTERVAL(3) '1.5' SECOND AS a"),
+    ("parse_error", "SELECT INTERVAL '1' DAY(3) AS a"),
+    ("parse_error", "SELECT INTERVAL '1' \"Day\" AS v"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3196,6 +3206,7 @@ MIN_SERVER_VERSION: dict[str, int] = {
     "SELECT 1_000": 160000,
     "SELECT 1_000.5_0 AS a, .5_0 AS b, 1e1_0 AS c, 0x1F + 1 AS e, -0b11 AS f FROM t WHERE id = 0x1F": 160000,
     "SELECT id FROM t ORDER BY id LIMIT 0x3": 160000,
+    "SELECT json_object('a' VALUE NULL ABSENT ON NULL) AS a, json_object('a' VALUE 1 RETURNING jsonb) AS b, json_object('k': '{\"x\": 1}' FORMAT JSON) AS c, json_object('a' VALUE id) AS e FROM t WHERE id < 3 ORDER BY id": 160000,
 }
 
 # Accepted and run as written; Postgres itself rejects them.
@@ -3248,6 +3259,10 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id, x IS NOT DISTINCT FROM y IS TRUE AS a FROM t ORDER BY id",
     "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",
     "SELECT id FROM t ORDER BY id LIMIT 'Infinity'::float8",
+    "SELECT id FROM t WHERE id = $1",
+    "SELECT id FROM t WHERE id = $1::int",
+    "SELECT id FROM t WHERE g = $name",
+    "SELECT INTERVAL '1' SECOND(3) TO SECOND",
     "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::float8)",
     "SELECT id FROM t ORDER BY id LIMIT ((SELECT 'Infinity'::float8 AS i))",
     "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::numeric FROM t WHERE id = 1)",

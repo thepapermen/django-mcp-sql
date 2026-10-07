@@ -1179,6 +1179,8 @@ class TestOperatorSigns:
             # Review round 7: operators sqlglot reads that Postgres lacks.
             "SELECT id FROM auth_permission WHERE id ==1",
             "SELECT id FROM auth_permission WHERE id <=> 1",
+            "SELECT id FROM auth_permission WHERE codename ?? 'a'",
+            "SELECT id FROM auth_permission WHERE codename ~~~ 'a'",
             # Review round 6: `=~`, `-~`, `*~` are one operator to Postgres.
             "SELECT id=~1 AS v FROM auth_permission",
             "SELECT -~id AS v FROM auth_permission",
@@ -1200,6 +1202,21 @@ class TestOperatorSigns:
     )
     def test_sign_postgres_reads_apart_is_accepted(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Review round 9: a parameter stays one (Postgres: "there is no
+            # parameter $1"); it was read as the prefix operator `@ 1`.
+            ("SELECT id FROM auth_permission WHERE id = $1", "id = $1"),
+            ("SELECT id FROM auth_permission WHERE id = $1::int", "CAST($1 AS INT)"),
+            ("SELECT id FROM auth_permission WHERE codename = $name", "= $name"),
+            ("SELECT @ -5 AS a, @x AS b FROM auth_permission", "@ -5 AS a, @ x AS b"),
+        ],
+    )
+    def test_parameter_is_not_the_at_operator(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
 
 
 class TestQualify:
@@ -1452,6 +1469,7 @@ class TestIntervalsAndSubscriptsAsWritten:
         [
             # A quoted word is an alias, not a field: 25 hours, not 0 days.
             ("""SELECT INTERVAL '25 hours' "DAY\"""", 'AS "DAY"'),
+            ("""SELECT INTERVAL '1' "day\"""", """INTERVAL '1' AS "day\""""),
             ("""SELECT INTERVAL '1' DAY "TO\"""", """INTERVAL '1' DAY AS "TO\""""),
             # The precision of a seconds field (1.23 s, not a parse error).
             ("SELECT INTERVAL '1.234' SECOND(2)", "INTERVAL '1.234' SECOND(2)"),
@@ -1468,8 +1486,18 @@ class TestIntervalsAndSubscriptsAsWritten:
     def test_interval(self, sql, rendered):
         assert rendered in self._rendered(sql)
 
-    def test_interval_precision_form_takes_no_field(self):
-        _expect_reject("SELECT INTERVAL(3) '1.5' SECOND", OutcomeReason.PARSE_ERROR)
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT INTERVAL(3) '1.5' SECOND",
+            # Postgres takes a precision on a seconds field only.
+            "SELECT INTERVAL '1' DAY(3)",
+            # A quoted alias, then a second one: Postgres's syntax error too.
+            """SELECT INTERVAL '1' "Day" AS v""",
+        ],
+    )
+    def test_interval_syntax_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
 
     @pytest.mark.parametrize(
         "sql",
