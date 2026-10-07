@@ -105,19 +105,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     sqlglot dropped the column as the keyword). Also as written: `INTERVAL
     '<string>' <field> [TO <field>]` (`INTERVAL '25 hours' DAY` is 0 days
     to Postgres; sqlglot dropped the field or read it as an alias) — only
-    an unquoted word is a field (`INTERVAL '25 hours' "DAY"` is 25 hours
-    and `INTERVAL '1' "day"` one second, each with an alias), a seconds
-    field keeps its precision (`SECOND(2)`, `DAY TO SECOND(3)`), and a field
-    word or `TO` after a complete qualifier (`INTERVAL '1' DAY HOUR`, `...
-    DAY TO`) is a parse error, as in Postgres (it ran with an alias); any
-    other word after the string is an alias, as to Postgres (`INTERVAL '1'
-    WEEK` is 1 second named `week`; sqlglot read `WEEK`, `DAYS`, `q`,
-    `MON`, `hr`, ... as units, 7 days), and the string keeps its spelling
-    (`'1 week'`, not `'1 WEEK'`) — and `INTERVAL(3) '1.23456'` (was the sum
-    `INTERVAL '3' + INTERVAL '1.23456'`); any other `INTERVAL(…)`
-    (`INTERVAL(3.0) '1.2'`, `INTERVAL(-1) '1 day'`, `INTERVAL(1 + 2) '…'`,
-    `INTERVAL(3)` alone) is a parse error, as in Postgres (it ran as a sum
-    or with parts dropped); a subscripted column named
+    an unquoted word is a field, compared as Postgres compares keywords
+    (ASCII letters only: `INTERVAL '1' "day"` is one second named `day`,
+    and so is `mınute` with a dotless `ı`, which `str.upper` had made
+    `MINUTE`), a seconds field keeps its precision (`SECOND(2)`, `DAY TO
+    SECOND(3)`), and a field word or `TO` after a complete qualifier
+    (`INTERVAL '1' DAY HOUR`, `... DAY TO`) is a parse error, as in
+    Postgres (it ran with an alias); any other word after the string is an
+    alias, as to Postgres (`INTERVAL '1' WEEK` is 1 second named `week`;
+    sqlglot read `WEEK`, `DAYS`, `q`, `MON`, `hr`, ... as units, 7 days),
+    and the string keeps its spelling (`'1 week'`, not `'1 WEEK'`) and its
+    quotes (`INTERVAL '1 day'', g, ''b'` had run as three projections) —
+    and `INTERVAL(3) '1.23456'` (was the sum `INTERVAL '3' + INTERVAL
+    '1.23456'`); any other `INTERVAL(…)` (`INTERVAL(3.0) '1.2'`,
+    `INTERVAL(-1) '1 day'`, `INTERVAL(1 + 2) '…'`, `INTERVAL(3)` alone) is
+    a parse error, as in Postgres (it ran as a sum or with parts dropped).
+    The string ends the interval: a `+` after it is the operator, not
+    sqlglot's sum of intervals (`INTERVAL '1 day' + 2 * INTERVAL '1 day'`
+    ran as `INTERVAL '1 day' + INTERVAL '2'`, dropping the rest). Every
+    form of string constant is that string, everywhere a string is: `E'…'`
+    without a backslash and `$$…$$` / `$tag$…$tag$` (sqlglot's own nodes
+    for them were not: `INTERVAL $$1$$ week` and `INTERVAL E'1' week` ran
+    as 7 days, `INTERVAL $$25 hours$$ DAY` as 25 hours, `INTERVAL(2)
+    $$1.234$$` and `DATE $$2024-01-01$$` were refused, `LIMIT
+    $$5000000000$$` failed as an int4). Also as written: a subscripted
+    column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
     `json_object(...)` whenever its arguments parse as plain expressions
@@ -129,16 +141,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     errors), `!! q` (tsquery negation, refused before) and `! x` (Postgres's
     error; sqlglot ran it as `NOT x`), `overlaps(a, b, c, d)`, and
     `qualify` as a name everywhere (select alias, `GROUP BY`). `LIMIT
-    '<integer>'` (also in parentheses, `LIMIT ('5000000000')`; surrounding
-    ASCII whitespace only, as Postgres's input) is read as the bigint it is
-    to Postgres. An array constructor subscripted without
+    '<integer>'` (also in parentheses, `LIMIT ('5000000000')`, or `$$…$$` /
+    `E'…'`; surrounding ASCII whitespace only, as Postgres's input) is read
+    as the bigint it is to Postgres. An array constructor subscripted without
     parentheses (`ARRAY[1, 2][1]`, a syntax error to Postgres, which
     sqlglot parenthesised; `ARRAY(SELECT …)[1]`, which it turned into
     `ARRAY[1]`) and `INTERVAL(p) '<string>' <field>` are `parse_error`. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    879 ordinary analytical queries (over data with NULLs and mixed case)
+    887 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the

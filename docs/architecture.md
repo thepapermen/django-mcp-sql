@@ -540,8 +540,13 @@ The load-bearing invariants and footguns, grouped by layer:
      (pinned in the corpus with `ABSENT ON NULL`, `RETURNING`, `FORMAT
      JSON`); constructor clauses sqlglot cannot read (`json_array(… NULL ON
      NULL)`, `json_objectagg(k VALUE v)`) are refused. It also keeps as
-     written: multi-part interval
-     strings, the right operand of `->` / `->>`, quoted type names, `bit` /
+     written: interval strings (multi-part, and with their quotes escaped;
+     the string ends the interval — Postgres has no sum of intervals, so a
+     `+` after it is the operator — and an interval field word is compared
+     as Postgres compares keywords, ASCII letters only), every form of
+     string constant as the string it is (`E'…'` without a backslash,
+     `$$…$$`, `$tag$…$tag$` — in an interval, a typed literal or a LIMIT
+     exactly like `'…'`), the right operand of `->` / `->>`, quoted type names, `bit` /
      `char` typed literals, numeric constants (incl. the PG16 forms `0x1F`,
      `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), the operators
      `a ^@ b` (sqlglot read `a ^ (@ b)`), `!! q` and `! x` (read as `NOT`),
@@ -564,7 +569,14 @@ The load-bearing invariants and footguns, grouped by layer:
   `SQRT(x)` / `CBRT(x)` (another column name), a generic typed literal of a
   type sqlglot does not know (`lseg '…'`) is refused; syntax Postgres rejects that sqlglot still understands (`REGEXP`,
   `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+) is
-  translated rather than failing as in Postgres; and a few valid forms
+  translated rather than failing as in Postgres (so is a keyword spelled
+  with a non-ASCII letter that Python's `str.upper` folds onto ASCII:
+  sqlglot's tokenizer reads `ſelect`, `aſ`, `ınner`, `unıon`, `lımıt` as
+  the keywords, where Postgres reads names and raises — or, when a name is
+  spelled that way, reads it: `SELECT falſe FROM (SELECT 1 AS falſe) s`
+  is `false` here, 1 in Postgres, and `SELECT 1 ınner` is refused; and an
+  interval field used as a bare alias, `INTERVAL '1 day' + '1' DAY`,
+  which Postgres requires `AS` for); and a few valid forms
   sqlglot cannot parse are refused (`ORDER BY … USING`, `bit varying '…'`,
   `j @? path` on 30.7, the infix operator `a @ b` — tsquery / geometric
   "contains"; the prefix `@ x` is kept as written). Also accepted: `SELECT 123abc` / `1e3x` /
@@ -577,7 +589,8 @@ The load-bearing invariants and footguns, grouped by layer:
   the lexical check running first. Interval types with a precision in a
   cast (`'1.5'::interval(3)`, `interval second(2)`) and a subscript after
   an array type (`'{1,2}'::int[][1]`) are refused (sqlglot cannot read or
-  render them); `INTERVAL(3) '…'` (the precision form) is kept as written,
+  render them); `INTERVAL(3) '…'` (the precision form, with any form of
+  string constant) is kept as written,
   and any other `INTERVAL(…)` (`INTERVAL(1 + 2) '…'`, `INTERVAL(3.0) '…'`,
   `INTERVAL(3)` alone; Postgres rejects them) is a parse error. A LIMIT whose type is not evident from how it is
   written (a column, a function call) is capped with `LEAST` uncast, so a
@@ -589,7 +602,7 @@ The load-bearing invariants and footguns, grouped by layer:
   `BAN_SELECT_STAR` (any `t.*` is `select_star`), `t.f` when a column `t`
   is also in scope. Pre-existing and tracked separately:
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 879
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 887
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must
