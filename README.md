@@ -391,9 +391,9 @@ DRF:
 
 | Django  | Python      | DRF (supported) | django-oauth-toolkit |
 |---------|-------------|-----------------|----------------------|
-| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.2 – 3.3            |
-| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.2 – 3.3            |
-| 6.0     | 3.12, 3.13  | 3.17            | 3.3                  |
+| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.2 – 3.4            |
+| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.2 – 3.4            |
+| 6.0     | 3.12, 3.13  | 3.17            | 3.3 – 3.4            |
 
 - The DRF floor is **3.14** — the lowest we support, i.e. what a legacy
   Django 4.2 app is likely already pinning. Each Django line has its own DRF
@@ -404,7 +404,10 @@ DRF:
 - **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13** — hence
   the ragged Python columns.
 - `django-oauth-toolkit`, `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not
-  Django-version-coupled within their declared ranges.
+  Django-version-coupled within their declared ranges. CI runs
+  django-oauth-toolkit at its floor (3.2) and the newest 3.x (3.4.1); only
+  3.4 and later store an RFC 8707 `resource` on a token and audience-check
+  it (see `docs/oauth.md`).
 
 ### Dropping into an existing app with an older pinned DRF
 

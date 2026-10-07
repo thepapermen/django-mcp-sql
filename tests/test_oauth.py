@@ -909,12 +909,15 @@ class TestLogoutKillsPendingCode:
         Branches on the INSTALLED DOT version, not on the response, so a DOT
         that changed behaviour fails here instead of slipping into the other
         branch. CI runs DOT 3.2 (floor job) and the newest 3.x (3.4.x today).
+        The refusal arrived in 3.4.1 (an orphaned refresh token is invalid);
+        3.4.0 behaves like 3.2.
         """
         from importlib.metadata import version
 
         from mcp_sql.auth import MCPOAuth2Authentication
         from oauth2_provider.models import AccessToken
         from oauth2_provider.models import RefreshToken
+        from packaging.version import Version
         from rest_framework.exceptions import AuthenticationFailed
         from rest_framework.test import APIRequestFactory
 
@@ -933,13 +936,12 @@ class TestLogoutKillsPendingCode:
                 "client_id": self.CLIENT_ID,
             },
         )
-        dot = tuple(int(p) for p in version("django-oauth-toolkit").split(".")[:2])
-        if dot >= (3, 4):
+        if Version(version("django-oauth-toolkit")) >= Version("3.4.1"):
             # Refuses a refresh token whose access token is gone.
             assert refreshed.status_code == HTTPStatus.BAD_REQUEST, refreshed.content
             assert refreshed.json()["error"] == "invalid_grant"
             return
-        # DOT < 3.4 (3.2 is the tested floor): a token IS minted, but its scope
+        # DOT < 3.4.1 (3.2 is the tested floor): a token IS minted, but its scope
         # is read from the deleted access token, so it carries none...
         assert refreshed.status_code == HTTPStatus.OK, refreshed.content
         new = AccessToken.objects.get(token=refreshed.json()["access_token"])
