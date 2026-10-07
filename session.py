@@ -40,6 +40,15 @@ EXPECTED_SESSION_GUCS: dict[str, str] = {
     # no longer mean what was checked (`'a\' AS x, '...'` shifts quotes).
     # Pinned per transaction, like every guard.
     "standard_conforming_strings": "on",
+    # Where an unqualified relation name resolves. The parser matches `FROM t`
+    # against the whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`);
+    # the login's own `search_path` (a `"$user"` schema — under `SET ROLE`,
+    # one named after the profile role — a database- or role-level setting,
+    # a connection option) could otherwise resolve it to a same-named
+    # relation elsewhere. `pg_temp` is listed last so a temporary table
+    # cannot shadow it either (unlisted, it is searched first). A list: see
+    # `guc_value_sql`.
+    "search_path": "public, pg_temp",
 }
 
 # Per-transaction only, never a role default. `default_transaction_read_only`
@@ -57,7 +66,7 @@ TRANSACTION_GUCS: dict[str, str] = {"transaction_read_only": "on"}
 # value is a safe identifier — a future contributor who slips `"; SELECT 1 --`
 # into the dict should fail at module load, not at the next cursor open.
 _SAFE_GUC_NAME = re.compile(r"^[a-z_]+$")
-_SAFE_GUC_VALUE = re.compile(r"^[a-z0-9]+$")
+_SAFE_GUC_VALUE = re.compile(r"^[a-z0-9_]+(, [a-z0-9_]+)*$")
 for _name, _value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
     if not _SAFE_GUC_NAME.fullmatch(_name):
         _msg = f"unsafe GUC name in EXPECTED_SESSION_GUCS: {_name!r}"
@@ -65,6 +74,15 @@ for _name, _value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
     if not _SAFE_GUC_VALUE.fullmatch(_value):
         _msg = f"unsafe GUC value in EXPECTED_SESSION_GUCS: {_value!r}"
         raise ValueError(_msg)
+
+
+def guc_value_sql(value: str) -> str:
+    """A guard's value as the right-hand side of `SET` / `ALTER ROLE ... SET`:
+    each list element quoted on its own (`'public', 'pg_temp'`; one quoted
+    string `'public, pg_temp'` would be a single schema of that name). The
+    values are the validated constants above, never input."""
+    return ", ".join(f"'{item}'" for item in value.split(", "))
+
 
 # SESSION_CONTEXT hook GUC names. The hook is consumer code; its values are
 # bound as `set_config` params (never interpolated), and the name is bound
@@ -114,7 +132,7 @@ def enter_readonly_session(
     """
     cursor.execute(f"SET LOCAL ROLE {role}")
     for name, value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
-        cursor.execute(f"SET LOCAL {name} = '{value}'")
+        cursor.execute(f"SET LOCAL {name} = {guc_value_sql(value)}")
     if session_context:
         validate_session_context(session_context)
         for name, value in session_context.items():

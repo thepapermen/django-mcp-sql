@@ -18,6 +18,7 @@ from mcp_sql.models import MCPQueryLog
 from mcp_sql.schemas import OutcomeReason
 from mcp_sql.session import EXPECTED_SESSION_GUCS
 from mcp_sql.session import enter_readonly_session
+from mcp_sql.session import guc_value_sql
 from mcp_sql.session import session_drift
 from mcp_sql.tests.factories import UserFactory
 from mcp_sql.tests.test_executor import _DEFAULT_PROFILE
@@ -61,7 +62,7 @@ class TestReadOnlySession:
             # running transaction left read-write.
             cur.execute(f"SET LOCAL ROLE {_ROLE}")
             for name, value in EXPECTED_SESSION_GUCS.items():
-                cur.execute(f"SET LOCAL {name} = '{value}'")
+                cur.execute(f"SET LOCAL {name} = {guc_value_sql(value)}")
             drift = session_drift(cur, _ROLE)
         assert drift == {"transaction_read_only": ("on", "off")}
 

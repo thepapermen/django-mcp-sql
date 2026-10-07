@@ -3,6 +3,7 @@ from django.core.management.base import CommandError
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
+from mcp_sql.grants import relation_sql
 
 
 class Command(BaseCommand):
@@ -41,9 +42,10 @@ class Command(BaseCommand):
         for name, drift in result.per_profile.items():
             role = profiles[name].role
             for table in drift.granted:
-                self.stdout.write(f'GRANT SELECT ON "{table}" TO {role};')
+                self.stdout.write(f"GRANT SELECT ON {relation_sql(table)} TO {role};")
             for table in drift.revoked:
-                self.stdout.write(f'REVOKE SELECT ON "{table}" FROM {role};')  # noqa: S608
+                revoke = f"REVOKE SELECT ON {relation_sql(table)} FROM {role};"  # noqa: S608
+                self.stdout.write(revoke)
 
         if not result.changed:
             self.stdout.write(self.style.SUCCESS("Grants in sync; no action."))

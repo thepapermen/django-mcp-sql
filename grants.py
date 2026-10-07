@@ -31,6 +31,8 @@ from django.db import connection
 from django.db import transaction
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.parser import relation_key
+from mcp_sql.parser import relation_of
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +69,11 @@ class ProfileDrift:
     """Per-profile drift between a profile's declared whitelist and the
     SELECT grants on its Postgres role.
 
-    - `granted`, `revoked`: sorted `db_table` names to grant / revoke on
-      this profile's role (with `apply=False`) or that were granted /
-      revoked (with `apply=True`).
+    - `granted`, `revoked`: sorted relations to grant / revoke on this
+      profile's role (with `apply=False`) or that were granted / revoked
+      (with `apply=True`), each spelled as `parser.relation_key` spells it:
+      the bare name in `public`, `schema"."name` elsewhere (`relation_sql`
+      renders either for SQL).
     - `skipped_reason`: non-empty in lenient mode when this profile's
       env-level preflight failed (`"role_missing"` / `"no_membership"`);
       both action lists are empty and the apply path is a no-op for it.
@@ -148,21 +152,40 @@ def declared_tables(profile: Profile) -> dict[str, str]:
     return out
 
 
+def relation_sql(relation: str) -> str:
+    """A relation (a `db_table`, or a `relation_key` spelling) as a
+    schema-qualified SQL name, `"public"."t"` / `"analytics"."t"`: GRANT and
+    REVOKE name the relation the parser matches, never whatever the app
+    role's own `search_path` finds first."""
+    schema, name = relation_of(relation)
+    return f'"{schema}"."{name}"'
+
+
 def granted_tables(role: str) -> set[str]:
-    """The public-schema tables on which `role` currently holds SELECT."""
+    """Every relation outside the system schemas on which `role` currently
+    holds SELECT, spelled as `parser.relation_key` spells it.
+
+    Not only `public`: a grant on a relation in another schema (a
+    `GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO <role>`, or a
+    same-named copy of a whitelisted table) is a grant nothing declares, so
+    the drift check reports it and `--apply` revokes it."""
     _verify_default_alias()
     with connection.cursor() as cur:
         cur.execute(
-            """
-            SELECT table_name
+            r"""
+            SELECT table_schema, table_name
             FROM information_schema.role_table_grants
             WHERE grantee = %s
               AND privilege_type = 'SELECT'
-              AND table_schema = 'public'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_schema NOT LIKE 'pg\_%%'
             """,
             [role],
         )
-        return {row[0] for row in cur.fetchall()}
+        return {
+            name if schema == "public" else f'{schema}"."{name}'
+            for schema, name in cur.fetchall()
+        }
 
 
 def role_exists(role: str) -> bool:
@@ -237,7 +260,7 @@ def _verify_view_parity(profile: Profile) -> None:
             # f-string SQL even when the only interpolation is a trusted
             # Django identifier — there is no parameterisable form for
             # the table name in `SELECT * FROM ...`.
-            cur.execute(f'SELECT * FROM "{table}" LIMIT 0')  # noqa: S608
+            cur.execute(f"SELECT * FROM {relation_sql(table)} LIMIT 0")  # noqa: S608
             view_columns = {col.name for col in cur.description}
         if model_columns != view_columns:
             mismatches.append(
@@ -322,7 +345,9 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
     # statements against an out-of-sync view.
     _verify_view_parity(profile)
 
-    declared = set(declared_tables(profile).values())
+    # One spelling per relation on both sides (`"t"` and `t` are the same
+    # table; `s"."t` is not `t`).
+    declared = {relation_key(table) for table in declared_tables(profile).values()}
     current = granted_tables(profile.role)
     drift = ProfileDrift(
         granted=sorted(declared - current),
@@ -332,7 +357,7 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
         role = profile.role
         with transaction.atomic(), connection.cursor() as cur:
             for table in drift.granted:
-                cur.execute(f'GRANT SELECT ON "{table}" TO {role};')
+                cur.execute(f"GRANT SELECT ON {relation_sql(table)} TO {role};")
             for table in drift.revoked:
-                cur.execute(f'REVOKE SELECT ON "{table}" FROM {role};')  # noqa: S608
+                cur.execute(f"REVOKE SELECT ON {relation_sql(table)} FROM {role};")  # noqa: S608
     return drift

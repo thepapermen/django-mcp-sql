@@ -148,6 +148,10 @@ DENIED_SRF_FUNCTIONS: frozenset[str] = frozenset(
     }
 )
 SYSTEM_SCHEMAS: frozenset[str] = frozenset({"pg_catalog", "information_schema"})
+# The schema an unqualified relation name resolves to: the read transaction
+# pins `search_path` to it, then `pg_temp` (`session.SEARCH_PATH`), so a
+# same-named relation in another schema is never what `FROM t` opens.
+DEFAULT_SCHEMA = "public"
 # Postgres reads `x.f` / `(expr).f` as the call `f(x)` when `x` has no column
 # `f` ("attribute notation"): `('server_version'::text).current_setting` is
 # `current_setting('server_version')`. So a qualified name that is a denied
@@ -1172,12 +1176,16 @@ def parse_and_validate(
 
     `allowed_tables` is the set of `db_table` names the agent may read,
     pre-resolved by the caller (`mcp_sql.grants.declared_tables`), each
-    spelled exactly as the relation is named. A table reference matches the
-    way Postgres matches it: a quoted name exactly, an unquoted one folded
-    to lowercase (`_check_tables`); the schema is not part of the match,
-    and a system schema is rejected unconditionally.
+    spelled exactly as the relation is named — in `DEFAULT_SCHEMA`, or in
+    the schema a `db_table` written `schema"."name` names (`relation_of`).
+    A table reference matches the way Postgres resolves it: the schema and
+    the name each quoted exactly, unquoted folded to lowercase, and an
+    unqualified name in `DEFAULT_SCHEMA`, which the read transaction pins
+    as its `search_path` (`_check_tables`). A same-named relation in
+    another schema is not on the whitelist, and a system schema is rejected
+    unconditionally.
 
-    `table_columns` maps a whitelisted `db_table` (spelled exactly, as in
+    `table_columns` maps a whitelisted `db_table` (spelled as in
     `allowed_tables`) to its column names as spelled in the database, so
     that `t.name` is known to be a column when `t` has one
     (`_attribute_calls`); a table missing from it is treated as having no
@@ -1292,6 +1300,8 @@ def _parse_and_validate(
     _check_no_fetch(ast)
     _check_no_locking_reads(ast)
     referenced_tables = _check_tables(ast, allowed_tables=allowed_tables)
+    # Keyed like `_item_columns` looks them up: one spelling per relation.
+    table_columns = {relation_key(table): cols for table, cols in table_columns.items()}
     _check_no_denied_functions(ast, table_columns)
     _check_no_denied_calls(tokens, ast)
     _check_no_bare_keyword_columns(ast)
@@ -2232,6 +2242,46 @@ def _is_row_field(
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
+def relation_of(db_table: str) -> tuple[str, str]:
+    """The relation a `db_table` names, as `(schema, name)`.
+
+    Django quotes a `db_table` that is not already quoted, so both
+    `'analytics"."widget'` and `'"analytics"."widget"'` name the relation
+    `widget` in the schema `analytics`; any other `db_table` (`'"t"'`
+    included) names a relation in `DEFAULT_SCHEMA`.
+    """
+    quoted = len(db_table) > 1 and db_table[0] == db_table[-1] == '"'
+    inner = db_table[1:-1] if quoted else db_table
+    schema, dot, name = inner.partition('"."')
+    if dot:
+        return schema, name
+    return DEFAULT_SCHEMA, inner
+
+
+def relation_key(db_table: str) -> str:
+    """One spelling per relation (see `_spelling`)."""
+    return _spelling(*relation_of(db_table))
+
+
+def _spelling(schema: str, name: str) -> str:
+    """A relation's one spelling: the name in `DEFAULT_SCHEMA`, else
+    `schema"."name` (as a `db_table` names it)."""
+    return name if schema == DEFAULT_SCHEMA else f'{schema}"."{name}'
+
+
+def _table_relation(table: exp.Table) -> tuple[str, str]:
+    """The relation a table reference opens, as Postgres resolves it: a
+    schema-qualified name in its schema (quoted exactly, unquoted folded),
+    an unqualified one in `DEFAULT_SCHEMA` (the pinned `search_path`). A
+    database qualifier (`db.schema.t`) Postgres accepts only for the
+    current database."""
+    schema = table.args.get("db")
+    return (
+        DEFAULT_SCHEMA if schema is None else _name_key(schema),
+        _name_key(table.this),
+    )
+
+
 def _name_key(identifier: exp.Expression) -> str:
     """An identifier as Postgres compares it: quoted as written, unquoted
     folded to lowercase."""
@@ -2338,7 +2388,7 @@ def _item_columns(
         if cte is not None:
             return _renamed(renamed, _cte_columns(cte))
         certain, possible = _base_table_columns(
-            table_columns.get(_name_key(source.this)), renamed
+            table_columns.get(_spelling(*_table_relation(source))), renamed
         )
         # A table's system columns are columns too, whatever the alias list
         # (a view has none, but the model does not say which it is).
@@ -2577,17 +2627,25 @@ def _check_tables(
     *,
     allowed_tables: set[str],
 ) -> set[str]:
-    """Validate every table reference and return the set of touched tables.
+    """Validate every table reference and return the set of touched tables
+    (as their whitelist entries spell them).
 
-    A reference matches a whitelist entry (a `db_table`) the way Postgres
-    matches it to a relation: quoted exactly, unquoted folded to lowercase.
-    References that resolve to an IN-SCOPE CTE are skipped (they look like
-    `exp.Table(name='q')` but resolve to the CTE body, which has already
-    been walked) — see `_resolves_to_cte` for why scope matters. System
-    catalogs (`pg_catalog`, `information_schema`, anything in the `pg_*`
-    namespace) are rejected even when nominally on the whitelist.
+    A reference matches a whitelist entry (a `db_table`, the relation
+    `relation_of` reads from it) the way Postgres resolves it to a
+    relation: schema and name quoted exactly, unquoted folded to lowercase,
+    an unqualified name in `DEFAULT_SCHEMA` (the pinned `search_path`), a
+    qualified one in the schema it names — `analytics.t` is not the
+    whitelisted `t`, whatever grants the role holds on it. A database
+    qualifier (`db.public.t`) is left to Postgres, which accepts only the
+    current database. References that resolve to an IN-SCOPE CTE are
+    skipped (they look like `exp.Table(name='q')` but resolve to the CTE
+    body, which has already been walked) — see `_resolves_to_cte` for why
+    scope matters. System catalogs (`pg_catalog`, `information_schema`,
+    anything in the `pg_*` namespace) are rejected even when nominally on
+    the whitelist.
     """
     referenced: set[str] = set()
+    whitelist = {relation_of(entry): entry for entry in allowed_tables}
 
     for table in ast.find_all(exp.Table):
         schema = (table.db or "").lower()
@@ -2618,11 +2676,19 @@ def _check_tables(
             raise QueryRejectedError(OutcomeReason.SYSTEM_SCHEMA, msg)
         if _resolves_to_cte(table):
             continue
-        # The relation Postgres opens: a quoted name as written, an unquoted
-        # one folded; a whitelist entry is a `db_table`, the exact name.
-        key = _name_key(table.this)
-        if key not in allowed_tables:
-            msg = f"Table '{key}' is not on the MCP whitelist"
+        # The relation Postgres opens: schema and name quoted as written,
+        # unquoted folded; no schema is the pinned `search_path`'s.
+        in_schema, relation = _table_relation(table)
+        entry = whitelist.get((in_schema, relation))
+        if entry is None:
+            shown = (
+                relation if table.args.get("db") is None else f"{in_schema}.{relation}"
+            )
+            msg = f"Table '{shown}' is not on the MCP whitelist"
+            elsewhere = sorted(s for s, n in whitelist if n == relation)
+            if elsewhere:
+                where = ", ".join(f"'{s}'" for s in elsewhere)
+                msg += f" (the whitelisted '{relation}' is the one in schema {where})"
             raise QueryRejectedError(OutcomeReason.DISALLOWED_TABLE, msg)
-        referenced.add(key)
+        referenced.add(entry)
     return referenced

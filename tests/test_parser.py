@@ -634,6 +634,126 @@ class TestDisallowedTable:
         _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE)
 
 
+class TestSchemaQualifiedNames:
+    """Review round 16 (MiMo security, ledger F04 / F132): a whitelist entry is
+    a relation in a schema — `public`, or the schema a `db_table` written
+    `schema"."name` names — and a reference matches it only in that schema;
+    an unqualified name is the one in `public` (the read transaction pins
+    `search_path`). Before: the bare name matched in any schema."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM auth_permission",
+            "SELECT id FROM public.auth_permission",
+            'SELECT id FROM "public".auth_permission',
+            'SELECT id FROM "public"."auth_permission"',
+            "SELECT id FROM PUBLIC.Auth_Permission",
+            # Postgres accepts a database qualifier for the current database.
+            "SELECT id FROM mydb.public.auth_permission",
+            'SELECT id FROM public."Mixed_Table"',
+        ],
+    )
+    def test_the_whitelisted_relation_in_public(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED | {"Mixed_Table"})
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM analytics.auth_permission",
+            'SELECT id FROM "analytics"."auth_permission"',
+            "SELECT id FROM archive.auth_permission a",
+            # A quoted schema is not folded: `"Public"` is not `public`.
+            'SELECT id FROM "Public".auth_permission',
+            'SELECT id FROM "PUBLIC".auth_permission',
+            "SELECT id FROM public_x.auth_permission",
+            "SELECT id FROM mydb.analytics.auth_permission",
+            "SELECT p.id FROM auth_permission p JOIN analytics.auth_group g ON true",
+            "SELECT id FROM auth_permission WHERE id IN "
+            "(SELECT id FROM analytics.auth_permission)",
+            "WITH a AS (SELECT id FROM analytics.auth_permission) SELECT id FROM a",
+            # A CTE does not mask a qualified name, nor make it whitelisted.
+            "WITH auth_permission AS (SELECT 1 AS id) "
+            "SELECT id FROM analytics.auth_permission",
+        ],
+    )
+    def test_the_same_name_in_another_schema_is_refused(self, sql):
+        exc = _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE)
+        assert "is not on the MCP whitelist" in exc.detail
+
+    def test_the_refusal_names_the_schema_and_the_whitelisted_one(self):
+        exc = _expect_reject(
+            "SELECT id FROM analytics.auth_permission", OutcomeReason.DISALLOWED_TABLE
+        )
+        assert "'analytics.auth_permission'" in exc.detail
+        assert "is the one in schema 'public'" in exc.detail
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT relname FROM pg_catalog.pg_class",
+            "SELECT relname FROM mydb.pg_catalog.pg_class",
+            "SELECT table_name FROM mydb.information_schema.tables",
+            "SELECT id FROM pg_temp.auth_permission",
+            "SELECT id FROM pg_toast.auth_permission",
+        ],
+    )
+    def test_system_schemas_stay_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.SYSTEM_SCHEMA)
+
+    @pytest.mark.parametrize("entry", ['analytics"."widget', '"analytics"."widget"'])
+    def test_an_entry_in_another_schema(self, entry):
+        # Django quotes a `db_table` not already quoted, so both spellings
+        # name `analytics.widget`.
+        allowed = {entry}
+        for sql in (
+            "SELECT id FROM analytics.widget",
+            'SELECT id FROM "analytics"."widget"',
+            "SELECT id FROM ANALYTICS.WIDGET",
+        ):
+            parsed = parse_and_validate(sql, allowed_tables=allowed)
+            assert parsed.referenced_tables == {entry}
+        for sql in (
+            "SELECT id FROM widget",
+            "SELECT id FROM public.widget",
+            "SELECT id FROM other.widget",
+        ):
+            _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE, allowed=allowed)
+
+    def test_a_quoted_db_table_is_the_relation_in_public(self):
+        parsed = parse_and_validate(
+            "SELECT id FROM public.widget", allowed_tables={'"widget"'}
+        )
+        assert parsed.referenced_tables == {'"widget"'}
+
+    def test_columns_are_the_qualified_relations_own(self):
+        # `t.current_setting` is a column only of the relation that has one:
+        # the column map is keyed by relation, not by bare name.
+        allowed = {"auth_permission", 'analytics"."auth_permission'}
+        columns = {
+            "auth_permission": frozenset({"id", "current_setting"}),
+            'analytics"."auth_permission': frozenset({"id"}),
+        }
+        parse_and_validate(
+            "SELECT p.current_setting FROM auth_permission p",
+            allowed_tables=allowed,
+            table_columns=columns,
+        )
+        _expect_reject(
+            "SELECT p.current_setting FROM analytics.auth_permission p",
+            OutcomeReason.DISALLOWED_FUNCTION,
+            allowed=allowed,
+            table_columns=columns,
+        )
+        parse_and_validate(
+            "SELECT p.current_setting FROM analytics.auth_permission p",
+            allowed_tables=allowed,
+            table_columns={
+                '"analytics"."auth_permission"': frozenset({"current_setting"})
+            },
+        )
+
+
 class TestDisallowedFunction:
     @pytest.mark.parametrize(
         "fn",

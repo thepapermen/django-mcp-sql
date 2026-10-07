@@ -147,3 +147,68 @@ class TestGrantsCheck:
         with pytest.raises(CommandError) as exc:
             _run()
         assert "NOT a member" in str(exc.value)
+
+
+class TestRelationsOutsidePublic:
+    """Review round 16: the inventory covers every non-system schema, so a
+    grant on a relation outside `public` is drift (and `--apply` revokes it);
+    GRANT / REVOKE name the relation schema-qualified."""
+
+    def test_an_out_of_schema_grant_is_drift(self, patched_grants):
+        patched_grants["declared_tables"].return_value = {
+            "auth.Permission": "auth_permission",
+        }
+        patched_grants["granted_tables"].return_value = {
+            "auth_permission",
+            'analytics"."auth_permission',
+        }
+        out = StringIO()
+        with pytest.raises(CommandError) as exc:
+            call_command("mcp_sql_grants", stdout=out)
+        assert 'granted but not declared: analytics"."auth_permission' in str(exc.value)
+        assert (
+            'REVOKE SELECT ON "analytics"."auth_permission" FROM mcp_readonly_role;'
+            in out.getvalue()
+        )
+
+    def test_a_missing_grant_names_the_public_relation(self, patched_grants):
+        patched_grants["declared_tables"].return_value = {
+            "auth.Permission": "auth_permission",
+        }
+        patched_grants["granted_tables"].return_value = set()
+        out = StringIO()
+        with pytest.raises(CommandError):
+            call_command("mcp_sql_grants", stdout=out)
+        assert (
+            'GRANT SELECT ON "public"."auth_permission" TO mcp_readonly_role;'
+            in out.getvalue()
+        )
+
+    @pytest.mark.parametrize(
+        ("db_table", "granted"),
+        [
+            ('"auth_permission"', "auth_permission"),
+            ('analytics"."widget', 'analytics"."widget'),
+            ('"analytics"."widget"', 'analytics"."widget'),
+        ],
+    )
+    def test_each_db_table_spelling_is_its_relation(
+        self, patched_grants, db_table, granted
+    ):
+        patched_grants["declared_tables"].return_value = {"auth.Permission": db_table}
+        patched_grants["granted_tables"].return_value = {granted}
+        assert "Grants in sync" in _run()
+
+    @pytest.mark.parametrize(
+        ("relation", "sql"),
+        [
+            ("auth_permission", '"public"."auth_permission"'),
+            ('"auth_permission"', '"public"."auth_permission"'),
+            ('analytics"."widget', '"analytics"."widget"'),
+            ('"analytics"."widget"', '"analytics"."widget"'),
+        ],
+    )
+    def test_relation_sql(self, relation, sql):
+        from mcp_sql.grants import relation_sql
+
+        assert relation_sql(relation) == sql

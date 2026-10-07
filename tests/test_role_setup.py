@@ -25,10 +25,20 @@ _ROLE_SETUP_SQL = Path(mcp_sql.__file__).resolve().parent / "sql" / "role_setup.
 
 # `ALTER ROLE <role> SET <name> = <value>;` — value optionally quoted, since the
 # static file writes booleans unquoted (`= on`) and intervals quoted (`= '5s'`)
-# while the generated SQL quotes uniformly; both are valid SET syntax. The value
-# class excludes whitespace (`[^\s';]`, not `[^';]`) so a match cannot span the
-# newline into the next ALTER line and mis-pair name with value.
-_GUC_RE = re.compile(rf"ALTER ROLE {_ROLE} SET (\w+) = '?([^\s';]+)'?;")
+# while the generated SQL quotes uniformly (a list element by element:
+# `search_path`); both are valid SET syntax. The value class excludes the
+# newline so a match cannot span into the next ALTER line and mis-pair name
+# with value.
+_GUC_RE = re.compile(rf"ALTER ROLE {_ROLE} SET (\w+) = ([^;\n]+);")
+
+
+def _gucs(sql: str) -> dict[str, str]:
+    """`{name: value}`, a list value (`public, pg_temp` / `'public',
+    'pg_temp'`) normalised to `public, pg_temp`."""
+    return {
+        name: ", ".join(item.strip().strip("'") for item in value.split(","))
+        for name, value in _GUC_RE.findall(sql)
+    }
 
 
 def _emit_sql() -> str:
@@ -45,8 +55,8 @@ def test_guc_defaults_agree_across_both_sources():
     """The GUC defaults encoded by the generated SQL and by the hand-written
     file are each exactly `session.EXPECTED_SESSION_GUCS` — the single source
     both must track."""
-    assert dict(_GUC_RE.findall(_emit_sql())) == EXPECTED_SESSION_GUCS
-    assert dict(_GUC_RE.findall(_static_sql())) == EXPECTED_SESSION_GUCS
+    assert _gucs(_emit_sql()) == EXPECTED_SESSION_GUCS
+    assert _gucs(_static_sql()) == EXPECTED_SESSION_GUCS
 
 
 def test_create_role_block_shape_matches():
