@@ -126,6 +126,17 @@ class TestOnlyPostReachesTheTransport:
         assert response["Allow"] == "POST"
         assert reached == []
 
+    def test_post_stays_csrf_exempt(self):
+        """The split into a plain view + DRF view keeps `/mcp/sql/` exempt:
+        a CSRF-enforcing client's anonymous POST gets the auth challenge,
+        not Django's CSRF 403."""
+        from django.test import Client
+
+        response = Client(enforce_csrf_checks=True).post(
+            reverse("mcp_sql_endpoint"), data=b"{}", content_type="application/json"
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+
     def test_anonymous_get_is_405_too(self, client):
         response = client.get(reverse("mcp_sql_endpoint"))
         assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
