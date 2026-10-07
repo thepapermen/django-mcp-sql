@@ -149,6 +149,17 @@ jobs:
           EOF
       - name: Install package + test deps at floors
         run: pip install -e '.[allauth,test]' -c /tmp/min-constraints.txt
+      - name: Apply every migration to a fresh database
+        # The suite runs with --nomigrations, so this is what executes the
+        # hand-written RunSQL migrations (e.g. the REVOKEs in 0002 / 0008 /
+        # 0013) on the floor stack; the package tables must end unreadable
+        # to mcp_readonly_role.
+        env:
+          PGPASSWORD: postgres
+        run: |
+          createdb -h 127.0.0.1 -U postgres mcp_sql_migrate
+          MCP_SQL_TEST_PG_DB=mcp_sql_migrate python -m django migrate --settings=mcp_sql.tests.settings
+          psql -h 127.0.0.1 -U postgres -d mcp_sql_migrate -Atc "SELECT bool_or(has_table_privilege('mcp_readonly_role', t, 'SELECT')) FROM unnest(ARRAY['mcp_sql_mcpquerylog', 'mcp_sql_mcpauthrejectionlog', 'mcp_sql_mcprefreshtokenfamily']) t" | grep -qx f
       - name: Run the test suite
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
