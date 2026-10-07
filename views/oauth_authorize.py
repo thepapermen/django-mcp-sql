@@ -183,7 +183,7 @@ class MCPAuthorizationView(AuthorizationView):
         ):
             return False
         validator = self.get_validator_class()()
-        oauthlib_request = OAuthlibRequest(self.request.build_absolute_uri())
+        oauthlib_request = OAuthlibRequest("")
         try:
             return bool(
                 validator.validate_client_id(client_id, oauthlib_request)
