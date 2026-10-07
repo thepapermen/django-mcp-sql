@@ -2988,6 +2988,66 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "typed-literals",
         "SELECT DATE $$2024-01-01$$ AS a, TIMESTAMP E'2024-01-01 10:00' AS b, bit $$011$$ AS c, char E'abc' AS e, d - DATE $t$2024-01-01$t$ AS f FROM t ORDER BY id",
     ),
+    (
+        "intervals",
+        "SELECT id, interval + 1 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval - 1 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval + '1' AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval - y AS v FROM (SELECT id, id AS interval, y FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval[1] AS v FROM (SELECT id, arr AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval ~ '^a' AS v FROM (SELECT id, g AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        'SELECT id, interval COLLATE "C" AS v FROM (SELECT id, g AS interval FROM t) s ORDER BY v, id',
+    ),
+    (
+        "intervals",
+        "SELECT id, interval % 3 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id FROM (SELECT id, y AS interval FROM t) s WHERE interval + 1 > 2 ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval * 2 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval / 2 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT id, interval ^ 2 AS v FROM (SELECT id, y AS interval FROM t) s ORDER BY id",
+    ),
+    (
+        "patterns",
+        "SELECT id, g ILIKE 'A%' ESCAPE E'#' AS v FROM t ORDER BY id",
+    ),
+    (
+        "typed-literals",
+        "SELECT char(2) E'abcd' AS a",
+    ),
+    (
+        "typed-literals",
+        "SELECT time(1) E'10:00:00.66' AS a",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3260,6 +3320,16 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT INTERVAL '1' \"Day\" AS v"),
     ("parse_error", "SELECT INTERVAL $$1$$ WEEK AS w"),
     ("parse_error", "SELECT INTERVAL '90.5 seconds' m\u0131nute AS v"),
+    ("parse_error", "SELECT INTERVAL 5 DAY AS v"),
+    ("parse_error", "SELECT INTERVAL 5::text AS v"),
+    ("parse_error", "SELECT INTERVAL N'1' week AS v"),
+    ("parse_error", "SELECT INTERVAL B'1' week AS v"),
+    ("parse_error", "SELECT INTERVAL X'1' week AS v"),
+    ("parse_error", "SELECT INTERVAL INTERVAL '1 day' AS v"),
+    (
+        "parse_error",
+        "SELECT interval y '1' AS v FROM (SELECT id AS interval, y FROM t) s",
+    ),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).

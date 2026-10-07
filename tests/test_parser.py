@@ -1842,6 +1842,18 @@ class TestReviewRound13:
             ("SELECT bit $t$011$t$", """SELECT CAST('011' AS "bit") LIMIT"""),
             # A backslash-free E-string is the plain string.
             ("SELECT E'it''s' AS v", "SELECT 'it''s' AS v LIMIT"),
+            # Where sqlglot's parser takes only a string (`STRING_PARSERS`):
+            # an ESCAPE clause, a typed literal with a type modifier. Each
+            # was a parse error without it (review round 15).
+            (
+                "SELECT name ILIKE 'A%' ESCAPE E'#' AS v FROM auth_group",
+                "SELECT name ILIKE 'A%' ESCAPE '#' AS v FROM auth_group LIMIT",
+            ),
+            ("SELECT char(2) E'abcd' AS v", "SELECT CAST('abcd' AS CHAR(2)) AS v"),
+            (
+                "SELECT time(1) E'10:00:00.66' AS v",
+                "SELECT CAST('10:00:00.66' AS TIME(1)) AS v LIMIT",
+            ),
         ],
     )
     def test_every_string_constant_form_is_a_string(self, sql, rendered):
@@ -1915,6 +1927,85 @@ class TestReviewRound13:
         _expect_reject(
             "SELECT INTERVAL '1:02:03' HOUR TO m\u0131nute", OutcomeReason.PARSE_ERROR
         )
+
+
+class TestReviewRound15:
+    """Review round 15 (Opus final review of A13): `INTERVAL` is a typed
+    literal only before a string constant or `(`; anywhere else it is an
+    ordinary name, a column `interval`."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("expression", "column"),
+        [
+            # sqlglot took the next operand as the interval's value: `+ 1`
+            # ran as `INTERVAL '1'`, `- 1` as `INTERVAL '-1'`, `+ '1'` as
+            # `INTERVAL '1'`, `- y` / `[1]` were dropped (`INTERVAL`),
+            # `~ '^m'` ran as `INTERVAL '^m'`, `COLLATE "C"` as `INTERVAL
+            # 'COLLATE C'`, `% 3` as `INTERVAL '?' + INTERVAL '3'`.
+            ("interval + 1", "1"),
+            ("interval - 1", "1"),
+            ("interval + '1'", "1"),
+            ("interval - y", "1"),
+            ("interval[1]", "ARRAY[5]"),
+            ("interval ~ '^m'", "'m'"),
+            ('interval COLLATE "C"', "'m'"),
+            ("interval % 3", "4"),
+            # `* 2` was refused as `SELECT *`; `/ 2`, `^ 2` were parse errors.
+            ("interval * 2", "1"),
+            ("interval / 2", "4"),
+            ("interval ^ 2", "3"),
+        ],
+    )
+    def test_interval_is_a_column(self, expression, column):
+        source = f"(SELECT {column} AS interval, 2 AS y)"
+        sql = f"SELECT {expression} AS v FROM {source} s"  # noqa: S608
+        expected = f"SELECT {expression} AS v FROM {source} AS s LIMIT 11"  # noqa: S608
+        assert self._rendered(sql) == expected
+
+    def test_interval_column_in_a_condition(self):
+        # sqlglot ran `WHERE INTERVAL '1' > 2`.
+        sql = (
+            "SELECT interval AS v FROM (SELECT 2 AS interval) AS s"
+            " WHERE interval + 1 > 2"
+        )
+        assert self._rendered(sql) == f"{sql} LIMIT 11"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, which sqlglot ran: a number, a
+            # national / bit / hex string, a second INTERVAL after `INTERVAL`
+            # (`INTERVAL 5 DAY` was 5 days, `INTERVAL N'1' week` 7 days).
+            "SELECT INTERVAL 5 DAY",
+            "SELECT INTERVAL 5",
+            "SELECT INTERVAL 5::text",
+            "SELECT INTERVAL N'1' week",
+            "SELECT INTERVAL B'1' week",
+            "SELECT INTERVAL X'1' week",
+            "SELECT INTERVAL INTERVAL '1 day'",
+            # A word, then a string: sqlglot read a typed literal of the
+            # type `INTERVAL <word>` (`y` as `YEAR`: 365 days).
+            "SELECT interval day '1'",
+            "SELECT interval DAY TO SECOND '1'",
+            "SELECT interval y '1' FROM (SELECT 1 AS interval, 2 AS y) s",
+            # `INTERVAL(` is always the precision form to Postgres, even
+            # with a column `interval` in scope.
+            "SELECT interval(1) AS v FROM (SELECT 1 AS interval) s",
+        ],
+    )
+    def test_interval_syntax_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql", ["SELECT interval(1) '1.23' AS v", "SELECT interval (1) '1.23' AS v"]
+    )
+    def test_precision_form_is_kept(self, sql):
+        assert "SELECT INTERVAL(1) '1.23' AS v LIMIT" in self._rendered(sql)
 
 
 class TestCheckOrdering:

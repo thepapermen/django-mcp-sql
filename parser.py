@@ -851,8 +851,33 @@ class FaithfulPostgres(Postgres):
                     self._parse_primary()
                 )
                 return written
+            if kinds[:1] == [TokenType.INTERVAL]:
+                # Anywhere else `interval` is an ordinary name (a column
+                # `interval`): Postgres reads `INTERVAL` as a typed literal
+                # only before a string constant or `(`. sqlglot took the next
+                # operand as the interval's value (`interval + 1` ran as
+                # `INTERVAL '1'`, `interval - y` lost the `- y`, `interval *
+                # 2` was refused as `SELECT *`). Nothing is consumed.
+                self._no_interval_constant()
+                return None
             parsed: exp.Expression | None = super()._parse_interval(*args, **kwargs)
             return parsed
+
+        def _no_interval_constant(self) -> None:
+            """At an `INTERVAL` that is a name, refuse what sqlglot's
+            `_parse_type` would read next as a typed literal `<type>
+            <constant>`: `INTERVAL 5`, `INTERVAL 5::text`, `interval day
+            '1'`, `interval y '1'` (`y` read as the unit `YEAR`) are
+            Postgres's syntax errors, which ran as casts. The same reading is
+            tried here (`_parse_types`, then `_parse_primary`) and undone."""
+            index = self._index
+            data_type = self._parse_types(check_func=True, allow_identifiers=False)
+            constant = data_type is not None and isinstance(
+                self._parse_primary(), exp.Literal
+            )
+            self._retreat(index)
+            if constant:
+                self.raise_error("INTERVAL takes a string constant")
 
         def _interval_qualifier(self) -> exp.Expression | None:
             """An interval field qualifier right after the string (`DAY`,
@@ -1307,13 +1332,17 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> list[Token]:
     range:
 
     - An escape-string literal (`E'…'`, any case — sqlglot's `BYTE_STRING`
-      token in the postgres dialect) is decoded on parse but re-emitted with
-      its backslashes un-escaped: `E'\\\\'` (one backslash) comes back as
-      `e'\\'`, which swallows its closing quote and turns later literal text
-      into SQL; `E'a\\\\nb'` comes back as a newline. Any such literal
-      containing a backslash is rejected; one without (`E'it''s'`) is
-      faithful and allowed. Checked on the raw token text, because the
-      parsed value no longer shows which escapes were written.
+      token in the postgres dialect) with a backslash. `FaithfulPostgres`
+      reads an E-string as the plain string and renders it as `'…'`, but
+      sqlglot's tokenizer decodes only some escapes (`\\\\`, `\\'`, `\\n`,
+      ...) and keeps the others as written: `E'\\x41'` (`A` to Postgres)
+      would run as `'\\x41'`, four characters; so would `E'\\101'`,
+      `E'\\u0041'`. (Stock sqlglot re-emitted the decoded value un-escaped:
+      `E'\\\\'` came back as `e'\\'`, which swallows its closing quote and
+      turns later literal text into SQL.) Any such literal containing a
+      backslash is rejected; one without (`E'it''s'`) is the plain string
+      and allowed. Checked on the raw token text, because the parsed value
+      no longer shows which escapes were written.
     - An identifier written as a string constant (`AS $$…$$`,
       `AS $t$…$t$`, `AS 'x'`, `AS E'x'`) — which Postgres itself refuses —
       becomes an identifier whose text sqlglot re-emits, unquoted for the
