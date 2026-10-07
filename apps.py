@@ -10,7 +10,11 @@ class McpSqlConfig(AppConfig):
         self.validate_settings()
         self.warn_if_mfa_unconfigured()
         # Importing the module wires its @receiver-decorated handlers.
-        from mcp_sql import signals  # noqa: F401
+        from mcp_sql import signals
+
+        # Lets the password-change receiver tell Django's login-time hash
+        # upgrade apart from a real change (`signals._is_hash_upgrade`).
+        signals.install_password_check_marker()
 
     @staticmethod
     def validate_settings():

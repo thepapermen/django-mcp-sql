@@ -17,7 +17,9 @@ from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 import pytest
+from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
+from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.signals import user_logged_out
 from django.core.exceptions import ImproperlyConfigured
@@ -341,8 +343,9 @@ class TestPasswordChangeEdgeCases:
         change, though shaped like the hash upgrade (review round 3)."""
         user_model = type(mcp_user)
         if write == "after-set-password-save":
-            # `_password` now sits on the instance (as None) from an
-            # earlier, ordinary password change.
+            # `_password` now sits on the instance (as None: `save()`
+            # clears what `set_password` put there) from an earlier,
+            # ordinary password change.
             mcp_user.set_password("first-change")
             mcp_user.save()
             AccessToken.objects.filter(pk=mcp_access_token.pk).update(user=mcp_user)
@@ -373,6 +376,79 @@ class TestPasswordChangeEdgeCases:
         assert MCPAuthRejectionLog.objects.filter(
             user=mcp_user, reason=AuthRejectionReason.PASSWORD_CHANGE
         ).exists()
+
+    @pytest.mark.parametrize(
+        "shape",
+        ["setter-shaped", "set-password-then-other-fields", "malformed-old-hash"],
+    )
+    def test_real_change_shaped_like_the_upgrade_revokes(
+        self,
+        settings,
+        mcp_user,
+        mcp_access_token,
+        django_capture_on_commit_callbacks,
+        shape,
+    ):
+        """Review round 4: a real change on an instance whose stored hash
+        needs upgrading, saved exactly the way `check_password`'s setter
+        saves (`set_password`, `_password = None`, `update_fields=
+        ["password"]`), or after an earlier `set_password` whose save left
+        the password out, is still a change. So is a write over a stored
+        hash too malformed to decode (it must not raise either)."""
+        mcp_user.password = (
+            "pbkdf2_sha256$xyz"
+            if shape == "malformed-old-hash"
+            else make_password("old", hasher="md5")
+        )
+        mcp_user.save()
+        settings.PASSWORD_HASHERS = [
+            "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+            "django.contrib.auth.hashers.MD5PasswordHasher",
+        ]
+        target = type(mcp_user)._default_manager.get(pk=mcp_user.pk)
+        with django_capture_on_commit_callbacks(execute=True):
+            if shape == "set-password-then-other-fields":
+                target.set_password("temporary")
+                target.save(update_fields=[target.USERNAME_FIELD])
+                target.password = make_password("a-brand-new-password")
+            else:
+                target.set_password("a-brand-new-password")
+                target._password = None
+            target.save(update_fields=["password"])
+        assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+        assert MCPAuthRejectionLog.objects.filter(
+            user=mcp_user, reason=AuthRejectionReason.PASSWORD_CHANGE
+        ).exists()
+
+    @pytest.mark.skipif(
+        not hasattr(AbstractBaseUser, "acheck_password"),
+        reason="acheck_password is Django 5.0+",
+    )
+    def test_async_login_time_hash_upgrade_revokes_nothing(
+        self, settings, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        mcp_user.password = make_password("same-password", hasher="md5")
+        mcp_user.save()
+        settings.PASSWORD_HASHERS = [
+            "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+            "django.contrib.auth.hashers.MD5PasswordHasher",
+        ]
+        old_hash = mcp_user.password
+        with django_capture_on_commit_callbacks(execute=True):
+            assert async_to_sync(mcp_user.acheck_password)("same-password")
+        assert type(mcp_user)._default_manager.get(pk=mcp_user.pk).password != (
+            old_hash
+        )
+        assert AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+        assert not MCPAuthRejectionLog.objects.exists()
+
+    def test_password_check_marker_is_installed_once(self):
+        from mcp_sql import signals
+
+        check = AbstractBaseUser.check_password
+        assert getattr(check, signals._MARKED)
+        signals.install_password_check_marker()
+        assert AbstractBaseUser.check_password is check
 
     def test_unusable_password_with_update_fields_revokes(
         self, mcp_user, mcp_access_token, django_capture_on_commit_callbacks

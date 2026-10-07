@@ -6,14 +6,15 @@ on grants drift after post_migrate (advisory only — apply happens via
 `mcp_sql_grants --apply`). See `docs/architecture.md` file-map row for
 `signals.py`."""
 
+import functools
 import logging
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
+from typing import Any
 
 from django.apps import AppConfig
 from django.contrib.auth import get_user_model
-from django.contrib.auth.hashers import get_hasher
-from django.contrib.auth.hashers import identify_hasher
-from django.contrib.auth.hashers import is_password_usable
+from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
 from django.db import DatabaseError
@@ -33,9 +34,8 @@ from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
-
-    from django.contrib.auth.models import AbstractBaseUser
 
 logger = logging.getLogger(__name__)
 
@@ -195,38 +195,80 @@ def note_password_change(sender, instance, **kwargs):
     )
     if old is None or old == instance.password:
         return
-    if _is_hash_upgrade(instance, old, update_fields):
+    if _is_hash_upgrade(instance, update_fields):
         return
     setattr(instance, _PENDING_REVOCATION_ATTR, True)
 
 
 def _is_hash_upgrade(
-    instance: "AbstractBaseUser", old: str, update_fields: "Iterable[str] | None"
+    instance: "AbstractBaseUser", update_fields: "Iterable[str] | None"
 ) -> bool:
-    """True only for the exact save `AbstractBaseUser.check_password` makes
-    when it re-hashes the SAME password: its setter calls `set_password`,
-    resets `_password` to `None` on the instance, and saves with
-    `update_fields=["password"]` — and it does that only because the stored
-    hash's hasher is not the preferred one, or needs new parameters.
+    """True only for the save `AbstractBaseUser.check_password` makes when it
+    re-hashes the SAME password (a login after the preferred hasher or its
+    parameters changed): its setter saves with `update_fields=["password"]`
+    while `check_password` runs for this very instance, which
+    `install_password_check_marker` records.
 
-    All three are required. A real change written as `user.password =
-    make_password(new); user.save(update_fields=["password"])` (SSO / LDAP
-    sync, imports, a scripted reset) has the same `update_fields`, but no
-    `_password` on the instance, and normally replaces a hash that did not
-    need upgrading — so it revokes."""
-    if update_fields is None or set(update_fields) != {"password"}:
-        return False
-    attrs = vars(instance)
-    if "_password" not in attrs or attrs["_password"] is not None:
-        return False
-    if not (instance.has_usable_password() and is_password_usable(old)):
-        return False
-    try:
-        old_hasher = identify_hasher(old)
-    except ValueError:
-        return False
-    preferred = get_hasher()
-    return old_hasher.algorithm != preferred.algorithm or preferred.must_update(old)
+    That is positive evidence, not an inference from the save's shape: a
+    real change written as `user.password = make_password(new);
+    user.save(update_fields=["password"])` (SSO / LDAP sync, imports, a
+    scripted reset) — even through `set_password`, even on an instance
+    whose stored hash needs upgrading — happens outside `check_password`,
+    so it revokes (review round 4). A user model that overrides
+    `check_password` without calling `super()` never sets the marker; its
+    hash upgrades then revoke too (the safe direction)."""
+    return (
+        update_fields is not None
+        and set(update_fields) == {"password"}
+        and _CHECKING_PASSWORD.get() is instance
+    )
+
+
+# The user instance `AbstractBaseUser.check_password` is running for, if any.
+_CHECKING_PASSWORD: ContextVar[object | None] = ContextVar(
+    "mcp_sql_checking_password", default=None
+)
+_MARKED = "_mcp_sql_marks_password_check"
+
+
+def install_password_check_marker() -> None:
+    """Wrap `AbstractBaseUser.check_password` (and `acheck_password`, Django
+    5.0+) so that, while it runs, `_CHECKING_PASSWORD` holds the instance.
+    Behaviour is unchanged; the wrapper only sets and resets the context
+    variable. Idempotent. Called from `McpSqlConfig.ready()`."""
+    check = AbstractBaseUser.check_password
+    if not getattr(check, _MARKED, False):
+        setattr(AbstractBaseUser, "check_password", _marked(check))  # noqa: B010
+    acheck = getattr(AbstractBaseUser, "acheck_password", None)
+    if acheck is not None and not getattr(acheck, _MARKED, False):
+        setattr(AbstractBaseUser, "acheck_password", _amarked(acheck))  # noqa: B010
+
+
+def _marked(check: "Callable[..., bool]") -> "Callable[..., bool]":
+    @functools.wraps(check)
+    def check_password(self: AbstractBaseUser, raw_password: Any) -> bool:
+        token = _CHECKING_PASSWORD.set(self)
+        try:
+            return check(self, raw_password)
+        finally:
+            _CHECKING_PASSWORD.reset(token)
+
+    setattr(check_password, _MARKED, True)
+    return check_password
+
+
+def _amarked(acheck: "Callable[..., Any]") -> "Callable[..., Any]":
+    @functools.wraps(acheck)
+    async def acheck_password(self: AbstractBaseUser, raw_password: Any) -> bool:
+        token = _CHECKING_PASSWORD.set(self)
+        try:
+            correct: bool = await acheck(self, raw_password)
+            return correct
+        finally:
+            _CHECKING_PASSWORD.reset(token)
+
+    setattr(acheck_password, _MARKED, True)
+    return acheck_password
 
 
 @receiver(post_save)
