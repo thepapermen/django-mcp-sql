@@ -259,6 +259,16 @@ class TestForeignResourceIsRefusedAtAuthorize:
         _assert_invalid_target_redirect(client.get(reverse("authorize") + "?" + query))
         assert _grant_count() == 0
 
+    def test_get_with_a_nul_is_invalid_target_not_500(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        """A NUL `resource` never reaches DOT (which, from 3.4, stores it on
+        the grant: a Postgres `DataError` where consent is skipped)."""
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED + "\x00"]))
+        client.force_login(mcp_user)
+        _assert_invalid_target_redirect(client.get(reverse("authorize") + "?" + query))
+
     def test_get_with_one_foreign_among_repeated_values(
         self, client, mcp_app, mcp_user, gate_posture
     ):
@@ -387,6 +397,14 @@ class TestForeignResourceIsRefusedAtToken:
         assert Grant.objects.filter(code=code).exists()
         # The same code still works without the resource.
         assert _exchange(client, code, verifier).status_code == HTTPStatus.OK
+
+    def test_nul_is_invalid_target_not_500(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        code, verifier = self._grant(mcp_app, mcp_user)
+        response = _exchange(client, code, verifier, [SLASHED + "\x00"])
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_target"
 
     def test_query_string(self, client, mcp_app, mcp_user, gate_posture):
         from oauth2_provider.models import AccessToken
