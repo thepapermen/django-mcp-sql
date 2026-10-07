@@ -75,8 +75,9 @@ dependencies = [
     # document the combinations that are actually supported.
     "djangorestframework>=3.14,<4",
     # DOT 3.x semantics are load-bearing: loopback port-wildcarding,
-    # validator hooks, skip_authorization flow; RFC 8707 audience binding is
-    # explicitly deferred to DOT 4.x — a major bump must be reviewed, never
+    # validator hooks, skip_authorization flow, and from 3.4 the RFC 8707
+    # `resource` storage and bearer audience check that `audience.py` pins to
+    # the advertised resource — a major bump must be reviewed, never
     # auto-resolved.
     "django-oauth-toolkit>=3.2,<4",
     # The parser is the security boundary and sqlglot bumps majors often

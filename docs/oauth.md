@@ -109,6 +109,47 @@ screen and before the token exchange — the surface was unreachable from it,
 and the path implied by the advertised identifier 404'd for everyone.
 Pinned by `test_discovery.TestResourceIdentifierMatchesMetadataPath`.
 
+### The `resource` parameter (RFC 8707)
+
+MCP clients send the protected resource they want a token for as `resource`
+on `/o/authorize/` and `/o/token/` (RFC 8707). From DOT 3.4, DOT stores it on
+the grant and the access token and audience-checks every bearer that carries
+one against the URL of the request it arrives on. So the package accepts
+exactly one value: the `resource` the protected-resource document above
+advertises — `https://<host>/mcp/sql/` or `https://<host>/mcp/sql` (`http`
+only when `DEBUG` is on), on the host the request arrives at, compared as an
+exact string. Repeating it is fine; omitting it is fine (the token is then
+not resource-bound, as before).
+
+Anything else is refused with **`invalid_target`** (RFC 8707 §2), naming the
+accepted value in `error_description`:
+
+| Where | Answer |
+|---|---|
+| `/o/authorize/` GET | 302 to the client's registered `redirect_uri` with `error=invalid_target` and its `state`; no consent page, no authorization code |
+| consent POST | the same, for the form's `resource` field or one in the URL's query string (from DOT 3.4 the two must agree); a tampered `redirect_uri` still gets the error page, never a redirect |
+| `/o/token/` | 400 JSON `{"error": "invalid_target", ...}` with `Cache-Control: no-store`; the code is not consumed, so the client can retry |
+
+Typical causes: a client configured with a URL other than the one discovery
+returns (another host or alias, `http` for `https`, a different path), or a
+hand-written OAuth client. Fix the client's server URL; the discovery
+document shows the exact value expected.
+
+Before this check, DOT 3.4+ issued a token for any `resource` and then
+refused it at `/mcp/sql/` on every call with a bare 401 — no audit row, and
+each call counted toward the bad-token IP throttle
+(`MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]`), so a shared egress IP could end up
+silently blocked. The same happened to the correct `https` value behind a
+TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`, because DOT built
+the request URL from `request.scheme` (`http`). `/mcp/sql/` now hands DOT's check the request URL
+built the same way discovery builds `resource` (https whenever `DEBUG` is
+off), so a token bound to the advertised value always passes, with or
+without `SECURE_PROXY_SSL_HEADER`. DOT's check is not switched off: a token
+bound to anything else (one issued before this release) still gets a 401
+until it expires. Below DOT 3.4, which ignores `resource`, the package's
+checks answer the same way and tokens are never resource-bound. Pinned by
+`tests/test_resource_audience.py`.
+
 Both discovery endpoints return `Access-Control-Allow-Origin: *` so a
 future browser-based MCP client can `fetch()` them without CORS preflight
 trouble. The wildcard is appropriate because the payloads carry no
@@ -538,6 +579,9 @@ transport. Your server must therefore be reachable at a **public HTTPS URL**; a
 tunnel (ngrok / cloudflared), and make sure the discovery documents advertise
 that public `https` origin (if a proxy terminates TLS, set
 `SECURE_PROXY_SSL_HEADER` and `USE_X_FORWARDED_HOST` — see `example/settings.py`).
+The token's RFC 8707 audience does not depend on them: the accepted
+`resource` and the URL a token is checked against are built by the same rule
+(see "The `resource` parameter (RFC 8707)").
 
 1. Run `migrate`. Provisioning is a `post_migrate` receiver — it runs on any
    deploy that migrates and is idempotent, but a plain web-process restart does

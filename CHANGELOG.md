@@ -236,8 +236,10 @@ separately below precisely because they do **not** announce themselves.
   The pointer's path changes only for requests to `/mcp/sql/`; a client whose
   request URL is slash-less — which is what the original Cursor Desktop failure
   implies — is pointed exactly where it was (its scheme is covered by the next
-  entry). The pointer change was not re-tested against a live client. Nothing
-  server-side validates `resource`, so no live token is affected.
+  entry). The pointer change was not re-tested against a live client. No live
+  token is affected: a token bound to either spelling passes at either
+  transport path (see the RFC 8707 entry below for what the server now does
+  with `resource`).
 - **Both discovery documents now agree on one origin.** The scheme is the
   other half of the same identifier: `resource` and the four AS endpoint URLs
   were composed with `request.build_absolute_uri`, which trusts
@@ -256,6 +258,43 @@ separately below precisely because they do **not** announce themselves.
   only `issuer` was. A `DEBUG=False` plain-http deployment was
   already out of spec for RFC 8414 §2, but it will now advertise an https
   surface it does not serve.
+- **An RFC 8707 `resource` other than this server's MCP endpoint minted a
+  token `/mcp/sql/` could never accept (DOT 3.4 and later).** From DOT 3.4 a
+  `resource` sent to `/o/authorize/` or `/o/token/` is stored on the grant and
+  access token, and DOT audience-checks every bearer carrying one against the
+  request URL. Any `resource` was accepted, so another URL — or the endpoint
+  with another scheme, host or path — got a 200 token and then a bare 401 on
+  every MCP call: indistinguishable from a bad token, no audit row, and each
+  call counted toward the bad-token IP throttle until a shared egress IP was
+  silently blocked. The advertised value itself failed the same way behind a
+  TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`: discovery says
+  `https` (`DEBUG` off), DOT built the request URL as `http`. Now:
+  - `/o/authorize/` and `/o/token/` accept a `resource` only if it is exactly
+    the discovery document's `resource`, with or without the trailing slash,
+    on the host of the request; anything else (including an empty value, an
+    uppercase host, an explicit `:443`, a query) is **`invalid_target`** —
+    a redirect to the client's validated `redirect_uri` with its `state` and
+    no grant at the authorization endpoint (GET, and the consent POST's form
+    field and query string), a 400 at the token endpoint (`MCPTokenView`, now
+    mounted at `/o/token/`; the code is not consumed). A NUL `resource` gets
+    the same answer instead of a 500.
+  - `/mcp/sql/` hands DOT's audience check the request URL built the same way
+    discovery builds `resource`, so a token bound to the advertised value
+    always passes, with or without `SECURE_PROXY_SSL_HEADER`. The check is
+    not disabled: a token bound to anything else still gets a 401 (tokens
+    issued before upgrading expire within their 6 h).
+  - On the consent POST (DOT 3.4 and later) the form's `resource` and a
+    `resource` in the URL's query string must agree; a blank form field
+    beside a query `resource` reached the grant as a plain string and 500'd.
+
+  **Behaviour change**, also on DOT below 3.4 (which ignores `resource`, so
+  such clients used to get a working, unrestricted token): a client sending
+  a `resource` that is not the advertised one is now refused with
+  `invalid_target` naming the expected value. The bearer is verified through
+  `audience.CanonicalUriOAuthLibCore` on the configured `OAUTH2_SERVER_CLASS`
+  and `OAUTH2_VALIDATOR_CLASS`; a custom `OAUTH2_BACKEND_CLASS` no longer
+  applies to `/mcp/sql/`. `docs/oauth.md` → "The `resource` parameter
+  (RFC 8707)". Also affects 0.1.0b5 on DOT 3.4.
 - **A declared https callback on a loopback host was classified and audited
   as `cloud`.** Kind derives from the scheme, so an https callback whose host
   was really the user's own machine (`https://localhost:8443/cb`) took the
@@ -511,7 +550,7 @@ separately below precisely because they do **not** announce themselves.
   that (GH #1006), so a NUL `client_id` at `/o/token/` or `/o/revoke_token/`
   is a 401 `invalid_client`, but the other cases are still a 500. The cases:
   `client_id` and `code` at `/o/token/`, `client_id` at `/o/revoke_token/`,
-  and `code_challenge`, `nonce` or (DOT 3.4 and later) `resource` on an
+  and `code_challenge` or `nonce` on an
   `/o/authorize/` GET that issues a code without consent — which no
   Application the package creates does any more (every kind requires
   consent since migration `0015`); only a hand-flipped or legacy
