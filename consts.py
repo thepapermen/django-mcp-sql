@@ -11,6 +11,7 @@ on the settings accessor (`mcp_sql_settings.APPLICATION_NAME` /
 
 Also `absolute_url`, the one place an absolute URL on the OAuth surface is
 composed (discovery documents, the 401 challenge, `/o/register`'s response),
+with `canonical_authority`, the host spelling it and the RFC 8707 check share,
 and `client_ip` / `normalize_client_ip`, the one place an audit row's
 `client_ip` is derived.
 """
@@ -46,9 +47,46 @@ def absolute_url(request: HttpRequest, path: str) -> str:
     `DEBUG` off means the project is unambiguously a non-loopback deploy, so
     https is forced; local dev (`DEBUG=True`) keeps `request.scheme` and stays
     honest about http on loopback.
+
+    The host is `request.get_host()` in canonical form (`canonical_authority`):
+    lowercased, without the scheme's default port. A proxy that forwards
+    `Host: <name>:443` (nginx `proxy_set_header Host $host:$server_port`, or
+    an `X-Forwarded-Host` carrying the port under `USE_X_FORWARDED_HOST`) or
+    an uppercase name otherwise made discovery advertise
+    `https://<name>:443/mcp/sql/`, which every client that parses the URL
+    sends back as `https://<name>/mcp/sql/` (the TypeScript SDK's
+    `URL.href`, the Python SDK's pydantic URL) — a different string for the
+    same resource.
     """
-    scheme = request.scheme if settings.DEBUG else "https"
-    return f"{scheme}://{request.get_host()}{path}"
+    # `request.scheme` is typed optional; Django's own default is `http`.
+    scheme = (request.scheme or "http") if settings.DEBUG else "https"
+    return f"{scheme}://{canonical_authority(scheme, request.get_host())}{path}"
+
+
+DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def canonical_authority(scheme: str, authority: str) -> str:
+    """`authority` (`host[:port]`) as URL parsers serialise it for `scheme`.
+
+    The host lowercased (RFC 3986 §6.2.2.1: scheme and host are
+    case-insensitive), a port's leading zeros dropped, and a port equal to the
+    scheme's default left out (§6.2.3; WHATWG URL serialisation does the
+    same). Anything that does not end in `:<ASCII digits>` (including a
+    bracketed IPv6 literal without a port, or an empty port) keeps its
+    spelling apart from the case. Pure string work, no `int()`: a Host
+    header's port is unbounded digits.
+
+    Used by `absolute_url` on `request.get_host()` and by
+    `audience.foreign_resource` on a client's `resource`, so both sides of
+    the RFC 8707 comparison spell the authority the same way.
+    """
+    authority = authority.lower()
+    host, colon, port = authority.rpartition(":")
+    if not (colon and port.isascii() and port.isdigit()):
+        return authority
+    port = port.lstrip("0") or "0"
+    return host if port == DEFAULT_PORTS.get(scheme) else f"{host}:{port}"
 
 
 def normalize_client_ip(value: object) -> str | None:

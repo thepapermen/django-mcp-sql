@@ -17,6 +17,12 @@ end-to-end tests therefore fail on DOT 3.4 without the bearer half of the
 fix, and the refusal tests fail on every DOT version without the issuance
 half.
 
+"The advertised identifier" is compared by RFC 3986 equivalence of scheme
+and authority (case, default port), with the path exact; and the host in it
+is spelled canonically whatever the Host header says (`<name>:443`, an
+uppercase name), so a client that parses discovery's value and sends back
+the normalised form is accepted end to end on that host.
+
 DOT below 3.4 ignores `resource` (no field on the grant or token); the
 package's checks run on every version, so the answers are the same there and
 a token is simply unrestricted.
@@ -45,19 +51,68 @@ SLASHLESS = "https://testserver/mcp/sql"
 FOREIGN = [
     "https://somewhere.example/api",
     "http://testserver/mcp/sql/",  # scheme differs from what discovery says
+    "ftp://testserver/mcp/sql/",
     "https://testserver/mcp/sql//",
     "https://testserver/mcp/",
+    "https://testserver/mcp",
     "https://testserver/mcp/sql/tools",
+    "https://testserver/MCP/SQL/",  # the path is case-sensitive
+    "https://testserver/mcp/%73ql/",  # no percent-decoding
+    "https://testserver/mcp/./sql/",  # no dot segments
+    "https://testserver",  # the bare origin
+    "https://testserver/",
     "https://other.example/mcp/sql/",
-    "https://TESTSERVER/mcp/sql/",
-    "https://testserver:443/mcp/sql/",
+    "https://testserver.example/mcp/sql/",
+    "https://testserver./mcp/sql/",
+    "https://testserver:8443/mcp/sql/",
+    "https://testserver:80/mcp/sql/",  # http's default port, not https's
+    "https://testserver:/mcp/sql/",  # an empty port
     "https://testserver/mcp/sql/?x=1",
+    "https://testserver/mcp/sql/?",  # an empty query
     "https://testserver/mcp/sql/#f",
+    "https://testserver/mcp/sql/#",
     "https://user@testserver/mcp/sql/",
+    "https://@testserver/mcp/sql/",
+    "https:testserver/mcp/sql/",
+    "//testserver/mcp/sql/",
+    "testserver/mcp/sql/",
+    "https://testserver/mcp/\tsql/",  # urlsplit would drop the tab
+    "https://testsérver/mcp/sql/",
     "",
     "not a uri",
     f"{SLASHED} https://somewhere.example/api",
 ]
+
+# The advertised identifier in other spellings of the same URL (RFC 3986
+# §6.2.2.1 / §6.2.3): scheme and host in any case, the default port explicit.
+# The MCP spec has servers accept uppercase scheme and host; a client that
+# parses discovery's value sends the canonical form, one that does not may
+# send what its user typed.
+EQUIVALENT = [
+    "https://TESTSERVER/mcp/sql/",
+    "https://TestServer/mcp/sql",
+    "HTTPS://testserver/mcp/sql/",
+    "Https://testserver/mcp/sql",
+    "https://testserver:443/mcp/sql/",
+    "https://testserver:443/mcp/sql",
+    "https://TESTSERVER:0443/mcp/sql/",
+]
+
+# Host headers naming this server non-canonically: a proxy forwarding
+# `$host:$server_port` (nginx), an `X-Forwarded-Host` with the port, an
+# uppercase name. All in `ALLOWED_HOSTS` (Django compares it lowercased).
+NON_CANONICAL_HOSTS = [
+    "testserver:443",
+    "TESTSERVER",
+    "TestServer:443",
+    "testserver:0443",
+]
+
+
+def exact_audience_validator(request_uri: str, audiences: list[str]) -> bool:
+    """A `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` comparing strings (bar
+    the trailing slash), stricter than DOT's default."""
+    return request_uri.rstrip("/") in {audience.rstrip("/") for audience in audiences}
 
 
 def _dot_stores_resource() -> bool:
@@ -86,7 +141,7 @@ def _authorize_params(challenge: str, resources: list[str]) -> list[tuple[str, s
     return params + [("resource", value) for value in resources]
 
 
-def _consent(client, query: str, form_resource: str | None):
+def _consent(client, query: str, form_resource: str | None, **extra):
     """The consent POST as a browser sends it: back to the page's URL (query
     string included) with the form's fields, `resource` among them from
     DOT 3.4 (blank when the GET carried none)."""
@@ -95,7 +150,7 @@ def _consent(client, query: str, form_resource: str | None):
     data["allow"] = "Authorize"
     if form_resource is not None:
         data["resource"] = form_resource
-    return client.post(reverse("authorize") + "?" + query, data=data)
+    return client.post(reverse("authorize") + "?" + query, data=data, **extra)
 
 
 def _code_from(response) -> str:
@@ -105,7 +160,7 @@ def _code_from(response) -> str:
     return parse_qs(location.query)["code"][0]
 
 
-def _exchange(client, code: str, verifier: str, resources: Sequence[str] = ()):
+def _exchange(client, code: str, verifier: str, resources: Sequence[str] = (), **extra):
     data = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -117,6 +172,7 @@ def _exchange(client, code: str, verifier: str, resources: Sequence[str] = ()):
         reverse("token"),
         data=urlencode(data),
         content_type="application/x-www-form-urlencoded",
+        **extra,
     )
 
 
@@ -244,6 +300,175 @@ class TestMatchingResourceWorksEndToEnd:
             client.get(reverse("authorize") + "?" + query),
             accepted="http://testserver/mcp/sql/",
         )
+
+
+def _round_trip(client, mcp_user, resource: str, **extra) -> str:
+    """Authorize GET (consent page) → consent POST → token, all sending
+    `resource`; the access token."""
+    verifier, challenge = _pkce()
+    query = urlencode(_authorize_params(challenge, [resource]))
+    client.force_login(mcp_user)
+    page = client.get(reverse("authorize") + "?" + query, **extra)
+    assert page.status_code == HTTPStatus.OK, page.get("Location", page.content[:300])
+    assert b'id="authorizationForm"' in page.content
+    code = _code_from(_consent(client, query, resource, **extra))
+    token = _exchange(client, code, verifier, [resource], **extra)
+    assert token.status_code == HTTPStatus.OK, token.content
+    return token.json()["access_token"]
+
+
+@pytest.mark.django_db
+class TestEquivalentSpellingsAreAccepted:
+    """The advertised identifier with an uppercase scheme or host, or the
+    default port spelled out, is the same resource: accepted end to end, and
+    the token works (DOT's default audience validator compares the parsed
+    scheme, host, port and path the same way)."""
+
+    @pytest.mark.parametrize("resource", EQUIVALENT)
+    def test_round_trip(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, resource
+    ):
+        access_token = _round_trip(client, mcp_user, resource)
+
+        from oauth2_provider.models import AccessToken
+
+        if _dot_stores_resource():
+            assert AccessToken.objects.get(token=access_token).resource == [resource]
+        assert _ping(client, access_token).status_code == HTTPStatus.OK
+
+    def test_mixed_spellings_in_one_request(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED, *EQUIVALENT]))
+        client.force_login(mcp_user)
+        assert client.get(reverse("authorize") + "?" + query).status_code == 200
+
+
+@pytest.mark.django_db
+class TestNonCanonicalHostHeader:
+    """A Host header naming this server non-canonically (`<name>:443`, an
+    uppercase name) no longer leaks into the identifier: discovery
+    advertises the canonical URL, which is what a client that parses it
+    sends back, and that value works end to end on the same host. Before,
+    discovery said `https://testserver:443/mcp/sql/`, the client sent
+    `https://testserver/mcp/sql/`, and the exact comparison answered
+    `invalid_target`."""
+
+    @pytest.mark.parametrize("slash", [True, False])
+    @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
+    def test_discovery_advertises_the_canonical_host(self, client, host, slash):
+        path = reverse("mcp_sql_protected_resource_metadata") + ("/" if slash else "")
+        document = client.get(path, HTTP_HOST=host).json()
+        assert document["resource"] == (SLASHED if slash else SLASHLESS)
+        assert document["authorization_servers"] == ["https://testserver/o"]
+        metadata = client.get(
+            reverse("oauth_authorization_server_metadata"), HTTP_HOST=host
+        ).json()
+        assert metadata["issuer"] == "https://testserver/o"
+        assert metadata["token_endpoint"] == "https://testserver/o/token/"
+        challenge = client.post("/mcp/sql/", HTTP_HOST=host)["WWW-Authenticate"]
+        assert 'resource_metadata="https://testserver/.well-known/' in challenge
+
+    def test_an_unbounded_port_is_kept_not_a_500(self, client):
+        host = "testserver:" + "9" * 5000
+        response = client.get(
+            reverse("mcp_sql_protected_resource_metadata") + "/", HTTP_HOST=host
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert response.json()["resource"] == f"https://{host}/mcp/sql/"
+
+    @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
+    def test_discovered_resource_round_trips(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, host
+    ):
+        resource = client.get(
+            reverse("mcp_sql_protected_resource_metadata") + "/", HTTP_HOST=host
+        ).json()["resource"]
+        access_token = _round_trip(client, mcp_user, resource, HTTP_HOST=host)
+        response = _ping(client, access_token, HTTP_HOST=host)
+        assert response.status_code == HTTPStatus.OK, response.content
+
+    @pytest.mark.skipif(
+        not _dot_stores_resource(), reason="DOT audience-checks tokens from 3.4"
+    )
+    @pytest.mark.parametrize("resource", [SLASHED, SLASHLESS])
+    @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
+    def test_bearer_sees_the_canonical_url(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self,
+        client,
+        settings,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        host,
+        resource,
+    ):
+        """The URL `/mcp/sql/` hands DOT's audience check is built like
+        discovery's, so it is canonical too: a token bound to the
+        advertised value passes even a validator that compares strings."""
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR": (
+                "mcp_sql.tests.test_resource_audience.exact_audience_validator"
+            ),
+        }
+        from oauth2_provider.models import AccessToken
+
+        token = AccessToken.objects.create(
+            user=mcp_user,
+            token="test_" + secrets.token_urlsafe(24),
+            application=mcp_app,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+            resource=[resource],
+        )
+        response = _ping(client, token.token, HTTP_HOST=host)
+        assert response.status_code == HTTPStatus.OK, response.content
+        foreign = ["https://testserver:443/mcp/sql/"]
+        token = AccessToken.objects.create(
+            user=mcp_user,
+            token="test_" + secrets.token_urlsafe(24),
+            application=mcp_app,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+            resource=foreign,
+        )
+        # ...and the validator is really in force.
+        assert _ping(client, token.token, HTTP_HOST=host).status_code == 401
+
+    @pytest.mark.parametrize("resource", [SLASHED, *EQUIVALENT])
+    @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
+    def test_every_spelling_is_accepted_on_every_host(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self, client, mcp_app, mcp_user, gate_posture, host, resource
+    ):
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [resource]))
+        client.force_login(mcp_user)
+        page = client.get(reverse("authorize") + "?" + query, HTTP_HOST=host)
+        assert page.status_code == HTTPStatus.OK, page.get("Location")
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "https://testserver",
+            "https://testserver:8443/mcp/sql/",
+            "http://testserver/mcp/sql/",
+            "https://other.example/mcp/sql/",
+            "https://testserver/mcp/sql/?x=1",
+        ],
+    )
+    @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
+    def test_foreign_values_stay_refused(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self, client, mcp_app, mcp_user, gate_posture, host, resource
+    ):
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [resource]))
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + query, HTTP_HOST=host)
+        _assert_invalid_target_redirect(response)
+        assert _grant_count() == 0
 
 
 @pytest.mark.django_db
@@ -502,6 +727,47 @@ class TestBearerAudienceCheck:
         assert _ping(client, token.token).status_code == HTTPStatus.OK
         token = self._token(mcp_user, mcp_app, [SLASHED])
         assert _ping(client, token.token).status_code == HTTPStatus.UNAUTHORIZED
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://\u212aelvin.example/mcp/sql/",  # KELVIN SIGN lowercases to k
+        "https://\u212aELVIN.EXAMPLE:443/mcp/sql",
+    ],
+)
+def test_non_ascii_that_lowercases_to_the_host_is_foreign(settings, rf, value):
+    from mcp_sql.audience import foreign_resource
+
+    settings.ALLOWED_HOSTS = ["kelvin.example"]
+    request = rf.get("/", HTTP_HOST="kelvin.example")
+    assert foreign_resource(request, ["https://KELVIN.example/mcp/sql/"]) is None
+    assert foreign_resource(request, [value]) == value
+
+
+@pytest.mark.parametrize(
+    ("scheme", "authority", "canonical"),
+    [
+        ("https", "Example.COM", "example.com"),
+        ("https", "example.com:443", "example.com"),
+        ("https", "example.com:0443", "example.com"),
+        ("http", "example.com:80", "example.com"),
+        ("https", "example.com:80", "example.com:80"),
+        ("http", "example.com:443", "example.com:443"),
+        ("https", "example.com:08443", "example.com:8443"),
+        ("https", "example.com:0", "example.com:0"),
+        ("https", "example.com:", "example.com:"),
+        ("https", "[::1]", "[::1]"),
+        ("https", "[::1]:443", "[::1]"),
+        ("https", "[::1]:8443", "[::1]:8443"),
+        ("https", "[::FFFF:1.2.3.4]:443", "[::ffff:1.2.3.4]"),
+        ("ftp", "example.com:21", "example.com:21"),
+    ],
+)
+def test_canonical_authority(scheme, authority, canonical):
+    from mcp_sql.consts import canonical_authority
+
+    assert canonical_authority(scheme, authority) == canonical
 
 
 def test_token_endpoint_is_the_package_view():
