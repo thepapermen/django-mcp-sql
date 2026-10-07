@@ -73,10 +73,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     integer (`LIMIT 3.5`, `LIMIT 2 + 3`, `LIMIT (SELECT …)`, `LIMIT -1`) is
     kept and capped (`LIMIT LEAST(<as written>, n)`) instead of being
     replaced by the cap; a value numeric as written (number literals,
-    arithmetic on them, a cast to a numeric type) is cast to bigint first,
+    arithmetic on them, a cast to a numeric type, a scalar subquery
+    selecting one: `(SELECT 'NaN'::float8)`) is cast to bigint first,
     which for those is exactly Postgres's LIMIT coercion (`'NaN'::float8`,
     an integer beyond bigint: Postgres's error), while anything else is
     left to Postgres's type resolution (`LIMIT '3'::text` stays an error).
+    A value whose type is not evident from how it is written (a column or
+    function call, a subquery selecting one) is not cast, so a NaN or
+    infinite float there yields the cap where Postgres raises: a known
+    residual (the cap still holds).
     `(SELECT … LIMIT 5)` no longer fails with a second LIMIT.
     `QUALIFY` (not Postgres SQL) is a syntax error and `qualify` an ordinary
     name, as in Postgres. Also rendered as written: `x IS NOT NULL IS TRUE`
@@ -94,17 +99,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     ran as `=`, `IS NOT DISTINCT FROM`, ...) and `json_object(KEY 'a' VALUE
     1)` (no `KEY` in Postgres) are refused. Also as written: `INTERVAL
     '<string>' <field> [TO <field>]` (`INTERVAL '25 hours' DAY` is 0 days
-    to Postgres; sqlglot dropped the field or read it as an alias),
+    to Postgres; sqlglot dropped the field or read it as an alias) — only
+    an unquoted word is a field (`INTERVAL '25 hours' "DAY"` is 25 hours
+    and `INTERVAL '1' "day"` one second, each with an alias), and a seconds field keeps its precision (`SECOND(2)`,
+    `DAY TO SECOND(3)`) — and `INTERVAL(3) '1.23456'` (was the sum
+    `INTERVAL '3' + INTERVAL '1.23456'`); a subscripted column named
+    `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
+    constructor `ARRAY[1]` / `LIST(1)`),
     `json_object(...)` whenever its arguments parse as plain expressions
     (array slices, `format(...)`, columns named `value` / `key` / `on` had
     turned it into the SQL/JSON constructor), the prefix operators `@ x`
-    and `@-@ x` (read as a parameter `$x`), `overlaps(a, b, c, d)`, and
+    and `@-@ x` (read as a parameter `$x`; a real parameter `$1` / `$name`
+    stays one, an error in Postgres, and is never read as `@`), `overlaps(a, b, c, d)`, and
     `qualify` as a name everywhere (select alias, `GROUP BY`). `LIMIT
-    '<integer>'` is read as the bigint it is to Postgres. The guarantee is about what sqlglot reads in the
+    '<integer>'` (also in parentheses, `LIMIT ('5000000000')`) is read as
+    the bigint it is to Postgres. An array constructor subscripted without
+    parentheses (`ARRAY[1, 2][1]`, a syntax error to Postgres, which
+    sqlglot parenthesised; `ARRAY(SELECT …)[1]`, which it turned into
+    `ARRAY[1]`) and `INTERVAL(p) '<string>' <field>` are `parse_error`. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    857 ordinary analytical queries (over data with NULLs and mixed case)
+    873 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
@@ -126,10 +142,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     whitelisted table's column (from its model), a schema-qualified type
     name (`'0/0'::pg_catalog.pg_lsn`) — as do names of denied functions
     attribute notation cannot call (`t.version`, `t.user`, `t.has_access`).
-    Anything not provably a column counts as a call: a bare parenthesised
-    name `(x).f` (a column `x` of any FROM item wins over the row, so it is
-    `f(x)`), `t.f` when `t` is also a column name in scope. Quoted names
-    compare case-sensitively, as Postgres compares them.
+    So does `(t).f` on the same terms, provided no FROM item in scope has,
+    or may have, a column named `t` (a column `t` wins over the row and
+    `(t).f` is then `f(t)`); a FROM item whose column names are not all
+    known — a function, a `SELECT *`, an unaliased expression Postgres
+    names after its type (`'x'::text` is the column `text`), a whitelisted
+    table without model columns — leaves `(t).f` a call. Output names are
+    the ones Postgres derives (a scalar subquery's is its own column's, a
+    VALUES list's `column1`, …). Anything not provably a column counts as a
+    call, including `t.f` when `t` is also a column name in scope — a
+    deliberate over-refusal: Postgres reads the FROM item there. Quoted
+    names compare case-sensitively, as Postgres compares them.
+  - Table names are matched as Postgres matches them (review round 9): a
+    quoted name exactly, an unquoted one folded to lowercase — against the
+    whitelist (each entry is a model's exact `db_table`) and against CTE
+    names. A quoted CTE `"Shipments"` no longer stands in for the table
+    `shipments` (which let an off-whitelist table through and lent the
+    real table the CTE's columns), `"Auth_Permission"` is not the
+    whitelisted `auth_permission`, and an unquoted reference to a
+    mixed-case `db_table` is refused. A CTE name is in scope only where
+    Postgres sees it: a CTE's own body sees just the CTEs before it (`WITH
+    t AS (SELECT … FROM t)` reads the table `t`), and a schema-qualified
+    `public.t` is the table whatever CTE `t` exists; all three had let a
+    table off the profile's whitelist through the parser.
   - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
     `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
