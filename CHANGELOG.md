@@ -240,7 +240,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and pending authorization codes after the change commits, with an
   `MCPAuthRejectionLog` row (new reason `password_change`; migration
   0013). Done with model signals, so it needs no session table and holds
-  with `SESSION_MODEL=None`. Django's login-time password-hash upgrade is
+  with `SESSION_MODEL=None`. The stored hash is read through the user
+  model's base manager on the database being written, so a default manager
+  that filters rows (active users only, soft delete) cannot hide the user —
+  reactivating a user with a new password is a change too. Django's login-time password-hash upgrade is
   not treated as a change — only the save `check_password` (or
   `acheck_password`) makes while it runs, which the package marks by
   wrapping those two methods of `AbstractBaseUser` in `ready()`, and only
