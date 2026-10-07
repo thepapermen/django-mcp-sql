@@ -115,14 +115,19 @@ MCP clients send the protected resource they want a token for as `resource`
 on `/o/authorize/` and `/o/token/` (RFC 8707). From DOT 3.4, DOT stores it on
 the grant and the access token and audience-checks every bearer that carries
 one against the URL of the request it arrives on. So the package accepts
-exactly one value: the `resource` the protected-resource document above
+exactly one resource: the `resource` the protected-resource document above
 advertises — `https://<host>/mcp/sql/` or `https://<host>/mcp/sql` (`http`
-only when `DEBUG` is on), on the host the request arrives at, compared as an
-exact string. Repeating it is fine; omitting it is fine (the token is then
-not resource-bound, as before).
+only when `DEBUG` is on), on the host the request arrives at. Scheme and
+host are compared case-insensitively and the scheme's default port may be
+spelled out (`https://<HOST>:443/mcp/sql/` is the same resource, as RFC 3986
+§6.2 has it and the MCP spec asks servers to accept); the path must be the
+endpoint's exactly, with or without the trailing slash. Repeating it is
+fine; omitting it is fine (the token is then not resource-bound, as before).
 
-Anything else is refused with **`invalid_target`** (RFC 8707 §2), naming the
-accepted value in `error_description`:
+Anything else — the bare origin `https://<host>`, another path, host, port
+or scheme, a query, a fragment, userinfo, an empty value — is refused with
+**`invalid_target`** (RFC 8707 §2), naming the accepted value in
+`error_description` (never the value the client sent):
 
 | Where | Answer |
 |---|---|
@@ -135,6 +140,20 @@ returns (another host or alias, `http` for `https`, a different path), or a
 hand-written OAuth client. Fix the client's server URL; the discovery
 document shows the exact value expected.
 
+The host in that value (and in every other URL discovery advertises) is the
+request's host in canonical form: lowercased, without the scheme's default
+port. A proxy that forwards `Host: <name>:443` (nginx
+`proxy_set_header Host $host:$server_port`, or an `X-Forwarded-Host` that
+carries the port, under `USE_X_FORWARDED_HOST`) or an uppercase name
+therefore still yields `https://<name>/mcp/sql/` — the spelling clients
+that parse the URL (the MCP TypeScript and Python SDKs) send back. A
+non-default port stays (`https://<name>:8443/mcp/sql/`).
+
+`/o/token/` reads its parameters from the form body only, whatever
+`OAUTH2_PROVIDER["OAUTH2_BACKEND_CLASS"]` says: with DOT's deprecated
+`JSONOAuthLibCore` a JSON body's `resource` would bypass the check, so a JSON
+token request is refused.
+
 Before this check, DOT 3.4+ issued a token for any `resource` and then
 refused it at `/mcp/sql/` on every call with a bare 401 — no audit row, and
 each call counted toward the bad-token IP throttle
@@ -143,8 +162,12 @@ silently blocked. The same happened to the correct `https` value behind a
 TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`, because DOT built
 the request URL from `request.scheme` (`http`). `/mcp/sql/` now hands DOT's check the request URL
 built the same way discovery builds `resource` (https whenever `DEBUG` is
-off), so a token bound to the advertised value always passes, with or
-without `SECURE_PROXY_SSL_HEADER`. DOT's check is not switched off: a token
+off, the host canonical), so a token bound to the advertised value always
+passes, with or without `SECURE_PROXY_SSL_HEADER`. A token bound to another
+accepted spelling (uppercase, `:443`) passes DOT's default audience
+validator, which compares parsed URLs; a custom
+`RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings would
+accept only the canonical one. DOT's check is not switched off: a token
 bound to anything else (one issued before this release) still gets a 401
 until it expires. Below DOT 3.4, which ignores `resource`, the package's
 checks answer the same way and tokens are never resource-bound. Pinned by

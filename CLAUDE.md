@@ -32,12 +32,16 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   `IsAuthenticated` so stock DRF defaults can't pierce the package.
 - **An RFC 8707 `resource` is the advertised identifier or `invalid_target`**
   (`audience.py`): `/o/authorize/` and `/o/token/` accept only
-  `audience.mcp_resource_url` with or without its trailing slash (exact
-  match), and `/mcp/sql/` verifies bearers through
-  `audience.CanonicalUriOAuthLibCore`, so DOT's (3.4+) audience check sees
-  the URL built the way discovery builds `resource`. Build any new OAuth
-  absolute URL with `consts.absolute_url`; never verify the bearer with
-  DOT's stock core.
+  `audience.mcp_resource_url` with or without its trailing slash, scheme and
+  host case-insensitive and the default port optional (both sides through
+  `consts.canonical_authority`; the path, query, fragment and userinfo are
+  never normalised — the bare origin and other prefixes stay foreign), and
+  `/mcp/sql/` verifies bearers through `audience.CanonicalUriOAuthLibCore`,
+  so DOT's (3.4+) audience check sees the URL built the way discovery
+  builds `resource`. Build any new OAuth absolute URL with
+  `consts.absolute_url`; never verify the bearer with DOT's stock core, and
+  keep `MCPTokenView` on DOT's form-body `OAuthLibCore` (a JSON backend
+  would parse a `resource` the check never read).
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over
   the authenticated user). Tools are `async def`, dispatch ORM work via
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is

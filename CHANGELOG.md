@@ -269,20 +269,31 @@ separately below precisely because they do **not** announce themselves.
   silently blocked. The advertised value itself failed the same way behind a
   TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`: discovery says
   `https` (`DEBUG` off), DOT built the request URL as `http`. Now:
-  - `/o/authorize/` and `/o/token/` accept a `resource` only if it is exactly
-    the discovery document's `resource`, with or without the trailing slash,
-    on the host of the request; anything else (including an empty value, an
-    uppercase host, an explicit `:443`, a query) is **`invalid_target`** —
-    a redirect to the client's validated `redirect_uri` with its `state` and
-    no grant at the authorization endpoint (GET, and the consent POST's form
-    field and query string), a 400 at the token endpoint (`MCPTokenView`, now
-    mounted at `/o/token/`; the code is not consumed). A NUL `resource` gets
-    the same answer instead of a 500.
+  - `/o/authorize/` and `/o/token/` accept a `resource` only if it names the
+    discovery document's `resource` on the host of the request: scheme and
+    host in any case, the scheme's default port spelled out or omitted, the
+    path exactly the endpoint's, with or without the trailing slash. Anything
+    else (including an empty value, the bare origin `https://<host>`, another
+    path, port, host or scheme, a query, a fragment, userinfo) is
+    **`invalid_target`** — a redirect to the client's validated
+    `redirect_uri` with its `state` and no grant at the authorization
+    endpoint (GET, and the consent POST's form field and query string), a
+    400 at the token endpoint (`MCPTokenView`, now mounted at `/o/token/`;
+    the code is not consumed). This error names the accepted value, never the
+    client's. A NUL `resource` gets the same answer instead of a 500.
+  - Discovery, and every other absolute URL the package builds, spells the
+    host canonically: lowercased, without the scheme's default port. A proxy
+    forwarding `Host: <name>:443` (nginx `proxy_set_header Host
+    $host:$server_port`, or an `X-Forwarded-Host` carrying the port under
+    `USE_X_FORWARDED_HOST`) made discovery advertise
+    `https://<name>:443/mcp/sql/`, which clients that parse the URL (the MCP
+    TypeScript and Python SDKs) send back as `https://<name>/mcp/sql/`.
   - `/mcp/sql/` hands DOT's audience check the request URL built the same way
     discovery builds `resource`, so a token bound to the advertised value
-    always passes, with or without `SECURE_PROXY_SSL_HEADER`. The check is
-    not disabled: a token bound to anything else still gets a 401 (tokens
-    issued before upgrading expire within their 6 h).
+    always passes, with or without `SECURE_PROXY_SSL_HEADER`, whatever the
+    spelling of the forwarded host. The check is not disabled: a token bound
+    to anything else still gets a 401 (tokens issued before upgrading expire
+    within their 6 h).
   - On the consent POST (DOT 3.4 and later) the form's `resource` and a
     `resource` in the URL's query string must agree; a blank form field
     beside a query `resource` reached the grant as a plain string and 500'd.
@@ -293,8 +304,13 @@ separately below precisely because they do **not** announce themselves.
   `invalid_target` naming the expected value. The bearer is verified through
   `audience.CanonicalUriOAuthLibCore` on the configured `OAUTH2_SERVER_CLASS`
   and `OAUTH2_VALIDATOR_CLASS`; a custom `OAUTH2_BACKEND_CLASS` no longer
-  applies to `/mcp/sql/`. `docs/oauth.md` → "The `resource` parameter
-  (RFC 8707)". Also affects 0.1.0b5 on DOT 3.4.
+  applies to `/mcp/sql/` or `/o/token/`, which pins DOT's form-body
+  `OAuthLibCore` (with DOT's `JSONOAuthLibCore` configured, a JSON token
+  request's `resource` was never seen by the check and reached the token; a
+  JSON body is now not read, as RFC 6749 §4.1.3 has it, and is refused).
+  Discovery's URLs change spelling only where the forwarded host was not
+  canonical. `docs/oauth.md` → "The `resource` parameter (RFC 8707)". Also
+  affects 0.1.0b5 on DOT 3.4.
 - **A declared https callback on a loopback host was classified and audited
   as `cloud`.** Kind derives from the scheme, so an https callback whose host
   was really the user's own machine (`https://localhost:8443/cb`) took the
