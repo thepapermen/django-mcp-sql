@@ -17,7 +17,9 @@ sends the token models elsewhere.
 """
 
 import logging
+import re
 import secrets
+import time
 from datetime import timedelta
 
 import pytest
@@ -25,6 +27,8 @@ from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
+from django.db import DatabaseError
+from django.db import connections
 from django.db import transaction
 from django.utils import timezone
 from mcp_sql.conf import mcp_sql_settings
@@ -83,6 +87,53 @@ def _routers(*first: type) -> list[str]:
 @pytest.fixture(autouse=True)
 def _no_session_gate(settings):
     settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": None}
+
+
+# Watchdog (review round 18). The revocation's own connection can wait on a
+# lock the test's connection holds while that connection, in the same
+# thread, waits for it: a regression there (no bounded wait, the original
+# connection not put back) hung the suite. PostgreSQL ends a session left
+# idle inside a transaction this long, which releases the lock, so such a
+# regression fails the test instead.
+_WATCHDOG = "10s"
+
+
+@pytest.fixture(autouse=True)
+def _idle_transaction_watchdog():
+    for alias in ("default", SECOND):
+        with connections[alias].cursor() as cursor:
+            cursor.execute(f"SET idle_in_transaction_session_timeout = '{_WATCHDOG}'")
+    yield
+    for alias in ("default", SECOND):
+        connection = connections[alias]
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("RESET idle_in_transaction_session_timeout")
+        except DatabaseError:
+            connection.close()
+
+
+@pytest.fixture
+def own_connections(monkeypatch):
+    """Each connection `_outside_open_transaction` opens, with the SQL run
+    on it."""
+    opened: list[tuple[object, list[str]]] = []
+    create = connections.create_connection
+
+    def recording(alias):
+        connection = create(alias)
+        statements: list[str] = []
+
+        def record(execute, sql, params, many, context):
+            statements.append(sql)
+            return execute(sql, params, many, context)
+
+        connection.execute_wrappers.append(record)
+        opened.append((connection, statements))
+        return connection
+
+    monkeypatch.setattr(connections, "create_connection", recording)
+    return opened
 
 
 def _application(using: str) -> Application:
@@ -201,18 +252,51 @@ class TestPasswordChangeOnAnotherDatabase:
         """The open transaction on the token database locked a row the
         revocation deletes. The revocation's own connection would wait for
         it forever (same thread); it gives up after the bounded wait, logs
-        the failure and the request goes on."""
+        the failure (no audit row: the access did not end) and the request
+        goes on."""
         from mcp_sql import signals
 
         monkeypatch.setattr(signals, "_OWN_CONNECTION_LOCK_TIMEOUT", "200ms")
+        started = time.monotonic()
         with (
             caplog.at_level(logging.ERROR, logger="mcp_sql.signals"),
             transaction.atomic(using="default"),
         ):
             AccessToken.objects.filter(user_id=user.pk).update(scope="mcp:sql")
             self._change(user)
+        assert time.monotonic() - started < 5
         assert "Failed to revoke MCP tokens on password change" in caplog.text
         assert _remaining(user, "default") == _ALL
+        assert not MCPAuthRejectionLog.objects.exists()
+
+    def test_the_own_connection(self, user, own_connections):
+        """Review round 18: the lock bound is `SET LOCAL` (a bare `SET`
+        would outlive the transaction), the connection is closed, and the
+        original one is back in place inside the still-open transaction."""
+        from mcp_sql import signals
+
+        with transaction.atomic(using="default"):
+            original = connections["default"]
+            self._change(user)
+            current = connections["default"]
+            in_atomic = original.in_atomic_block
+        assert current is original
+        assert in_atomic
+        assert len(own_connections) == 1
+        own, statements = own_connections[0]
+        assert own is not original
+        assert own.connection is None  # closed
+        assert statements[0] == (
+            f"SET LOCAL lock_timeout = '{signals._OWN_CONNECTION_LOCK_TIMEOUT}'"
+        )
+        assert not [s for s in statements if re.match(r"\s*SET\s+(?!LOCAL\b)", s)]
+        assert _remaining(user, "default") == _NONE
+        assert _audited(user, "default", AuthRejectionReason.PASSWORD_CHANGE)
+
+    def test_no_own_connection_outside_a_transaction(self, user, own_connections):
+        self._change(user)
+        assert own_connections == []
+        assert _remaining(user, "default") == _NONE
 
 
 class TestLogoutWithTokensOnAnotherDatabase:

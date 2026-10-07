@@ -399,3 +399,188 @@ class TestSignalDatabaseErrorResilience:
             out = _mcp_memberships({7}, {10: "default"}, "default")
         assert out == {7: []}
         assert "MCP membership query failed" in caplog.text
+
+
+def _mcp_credentials(user):
+    """An access token, a refresh token and a pending code for `user` on
+    the canonical `mcp-sql` Application."""
+    from mcp_sql.conf import mcp_sql_settings
+    from oauth2_provider.models import AccessToken
+    from oauth2_provider.models import Application
+    from oauth2_provider.models import Grant
+    from oauth2_provider.models import RefreshToken
+
+    app, _ = Application.objects.get_or_create(
+        name=mcp_sql_settings.APPLICATION_NAME,
+        defaults={
+            "client_id": "mcp-sql",
+            "client_secret": "",
+            "client_type": Application.CLIENT_PUBLIC,
+            "authorization_grant_type": Application.GRANT_AUTHORIZATION_CODE,
+            "redirect_uris": "http://127.0.0.1",
+            "algorithm": "",
+        },
+    )
+    access = AccessToken.objects.create(
+        user=user,
+        token=secrets.token_urlsafe(24),
+        application=app,
+        expires=timezone.now() + timedelta(hours=1),
+        scope="mcp:sql",
+    )
+    RefreshToken.objects.create(
+        user=user,
+        token=secrets.token_urlsafe(24),
+        application=app,
+        access_token=access,
+    )
+    Grant.objects.create(
+        user=user,
+        code=secrets.token_urlsafe(24),
+        application=app,
+        expires=timezone.now() + timedelta(minutes=1),
+        redirect_uri="http://127.0.0.1",
+        scope="mcp:sql",
+        code_challenge="x" * 43,
+        code_challenge_method="S256",
+    )
+
+
+def _remaining_credentials(user) -> int:
+    from oauth2_provider.models import AccessToken
+    from oauth2_provider.models import Grant
+    from oauth2_provider.models import RefreshToken
+
+    return sum(
+        model.objects.filter(user_id=user.pk).count()
+        for model in (AccessToken, RefreshToken, Grant)
+    )
+
+
+def _logged_in_request(user, remote_addr="127.0.0.1"):
+    """A request with a saved database session, as `logout()` gets it."""
+    from django.contrib.sessions.backends.db import SessionStore
+
+    request = RequestFactory().get("/logout/", REMOTE_ADDR=remote_addr)
+    request.session = SessionStore()
+    request.session["marker"] = "logged-in"
+    request.session.save()
+    request.user = user
+    return request
+
+
+@pytest.fixture
+def _session_gate_off(settings):
+    settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": None}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("_session_gate_off")
+class TestNothingEscapesIntoLogout:
+    """Review round 18. With no transaction open, the logout revocation
+    runs inside `logout()` itself — `user_logged_out` is sent before the
+    session is flushed — so anything it raised would 500 the logout and
+    leave the session alive."""
+
+    def test_a_forwarded_list_in_remote_addr(self, caplog):
+        """A `REMOTE_ADDR` that is not one IP address (a real-IP
+        middleware copying `X-Forwarded-For` whole): psycopg 3 adapts the
+        `inet` value with `ipaddress.ip_address` and raised `ValueError`
+        from the audit write, which rolled the deletes back and escaped
+        `logout()`. The row is now written without the address."""
+        from django.contrib.auth import logout
+        from django.contrib.sessions.models import Session
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        request = _logged_in_request(user, remote_addr="10.0.0.1, 10.0.0.2")
+        session_key = request.session.session_key
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.signals"):
+            logout(request)
+        assert _remaining_credentials(user) == 0
+        row = MCPAuthRejectionLog.objects.get(user=user)
+        assert row.client_ip is None
+        assert not Session.objects.filter(session_key=session_key).exists()
+        assert "marker" not in request.session
+        assert caplog.records == []
+
+    def test_a_single_address_is_recorded(self):
+        from django.contrib.auth import logout
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        logout(_logged_in_request(user, remote_addr="2001:db8::7"))
+        assert MCPAuthRejectionLog.objects.get(user=user).client_ip == "2001:db8::7"
+
+    def test_an_error_outside_the_audit_write(self, monkeypatch, caplog):
+        """Any exception in the revocation (here: not a database error) is
+        logged; `logout()` completes and flushes the session."""
+        from django.contrib.auth import logout
+        from django.contrib.sessions.models import Session
+        from oauth2_provider.models import RefreshToken
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        monkeypatch.setattr(
+            RefreshToken,
+            "objects",
+            _mgr(filter_delete_side_effect=RuntimeError("not a database error")),
+        )
+        request = _logged_in_request(user)
+        session_key = request.session.session_key
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.signals"):
+            logout(request)
+        assert "Failed to revoke MCP tokens on logout" in caplog.text
+        assert not Session.objects.filter(session_key=session_key).exists()
+
+
+@pytest.mark.django_db
+class TestAFailedAuditWriteKeepsTheDeletes:
+    """Review round 18: the audit row is written in a savepoint inside the
+    deletes' transaction; whatever makes it fail is rolled back to that
+    savepoint, never the deletes."""
+
+    def _logout(self, user, django_capture_on_commit_callbacks):
+        with django_capture_on_commit_callbacks(execute=True):
+            user_logged_out.send(
+                sender=type(user), request=_logout_request(), user=user
+            )
+
+    def test_a_database_error(self, caplog, django_capture_on_commit_callbacks):
+        """A real failure in PostgreSQL (a constraint every new audit row
+        violates), no mocks."""
+        from django.db import connection
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        table = MCPAuthRejectionLog._meta.db_table
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'ALTER TABLE "{table}" ADD CONSTRAINT mcp_sql_a18_refuse_rows '
+                "CHECK (false) NOT VALID"
+            )
+        with caplog.at_level(logging.INFO, logger="mcp_sql.signals"):
+            self._logout(user, django_capture_on_commit_callbacks)
+        assert _remaining_credentials(user) == 0
+        assert not MCPAuthRejectionLog.objects.filter(user=user).exists()
+        assert "failed to write the audit row" in caplog.text
+        assert "(no audit row)" in caplog.text
+
+    def test_any_other_exception(
+        self, monkeypatch, caplog, django_capture_on_commit_callbacks
+    ):
+        import mcp_sql.signals as signals_mod
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        audit = _mgr()
+        audit.create.side_effect = ValueError("not a database error")
+        monkeypatch.setattr(signals_mod.MCPAuthRejectionLog, "objects", audit)
+        with caplog.at_level(logging.INFO, logger="mcp_sql.signals"):
+            self._logout(user, django_capture_on_commit_callbacks)
+        assert _remaining_credentials(user) == 0
+        assert "failed to write the audit row" in caplog.text
+        assert "(no audit row)" in caplog.text

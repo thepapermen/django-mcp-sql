@@ -1,6 +1,30 @@
+import ipaddress
+
 from django.conf import settings
 from django.db import models
 from mcp_sql.schemas import AuthRejectionReason
+
+
+def audit_client_ip(remote_addr: object) -> str | None:
+    """`REMOTE_ADDR` as the audit tables' `client_ip` stores it: the value
+    when it is one IP address, else None.
+
+    `REMOTE_ADDR` is whatever the server or a real-IP middleware put there
+    (a forwarded list `"a, b"`, a hostname, a scoped `fe80::1%eth0`).
+    Django adapts a `GenericIPAddressField` value with
+    `ipaddress.ip_address` on psycopg 3 (`ValueError`, not a
+    `DatabaseError`) and PostgreSQL's `inet` rejects a scope id, so such a
+    value would make the audit insert fail. The row is kept, without the
+    address."""
+    if not isinstance(remote_addr, str):
+        return None
+    try:
+        address = ipaddress.ip_address(remote_addr)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        return None
+    return remote_addr
 
 
 class MCPQueryLog(models.Model):

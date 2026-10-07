@@ -254,6 +254,29 @@ class TestAuthRejectionAuditLog:
         assert log.reason == AuthRejectionReason.INACTIVE_OR_NON_STAFF
         assert log.user_id == mcp_user.pk
 
+    # The throttle keys its cache on the raw `REMOTE_ADDR` (a space in it
+    # warns: memcached would refuse such a key).
+    @pytest.mark.filterwarnings("ignore::django.core.cache.CacheKeyWarning")
+    @pytest.mark.usefixtures("_isolated_mcp_cache")
+    @pytest.mark.parametrize(
+        ("remote_addr", "recorded"),
+        [("198.51.100.4", "198.51.100.4"), ("10.0.0.1, 10.0.0.2", None)],
+    )
+    def test_audit_row_client_ip_is_one_address_or_none(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, remote_addr, recorded
+    ):
+        """Review round 18: a `REMOTE_ADDR` that is not one IP address made
+        the audit insert raise `ValueError` (psycopg 3 adapts `inet` with
+        `ipaddress.ip_address`), which escaped as a 500 instead of the 401."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        mcp_user.is_active = False
+        mcp_user.save()
+        request = _bearer_request_from_ip(mcp_access_token.token, remote_addr)
+        with pytest.raises(AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(request)
+        assert MCPAuthRejectionLog.objects.get().client_ip == recorded
+
     def test_no_mfa_writes_audit_row(self, mcp_user, mcp_access_token, mcp_mfa_off):
         from mcp_sql.models import MCPAuthRejectionLog
 

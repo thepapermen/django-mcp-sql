@@ -45,6 +45,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import audit_client_ip
 from mcp_sql.oauth_server import get_mcp_oauthlib_core
 from mcp_sql.schemas import AuthRejectionReason
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
@@ -429,7 +430,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 client_redirect=token.application.redirect_uris or "",
                 reason=reason,
                 error=error,
-                client_ip=request.META.get("REMOTE_ADDR"),
+                client_ip=audit_client_ip(request.META.get("REMOTE_ADDR")),
                 started_at=timezone.now(),
             )
         except DatabaseError:

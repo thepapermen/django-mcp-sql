@@ -37,6 +37,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import audit_client_ip
 from mcp_sql.schemas import AuthRejectionReason
 
 if TYPE_CHECKING:
@@ -73,7 +74,11 @@ def revoke_mcp_tokens_on_logout(
     # not delete the user row, so its `pk` and the audit FK resolve fine.
     # `started_at` is the logout moment, not the (marginally later)
     # post-commit callback time.
-    client_ip = request.META.get("REMOTE_ADDR") if request is not None else None
+    client_ip = (
+        audit_client_ip(request.META.get("REMOTE_ADDR"))
+        if request is not None
+        else None
+    )
     logged_out_at = timezone.now()
     transaction.on_commit(
         lambda: _revoke_and_audit_on_logout(
@@ -167,13 +172,19 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
       or audit database (`_outside_open_transaction`), so a later rollback
       there cannot undo them;
     - the audit row commits only with the deletes (when both live on one
-      database; on two, it commits just before them), and a failure to
-      write it does not undo the deletes (a savepoint);
-    - any database error (a blip, a lock held past the bounded wait) is
-      logged with `logger.exception` (Sentry) and nothing is retried: the
-      tokens then live until they expire, and an operator must delete
-      them. It never surfaces as a 500 on the completed logout / password
-      change.
+      database; on two, it commits just before them); it is written in a
+      savepoint, so a failure to write it — a database error or any other
+      exception — is rolled back to that savepoint, logged with
+      `logger.exception` (Sentry), and does not undo the deletes;
+    - a failed deletion (a database error, a row lock held past the
+      bounded wait) rolls back all three deletes and writes no audit row:
+      the access did not end. It is logged with `logger.exception` only and
+      nothing is retried: the tokens then live until they expire, and an
+      operator must delete them;
+    - no exception leaves this function. When no transaction is open the
+      callback runs inside `logout()` (before the session is flushed) or
+      inside the user's `save()`; an error escaping would turn the
+      completed logout / password change into a 500.
     Not covered: tokens the open transaction itself created and has not
     committed (the own connection cannot see them).
     """
@@ -224,6 +235,10 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
                 # alongside the per-request gate denials, so the timeline of
                 # why a user lost MCP access is complete.
                 try:
+                    # Nested in the deletes' transaction (one database), a
+                    # savepoint: anything raised in it rolls back to the
+                    # savepoint, never the deletes. On a separate audit
+                    # database, a transaction of its own.
                     with _transaction(audit, own_connection=own[audit]):
                         # By pk: the user instance may come from another
                         # database than the audit table's (a router would
@@ -241,7 +256,7 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
                             client_ip=client_ip,
                             started_at=at,
                         )
-                except DatabaseError:
+                except Exception:
                     audit_failed = True
                     logger.exception(
                         "Revoking MCP tokens on %s for user %s: failed to write "
@@ -249,7 +264,7 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
                         event,
                         user.pk,
                     )
-    except DatabaseError:
+    except Exception:
         logger.exception(
             "Failed to revoke MCP tokens on %s for user %s", event, user.pk
         )
