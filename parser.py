@@ -282,6 +282,22 @@ def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
 
 _IS_NOT_TOKENS = 3  # `IS`, `NOT` and the value
 _INTERVAL_FIELDS = frozenset({"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"})
+# Postgres's string constants (`Sconst`) as sqlglot's postgres tokenizer
+# reads them: `'...'`, `E'...'` (`BYTE_STRING`; one with a backslash is
+# refused by `_check_lexical_fidelity`) and `$$...$$` / `$tag$...$tag$`
+# (`HEREDOC_STRING`). `U&'...'` is refused; `N'...'`, `B'...'`, `X'...'`
+# are not `Sconst` to Postgres.
+_SCONST_TOKENS = frozenset(
+    {TokenType.STRING, TokenType.BYTE_STRING, TokenType.HEREDOC_STRING}
+)
+_ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+
+
+def _keyword(text: str) -> str:
+    """`text` as a Postgres keyword compares: ASCII a-z upper-cased, nothing
+    else (`str.upper` turns a dotless i, U+0131, into `I` and a long s,
+    U+017F, into `S`, so `m\u0131nute` would be `MINUTE`)."""
+    return text.translate(_ASCII_UPPER)
 
 
 class _PrefixOperator(exp.Expression):
@@ -387,6 +403,11 @@ class FaithfulPostgres(Postgres):
       apart from the SQL/JSON constructor by its arguments.
     - `INTERVAL '1 day 02:03:04'` / `INTERVAL '3 days ago'` keep their
       string: sqlglot canonicalised them to their first `<n> <unit>` part.
+      The string ends the interval (`INTERVAL '1 day' + 2 * x` is the
+      operator `+`, not sqlglot's sum of intervals).
+    - `E'…'` (backslash-free) and `$$…$$` are the plain string constant,
+      everywhere a string is (`INTERVAL $$1$$ week`, `DATE E'2024-01-01'`,
+      `LIMIT $$5$$`): sqlglot's own nodes for them were not.
     - `j -> k` / `j ->> k` keep their right operand as written: sqlglot
       turned it into a JSON path, dropping an empty key (`j -> ''`) and, on
       30.7, a quote inside the key.
@@ -465,8 +486,23 @@ class FaithfulPostgres(Postgres):
             **Postgres.Parser.PLACEHOLDER_PARSERS,
             TokenType.PARAMETER: lambda self: self._parse_at_operator(),
         }
+        # `E'…'` and `$$…$$` / `$tag$…$tag$` are string constants to
+        # Postgres exactly like `'…'` (an E-string with a backslash is
+        # refused by `_check_lexical_fidelity`). sqlglot built its own nodes
+        # for them (`ByteString`, `RawString`), which its parser does not
+        # take where it takes a string: `DATE $$2024-01-01$$` was a parse
+        # error, `INTERVAL $$1$$ week` 7 days. Read as the plain string.
+        STRING_PARSERS = {
+            **Postgres.Parser.STRING_PARSERS,
+            **dict.fromkeys(
+                _SCONST_TOKENS, Postgres.Parser.STRING_PARSERS[TokenType.STRING]
+            ),
+        }
         PRIMARY_PARSERS = {
             **Postgres.Parser.PRIMARY_PARSERS,
+            **dict.fromkeys(
+                _SCONST_TOKENS, Postgres.Parser.PRIMARY_PARSERS[TokenType.STRING]
+            ),
             **{
                 kind: _number_as_written_or(Postgres.Parser.PRIMARY_PARSERS[kind])
                 for kind in (
@@ -609,7 +645,7 @@ class FaithfulPostgres(Postgres):
             return parsed
 
         def _parse_interval_span(
-            self, this: exp.Expression, *args: Any, **kwargs: Any
+            self, this: exp.Expression | None, *args: Any, **kwargs: Any
         ) -> exp.Expression:
             written = this.name if this is not None and this.is_string else None
             if written is not None:
@@ -770,14 +806,15 @@ class FaithfulPostgres(Postgres):
             tokens, i = self._tokens, self._index
             kinds = [token.token_type for token in tokens[i : i + 5]]
             if (
-                kinds
+                kinds[:4]
                 == [
                     TokenType.INTERVAL,
                     TokenType.L_PAREN,
                     TokenType.NUMBER,
                     TokenType.R_PAREN,
-                    TokenType.STRING,
                 ]
+                and len(kinds) == 5  # noqa: PLR2004 — the five tokens above
+                and kinds[4] in _SCONST_TOKENS
                 and tokens[i + 2].text.isdigit()
             ):
                 # `INTERVAL(3) '1.23456'`: the precision form, 1.235 seconds.
@@ -797,6 +834,23 @@ class FaithfulPostgres(Postgres):
                 # `INTERVAL(3.0) '1.2'`, `INTERVAL(-1) '1 day'`, `INTERVAL(3)`:
                 # Postgres's syntax error; sqlglot ran a sum or dropped parts.
                 self.raise_error("INTERVAL(p) takes an unsigned integer and a string")
+            if (
+                len(kinds) > 1
+                and kinds[0] == TokenType.INTERVAL
+                and kinds[1] in _SCONST_TOKENS
+            ):
+                # `INTERVAL <string> [<qualifier>]` is all Postgres has. sqlglot
+                # read an E-string or a dollar-quoted one as the start of an
+                # expression (`INTERVAL $$1$$ * 2` lost the `* 2`), and an
+                # interval followed by `+` and a string or a number as a sum
+                # of intervals (`INTERVAL '1 day' + 2 * INTERVAL '1 day'`
+                # came back `INTERVAL '1 day' + INTERVAL '2'`); a `+` after
+                # the interval is now the ordinary operator.
+                self._advance()
+                written: exp.Expression = self._parse_interval_span(
+                    self._parse_primary()
+                )
+                return written
             parsed: exp.Expression | None = super()._parse_interval(*args, **kwargs)
             return parsed
 
@@ -833,11 +887,11 @@ class FaithfulPostgres(Postgres):
         def _interval_field(self, i: int) -> tuple[str, int] | None:
             """The field at token `i` (`SECOND(3)` with its precision) and
             the index after it, or `None`."""
-            if not self._is_unquoted(i) or self._tokens[i].text.upper() not in (
+            if not self._is_unquoted(i) or _keyword(self._tokens[i].text) not in (
                 _INTERVAL_FIELDS
             ):
                 return None
-            name = self._tokens[i].text.upper()
+            name = _keyword(self._tokens[i].text)
             precision = self._tokens[i + 1 : i + 4]
             if (
                 name == "SECOND"
@@ -858,7 +912,7 @@ class FaithfulPostgres(Postgres):
                 or self._tokens[i].token_type == TokenType.IDENTIFIER
             ):
                 return False
-            return word is None or self._tokens[i].text.upper() == word
+            return word is None or _keyword(self._tokens[i].text) == word
 
         def _parse_json_object_or_call(self) -> exp.Expression | None:
             """`json_object(...)`: Postgres's function `json_object(text[]
@@ -1019,6 +1073,22 @@ class FaithfulPostgres(Postgres):
             exp.BitwiseNot: _prefix_operator("~"),
             exp.Neg: _prefix_operator("-"),
         }
+
+        def interval_sql(self, expression: exp.Interval) -> str:
+            # `INTERVAL '<string>'` (no unit: the parser keeps the string
+            # as written) with the string rendered as a string constant.
+            # sqlglot's own rendering pastes its value between quotes
+            # unescaped: `INTERVAL 'a'', g, ''b'` came back as the three
+            # projections `INTERVAL 'a', g, 'b'`.
+            this = expression.this
+            if (
+                expression.args.get("unit") is None
+                and isinstance(this, exp.Literal)
+                and this.is_string
+            ):
+                return f"INTERVAL {self.sql(expression, 'this')}"
+            rendered: str = super().interval_sql(expression)
+            return rendered
 
 
 def _keep_quoted_type(parsed: exp.DataType, token: Token) -> None:
@@ -1786,6 +1856,7 @@ def extract_limit(ast: exp.Query) -> int | None:
         return None
     # `LIMIT '5'` is the bigint 5 to Postgres (its input syntax: optional
     # surrounding spaces and `+`); `LEAST('5', n)` would read it as int4.
+    # `$$5$$` / `E'5'` too: the parser reads them as the same literal.
     text = (  # only the whitespace Postgres's int8 input skips (not NBSP)
         written.name.strip(" \t\n\r\v\f").removeprefix("+")
         if written.is_string

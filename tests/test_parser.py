@@ -1778,6 +1778,145 @@ class TestReviewRound12:
         assert extract_limit(ast) is None  # Postgres: invalid input for bigint
 
 
+class TestReviewRound13:
+    """Review round 13 (Opus final review of A12): every string-constant
+    form after `INTERVAL` and in a LIMIT, ASCII-only interval field words."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # `E'…'` (sqlglot: `ByteString`) and `$$…$$` / `$tag$…$tag$`
+            # (`RawString`) are string constants to Postgres like `'…'`. A
+            # word after them is an alias (1 second named `week`; sqlglot
+            # folded it in as a unit, 7 days), a field qualifier applies.
+            ("SELECT INTERVAL E'1' week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL e'2' days", "SELECT INTERVAL '2' AS days LIMIT"),
+            ("SELECT INTERVAL $$1$$ week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL $t$1$t$ week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL $$3$$ q", "SELECT INTERVAL '3' AS q LIMIT"),
+            ('SELECT INTERVAL $$1$$ "day"', """SELECT INTERVAL '1' AS "day" LIMIT"""),
+            (
+                "SELECT INTERVAL $$25 hours$$ DAY",
+                "SELECT INTERVAL '25 hours' DAY LIMIT",
+            ),
+            ("SELECT INTERVAL E'25 hours' DAY", "SELECT INTERVAL '25 hours' DAY LIMIT"),
+            ("SELECT INTERVAL $$1-2$$ YEAR TO MONTH", "INTERVAL '1-2' YEAR TO MONTH"),
+            ("SELECT INTERVAL $$1 week$$ AS v", "SELECT INTERVAL '1 week' AS v LIMIT"),
+            # The precision form takes any string constant too (was refused).
+            ("SELECT INTERVAL(2) $$1.234$$", "SELECT INTERVAL(2) '1.234' LIMIT"),
+            ("SELECT INTERVAL(2) E'1.234'", "SELECT INTERVAL(2) '1.234' LIMIT"),
+            # The string ends the interval: sqlglot read `$$1$$ * 2` as the
+            # value and rendered `INTERVAL` alone.
+            ("SELECT INTERVAL $$1$$ * 2", "SELECT INTERVAL '1' * 2 LIMIT"),
+        ],
+    )
+    def test_every_string_constant_form_is_an_interval_string(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, as for `'…'` (it ran as 7 days).
+            "SELECT INTERVAL $$1$$ WEEK AS w",
+            "SELECT INTERVAL E'1' DAY HOUR",
+            "SELECT INTERVAL(2) $$1.5$$ SECOND",
+        ],
+    )
+    def test_string_constant_forms_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # A typed literal takes any string constant (was a parse error).
+            ("SELECT DATE $$2024-01-01$$", "SELECT CAST('2024-01-01' AS DATE) LIMIT"),
+            (
+                "SELECT TIMESTAMP E'2024-01-01 10:00'",
+                "SELECT CAST('2024-01-01 10:00' AS TIMESTAMP) LIMIT",
+            ),
+            ("SELECT bit $t$011$t$", """SELECT CAST('011' AS "bit") LIMIT"""),
+            # A backslash-free E-string is the plain string.
+            ("SELECT E'it''s' AS v", "SELECT 'it''s' AS v LIMIT"),
+        ],
+    )
+    def test_every_string_constant_form_is_a_string(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres has no sum of intervals: `+` is the operator.
+            # sqlglot rendered `INTERVAL '1 day' + INTERVAL '2'` (dropping
+            # `* INTERVAL '1 day'`).
+            (
+                "SELECT INTERVAL '1 day' + 2 * INTERVAL '1 day'",
+                "SELECT INTERVAL '1 day' + 2 * INTERVAL '1 day' LIMIT",
+            ),
+            ("SELECT INTERVAL '1 day' + 2", "SELECT INTERVAL '1 day' + 2 LIMIT"),
+            ("SELECT INTERVAL '1 day' + '1' week", "INTERVAL '1 day' + '1' AS week"),
+        ],
+    )
+    def test_plus_after_an_interval_is_the_operator(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    def test_interval_string_is_escaped(self):
+        # sqlglot pasted the value between quotes: the quotes inside became
+        # SQL (three projections, where Postgres reads one invalid interval).
+        expected = "SELECT INTERVAL '1 day'', name, ''b' FROM auth_group"
+        rendered = self._rendered(
+            "SELECT INTERVAL '1 day'', name, ''b' FROM auth_group"
+        )
+        assert expected in rendered
+        rendered = self._rendered(
+            "SELECT INTERVAL $$1 day', name, 'b$$ FROM auth_group"
+        )
+        assert expected in rendered
+
+    @pytest.mark.parametrize(
+        ("limit", "value"),
+        [
+            ("$$5000000000$$", 5000000000),
+            ("E'5000000000'", 5000000000),
+            ("$t$ +12 $t$", 12),
+            ("($$7$$)", 7),
+            ("$$5\u00a0$$", None),  # Postgres: invalid input for bigint
+            ("$$3 apples$$", None),
+        ],
+    )
+    def test_limit_reads_every_string_constant_form(self, limit, value):
+        ast = parse_and_validate(
+            f"SELECT id FROM auth_permission LIMIT {limit}",  # noqa: S608
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == value
+
+    def test_dollar_quoted_big_limit_is_the_bigint(self):
+        # `LEAST('5000000000', n)` would read it as int4 and overflow.
+        assert _executed("LIMIT $$5000000000$$").endswith(" LIMIT 11")
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres folds only ASCII letters: a dotless i (U+0131) or a long s
+            # (U+017F) makes another word, an alias (`str.upper` made it a field).
+            ("SELECT INTERVAL '90 seconds' m\u0131nute", "AS m\u0131nute"),
+            ("SELECT INTERVAL '1.789' \u017fecond", "AS \u017fecond"),
+        ],
+    )
+    def test_interval_field_words_are_ascii(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    def test_non_ascii_field_word_after_to_is_a_parse_error(self):
+        _expect_reject(
+            "SELECT INTERVAL '1:02:03' HOUR TO m\u0131nute", OutcomeReason.PARSE_ERROR
+        )
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

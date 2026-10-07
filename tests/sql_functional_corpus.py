@@ -2956,6 +2956,38 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "cte-names",
         'WITH x AS (SELECT id FROM t WHERE id < 3), "X" AS (SELECT 5 AS id) SELECT id FROM x UNION ALL SELECT id FROM "X" ORDER BY id',
     ),
+    (
+        "intervals",
+        "SELECT INTERVAL E'1' week, INTERVAL $$2$$ days, INTERVAL $t$3$t$ q, INTERVAL $$25 hours$$ DAY AS a, INTERVAL E'25 hours' DAY AS b, INTERVAL $$1$$ \"day\", INTERVAL $$1-2$$ YEAR TO MONTH AS c, INTERVAL E'1 week' AS w",
+    ),
+    (
+        "intervals",
+        "SELECT id, d + INTERVAL $$1$$ week FROM t WHERE id < 4 ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL(2) $$1.234$$ AS a, INTERVAL(2) E'1.234' AS b, INTERVAL $$1.5$$ SECOND(3) AS c, INTERVAL $$1$$ * 2 AS e",
+    ),
+    (
+        "intervals",
+        "SELECT id, INTERVAL '1 day' + 2 * iv AS a, INTERVAL '1 day' + 2 * INTERVAL '1 hour' AS b, INTERVAL '1 day' + '1 hour' AS c FROM t ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT INTERVAL '90 seconds' m\u0131nute, INTERVAL '1.789' \u017fecond",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT $$5000000000$$",
+    ),
+    (
+        "limit",
+        "SELECT id FROM t ORDER BY id LIMIT E' 5000000000 '",
+    ),
+    (
+        "typed-literals",
+        "SELECT DATE $$2024-01-01$$ AS a, TIMESTAMP E'2024-01-01 10:00' AS b, bit $$011$$ AS c, char E'abc' AS e, d - DATE $t$2024-01-01$t$ AS f FROM t ORDER BY id",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3226,6 +3258,8 @@ REFUSED: list[tuple[str, str]] = [
         "SELECT (tableoid).pg_relation_filepath AS v FROM t, (SELECT 1 AS pg_relation_filepath) tableoid",
     ),
     ("parse_error", "SELECT INTERVAL '1' \"Day\" AS v"),
+    ("parse_error", "SELECT INTERVAL $$1$$ WEEK AS w"),
+    ("parse_error", "SELECT INTERVAL '90.5 seconds' m\u0131nute AS v"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3304,4 +3338,6 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::float8)",
     "SELECT id FROM t ORDER BY id LIMIT ((SELECT 'Infinity'::float8 AS i))",
     "SELECT id FROM t ORDER BY id LIMIT (SELECT 'NaN'::numeric FROM t WHERE id = 1)",
+    "SELECT INTERVAL '1 day'', g, ''b' FROM t",
+    "SELECT INTERVAL '1 day' + 2 AS v",
 ]
