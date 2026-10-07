@@ -408,6 +408,15 @@ announce themselves.
   pending codes survive and no audit row is written. `docs/oauth.md` →
   "What logout cannot revoke" says so and gives the remedy (log in, then log
   out). Unchanged behaviour, also in 0.1.0b5.
+- **A consent POST's error redirect trusted the form's hidden `redirect_uri`.**
+  DOT raises Cancel's `access_denied` and an invalid `resource`'s
+  `invalid_target` before oauthlib validates that field, then redirected the
+  user's browser, `state` included, to whatever it held. Exploiting it takes a
+  tampered, CSRF-bearing consent POST (script on the same origin). The view now
+  re-validates the target against the client before every error redirect and
+  shows the error page when it does not belong to the client. A consent POST
+  naming a `client_id` that does not exist was a 500; it shows the same error
+  page. Both inherited from DOT, also in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

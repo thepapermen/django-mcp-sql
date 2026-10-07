@@ -833,6 +833,88 @@ class TestLogoutKillsPendingCode:
             MCPOAuth2Authentication().authenticate(bearer)
 
 
+@pytest.mark.django_db
+class TestConsentPostErrorsNeverRedirectOffClient:
+    """A consent POST's error redirect goes only to a URI the client owns.
+
+    DOT raises Cancel's `access_denied` and an invalid `resource`'s
+    `invalid_target` BEFORE oauthlib validates the form's hidden
+    `redirect_uri`, and then redirected to whatever that field held. A
+    tampered form (it takes a same-origin, CSRF-bearing POST) could send the
+    user's browser, with `state`, anywhere. The view now re-validates the
+    redirect against the client first and renders the error page when it
+    fails. An unknown `client_id` in the POST was a 500 (`DoesNotExist`); it
+    renders the same error page.
+    """
+
+    CLIENT_ID = "mcp-sql-cloud.claude"  # the shipped declared client
+    CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+    EVIL = "https://evil.example/steal"
+
+    def _post(self, client, mcp_user, **overrides):
+        data = {
+            "client_id": self.CLIENT_ID,
+            "redirect_uri": self.CALLBACK,
+            "response_type": "code",
+            "scope": "mcp:sql",
+            "state": "s",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        data.update(overrides)
+        client.force_login(mcp_user)
+        return client.post(reverse("authorize"), data=data)
+
+    @staticmethod
+    def _assert_error_page(response):
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert "Location" not in response
+        assert b'id="authorizationForm"' not in response.content
+
+    def test_cancel_with_tampered_redirect_renders_error_page(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(client, mcp_user, redirect_uri=self.EVIL)
+        self._assert_error_page(response)
+        assert b"evil.example" not in response.content
+
+    def test_bad_resource_with_tampered_redirect_renders_error_page(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(
+            client,
+            mcp_user,
+            redirect_uri=self.EVIL,
+            resource="not a uri",
+            allow="Authorize",
+        )
+        self._assert_error_page(response)
+
+    def test_cancel_with_the_registered_redirect_still_redirects(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(client, mcp_user)
+        assert response.status_code == HTTPStatus.FOUND
+        assert response["Location"].startswith(self.CALLBACK + "?")
+        assert "error=access_denied" in response["Location"]
+
+    def test_bad_resource_with_the_registered_redirect_still_redirects(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(client, mcp_user, resource="not a uri", allow="Authorize")
+        assert response.status_code == HTTPStatus.FOUND
+        assert response["Location"].startswith(self.CALLBACK + "?")
+        assert "error=invalid_target" in response["Location"]
+
+    def test_unknown_client_id_renders_error_page_not_500(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(
+            client, mcp_user, client_id="no-such-client", allow="Authorize"
+        )
+        self._assert_error_page(response)
+
+
 class TestOauthAdminUnregistered:
     """DOT ModelAdmin classes must not be reachable via Django admin.
 

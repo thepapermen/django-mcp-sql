@@ -10,7 +10,12 @@ from urllib.parse import urlparse
 from django.core.exceptions import PermissionDenied
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
+from oauth2_provider.exceptions import FatalClientError
+from oauth2_provider.models import get_application_model
 from oauth2_provider.views import AuthorizationView
+from oauthlib.common import Request as OAuthlibRequest
+from oauthlib.oauth2.rfc6749 import errors as oauth2_errors
+from oauthlib.uri_validate import is_absolute_uri
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
@@ -30,8 +35,10 @@ class MCPAuthorizationView(AuthorizationView):
         # template renders this view performs: the consent page (`get`)
         # and the fatal-client-error page (`error_response` when oauthlib
         # refuses to redirect — unknown `client_id` / untrusted
-        # `redirect_uri`). Every other outcome is a redirect (recoverable
-        # OAuth errors bounce back to the client, success carries the auth
+        # `redirect_uri` — or when this view's own re-validation in
+        # `error_response` / `form_valid` does). Every other outcome is a
+        # redirect (recoverable OAuth errors bounce back to the client,
+        # success carries the auth
         # code, login / `prompt=none` 302), and a failed issuance gate
         # raises `PermissionDenied` rendered by the consumer's 403 page —
         # none of those render here. So injecting here reaches every page
@@ -111,6 +118,79 @@ class MCPAuthorizationView(AuthorizationView):
         # shown rather than silently dropped.
         shown = f"[{host}]" if ":" in host else host
         return f"{parsed.scheme}://{shown}" + (f":{port}" if port is not None else "")
+
+    def form_valid(self, form):
+        # DOT's `form_valid` starts with `Application.objects.get(client_id=
+        # <hidden field>)`, so a consent POST naming a client that does not
+        # exist was a 500 (`DoesNotExist`; with a NUL in it, a `DataError`).
+        # Render the fatal-client error page instead, as DOT does for an
+        # unknown client on the GET.
+        client_id = form.cleaned_data.get("client_id") or ""
+        if not self._is_known_client_id(client_id):
+            return super().error_response(
+                FatalClientError(error=oauth2_errors.InvalidClientIdError()),
+                application=None,
+            )
+        return super().form_valid(form)
+
+    def error_response(self, error, application, **kwargs):
+        # DOT redirects every non-fatal error to `error.redirect_uri`. On the
+        # consent POST that is the form's hidden `redirect_uri`, and two
+        # errors are raised BEFORE oauthlib has validated it: Cancel's
+        # `access_denied` (`create_authorization_response(allow=False)`) and
+        # an invalid `resource`'s `invalid_target`. A tampered form could so
+        # send the user's browser, `state` and all, to any URL. Re-validate
+        # the target against the client exactly as oauthlib would before ANY
+        # error redirect, and render the error page when it fails. On the
+        # paths where oauthlib already validated it this is a no-op.
+        if not isinstance(error, FatalClientError):
+            target = error.oauthlib_error.redirect_uri
+            client_id = (
+                application.client_id
+                if application is not None
+                else self.request.GET.get("client_id", "")
+            )
+            if not self._is_registered_redirect(client_id, target):
+                error = FatalClientError(
+                    error=oauth2_errors.MismatchingRedirectURIError()
+                )
+        return super().error_response(error, application, **kwargs)
+
+    @staticmethod
+    def _is_known_client_id(client_id: str) -> bool:
+        # A NUL never names a client and would make Postgres raise.
+        if not client_id or "\x00" in client_id:
+            return False
+        return get_application_model().objects.filter(client_id=client_id).exists()
+
+    def _is_registered_redirect(self, client_id: str, redirect_uri: Any) -> bool:
+        """True iff oauthlib would accept `redirect_uri` for `client_id`.
+
+        The same checks, through the configured validator class, that
+        oauthlib's `_handle_redirects` runs on the GET: an absolute URI,
+        and `validate_redirect_uri` (DOT's registered-URI matching, plus this
+        package's declared-client prefix rules), after `validate_client_id`
+        has loaded the client. Anything unexpected counts as not registered.
+        """
+        if (
+            not client_id
+            or not isinstance(redirect_uri, str)
+            or not redirect_uri
+            or "\x00" in client_id
+            or not is_absolute_uri(redirect_uri)
+        ):
+            return False
+        validator = self.get_validator_class()()
+        oauthlib_request = OAuthlibRequest(self.request.build_absolute_uri())
+        try:
+            return bool(
+                validator.validate_client_id(client_id, oauthlib_request)
+                and validator.validate_redirect_uri(
+                    client_id, redirect_uri, oauthlib_request
+                )
+            )
+        except Exception:  # noqa: BLE001 — fail closed to the error page
+            return False
 
     def dispatch(self, request, *args, **kwargs):
         # Pin DOT's `approval_prompt` to "force", whatever the query string or
