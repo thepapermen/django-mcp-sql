@@ -34,6 +34,7 @@ import json
 import secrets
 from collections.abc import Sequence
 from datetime import timedelta
+from html.parser import HTMLParser
 from http import HTTPStatus
 from importlib.metadata import version
 from urllib.parse import parse_qs
@@ -160,6 +161,43 @@ def _consent(client, query: str, form_resource: str | None, **extra):
     if form_resource is not None:
         data["resource"] = form_resource
     return client.post(reverse("authorize") + "?" + query, data=data, **extra)
+
+
+class _HiddenFields(HTMLParser):
+    """The hidden `<input>`s of the consent page's `authorizationForm`, as
+    a browser would submit them (name, value; in page order)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_form = False
+        self.fields: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "form":
+            self.in_form = attributes.get("id") == "authorizationForm"
+        elif self.in_form and tag == "input" and attributes.get("type") == "hidden":
+            self.fields.append((attributes["name"], attributes.get("value") or ""))
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.in_form = False
+
+
+def _submit_consent_page(client, page_url: str, page, **extra):
+    """Approve the rendered consent page as a browser does: its own hidden
+    fields, untouched, posted back to the page's URL (the form has no
+    `action`)."""
+    parser = _HiddenFields()
+    parser.feed(page.content.decode())
+    assert parser.fields, page.content[:300]
+    data = urlencode([*parser.fields, ("allow", "Authorize")])
+    return client.post(
+        page_url,
+        data=data,
+        content_type="application/x-www-form-urlencoded",
+        **extra,
+    )
 
 
 def _code_from(response) -> str:
@@ -355,6 +393,104 @@ class TestEquivalentSpellingsAreAccepted:
 
 
 @pytest.mark.django_db
+class TestConsentPageRoundTrip:
+    """The consent POST built from the RENDERED page, not from the test's
+    idea of it: DOT 3.4 renders the GET's `resource` values as one
+    whitespace-joined hidden field, and `form_valid` splits it and requires
+    it to agree with the query string. Every other consent test posts a
+    hand-built field; this pins that what DOT actually renders goes back
+    through the check and gets a code (were the rendering and the split to
+    disagree, every real consent POST carrying a `resource` would be
+    refused)."""
+
+    @pytest.mark.parametrize(
+        "resources",
+        [
+            [SLASHED],
+            [SLASHLESS],
+            [SLASHED, SLASHLESS],
+            ["https://TESTSERVER:443/mcp/sql/"],
+            [SLASHED, *EQUIVALENT],
+            [],
+        ],
+    )
+    def test_the_rendered_form_round_trips(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, resources
+    ):
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+
+        verifier, challenge = _pkce()
+        page_url = (
+            reverse("authorize")
+            + "?"
+            + urlencode(_authorize_params(challenge, resources))
+        )
+        client.force_login(mcp_user)
+        page = client.get(page_url)
+        assert page.status_code == HTTPStatus.OK
+        code = _code_from(_submit_consent_page(client, page_url, page))
+        if _dot_stores_resource():
+            assert Grant.objects.get(code=code).resource == resources
+        # No `resource` at the token endpoint: the token inherits the grant's.
+        token = _exchange(client, code, verifier)
+        assert token.status_code == HTTPStatus.OK, token.content
+        access_token = token.json()["access_token"]
+        if _dot_stores_resource():
+            assert AccessToken.objects.get(token=access_token).resource == resources
+        assert _ping(client, access_token).status_code == HTTPStatus.OK
+
+
+@pytest.mark.django_db
+class TestSpellingsAcrossSteps:
+    """Equivalent spellings are equivalent at each step on its own, not
+    across steps: from DOT 3.4, `/o/token/` also requires each `resource`
+    to be one of the grant's, compared as strings
+    (`_check_and_set_request_resource`). Another accepted spelling passes
+    the package's check and then gets DOT's own `invalid_target` (which
+    names the value sent); the code is not consumed, and the exchange
+    works with the authorization request's own string, or with none."""
+
+    @pytest.mark.parametrize(
+        ("at_authorize", "at_token"),
+        [
+            (SLASHED, SLASHLESS),
+            ("https://TESTSERVER/mcp/sql/", SLASHED),
+            ("https://testserver:443/mcp/sql/", SLASHED),
+        ],
+    )
+    def test_the_token_step_wants_the_granted_string(  # noqa: PLR0913 — fixtures + two parameters
+        self,
+        client,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        at_authorize,
+        at_token,
+    ):
+        verifier, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [at_authorize]))
+        client.force_login(mcp_user)
+        assert client.get(reverse("authorize") + "?" + query).status_code == 200
+        code = _code_from(_consent(client, query, at_authorize))
+        response = _exchange(client, code, verifier, [at_token])
+        if not _dot_stores_resource():
+            # Below 3.4 DOT ignores `resource`.
+            assert response.status_code == HTTPStatus.OK, response.content
+            return
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        # DOT's answer, not the package's (whose check the value passed);
+        # DOT labels its JSON body `text/html`.
+        body = json.loads(response.content)
+        assert body["error"] == "invalid_target"
+        assert "Token request cannot escalate" in body["error_description"]
+        response = _exchange(client, code, verifier, [at_authorize])
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert _ping(client, response.json()["access_token"]).status_code == 200
+
+
+@pytest.mark.django_db
 class TestNonCanonicalHostHeader:
     """A Host header naming this server non-canonically (`<name>:443`, an
     uppercase name) no longer leaks into the identifier: discovery
@@ -502,6 +638,26 @@ class TestForeignResourceIsRefusedAtAuthorize:
         query = urlencode(_authorize_params(challenge, [SLASHED + "\x00"]))
         client.force_login(mcp_user)
         _assert_invalid_target_redirect(client.get(reverse("authorize") + "?" + query))
+
+    def test_consent_form_field_with_a_nul_is_refused_not_500(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        """From DOT 3.4 the consent form has a `resource` field, and Django's
+        form validation refuses a NUL in it before `form_valid` runs: the
+        consent page is re-rendered with the form error (no redirect,
+        nothing stored). Below 3.4 the form has no such field, and the
+        package's check answers `invalid_target`."""
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, []))
+        client.force_login(mcp_user)
+        response = _consent(client, query, SLASHED + "\x00")
+        assert _grant_count() == 0
+        if _dot_stores_resource():
+            assert response.status_code == HTTPStatus.OK
+            assert "Location" not in response
+            assert b'id="authorizationForm"' in response.content
+        else:
+            _assert_invalid_target_redirect(response)
 
     def test_get_with_one_foreign_among_repeated_values(
         self, client, mcp_app, mcp_user, gate_posture
@@ -722,11 +878,35 @@ class TestBearerAudienceCheck:
     def test_a_token_bound_elsewhere_is_still_refused(  # noqa: PLR0913 — fixtures + parameter
         self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, resource
     ):
-        """Rows from before this fix (or written by hand) keep failing DOT's
-        audience check: the check is pointed at the right URL, not off."""
+        """Rows from before this fix (or written by hand) bound to a URL that
+        is not a prefix of the endpoint's keep failing DOT's audience check:
+        the check is pointed at the right URL, not off."""
         token = self._token(mcp_user, mcp_app, [resource])
         response = _ping(client, token.token)
         assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "https://testserver",
+            "https://testserver/",
+            "https://testserver/mcp",
+            "https://testserver/mcp/",
+            "https://TESTSERVER:443/",
+        ],
+    )
+    def test_a_token_bound_to_a_prefix_passes(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, resource
+    ):
+        """DOT's default validator (`validate_resource_as_url_prefix`) takes
+        a token's `resource` as a base the request URL must fall under, so a
+        token bound to a prefix of the endpoint URL (the origin, `/mcp`)
+        passes at `/mcp/sql/`. The package no longer issues one (those
+        values are `invalid_target`); a row from before this fix, or written
+        by hand, works until it expires."""
+        token = self._token(mcp_user, mcp_app, [resource])
+        response = _ping(client, token.token)
+        assert response.status_code == HTTPStatus.OK, response.content
 
     def test_debug_on_uses_the_request_scheme(  # noqa: PLR0913 — fixtures, all load-bearing
         self, client, settings, mcp_app, mcp_user, mcp_active_session, gate_posture
