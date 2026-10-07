@@ -669,8 +669,8 @@ def _guard_bridge(asgi_app):
     """
 
     async def call(scope, receive, send):
-        started = finished = False
-        in_flight: asyncio.Task[None] | None = None
+        started = finished = closed = False
+        in_flight: set[asyncio.Task[None]] = set()
 
         async def deliver(message):
             nonlocal started, finished
@@ -682,9 +682,14 @@ def _guard_bridge(asgi_app):
             )
 
         async def tracked_send(message):
-            nonlocal in_flight
-            in_flight = asyncio.ensure_future(deliver(message))
-            await asyncio.shield(in_flight)
+            if closed:
+                # The guard has let go (the app returned or failed): a send
+                # the app left scheduled must not reach a2wsgi afterwards.
+                msg = "ASGI send after the MCP bridge exchange ended"
+                raise RuntimeError(msg)
+            task = asyncio.ensure_future(deliver(message))
+            in_flight.add(task)
+            await asyncio.shield(task)
 
         status = HTTPStatus.INTERNAL_SERVER_ERROR
         try:
@@ -697,14 +702,16 @@ def _guard_bridge(asgi_app):
                 raise
             status = HTTPStatus.GATEWAY_TIMEOUT
         finally:
-            # On EVERY exit, the exception paths included: a send still in
-            # flight is settled before anything else happens, so no message
-            # is left half-delivered on the shared loop (a2wsgi's per-message
-            # lock is released only once its WSGI half has taken the message).
-            if in_flight is not None:
-                await asyncio.wait({in_flight})
-        if in_flight is not None:
-            in_flight.result()  # a failed send is this exchange's failure
+            # On EVERY exit, the exception paths included: no new send may
+            # start, and every send still in flight (not just the latest) is
+            # settled before anything else happens, so no message is left
+            # half-delivered on the shared loop (a2wsgi's per-message lock is
+            # released only once its WSGI half has taken the message).
+            closed = True
+            if in_flight:
+                await asyncio.wait(in_flight)
+        for task in in_flight:
+            task.result()  # a failed send is this exchange's failure
         if not finished:
             await _complete_response(scope, send, started=started, status=status)
 

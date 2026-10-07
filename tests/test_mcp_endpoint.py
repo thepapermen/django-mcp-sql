@@ -811,6 +811,77 @@ class TestBridgeGuard:
         assert settled_before_release is False
         assert delivered == ["http.response.start", "http.response.body"]
 
+    def test_app_exception_waits_for_every_in_flight_send(self):
+        """Two sends in flight when the app fails: the guard settles both,
+        not just the latest, before the exception propagates. The earlier
+        one is released last, so settling only the latest would let the
+        guard finish while it is still pending."""
+        gates = {b"a": asyncio.Event(), b"b": asyncio.Event()}
+        delivered = []
+
+        async def send(message):
+            body = message.get("body")
+            if body in gates:
+                await gates[body].wait()
+            delivered.append(body or message["type"])
+
+        senders = []
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            for chunk in (b"a", b"b"):
+                message = {
+                    "type": "http.response.body",
+                    "body": chunk,
+                    "more_body": True,
+                }
+                senders.append(asyncio.ensure_future(send(message)))
+                await asyncio.sleep(0)
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)
+
+        async def scenario():
+            guarded = asyncio.ensure_future(
+                _guard_bridge(app)({"type": "http"}, None, send)
+            )
+            await asyncio.sleep(0.05)
+            gates[b"b"].set()  # the latest send completes...
+            await asyncio.sleep(0.05)
+            done_with_a_pending = guarded.done()  # ...the earlier one has not
+            gates[b"a"].set()
+            with pytest.raises(TimeoutError):
+                await guarded
+            return done_with_a_pending
+
+        assert asyncio.run(scenario()) is False
+        assert delivered[1:] == [b"b", b"a"]
+
+    def test_send_started_after_the_guard_finished_never_reaches_a2wsgi(self):
+        """A send the app scheduled but that had not started when the app
+        failed must not slip out to a2wsgi after the guard has let go: it
+        fails in the app's own task instead."""
+        delivered = []
+        leaked = []
+
+        async def send(message):
+            delivered.append(message.get("body", message["type"]))
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            message = {"type": "http.response.body", "body": b"late", "more_body": True}
+            leaked.append(asyncio.ensure_future(send(message)))
+            msg = "boom"
+            raise RuntimeError(msg)  # before the scheduled send ever runs
+
+        async def scenario():
+            with pytest.raises(RuntimeError, match="boom"):
+                await _guard_bridge(app)({"type": "http"}, None, send)
+            with pytest.raises(RuntimeError, match="after the MCP bridge exchange"):
+                await leaked[0]
+
+        asyncio.run(scenario())
+        assert b"late" not in delivered
+
     def test_endless_stream_is_closed_at_the_deadline(self, monkeypatch):
         monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
 

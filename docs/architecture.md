@@ -670,8 +670,10 @@ The load-bearing invariants and footguns, grouped by layer:
   raises, a `TimeoutError` of its own included (only the guard's own expired
   deadline is a 504), is left to a2wsgi: a `500`, or re-raised into
   `_invoke_wsgi_app` once a body chunk was sent, with no guard log line.
-  Either way a send still in flight is settled first, so no message is left
-  half-delivered on the shared loop. `wait_time` caps how long a2wsgi waits for
+  Either way every send still in flight is settled first and no new one may
+  start once the exchange has ended (a send the app left scheduled fails in
+  its own task), so no message is left half-delivered on the shared loop or
+  reaches a2wsgi after the guard has let go. `wait_time` caps how long a2wsgi waits for
   the task to wind down after the response. Keep both if the bridge is ever
   rebuilt. Pinned by `TestBridgeGuard` and `TestRealSdkThroughTheBridge`.
 - **DRF pre-reads `request.body` for content negotiation.** By the time
