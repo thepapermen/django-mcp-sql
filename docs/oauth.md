@@ -171,7 +171,9 @@ to turn them on:
   Rows whose refresh tokens are gone (revoked, removed by `cleartokens`, or
   refresh switched off again) are inert and safe to delete, e.g. next to
   `cleartokens`:
-  `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.objects.values("token_family")).delete()`.
+  `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.objects.filter(token_family__isnull=False).values("token_family")).delete()`
+  (keep the `isnull` filter: `NOT IN` over a list holding a NULL matches
+  nothing, so without it the snippet deletes no rows).
 - The discovery document and the DCR response (when the client asked for
   it) list `refresh_token`.
 - Logout and a password change delete the user's MCP refresh tokens with

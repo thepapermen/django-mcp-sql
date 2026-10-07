@@ -442,3 +442,39 @@ class TestPasswordChangeEdgeCases:
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"] == "invalid_grant"
         assert not AccessToken.objects.filter(user=mcp_user).exists()
+
+
+@pytest.mark.django_db
+def test_documented_family_prune_deletes_only_orphaned_families(mcp_user, mcp_app):
+    """The prune snippet in `MCPRefreshTokenFamily`'s docstring and
+    docs/oauth.md: families without a refresh token go, live ones stay —
+    also when some refresh token has no family (a NULL in the `NOT IN`)."""
+    import uuid
+
+    live, orphan = uuid.uuid4(), uuid.uuid4()
+    now = timezone.now()
+    MCPRefreshTokenFamily.objects.create(token_family=live, consented_at=now)
+    MCPRefreshTokenFamily.objects.create(token_family=orphan, consented_at=now)
+    for family in (live, None):
+        access = AccessToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(24),
+            application=mcp_app,
+            expires=now + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+        RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=mcp_app,
+            access_token=access,
+            token_family=family,
+        )
+    MCPRefreshTokenFamily.objects.exclude(
+        token_family__in=RefreshToken.objects.filter(token_family__isnull=False).values(
+            "token_family"
+        )
+    ).delete()
+    assert list(
+        MCPRefreshTokenFamily.objects.values_list("token_family", flat=True)
+    ) == [live]

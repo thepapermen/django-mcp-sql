@@ -222,8 +222,10 @@ class MCPRefreshTokenFamily(models.Model):
     tokens are gone (revoked, deleted by `cleartokens`, or refresh switched
     off again) are inert — a family is only consulted for a live refresh
     token — and can be deleted at will, e.g. alongside `cleartokens`:
-    `MCPRefreshTokenFamily.objects.exclude(token_family__in=
-    RefreshToken.objects.values("token_family")).delete()`.
+    `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.
+    objects.filter(token_family__isnull=False).values("token_family"))
+    .delete()` (the `isnull` filter is required: `NOT IN` over a list
+    holding a NULL matches nothing).
     """
 
     token_family = models.UUIDField(primary_key=True)

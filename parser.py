@@ -596,9 +596,12 @@ def render_for_execution(
        never be checked).
     2. Run the full `parse_and_validate` on that text, with the same
        whitelist — every check the agent's text passed, now on the text
-       that will run. A rendering that smuggles in an extra projection,
-       statement, table or function fails here.
-    3. Render the re-parsed tree again and require the identical string:
+       that will run. A rendering that smuggles in a statement, a table off
+       the whitelist or a denied function fails here (a harmless extra
+       projection would pass every check and run as rendered — what runs is
+       always what was checked).
+    3. Render the re-parsed tree again and require the identical string
+       (and that it still ends in exactly `LIMIT limit`):
        sqlglot reads its own output back as exactly what it wrote (a
        fixpoint), so the text that ran the checks is the text executed.
        A rendering from the agent's tree can still differ in spelling from
@@ -609,12 +612,17 @@ def render_for_execution(
        passed every check and re-renders to itself.
 
     Any failure is `QueryRejectedError(ROUNDTRIP_MISMATCH)` naming the
-    step; nothing runs. Rewrites that keep the meaning — sqlglot's `CAST` in
-    `ROUND(AVG(x), 2)`, an expanded window frame, `SOME` → `ANY`,
-    `date_part` → `EXTRACT` — validate and run.
+    step; nothing runs. That includes a construct sqlglot cannot express in
+    Postgres (it would otherwise drop it — `IGNORE NULLS`, `initcap`'s
+    delimiter — see `_render`). Rewrites that keep the meaning — sqlglot's
+    `CAST` in `ROUND(AVG(x), 2)`, an expanded window frame, `SOME` → `ANY` —
+    validate and run; the ones that do not are switched off in
+    `FaithfulPostgres`. `tests/test_sql_functional_corpus.py` pins that
+    ordinary analytics return what Postgres returns for the original text.
 
     The residual: the checks prove what sqlglot reads in the executed text,
-    not what Postgres's lexer reads. Where the two lexers disagree on a
+    not what Postgres's lexer reads, and the result values are only as
+    faithful as sqlglot's generator. Where the two lexers disagree on a
     source form, the parser refuses that form up front
     (`_check_lexical_fidelity`); a disagreement nobody has found yet would
     not be caught here.
