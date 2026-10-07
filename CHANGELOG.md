@@ -453,12 +453,18 @@ announce themselves.
   else. Ordinary non-ASCII text is still accepted. An unparseable body is
   `invalid_client_metadata`, and `grant_types` / `response_types` must be
   arrays of strings. Also affects 0.1.0b5.
-- **Known, fixed by the 0.1.0b6 OAuth rework (merged before this release):** a
-  NUL byte in `client_id` at `/o/token/` or `/o/revoke_token/`, and in
-  `code_challenge` or `nonce` on an `/o/authorize/` GET that issues a code
-  without consent, still reaches Postgres on this branch alone and answers
-  500. 0.1.0b6's control-character refusal on those endpoints covers them;
-  nothing here duplicates it.
+- **Known on this branch alone, fixed by PR #4 (branch
+  `fix/dcr-redirect-whitespace`, 0.1.0b6, which merges first):** a NUL byte
+  in a parameter of DOT's own OAuth views still reaches the database. Under
+  psycopg 3 every case below is a 500 (`DataError`). Under psycopg2 the driver
+  refuses the NUL client-side with `ValueError`; DOT's client lookup catches
+  that (GH #1006), so a NUL `client_id` at `/o/token/` or `/o/revoke_token/`
+  is a 401 `invalid_client`, but the other cases are still a 500. The cases:
+  `client_id` and `code` at `/o/token/`, `client_id` at `/o/revoke_token/`,
+  and `code_challenge`, `nonce` or (DOT 3.4 and later) `resource` on an
+  `/o/authorize/` GET that issues a code without consent. PR #4 refuses a
+  control character in every parameter of those views (and in any
+  `client_id` DOT looks up) before DOT runs; nothing here duplicates it.
 
 ## 0.1.0b5 - 2026-07-01
 
