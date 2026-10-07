@@ -322,10 +322,11 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     if not isinstance(body, dict):
         return _error("invalid_client_metadata", "Request body must be a JSON object")
 
-    requested_uris = body.get("redirect_uris")
-    uris_error = _requested_uris_error(requested_uris)
+    uris_error = _requested_uris_error(body.get("redirect_uris"))
     if uris_error is not None:
         return uris_error
+    # A non-empty list from here on (`_requested_uris_error` checked it).
+    requested_uris: list[Any] = body["redirect_uris"]
     # Register the loopback SUBSET rather than refusing the whole request.
     # RFC 7591 §3.2.1 already has us registering the subset of requested
     # metadata we support and echoing back what we actually registered, and
