@@ -296,8 +296,9 @@ separately below precisely because they do **not** announce themselves.
   crafted link. Reproduced against DOT 3.4.1 (302
   to the callback with the code). `MCPAuthorizationView` now pins
   `approval_prompt` to `force` for every request, so consent is an explicit
-  POST every time; the curated `skip_authorization=True` Application is
-  unaffected. **This predates the multi-client work** — DCR clients (and
+  POST every time. The pin covers every Application the package creates,
+  the curated `mcp-sql` row included (it requires consent since migration
+  `0015`, see Breaking). **This predates the multi-client work** — DCR clients (and
   0.1.0b5's opt-in cloud clients) had the same skip — but declared clients
   shipping ON makes it reachable by default. Whether a given provider then
   completes a callback it receives in another user's browser is outside this
@@ -511,9 +512,16 @@ separately below precisely because they do **not** announce themselves.
   is a 401 `invalid_client`, but the other cases are still a 500. The cases:
   `client_id` and `code` at `/o/token/`, `client_id` at `/o/revoke_token/`,
   and `code_challenge`, `nonce` or (DOT 3.4 and later) `resource` on an
-  `/o/authorize/` GET that issues a code without consent. PR #4 refuses a
-  control character in every parameter of those views (and in any
-  `client_id` DOT looks up) before DOT runs; nothing here duplicates it.
+  `/o/authorize/` GET that issues a code without consent — which no
+  Application the package creates does any more (every kind requires
+  consent since migration `0015`); only a hand-flipped or legacy
+  `skip_authorization=True` row reaches it. PR #4 refuses a control
+  character in every parameter of those views (and in any `client_id` DOT
+  looks up) before DOT runs; nothing here duplicates it. Also fixed by PR #4,
+  through its `django-oauth-toolkit>=3.4.1` floor: on DOT 3.2.0 (this
+  branch's declared floor), an anonymous `prompt=none` request to
+  `/o/authorize/` is redirected to the `redirect_uri` in the query string
+  without validating it; DOT 3.4.1 answers 400. Same code on 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 
