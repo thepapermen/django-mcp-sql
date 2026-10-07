@@ -85,9 +85,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `(SELECT … LIMIT 5)` no longer fails with a second LIMIT.
     `QUALIFY` (not Postgres SQL) is a syntax error and `qualify` an ordinary
     name, as in Postgres. Also rendered as written: `x IS NOT NULL IS TRUE`
-    (sqlglot 30.13+ dropped the `NOT`), `IS NOT TRUE` / `IS NOT FALSE` /
-    `IS NOT UNKNOWN` inside a comparison or an IS chain (`y > 2 IS NOT TRUE`
-    came back `y > NOT 2 IS TRUE`), a negated operator inside one on 30.7
+    (sqlglot 30.13+ dropped the `NOT`), `IS NOT TRUE` / `IS NOT FALSE`
+    inside a comparison or an IS chain (`y > 2 IS NOT TRUE` came back `y >
+    NOT 2 IS TRUE`; `IS NOT UNKNOWN` there keeps its `NOT`, but renders as
+    `IS NOT NULL`, like `IS UNKNOWN` as `IS NULL` — the same for a boolean
+    operand; on any other type Postgres raises and the rendering runs, a
+    known residual), a negated operator inside one on 30.7
     (`g NOT LIKE 'a%' IS TRUE` came back `NOT g LIKE 'a%' IS TRUE`; any `NOT`
     that is an operand now keeps its parentheses), `a ^ b` (was `POWER(a,
     b)`: another column name and sqlglot's precedence), `~ -1` / `- ~1`
@@ -110,7 +113,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     (array slices, `format(...)`, columns named `value` / `key` / `on` had
     turned it into the SQL/JSON constructor), the prefix operators `@ x`
     and `@-@ x` (read as a parameter `$x`; a real parameter `$1` / `$name`
-    stays one, an error in Postgres, and is never read as `@`), `overlaps(a, b, c, d)`, and
+    stays one, an error in Postgres, and is never read as `@`), `a ^@ b`
+    (starts with; read as `a ^ (@ b)`, which returned other values or
+    errors), `!! q` (tsquery negation, refused before) and `! x` (Postgres's
+    error; sqlglot ran it as `NOT x`), `overlaps(a, b, c, d)`, and
     `qualify` as a name everywhere (select alias, `GROUP BY`). `LIMIT
     '<integer>'` (also in parentheses, `LIMIT ('5000000000')`) is read as
     the bigint it is to Postgres. An array constructor subscripted without
@@ -120,7 +126,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    873 ordinary analytical queries (over data with NULLs and mixed case)
+    876 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the

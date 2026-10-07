@@ -543,8 +543,9 @@ The load-bearing invariants and footguns, grouped by layer:
      written: multi-part interval
      strings, the right operand of `->` / `->>`, quoted type names, `bit` /
      `char` typed literals, numeric constants (incl. the PG16 forms `0x1F`,
-     `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), `DISTINCT` over
-     several aggregate arguments, `current_*` precision.
+     `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), the operators
+     `a ^@ b` (sqlglot read `a ^ (@ b)`), `!! q` and `! x` (read as `NOT`),
+     `DISTINCT` over several aggregate arguments, `current_*` precision.
      `test_sql_fidelity.test_every_catalog_function_call_is_rendered_as_written`
      renders a call (plain string arguments) to every `pg_catalog`
      function the parser accepts and requires it unchanged, so a newer
@@ -559,8 +560,7 @@ The load-bearing invariants and footguns, grouped by layer:
   about Postgres's lexer, and values are only as faithful as sqlglot's
   generator. Where the two are known to disagree, the form is refused in
   layer 1 or rendered as written in layer 3; a disagreement nobody has
-  found yet is the residual risk. Known, accepted: `^@` renders to invalid
-  SQL (fails at execution — fail-closed), `|/ x` / `||/ x` render as
+  found yet is the residual risk. Known, accepted: `|/ x` / `||/ x` render as
   `SQRT(x)` / `CBRT(x)` (another column name), a generic typed literal of a
   type sqlglot does not know (`lseg '…'`) is refused; syntax Postgres rejects that sqlglot still understands (`REGEXP`,
   `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+) is
@@ -569,7 +569,9 @@ The load-bearing invariants and footguns, grouped by layer:
   `j @? path` on 30.7). Also accepted: `SELECT 123abc` / `1e3x` /
   `1_000abc` keep sqlglot's reading `123 AS abc` (Postgres 14's; 15+
   reject "trailing junk"), unary `+x` loses its `+` (column name `x` instead of
-  `?column?`), and a quoted call of a
+  `?column?`), `x IS [NOT] UNKNOWN` renders as `x IS [NOT] NULL` (the same
+  for a boolean `x`; for any other type Postgres raises "argument of IS
+  UNKNOWN must be type boolean" and the rendering runs), and a quoted call of a
   set-returning builtin (`"unnest"(...)`) is refused as `UNSAFE_LITERAL`,
   the lexical check running first. Interval types with a precision in a
   cast (`'1.5'::interval(3)`, `interval second(2)`) and a subscript after
@@ -584,7 +586,7 @@ The load-bearing invariants and footguns, grouped by layer:
   CTE alias `t` (the bare-row check), `t.f` when a column `t` is also in
   scope. Pre-existing and tracked separately:
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 873
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 876
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must
