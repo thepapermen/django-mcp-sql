@@ -533,7 +533,14 @@ The load-bearing invariants and footguns, grouped by layer:
   a self-referential entry): PostgreSQL truncates such a name, so the
   catalog lists a name the declared side never matches and each `--apply`
   granted and revoked it in turn. Queries are unaffected (PostgreSQL
-  truncates the name in the agent's SQL the same way).
+  truncates the name in the agent's SQL the same way). The byte count is
+  UTF-8's: exact on a UTF-8 server, stricter than needed on a
+  single-byte one; a server built with another `NAMEDATALEN`, or a
+  multi-byte encoding that spends more bytes on a character than UTF-8
+  does (`EUC_TW`'s four-byte planes), is not read. `reconcile_grants`
+  checks every profile and computes every drift before it applies any,
+  then runs all GRANT / REVOKE statements in one transaction, so a
+  refused profile changes no grant (review round 19).
 - **Catalog names are untrusted SQL.** Whoever owns a relation names it,
   and a name may hold `"`, `"."`, `;`, newlines. The grants pipeline
   carries relations as `(schema, name)` tuples (inventory rows as read;

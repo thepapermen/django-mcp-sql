@@ -347,23 +347,43 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
 
     See module docstring for the strict/apply matrix. Returns a
     `DriftDiff` whose `per_profile` maps each profile name to its
-    `ProfileDrift`. Self-referential whitelist entries and view-parity
-    drift always raise (`GrantsReconcileError`) — those are code-level
-    misconfigurations, not env-level state. In strict mode a missing role
-    or membership raises; in lenient mode that profile is skipped with a
-    WARNING and the others are still reconciled.
+    `ProfileDrift`. Self-referential whitelist entries, an overlong
+    `db_table` and view-parity drift always raise (`GrantsReconcileError`)
+    — those are code-level misconfigurations, not env-level state. In
+    strict mode a missing role or membership raises; in lenient mode that
+    profile is skipped with a WARNING and the others are still reconciled.
+
+    Every profile is checked and its drift computed before anything is
+    applied, and all profiles' GRANT / REVOKE statements run in one
+    transaction: a refusal of any profile changes no grant (review round
+    19: the profiles before the refused one had been applied already).
+    Roles are unique per profile (boot-validated), so one profile's
+    changes never alter another's drift.
     """
     _verify_default_alias()
     result = DriftDiff()
-    for profile in mcp_sql_settings.profiles().values():
-        result.per_profile[profile.name] = _reconcile_profile(
-            profile, strict=strict, apply=apply
-        )
+    profiles = list(mcp_sql_settings.profiles().values())
+    for profile in profiles:
+        result.per_profile[profile.name] = _profile_drift(profile, strict=strict)
+    if apply and result.changed:
+        with transaction.atomic():
+            for profile in profiles:
+                _apply_drift(profile.role, result.per_profile[profile.name])
     return result
 
 
 def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> ProfileDrift:
-    """Reconcile one profile's role against its declared whitelist.
+    """Reconcile one profile's role against its declared whitelist (the
+    checks and the drift of `_profile_drift`, then `_apply_drift`)."""
+    drift = _profile_drift(profile, strict=strict)
+    if apply and drift.changed:
+        with transaction.atomic():
+            _apply_drift(profile.role, drift)
+    return drift
+
+
+def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
+    """Check one profile and compute its role's drift; nothing is applied.
 
     Drift is computed strictly per role — declared-for-this-profile minus
     granted-to-this-profile's-role — so a table shared with another
@@ -422,18 +442,20 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
     # table; `s"."t` is not `t`).
     declared = {relation_of(table) for table in declared_tables(profile).values()}
     current = granted_tables(profile.role)
-    drift = ProfileDrift(
+    return ProfileDrift(
         granted=sorted(declared - current),
         revoked=sorted(current - declared),
     )
-    if apply and drift.changed:
-        role = profile.role
-        with transaction.atomic(), connection.cursor() as cur:
-            # `role` is boot-validated as a plain identifier
-            # (`validation._PG_IDENTIFIER_RE`), as for `SET LOCAL ROLE`.
-            for relation in drift.granted:
-                cur.execute(f"GRANT SELECT ON {relation_sql(relation)} TO {role};")
-            for relation in drift.revoked:
-                revoke = f"REVOKE SELECT ON {relation_sql(relation)} FROM {role};"  # noqa: S608
-                cur.execute(revoke)
-    return drift
+
+
+def _apply_drift(role: str, drift: ProfileDrift) -> None:
+    """Run the GRANT / REVOKE statements `drift` implies for `role`, in the
+    caller's transaction."""
+    with connection.cursor() as cur:
+        # `role` is boot-validated as a plain identifier
+        # (`validation._PG_IDENTIFIER_RE`), as for `SET LOCAL ROLE`.
+        for relation in drift.granted:
+            cur.execute(f"GRANT SELECT ON {relation_sql(relation)} TO {role};")
+        for relation in drift.revoked:
+            revoke = f"REVOKE SELECT ON {relation_sql(relation)} FROM {role};"  # noqa: S608
+            cur.execute(revoke)

@@ -375,3 +375,74 @@ class TestOverlongDbTable:
             call_command("mcp_sql_grants", stdout=out)
             assert "Grants in sync" in out.getvalue()
         assert grants.granted_tables(_ROLE) == {("public", db_table)}
+
+
+class TestARefusedProfileChangesNoGrant:
+    """Review round 19. The code-level checks (a self-referential or an
+    overlong entry) ran inside the per-profile loop, so with several
+    profiles `--apply` had already granted and revoked for the profiles
+    before the refused one. Every profile is now checked before any grant
+    changes, and all of them apply in one transaction."""
+
+    _TABLE = "mcp_sql_a19_widget"
+
+    @pytest.fixture
+    def two_profiles(self, settings, monkeypatch):
+        """Profile `a` (the default role) has drift: its table is not
+        granted. Profile `b` comes after it."""
+        tables = {"a": {"mcp_sql_testapp.Widget": self._TABLE}}
+        monkeypatch.setattr(
+            "mcp_sql.grants.declared_tables",
+            lambda profile: tables.get(profile.name, {}),
+        )
+        with connection.cursor() as cur:
+            cur.execute(f"CREATE TABLE public.{self._TABLE} (id int)")
+
+        def configure(b_models, b_tables):
+            tables["b"] = b_tables
+            settings.MCP_SQL = {
+                **settings.MCP_SQL,
+                "PROFILES": {
+                    "a": {
+                        "ROLE": _ROLE,
+                        "PERMISSION_CODENAME": "use_mcp_session",
+                        "GROUP_NAME": "mcp_sql_users",
+                        "ALLOWED_MODELS": ["mcp_sql_testapp.Widget"],
+                    },
+                    "b": {
+                        "ROLE": "mcp_sql_a19_b",
+                        "PERMISSION_CODENAME": "use_mcp_session_a19_b",
+                        "GROUP_NAME": "mcp_sql_a19_b",
+                        "ALLOWED_MODELS": b_models,
+                    },
+                },
+            }
+
+        return configure
+
+    @pytest.mark.parametrize(
+        ("b_models", "b_tables", "message"),
+        [
+            (
+                ["mcp_sql_testapp.Widget"],
+                {"mcp_sql_testapp.Widget": "mcp_sql_a19_" + "l" * 52},
+                "63-byte identifier limit",
+            ),
+            (["mcp_sql.MCPQueryLog"], {}, "Refusing to grant on mcp_sql models"),
+        ],
+    )
+    def test_the_profile_before_it_is_not_applied(
+        self, two_profiles, b_models, b_tables, message
+    ):
+        two_profiles(b_models, b_tables)
+        with pytest.raises(CommandError) as exc:
+            call_command("mcp_sql_grants", "--apply", stdout=StringIO())
+        assert message in str(exc.value)
+        assert ("public", self._TABLE) not in grants.granted_tables(_ROLE)
+
+    def test_both_profiles_apply_when_both_pass(self, two_profiles):
+        two_profiles(["mcp_sql_testapp.Widget"], {})
+        with connection.cursor() as cur:
+            cur.execute("CREATE ROLE mcp_sql_a19_b NOLOGIN")
+        call_command("mcp_sql_grants", "--apply", stdout=StringIO())
+        assert ("public", self._TABLE) in grants.granted_tables(_ROLE)

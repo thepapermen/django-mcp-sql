@@ -313,7 +313,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     refused (`GrantsReconcileError`, also logged by the `post_migrate`
     check): PostgreSQL truncates such a name, so the catalog never listed
     the declared name and every `--apply` re-granted it and revoked the
-    truncated one. Shorten `Meta.db_table`.
+    truncated one. Shorten `Meta.db_table`. `--apply` checks every
+    profile (and computes its drift) before it changes any grant, and
+    runs all profiles' GRANT / REVOKE statements in one transaction: a
+    profile refused for an overlong or self-referential entry, view
+    drift or a missing role no longer leaves the profiles before it
+    applied.
   - **Behaviour change:** names in agent queries resolve in `pg_catalog`
     and `public` only. An extension installed in another schema (Django's
     `CreateExtension` installs into the first schema on the app's
