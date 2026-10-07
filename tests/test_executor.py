@@ -858,3 +858,23 @@ def test_table_columns_come_from_the_whitelisted_models():
     columns = _table_columns({"auth.Permission": "auth_permission", "t": "t"})
     assert {"id", "codename", "content_type_id"} <= columns["auth_permission"]
     assert "t" not in columns  # no model: no columns known
+
+
+def test_table_columns_are_the_tables_own():
+    """A multi-table-inheritance child's table has only its own columns: a
+    parent field named `to_jsonb` would make `c.to_jsonb` (Postgres:
+    `to_jsonb(c)`, the whole row) look like a column (review round 11). A
+    proxy has its concrete model's table and columns."""
+    from mcp_sql.executor import _table_columns
+    from mcp_sql.tests.testapp.models import Gauge
+    from mcp_sql.tests.testapp.models import GaugeReading
+
+    child, parent = GaugeReading._meta.db_table, Gauge._meta.db_table
+    columns = _table_columns(
+        {
+            "mcp_sql_testapp.GaugeReading": child,
+            "mcp_sql_testapp.GaugeProxy": parent,
+        }
+    )
+    assert columns[child] == frozenset({"gauge_ptr_id", "reading"})
+    assert columns[parent] == frozenset({"id", "current_setting"})

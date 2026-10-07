@@ -49,6 +49,24 @@ class Gauge(models.Model):
         return f"Gauge #{self.pk}"
 
 
+class GaugeReading(Gauge):
+    """A multi-table-inheritance child of `Gauge`: its own table holds only
+    `gauge_ptr_id` and `reading`; `current_setting` is the parent table's."""
+
+    reading = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "mcp_sql_testapp"
+
+
+class GaugeProxy(Gauge):
+    """A proxy of `Gauge`: the same table and columns."""
+
+    class Meta:
+        app_label = "mcp_sql_testapp"
+        proxy = True
+
+
 class MCPWidgetSecondProfileView(models.Model):
     """Unmanaged handle on `mcp_widget_second_profile` — a curated VIEW projecting
     only id/name and only `kind = 'second_profile'` rows of `Widget`. Used by the

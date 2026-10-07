@@ -658,7 +658,11 @@ def _table_columns(tables: dict[str, str]) -> dict[str, frozenset[str]]:
             continue
         # Django quotes its column names, so this is their exact spelling
         # (the parser compares quoted names case-sensitively).
+        # The columns of this model's own table: a multi-table-inheritance
+        # child's parent fields live in the parent's table (`c.to_jsonb` is
+        # then `to_jsonb(c)`), and a proxy reads its concrete model's table.
+        concrete = model._meta.concrete_model._meta
         columns[db_table] = frozenset(
-            field.column for field in model._meta.concrete_fields
+            field.column for field in concrete.local_concrete_fields
         )
     return columns

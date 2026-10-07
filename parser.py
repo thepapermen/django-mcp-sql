@@ -2190,8 +2190,20 @@ def _item_columns(
         cte = _cte_named(source)
         if cte is not None:
             return _renamed(renamed, _cte_columns(cte))
-        return _base_table_columns(table_columns.get(_name_key(source.this)), renamed)
+        certain, possible = _base_table_columns(
+            table_columns.get(_name_key(source.this)), renamed
+        )
+        # A table's system columns are columns too, whatever the alias list
+        # (a view has none, but the model does not say which it is).
+        return certain | _SYSTEM_COLUMNS, (
+            None if possible is None else possible | _SYSTEM_COLUMNS
+        )
     return frozenset(renamed), None
+
+
+# Postgres's system columns of a table: `(tableoid).pg_relation_filepath`
+# calls the function on the table's `tableoid`, never a FROM item named so.
+_SYSTEM_COLUMNS = frozenset({"tableoid", "ctid", "xmin", "xmax", "cmin", "cmax"})
 
 
 def _base_table_columns(
