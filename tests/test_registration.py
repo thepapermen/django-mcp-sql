@@ -707,7 +707,7 @@ _URI_REFUSAL = (
 )
 _NAME_REFUSAL = (
     "client_name must be a string of at most 200 characters, without control, "
-    "format, separator or surrogate characters"
+    "separator, surrogate, bidirectional-control or invisible characters"
 )
 
 
@@ -726,7 +726,9 @@ class TestUnacceptableCharactersAreA400:
       and line / paragraph separators (`Zl`, `Zp`): storable, but in a
       callback stored on the Application (copied into every audit row's
       `client_redirect`) or in a logged client name they let a registrant
-      make the text read as something else.
+      make the text read as something else. A redirect URI refuses every
+      `Cf`; a client name only the display-altering ones (joiners, tags and
+      variation selectors are ordinary text there).
 
     Refused even beside a clean URI, and the error description is asserted so
     that a regression to "drop it from the loopback subset" (which answers a
@@ -769,7 +771,23 @@ class TestUnacceptableCharactersAreA400:
         assert Application.objects.count() == before
 
     @pytest.mark.parametrize(
-        "char", ["\x00", "\n", "\x1b", chr(0xD800), "\u202e", "\u200b", "\u2028"]
+        "char",
+        [
+            "\x00",
+            "\n",
+            "\x1b",
+            chr(0xD800),  # lone surrogate
+            chr(0x2028),  # line separator
+            chr(0x202E),  # right-to-left override
+            chr(0x2066),  # left-to-right isolate
+            chr(0x200E),  # left-to-right mark
+            chr(0x061C),  # Arabic letter mark
+            chr(0x200B),  # zero-width space
+            chr(0x2060),  # word joiner
+            chr(0xFEFF),  # BOM
+            chr(0x00AD),  # soft hyphen (invisible unless at a line break)
+            chr(0x3164),  # Hangul filler (renders blank)
+        ],
     )
     def test_client_name(self, client, char):
         before = Application.objects.count()
@@ -787,16 +805,48 @@ class TestUnacceptableCharactersAreA400:
         }
         assert Application.objects.count() == before
 
-    def test_ordinary_non_ascii_is_not_refused(self, client):
-        """Letters, punctuation and symbols outside ASCII are fine: the refusal
-        is for invisible and unencodable characters, not for non-English."""
-        uri = "http://localhost:8787/callbäck"
-        name = "Café — Kód ✓ 😀"
-        response = _post(client, {"redirect_uris": [uri], "client_name": name})
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Café — Kód ✓ 😀",
+            # Persian "I want": the zero-width NON-joiner is part of correct
+            # spelling, so it is allowed in a name.
+            "\u0645\u06cc" + chr(0x200C) + "\u062e\u0648\u0627\u0647\u0645",
+            # Emoji ZWJ sequence (man technologist): the zero-width joiner.
+            "Dev \U0001f468" + chr(0x200D) + "\U0001f4bb",
+            # Subdivision flag (Scotland): tag characters, format class `Cf`.
+            "\U0001f3f4"
+            + "".join(chr(0xE0000 + ord(c)) for c in "gbsct")
+            + chr(0xE007F),
+            # Variation selector (emoji presentation).
+            "Heart \u2764" + chr(0xFE0F),
+        ],
+        ids=["accents-emoji", "zwnj", "zwj-emoji", "flag-tags", "variation-sel"],
+    )
+    def test_ordinary_non_ascii_name_is_not_refused(self, client, name):
+        """Letters, punctuation, emoji and the joiners real scripts and emoji
+        sequences need are fine in a name: only characters that make it
+        display as something it is not are refused."""
+        response = _post(
+            client,
+            {"redirect_uris": ["http://localhost:8787/callback"], "client_name": name},
+        )
         assert response.status_code == HTTPStatus.CREATED
-        body = response.json()
-        assert body["redirect_uris"] == [uri]
-        assert body["client_name"] == name
+        assert response.json()["client_name"] == name
+
+    def test_ordinary_non_ascii_uri_is_not_refused(self, client):
+        uri = "http://localhost:8787/callbäck"
+        response = _post(client, {"redirect_uris": [uri]})
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.json()["redirect_uris"] == [uri]
+
+    @pytest.mark.parametrize("char", [chr(0x200C), chr(0x200D), chr(0xE0067)])
+    def test_joiners_and_tags_stay_refused_in_a_redirect_uri(self, client, char):
+        """Redirect URIs stay strict: every format character, joiners and tag
+        characters included, since nothing legitimate in a callback needs one."""
+        response = _post(client, {"redirect_uris": [f"http://localhost:8787/c{char}b"]})
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error_description"] == _URI_REFUSAL
 
 
 @pytest.mark.django_db

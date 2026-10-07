@@ -61,27 +61,73 @@ _MAX_REDIRECT_URI_LENGTH = 1024
 _MAX_CLIENT_NAME = 200
 
 
-# Unicode general categories refused anywhere in client metadata we store,
-# echo or log: control (`Cc`: C0, DEL, C1), surrogate (`Cs`), format (`Cf`:
-# bidi overrides, zero-width space, BOM, ...), line / paragraph separator
-# (`Zl`, `Zp`).
-_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
+# Characters that make text display as something it is not, refused in every
+# client-metadata field: bidirectional controls (marks, embeddings,
+# overrides, isolates) and invisible characters (zero-width space, word
+# joiner and invisible operators, BOM, soft hyphen, the Hangul fillers that
+# render blank, interlinear annotation marks, the deprecated format controls).
+# Deliberately NOT here: the zero-width non-joiner and joiner (U+200C/D),
+# which Persian, Indic scripts and emoji sequences need, tag characters
+# (subdivision flags) and variation selectors.
+_DISPLAY_ALTERING = frozenset(
+    {
+        0x00AD,  # soft hyphen
+        0x061C,  # Arabic letter mark
+        0x115F,  # Hangul choseong filler
+        0x1160,  # Hangul jungseong filler
+        0x180E,  # Mongolian vowel separator
+        0x200B,  # zero-width space
+        0x200E,  # left-to-right mark
+        0x200F,  # right-to-left mark
+        *range(0x202A, 0x202F),  # LRE, RLE, PDF, LRO, RLO
+        *range(0x2060, 0x2065),  # word joiner, invisible operators
+        *range(0x2066, 0x2070),  # isolates, deprecated format controls
+        0x3164,  # Hangul filler
+        0xFEFF,  # BOM / zero-width no-break space
+        0xFFA0,  # halfwidth Hangul filler
+        *range(0xFFF9, 0xFFFC),  # interlinear annotation marks
+    }
+)
+# Refused by general category, per field. Control (`Cc`: C0, DEL, C1) and
+# surrogate (`Cs`) fail downstream outright: Postgres refuses a NUL in a text
+# column (`DataError`), the driver's UTF-8 encoder a lone surrogate
+# (`UnicodeEncodeError`), each an anonymous 500. Line / paragraph separators
+# (`Zl`, `Zp`) break a name or URI across lines. A redirect URI is strict and
+# refuses every format character (`Cf`) too: nothing legitimate in a callback
+# needs one. A client name is free text, so only the display-altering ones
+# above are refused there.
+_URI_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
+_NAME_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
 
 
 def _has_unacceptable_character(value: str) -> bool:
-    """True if `value` holds a character no client metadata may carry.
+    """True if `value` holds a character no redirect URI may carry.
 
-    Two of the categories fail outright downstream: a NUL (`Cc`) is refused
-    by Postgres in a text column (`DataError`), a lone surrogate (`Cs`, a
-    legal JSON escape) by the driver's UTF-8 encoder (`UnicodeEncodeError`),
-    each an anonymous 500 that also skipped the per-IP `register` counter.
-    The rest are storable but invisible or reordering (U+202E, U+200B,
-    U+FEFF, U+2028, ...): a callback is stored on the Application and copied
-    into every audit row's `client_redirect`, and the client name is logged,
-    so a registrant could make either read as something it is not. None has
-    a place in a callback URI or a client name.
+    A stored callback is copied into every audit row's `client_redirect`, so
+    an invisible or reordering character there would let a registrant make it
+    read as something it is not; NUL and lone surrogates are 500s at the
+    INSERT. See `_URI_REFUSED_CATEGORIES` and `_DISPLAY_ALTERING`.
     """
-    return any(unicodedata.category(c) in _REFUSED_CATEGORIES for c in value)
+    return any(
+        unicodedata.category(c) in _URI_REFUSED_CATEGORIES
+        or ord(c) in _DISPLAY_ALTERING
+        for c in value
+    )
+
+
+def _has_unacceptable_name_character(value: str) -> bool:
+    """True if `value` holds a character no client name may carry.
+
+    Narrower than for a URI: ordinary text, joiners and emoji sequences
+    included, is accepted; control, surrogate, separator and display-altering
+    characters (`_DISPLAY_ALTERING`) are not. The name is never stored, but it
+    is echoed in the 201 and logged.
+    """
+    return any(
+        unicodedata.category(c) in _NAME_REFUSED_CATEGORIES
+        or ord(c) in _DISPLAY_ALTERING
+        for c in value
+    )
 
 
 def _error(
@@ -322,20 +368,19 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     if (
         not isinstance(client_name, str)
         or len(client_name) > _MAX_CLIENT_NAME
-        or _has_unacceptable_character(client_name)
+        or _has_unacceptable_name_character(client_name)
     ):
         # Bounded and typed before it is echoed in the 201 or written to the
         # log line below. The body cap is 64 KiB, so an unbounded name would
         # otherwise put ~64 KiB of caller-chosen text into both — and a
         # non-string (a nested object) would be reflected verbatim. The
-        # characters `_has_unacceptable_character` names are refused too: the
-        # name is never stored, but it is echoed and logged, and no real
-        # client name carries one.
+        # characters `_has_unacceptable_name_character` names are refused
+        # too: the name is never stored, but it is echoed and logged.
         return _error(
             "invalid_client_metadata",
             f"client_name must be a string of at most {_MAX_CLIENT_NAME} "
-            "characters, without control, format, separator or surrogate "
-            "characters",
+            "characters, without control, separator, surrogate, "
+            "bidirectional-control or invisible characters",
         )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).

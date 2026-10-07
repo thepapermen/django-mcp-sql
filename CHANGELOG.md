@@ -446,16 +446,21 @@ announce themselves.
     number); a string there also turned the "must include
     `authorization_code`" check into a substring test.
 
-  All are now RFC 7591 400s. Any requested `redirect_uris` entry or a
-  `client_name` containing a control (Unicode `Cc`), surrogate (`Cs`), format
-  (`Cf`: bidi overrides such as U+202E, zero-width space, BOM) or line /
-  paragraph separator (`Zl`, `Zp`) character refuses the whole request
-  (`invalid_redirect_uri` / `invalid_client_metadata`), even beside a clean
-  URI, so nothing of the kind is stored, echoed or logged; a callback is
-  copied into every audit row's `client_redirect`, and an invisible or
-  reordering character there would let a registrant make it read as something
-  else. A URI that does not parse is refused the same way. Ordinary non-ASCII
-  text is still accepted. A seeded fuzz of the endpoint (malformed hosts,
+  All are now RFC 7591 400s, for the whole request even beside a clean URI.
+  A requested `redirect_uris` entry is refused (`invalid_redirect_uri`) if it
+  holds a control (Unicode `Cc`), surrogate (`Cs`), any format (`Cf`) or a
+  line / paragraph separator (`Zl`, `Zp`) character, or does not parse. A
+  `client_name` (`invalid_client_metadata`) is held to a narrower rule fit for
+  free text: control, surrogate and separator characters, plus the ones that
+  make text display as something it is not (bidi marks, embeddings,
+  overrides and isolates such as U+202E; zero-width space, word joiner, BOM,
+  soft hyphen, the blank-rendering Hangul fillers). The zero-width
+  non-joiner and joiner that Persian, Indic scripts and emoji sequences need,
+  subdivision-flag tag characters and variation selectors stay allowed in a
+  name. Nothing refused is stored, echoed or logged: a callback is copied
+  into every audit row's `client_redirect`, and an invisible or reordering
+  character there would let a registrant make it read as something else.
+  Ordinary non-ASCII text is still accepted. A seeded fuzz of the endpoint (malformed hosts,
   ports, encodings, odd characters) pins that it answers only 201 or 400. An
   unparseable body is `invalid_client_metadata`, and `grant_types` /
   `response_types` must be arrays of strings. Also affects 0.1.0b5.
