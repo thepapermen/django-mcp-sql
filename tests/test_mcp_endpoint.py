@@ -67,6 +67,64 @@ class TestEndpointRouting:
         assert resp.status_code == 401
 
 
+@pytest.mark.django_db
+class TestOnlyPostReachesTheTransport:
+    """Every method but POST is refused with 405 before DRF and the bridge.
+
+    The transport is stateless with JSON responses, so a GET stream (and a
+    DELETE ending a session) has no purpose here. Forwarding a GET into the
+    bridge used to pin the worker thread forever: the SDK answered with an
+    SSE stream that never ends, or (with `Last-Event-ID`) with no response at
+    all, and the bridge waited for a body that never came. The refusal runs
+    before authentication, so it costs no DB query, and a GET from an MCP
+    client gets the spec's "no SSE stream here" answer, 405, which the
+    TypeScript SDK treats as expected rather than as an error.
+    """
+
+    @pytest.mark.parametrize("path", ["/mcp/sql/", "/mcp/sql"])
+    @pytest.mark.parametrize(
+        "method", ["get", "delete", "put", "patch", "head", "options"]
+    )
+    def test_non_post_is_405_before_auth_and_bridge(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self,
+        client,
+        mcp_access_token,
+        mcp_mfa_on,
+        mcp_active_session,
+        monkeypatch,
+        method,
+        path,
+    ):
+        reached = []
+
+        def _record(name):
+            def _hook(*args, **kwargs):
+                reached.append(name)
+
+            return _hook
+
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app", _record("bridge")
+        )
+        monkeypatch.setattr(
+            "mcp_sql.auth.MCPOAuth2Authentication.authenticate", _record("auth")
+        )
+        response = getattr(client, method)(
+            path,
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            HTTP_ACCEPT="application/json, text/event-stream",
+            HTTP_LAST_EVENT_ID="0",
+        )
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        assert response["Allow"] == "POST"
+        assert reached == []
+
+    def test_anonymous_get_is_405_too(self, client):
+        response = client.get(reverse("mcp_sql_endpoint"))
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        assert response["Allow"] == "POST"
+
+
 class TestSharedAsgiLoop:
     """C1: the a2wsgi bridge must reuse one process-global event loop. a2wsgi
     spawns a fresh loop + daemon thread whenever `ASGIMiddleware` is built

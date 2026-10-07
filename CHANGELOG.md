@@ -352,6 +352,20 @@ announce themselves.
   issued against … the auth url cannot lie". It is the Application's
   **registered** `redirect_uris` — DOT does not persist which redirect a given
   authorization used. Read it as "one of these". The docstring now says so.
+- **A GET to `/mcp/sql/` could pin a worker thread forever.** The view
+  accepted GET and DELETE and forwarded them into the FastMCP bridge. With a
+  valid token and `Accept: application/json, text/event-stream`, the SDK
+  answered a GET with an SSE stream that never ends (with `Last-Event-ID`, with
+  no response at all), and the bridge waited for it: a sync worker until
+  gunicorn's timeout, a gthread or ASGI thread for good, with a default-DB
+  connection held throughout (idle in transaction under
+  `ATOMIC_REQUESTS=True`), surviving token revocation. `/mcp/sql/` now answers
+  every method but POST with `405` and `Allow: POST`, before authentication.
+  No client loses anything: the transport is stateless, the Python MCP SDK
+  only opens a GET stream or sends DELETE once the server issued an
+  `Mcp-Session-Id` (a stateless server never does), and the TypeScript SDK's
+  post-initialize GET, previously answered `406`, now gets the `405` it treats
+  as "no stream offered". Also present in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

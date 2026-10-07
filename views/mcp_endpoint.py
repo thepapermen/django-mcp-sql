@@ -18,7 +18,9 @@ from a2wsgi import ASGIMiddleware
 from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.db import close_old_connections
+from django.http import HttpRequest
 from django.http import HttpResponse
+from django.http import HttpResponseNotAllowed
 from django.views.decorators.csrf import csrf_exempt
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -469,11 +471,36 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
 
 
 @csrf_exempt
-@api_view(["GET", "POST", "DELETE"])
+def mcp_endpoint(request: HttpRequest) -> HttpResponse:
+    """The /mcp/sql/ entry point: POST only, refused before DRF otherwise.
+
+    The transport is stateless with JSON responses (`_build_mcp_server`), so
+    every MCP exchange is one POST. The Streamable HTTP spec's GET (a
+    server-to-client SSE stream) and DELETE (ending a session) have nothing to
+    serve here, and the spec says a server without the GET stream answers
+    405. Refusing them HERE, before DRF, is what matters: forwarded into the
+    bridge, a GET made the SDK open an SSE stream that never ends (or, with
+    `Last-Event-ID`, return without any response), and `_invoke_wsgi_app`
+    waited on it forever, pinning the worker thread and its DB connection.
+    Before DRF also means before content negotiation and authentication: no
+    DB query, and the TypeScript SDK's post-initialize GET (`Accept:
+    text/event-stream` only, which DRF would answer 406) gets the 405 it
+    treats as "no stream offered" rather than an error. The Python SDK opens
+    its GET stream (and sends DELETE) only when the server issued an
+    `Mcp-Session-Id`, which a stateless server never does.
+
+    POST goes on to `_mcp_transport`, the DRF view that authenticates.
+    """
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    return _mcp_transport(request)
+
+
+@api_view(["POST"])
 @authentication_classes([MCPOAuth2Authentication])
 @permission_classes([IsAuthenticated])
-def mcp_endpoint(request):
-    """The /mcp/sql/ entry point.
+def _mcp_transport(request):
+    """The DRF half of `mcp_endpoint`, reached only by POST.
 
     Auth runs via the DRF auth class; the view self-declares
     `IsAuthenticated` so anonymous requests are rejected with 401 +
