@@ -420,6 +420,30 @@ class TestPasswordChangeEdgeCases:
             user=mcp_user, reason=AuthRejectionReason.PASSWORD_CHANGE
         ).exists()
 
+    def test_new_legacy_hash_completed_by_check_password_revokes(
+        self, settings, mcp_user, mcp_access_token, django_capture_on_commit_callbacks
+    ):
+        """Review round 5: a legacy hash for a NEW password, assigned in
+        memory (an import / migration path) and then verified, is stored by
+        `check_password`'s own setter. That save is a password change: the
+        hash checked is not the one stored."""
+        mcp_user.set_password("old-password")
+        mcp_user.save()
+        settings.PASSWORD_HASHERS = [
+            "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+            "django.contrib.auth.hashers.MD5PasswordHasher",
+        ]
+        target = type(mcp_user)._default_manager.get(pk=mcp_user.pk)
+        target.password = make_password("brand-new", hasher="md5")
+        with django_capture_on_commit_callbacks(execute=True):
+            assert target.check_password("brand-new")
+        stored = type(mcp_user)._default_manager.get(pk=mcp_user.pk)
+        assert stored.check_password("brand-new")  # the change was saved ...
+        assert not AccessToken.objects.filter(pk=mcp_access_token.pk).exists()
+        assert MCPAuthRejectionLog.objects.filter(
+            user=mcp_user, reason=AuthRejectionReason.PASSWORD_CHANGE
+        ).exists()
+
     @pytest.mark.skipif(
         not hasattr(AbstractBaseUser, "acheck_password"),
         reason="acheck_password is Django 5.0+",

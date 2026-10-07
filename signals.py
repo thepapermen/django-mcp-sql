@@ -195,19 +195,22 @@ def note_password_change(sender, instance, **kwargs):
     )
     if old is None or old == instance.password:
         return
-    if _is_hash_upgrade(instance, update_fields):
+    if _is_hash_upgrade(instance, old, update_fields):
         return
     setattr(instance, _PENDING_REVOCATION_ATTR, True)
 
 
 def _is_hash_upgrade(
-    instance: "AbstractBaseUser", update_fields: "Iterable[str] | None"
+    instance: "AbstractBaseUser", old: str, update_fields: "Iterable[str] | None"
 ) -> bool:
     """True only for the save `AbstractBaseUser.check_password` makes when it
     re-hashes the SAME password (a login after the preferred hasher or its
     parameters changed): its setter saves with `update_fields=["password"]`
     while `check_password` runs for this very instance, which
-    `install_password_check_marker` records.
+    `install_password_check_marker` records — and the hash it checked is the
+    one stored (`old`). Otherwise the instance carried a different, unsaved
+    hash (a legacy hash for a new password assigned in memory and then
+    checked, review round 5), and the save stores a new password.
 
     That is positive evidence, not an inference from the save's shape: a
     real change written as `user.password = make_password(new);
@@ -217,15 +220,19 @@ def _is_hash_upgrade(
     so it revokes (review round 4). A user model that overrides
     `check_password` without calling `super()` never sets the marker; its
     hash upgrades then revoke too (the safe direction)."""
+    checking = _CHECKING_PASSWORD.get()
     return (
         update_fields is not None
         and set(update_fields) == {"password"}
-        and _CHECKING_PASSWORD.get() is instance
+        and checking is not None
+        and checking[0] is instance
+        and checking[1] == old
     )
 
 
-# The user instance `AbstractBaseUser.check_password` is running for, if any.
-_CHECKING_PASSWORD: ContextVar[object | None] = ContextVar(
+# While `AbstractBaseUser.check_password` runs: the instance and the hash it
+# is checking the password against.
+_CHECKING_PASSWORD: ContextVar[tuple[object, str] | None] = ContextVar(
     "mcp_sql_checking_password", default=None
 )
 _MARKED = "_mcp_sql_marks_password_check"
@@ -233,7 +240,8 @@ _MARKED = "_mcp_sql_marks_password_check"
 
 def install_password_check_marker() -> None:
     """Wrap `AbstractBaseUser.check_password` (and `acheck_password`, Django
-    5.0+) so that, while it runs, `_CHECKING_PASSWORD` holds the instance.
+    5.0+) so that, while it runs, `_CHECKING_PASSWORD` holds the instance
+    and the hash being checked.
     Behaviour is unchanged; the wrapper only sets and resets the context
     variable. Idempotent. Called from `McpSqlConfig.ready()`."""
     check = AbstractBaseUser.check_password
@@ -247,7 +255,7 @@ def install_password_check_marker() -> None:
 def _marked(check: "Callable[..., bool]") -> "Callable[..., bool]":
     @functools.wraps(check)
     def check_password(self: AbstractBaseUser, raw_password: Any) -> bool:
-        token = _CHECKING_PASSWORD.set(self)
+        token = _CHECKING_PASSWORD.set((self, self.password))
         try:
             return check(self, raw_password)
         finally:
@@ -260,7 +268,7 @@ def _marked(check: "Callable[..., bool]") -> "Callable[..., bool]":
 def _amarked(acheck: "Callable[..., Any]") -> "Callable[..., Any]":
     @functools.wraps(acheck)
     async def acheck_password(self: AbstractBaseUser, raw_password: Any) -> bool:
-        token = _CHECKING_PASSWORD.set(self)
+        token = _CHECKING_PASSWORD.set((self, self.password))
         try:
             correct: bool = await acheck(self, raw_password)
             return correct
