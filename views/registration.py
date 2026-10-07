@@ -110,21 +110,20 @@ _ZWNJ, _ZWJ = 0x200C, 0x200D
 _VS15, _VS16 = 0xFE0E, 0xFE0F
 _KEYCAP = 0x20E3
 _BLACK_FLAG, _CANCEL_TAG = 0x1F3F4, 0xE007F
-_TAGS = (0xE0020, 0xE007E)
-_IDEOGRAPHIC_VS = (0xE0100, 0xE01EF)
+_TAGS = ((0xE0020, 0xE007E),)
+_IDEOGRAPHIC_VS = ((0xE0100, 0xE01EF),)
 _CJK_IDEOGRAPHS = (
     (0x3400, 0x4DBF),
     (0x4E00, 0x9FFF),
     (0xF900, 0xFAFF),
     (0x20000, 0x3FFFF),
 )
-_INTERLINEAR_ANNOTATION = (0xFFF9, 0xFFFB)
+_INTERLINEAR_ANNOTATION = ((0xFFF9, 0xFFFB),)
 _ALWAYS_REFUSED_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
 
 
-def _in(cp: int, ranges: Any) -> bool:
-    if isinstance(ranges[0], int):
-        return ranges[0] <= cp <= ranges[1]
+def _in(cp: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    """Whether `cp` lies in any of the inclusive `ranges`."""
     return any(lo <= cp <= hi for lo, hi in ranges)
 
 
