@@ -2257,6 +2257,161 @@ class TestReviewRound18:
             self._rendered(sql)
 
 
+class TestReviewRound19:
+    """The array part of a type name, in every position. sqlglot read
+    `<type> ARRAY` only before some tokens: at the end of the input `ARRAY`
+    was dropped (`'{a,b}'::text array` ran as `text`, `'{1}'::interval day
+    array` as one day), before a comma it became the alias `array`, before
+    an operator the query was refused; a bound after a type (`int[3]`) was
+    rendered as a subscript of the cast. `bit varying` ran as `bit(1)`; a
+    word after the quoted `"interval"` was dropped."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # `ARRAY` at the end of the input, before a comma, `)`, an
+            # alias, an operator; any case, a comment between.
+            ("'{a,b}'::text array", "CAST('{a,b}' AS TEXT[])"),
+            ("'{1,2}'::int ARRAY, 1 AS k", "CAST('{1,2}' AS INT[]), 1 AS k"),
+            ("1 AS k, '{1}'::int Array", "1 AS k, CAST('{1}' AS INT[])"),
+            ("('{1}'::int array)", "(CAST('{1}' AS INT[]))"),
+            ("'{1}'::int /* c */ array", "CAST('{1}' AS INT[])"),
+            ("'{1}'::int array AS v", "CAST('{1}' AS INT[]) AS v"),
+            ("'{1}'::int array v", "CAST('{1}' AS INT[]) AS v"),
+            ("'{1}'::int array = '{1}'", "CAST('{1}' AS INT[]) = '{1}'"),
+            ("'{1}'::int array || 2", "CAST('{1}' AS INT[]) || 2"),
+            ("'{1}'::int array IS NULL", "CAST('{1}' AS INT[]) IS NULL"),
+            ("'{1}'::int array::text", "CAST(CAST('{1}' AS INT[]) AS TEXT)"),
+            ("ARRAY[1]::text array", "CAST(ARRAY[1] AS TEXT[])"),
+            ("CAST('{1}' AS int array)", "CAST('{1}' AS INT[])"),
+            # `ARRAY[n]` and bounds: the type, as written.
+            ("'{1}'::int array[3]", "CAST('{1}' AS INT[3])"),
+            ("'{1}'::int ARRAY [ 03 ]", "CAST('{1}' AS INT[03])"),
+            (
+                "CAST('{1}' AS int array[2147483647])",
+                "CAST('{1}' AS INT[2147483647])",
+            ),
+            ("'{1}'::int[3]", "CAST('{1}' AS INT[3])"),
+            ("'{1}'::int[3][]", "CAST('{1}' AS INT[3][])"),
+            ("'{1}'::int[][3]", "CAST('{1}' AS INT[][3])"),
+            ("CAST('{1}' AS text[3])", "CAST('{1}' AS TEXT[3])"),
+            ("'{1.234}'::interval(1)[1]", "CAST('{1.234}' AS INTERVAL(1)[1])"),
+            # After every kind of type name.
+            ("'{1}'::interval array", "CAST('{1}' AS INTERVAL[])"),
+            ("'{1}'::interval day array", "CAST('{1}' AS INTERVAL DAY[])"),
+            ("'{1}'::interval(2) array", "CAST('{1}' AS INTERVAL(2)[])"),
+            (
+                "'{1}'::interval second(2) array",
+                "CAST('{1}' AS INTERVAL SECOND(2)[])",
+            ),
+            ("'{1}'::interval second(2)[2]", "CAST('{1}' AS INTERVAL SECOND(2)[2])"),
+            ("'{1}'::interval array days", "CAST('{1}' AS INTERVAL[]) AS days"),
+            ("'{1}'::timestamp with time zone array", "CAST('{1}' AS TIMESTAMPTZ[])"),
+            (
+                "'{1}'::double precision array[3]",
+                "CAST('{1}' AS DOUBLE PRECISION[3])",
+            ),
+            ("'{a}'::character varying(2) array", "CAST('{a}' AS VARCHAR(2)[])"),
+            ("'{1}'::numeric(5,2) array", "CAST('{1}' AS DECIMAL(5, 2)[])"),
+            ("'{1}'::pg_catalog.int4 array", "CAST('{1}' AS pg_catalog.int4[])"),
+            ("'{a}'::\"char\" array", "CAST('{a}' AS \"char\"[])"),
+            # `bit varying` (Postgres's `varbit`).
+            ("'10101'::bit varying", "CAST('10101' AS varbit)"),
+            ("'10101'::BIT VARYING, 1 AS k", "CAST('10101' AS varbit), 1 AS k"),
+            ("'10101'::bit varying (3)", "CAST('10101' AS varbit(3))"),
+            ("'{101}'::bit varying(2) array", "CAST('{101}' AS varbit(2)[])"),
+            ("bit varying '101'", "CAST('101' AS varbit)"),
+            # The quoted `"interval"` takes no field: a word after it is an
+            # alias, as after a qualified `interval`.
+            ("'90'::\"interval\" days", "CAST('90' AS \"interval\") AS days"),
+            (
+                "'90'::\"interval\" h, 1 AS k",
+                "CAST('90' AS \"interval\") AS h, 1 AS k",
+            ),
+            ("'90'::\"interval\"(1) secs", "CAST('90' AS \"interval\"(1)) AS secs"),
+            (
+                "'{9}'::\"interval\" array[2] days",
+                "CAST('{9}' AS \"interval\"[2]) AS days",
+            ),
+            (
+                "'90'::pg_catalog.interval days",
+                "CAST('90' AS pg_catalog.interval) AS days",
+            ),
+        ],
+    )
+    def test_rendered_as_postgres_reads_it(self, written, rendered):
+        assert self._rendered(f"SELECT {written}") == (f"SELECT {rendered} LIMIT 11")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, which ran (or ran as something else).
+            "SELECT '{1}'::int[] array",
+            "SELECT '{1}'::int array array",
+            "SELECT '{1}'::int array[1] array",
+            "SELECT '{1}'::int array[]",
+            "SELECT '{1}'::int array[2][3]",
+            "SELECT '{1}'::int array[+3]",
+            "SELECT '{1}'::int array[3.0]",
+            "SELECT '{1}'::int array[2147483648]",
+            "SELECT '{1}'::int[-1]",
+            "SELECT '{1}'::int[1.5]",
+            "SELECT CAST('{1}' AS int[id])",
+            "SELECT int[] '{1}'",
+            "SELECT int array '{1}'",
+            "SELECT '1'::bit varying(id)",
+            "SELECT '1'::bit varying(1.5)",
+            # `varying` belongs to `bit` / `character` only, written right
+            # after it; elsewhere it is an alias only after `AS`.
+            "SELECT '1'::bit(3) varying",
+            "SELECT '1'::\"bit\" varying",
+            "SELECT '1'::pg_catalog.bit varying",
+            "SELECT '1'::text varying",
+            "SELECT 1 array",
+            "SELECT 1 FROM auth_group array",
+            # An interval field after a type is an alias only after `AS`.
+            "SELECT '1'::int day",
+            "SELECT '{1}'::interval[] day",
+            "SELECT '{1}'::interval array day",
+            "SELECT '1'::interval day hour",
+            "SELECT '90'::\"interval\" day",
+            "SELECT '90'::\"interval\" day to second",
+            "SELECT '90'::pg_catalog.interval day",
+            "SELECT CAST('90' AS \"interval\" days)",
+        ],
+    )
+    def test_postgres_syntax_errors_are_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "bound", ["1.5", "1e3", "2147483648", "99999999999999999999"]
+    )
+    def test_a_bad_bound_is_a_parse_error_after_the_escape_check(self, bound):
+        # A bound that is no integer constant is sqlglot's `ParseError`, so
+        # the refused escape literal stays the audit reason.
+        _expect_reject(
+            f"SELECT E'a\\b' AS v, '{{1}}'::int[{bound}] AS w",
+            OutcomeReason.UNSAFE_LITERAL,
+        )
+        _expect_reject(
+            f"SELECT '{{1}}'::int ARRAY[{bound}] AS w", OutcomeReason.PARSE_ERROR
+        )
+
+    def test_sqlglot_matches_array_only_after_a_type(self):
+        """`_match` declines `TokenType.ARRAY` while sqlglot's own
+        `_parse_types` runs (the type suffix is read by `_array_suffix`). A
+        sqlglot matching it somewhere else too would need a look."""
+        import inspect
+
+        import sqlglot.parser
+
+        source = inspect.getsource(sqlglot.parser)
+        assert source.count("_match(TokenType.ARRAY)") == 1
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

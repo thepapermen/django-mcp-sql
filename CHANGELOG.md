@@ -146,14 +146,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `interval minute(2)` stay parse errors, as in Postgres. A word after an
     interval type in a cast that is not one of Postgres's fields (YEAR,
     MONTH, DAY, HOUR, MINUTE, SECOND) is an alias, as Postgres reads it:
-    sqlglot read a unit of its own list and normalised it, so
-    `'90'::interval days` ran as `INTERVAL DAY` (90 days, where Postgres
-    returns 90 seconds named `days`), `h` / `d` / `mins` / `mon` and the
-    like as their fields (a wrong value), `week` as `INTERVAL WEEK`
-    (Postgres's syntax error), and `'1.5'::interval(1) secs` was refused.
+    sqlglot read a unit of its own list there. The one-letter units ran as
+    a field, a wrong value: `'90'::interval h` as `INTERVAL HOUR` (3 days
+    18 hours, where Postgres returns 90 seconds named `h`), `y` as 90
+    years, `m` as 90 minutes, `d` as 90 days (`s`: the value, under another
+    column name). Other words were kept and failed in Postgres
+    (`'90'::interval days` / `mins` / `mon` / `week` came back as
+    `INTERVAL DAYS`, ..., a syntax error), and `'1.5'::interval(1) secs`
+    was refused.
     Where Postgres then rejects the text (`CAST(x AS interval h)`, the
     word in a `WHERE`, `interval min to sec`, `interval h[]`) it is now a
-    parse error (it ran). A refused
+    parse error (it ran). The array part of a type name is read as
+    Postgres reads it: `ARRAY` after a type was dropped at the end of the
+    input (`'{a,b}'::text array` ran as `text`, `'{1}'::interval day array`
+    as one day — wrong values), became the alias `array` before a comma and
+    was refused before an operator; `ARRAY[n]` was refused, and a bound
+    after a type (`'{1,2}'::int[3]`, `int[][1]`) was rendered as a
+    subscript of the cast (a Postgres syntax error) — all now run as
+    written. `bit varying` ran as `bit(1)` (`'10101'::bit varying` returned
+    `1`) and `bit varying(n)` was refused: both are `varbit` now. A word
+    after the quoted `"interval"` (a plain type name to Postgres, which
+    takes no field) was dropped (`'90'::"interval" days` lost its alias):
+    it is the alias. Postgres's syntax errors in the same places, which
+    ran, are parse errors: `int[] array`, `int array[]`, a bound that is
+    not an unsigned integer constant, an array type in a typed literal
+    (`int[] '{1}'`), a bare `array` alias, an interval field word or
+    `varying` after a type (`'1'::int day`, `'90'::"interval" day`,
+    `'1'::bit(3) varying`). A refused
     escape literal is the audit reason (`unsafe_literal`) also when the
     text fails to parse (`interval day E'a\b'` had become `parse_error`).
     Also as written: a subscripted
@@ -178,7 +197,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    912 ordinary analytical queries (over data with NULLs and mixed case)
+    918 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the

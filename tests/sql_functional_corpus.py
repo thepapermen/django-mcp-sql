@@ -3096,6 +3096,31 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "intervals",
         "SELECT id, '90'::interval days, '1'::interval h, '1.234'::interval(1) secs, iv::interval week FROM t ORDER BY id",
     ),
+    # Review round 19: `ARRAY` after a type (sqlglot dropped it at the end of
+    # the input, made it an alias before a comma, refused it before an
+    # operator), a bound after a type (rendered as a subscript of the cast),
+    # `bit varying` (ran as `bit(1)`), a word after the quoted `"interval"`
+    # (dropped).
+    (
+        "arrays",
+        "SELECT id, tags::text array, arr::int array[4] AS b, '{1}'::interval day array AS c FROM t ORDER BY id",
+    ),
+    (
+        "arrays",
+        "SELECT id FROM t WHERE tags::text array && '{y}' ORDER BY id, tags::varchar array",
+    ),
+    (
+        "arrays",
+        "SELECT cardinality(arr::bigint array) AS a, '{1.5}'::double precision array AS b, '{1}'::int[3] AS c, '{1}'::int[][2] AS d FROM t WHERE id = 1",
+    ),
+    (
+        "arrays",
+        "SELECT id, g::bit varying AS a, '{101}'::bit varying(2) array AS b, '10101'::bit varying FROM (SELECT id, '1' AS g FROM t) s WHERE id < 3 ORDER BY id",
+    ),
+    (
+        "intervals",
+        "SELECT '90'::\"interval\" days, '90'::pg_catalog.interval h, '{9}'::\"interval\" array[2] AS c",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3396,6 +3421,16 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT id FROM t WHERE iv < '1'::interval days"),
     ("parse_error", "SELECT '1'::interval min to sec AS a"),
     ("parse_error", "SELECT '{1}'::interval h[] AS a"),
+    # Review round 19: an array type written twice or with a bound Postgres
+    # does not take, an array type in a typed literal, a field word after a
+    # type (an alias only after `AS`), a bare `array` alias.
+    ("parse_error", "SELECT '{1}'::text[] array AS a"),
+    ("parse_error", "SELECT '{1}'::text array[] AS a"),
+    ("parse_error", "SELECT '{1}'::int[1.5] AS a"),
+    ("parse_error", "SELECT int[] '{1}' AS a"),
+    ("parse_error", "SELECT '{1}'::interval[] day"),
+    ("parse_error", "SELECT '90'::\"interval\" day"),
+    ("parse_error", "SELECT id array FROM t"),
     # The refused escape literal is the reason, though the text does not
     # parse either (`interval day '…'` is Postgres's syntax error).
     ("unsafe_literal", "SELECT interval day E'a\\b' AS v"),

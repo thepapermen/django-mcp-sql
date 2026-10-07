@@ -288,6 +288,9 @@ def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
 
 
 _IS_NOT_TOKENS = 3  # `IS`, `NOT` and the value
+# The largest integer Postgres's lexer reads as an integer constant
+# (`Iconst`, an `int4`); a larger one is a numeric constant.
+_MAX_ICONST = 2**31 - 1
 _INTERVAL_FIELDS = frozenset({"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"})
 # Postgres's string constants (`Sconst`) as sqlglot's postgres tokenizer
 # reads them: `'...'`, `E'...'` (`BYTE_STRING`; one with a backslash is
@@ -473,8 +476,14 @@ class FaithfulPostgres(Postgres):
             if kind != TokenType.QUALIFY
         }
         ID_VAR_TOKENS = Postgres.Parser.ID_VAR_TOKENS | {TokenType.QUALIFY}
-        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.QUALIFY}
-        ALIAS_TOKENS = Postgres.Parser.ALIAS_TOKENS | {TokenType.QUALIFY}
+        # `ARRAY` is reserved in Postgres: never an alias without `AS`
+        # (`SELECT 1 array` is a syntax error; sqlglot read an alias).
+        TABLE_ALIAS_TOKENS = (
+            Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.QUALIFY}
+        ) - {TokenType.ARRAY}
+        ALIAS_TOKENS = (Postgres.Parser.ALIAS_TOKENS | {TokenType.QUALIFY}) - {
+            TokenType.ARRAY
+        }
         # `overlaps(s1, e1, s2, e2)`: Postgres's function form of OVERLAPS.
         FUNC_TOKENS = Postgres.Parser.FUNC_TOKENS | {TokenType.OVERLAPS}
         QUERY_MODIFIER_TOKENS = Postgres.Parser.QUERY_MODIFIER_TOKENS - {
@@ -639,32 +648,188 @@ class FaithfulPostgres(Postgres):
             cast: exp.Expression = self.expression(exp.Cast(this=this, to=to))
             return cast
 
-        def _parse_types(self, *args: Any, **kwargs: Any) -> exp.Expression | None:
+        # Set while sqlglot's own `_parse_types` runs: its reading of an
+        # `ARRAY` after a type is declined (`_match`), `_array_suffix` reads
+        # it instead.
+        _reading_type = False
+
+        def _match(self, token_type: TokenType, *args: Any, **kwargs: Any) -> bool:
+            if token_type == TokenType.ARRAY and self._reading_type:
+                return False
+            matched: bool = super()._match(token_type, *args, **kwargs)
+            return matched
+
+        def _parse_types(  # sqlglot's own signature, positional booleans included
+            self,
+            check_func: bool = False,  # noqa: FBT001, FBT002
+            schema: bool = False,  # noqa: FBT001, FBT002
+            allow_identifiers: bool = True,  # noqa: FBT001, FBT002
+            **kwargs: Any,
+        ) -> exp.Expression | None:
             index = self._index
             token = self._tokens[index] if index < len(self._tokens) else None
-            parsed: exp.Expression | None = super()._parse_types(*args, **kwargs)
-            if (
-                token is not None
-                and token.token_type == TokenType.IDENTIFIER
-                and isinstance(parsed, exp.DataType)
-            ):
+            reading, self._reading_type = self._reading_type, True
+            try:
+                parsed: exp.Expression | None = super()._parse_types(
+                    check_func=check_func,
+                    schema=schema,
+                    allow_identifiers=allow_identifiers,
+                    **kwargs,
+                )
+            finally:
+                self._reading_type = reading
+            if not isinstance(parsed, exp.DataType):
+                return parsed
+            if not check_func and self._at(TokenType.L_BRACKET):
+                # sqlglot stopped before a bound (`int[3]`, `int[][3]`) and
+                # left the brackets for a subscript of the cast; Postgres
+                # reads every bracket after a type name as part of the
+                # type. `_array_suffix` reads them all again.
+                parsed = _element_type(parsed)
+            parsed = self._bit_varying(parsed, index)
+            parsed = self._interval_alias(parsed, index)
+            if token is not None and token.token_type == TokenType.IDENTIFIER:
                 _keep_quoted_type(parsed, token)
-            if isinstance(parsed, exp.DataType):
-                parsed = self._interval_alias(parsed, index)
-                return self._second_precision(parsed)
+            parsed = self._second_precision(parsed)
+            if check_func:
+                self._no_array_typed_literal(parsed)
+                return parsed
+            parsed = self._array_suffix(parsed)
+            if self._interval_field(self._index) is not None or self._is_unquoted(
+                self._index, "VARYING"
+            ):
+                # `'{1}'::interval ARRAY day`, `'1'::int day`, `'1'::bit(3)
+                # varying`: Postgres takes these words as an alias only
+                # after `AS` (a syntax error), which sqlglot read as one.
+                self.raise_error("An interval field or VARYING after a type")
             return parsed
+
+        def _at(self, kind: TokenType) -> bool:
+            """The current token is of `kind`."""
+            return self._curr is not None and self._curr.token_type == kind
+
+        def _array_suffix(self, parsed: exp.DataType) -> exp.DataType:
+            """The array part of a type name, as Postgres reads it: `ARRAY`
+            or `ARRAY[n]` (`text ARRAY` is `text[]`), or brackets, each
+            empty or one integer (`int[]`, `int[3][]`; the bounds mean
+            nothing to Postgres, kept as written) — never both. sqlglot read
+            `ARRAY` only before some tokens: at the end of the input it was
+            dropped (`'{a,b}'::text array` ran as `text`, `'{1}'::interval
+            day array` as one day), before a comma it became an alias, before
+            an operator a parse error; a bound after a type (`int[3]`) was
+            rendered as a subscript of the cast (a Postgres syntax error).
+            Any other bracket or `ARRAY` here is Postgres's syntax error."""
+            if self._at(TokenType.ARRAY):
+                if parsed.this == exp.DType.ARRAY:
+                    self.raise_error("ARRAY after an array type")
+                self._advance()
+                bound = self._array_bound() if self._at(TokenType.L_BRACKET) else None
+                if bound == []:
+                    self.raise_error("ARRAY[n] takes an integer")
+                parsed = exp.DataType(
+                    this=exp.DType.ARRAY,
+                    expressions=[parsed],
+                    values=bound,
+                    nested=True,
+                )
+            else:
+                while self._at(TokenType.L_BRACKET):
+                    parsed = exp.DataType(
+                        this=exp.DType.ARRAY,
+                        expressions=[parsed],
+                        values=self._array_bound() or None,
+                        nested=True,
+                    )
+            if self._at(TokenType.L_BRACKET) or self._at(TokenType.ARRAY):
+                self.raise_error("Unexpected array bound after the array type")
+            return parsed
+
+        def _array_bound(self) -> list[exp.Expression]:
+            """`[]` or `[<integer>]` at the current `[`, consumed: no value
+            or the integer. Postgres takes an unsigned integer constant
+            there (`Iconst`), nothing else (`[+1]`, `[1.5]`, `[x]`, `[2^31]`
+            are syntax errors)."""
+            tokens, i = self._tokens, self._index
+            kinds = [token.token_type for token in tokens[i : i + 3]]
+            if kinds[:2] == [TokenType.L_BRACKET, TokenType.R_BRACKET]:
+                self._advance(2)
+                return []
+            text = tokens[i + 1].text if len(kinds) == 3 else ""  # noqa: PLR2004
+            if (
+                kinds == [TokenType.L_BRACKET, TokenType.NUMBER, TokenType.R_BRACKET]
+                and text.isdigit()
+                and int(text) <= _MAX_ICONST
+            ):
+                self._advance(3)
+                return [exp.Literal.number(text)]
+            self.raise_error("An array bound is [] or [<integer>]")
+            return []  # not reached: raise_error raises
+
+        def _no_array_typed_literal(self, parsed: exp.DataType) -> None:
+            """`int[] '{1}'`: a typed literal takes no array type in
+            Postgres (a syntax error), which ran here as a cast. The
+            reading `_parse_type` tries next (a constant) is tried and
+            undone, as in `_no_interval_constant`."""
+            if parsed.this != exp.DType.ARRAY:
+                return
+            index = self._index
+            constant = isinstance(self._parse_primary(), exp.Literal)
+            self._retreat(index)
+            if constant:
+                self.raise_error("A typed literal takes no array type: cast instead")
+
+        def _bit_varying(self, parsed: exp.DataType, index: int) -> exp.DataType:
+            """`bit varying` / `bit varying(n)` (Postgres's `varbit`): sqlglot
+            read `bit` and then `varying` as an alias, so `'10101'::bit
+            varying` ran as `bit(1)` (the value `1`), and refused the
+            other forms. The word must follow the unquoted `bit` directly
+            (`bit(3) varying`, `"bit" varying` are Postgres's syntax
+            errors)."""
+            tokens = self._tokens
+            if (
+                parsed.this != exp.DType.BIT
+                or tokens[index].token_type != TokenType.BIT
+                or self._index != index + 1
+                or not self._is_unquoted(self._index, "VARYING")
+            ):
+                return parsed
+            self._advance()
+            typmod = []
+            if self._at(TokenType.L_PAREN):
+                size = tokens[self._index : self._index + 3]
+                if not (
+                    [token.token_type for token in size]
+                    == [TokenType.L_PAREN, TokenType.NUMBER, TokenType.R_PAREN]
+                    and size[1].text.isdigit()
+                ):
+                    self.raise_error("bit varying(n) takes an integer")
+                self._advance(3)
+                typmod = [exp.DataTypeParam(this=exp.Literal.number(size[1].text))]
+            return exp.DataType(
+                this=exp.DType.USERDEFINED,
+                kind=exp.to_identifier("varbit"),
+                expressions=typmod,
+            )
 
         def _interval_alias(self, parsed: exp.DataType, index: int) -> exp.DataType:
             """`'90'::interval days`, `'1.5'::interval(1) secs`: Postgres's
             interval type takes only the fields YEAR, MONTH, DAY, HOUR,
             MINUTE, SECOND (and their spans), so another word after it is
             an alias, as after a typed literal. sqlglot read a unit of its
-            own list there and normalised it: `days` ran as `INTERVAL DAY`
-            (90 days, where Postgres returns 90 seconds named `days`), `h`
-            as `HOUR`; `week` became `INTERVAL WEEK` (Postgres's syntax
-            error) and `interval(1) secs` was refused. The type then ends
-            before the word, and what follows parses as it does in
-            Postgres (an alias; `[]` or `to` after it is an error)."""
+            own list there: the one-letter ones it normalised to a field, a
+            wrong value (`'90'::interval h` ran as `INTERVAL HOUR`, 3 days
+            18 hours, where Postgres returns 90 seconds named `h`; `y` as
+            90 years, `m` as 90 minutes, `d` as 90 days; `s` kept the value
+            under another column name), the others it kept (`days`, `mins`,
+            `mon`, `week` came back as `INTERVAL DAYS`, ..., a Postgres
+            syntax error), and `interval(1) secs` was refused. The
+            type then ends before the word, and what follows parses as it
+            does in Postgres (an alias; `[]` or `to` after it is an error).
+            The quoted name `"interval"` (a plain type name to Postgres)
+            takes no field at all: the type ends at the name (sqlglot read
+            the next word as a unit and dropped it, `'90'::"interval" days`
+            lost its alias), so a word after it is an alias, a field word
+            Postgres's syntax error (`_parse_types`)."""
             inner = parsed
             while (
                 inner.this == exp.DType.ARRAY
@@ -672,12 +837,13 @@ class FaithfulPostgres(Postgres):
                 and isinstance(inner.expressions[0], exp.DataType)
             ):
                 inner = inner.expressions[0]
-            tokens = self._tokens
-            if (
-                not isinstance(inner.this, exp.Interval)
-                or tokens[index].token_type != TokenType.INTERVAL
-            ):
+            if not isinstance(inner.this, exp.Interval):
                 return parsed
+            # sqlglot reads an interval type from the keyword `interval` or
+            # the quoted `"interval"` only (a qualified name is a type of
+            # its own, `pg_catalog.interval`, which takes no unit).
+            tokens = self._tokens
+            quoted = tokens[index].token_type == TokenType.IDENTIFIER
             i = index + 1
             if [token.token_type for token in tokens[i : i + 3]] == [
                 TokenType.L_PAREN,
@@ -687,7 +853,7 @@ class FaithfulPostgres(Postgres):
                 i += 3
             unit = inner.this.args.get("unit")
             words = (i, i + 2) if isinstance(unit, exp.IntervalSpan) else (i,)
-            if all(
+            if not quoted and all(
                 self._is_unquoted(word)
                 and _keyword(tokens[word].text) in _INTERVAL_FIELDS
                 for word in words
@@ -701,8 +867,9 @@ class FaithfulPostgres(Postgres):
             fractional digits of a field-qualified interval type (Postgres's
             `interval_second`, the last field only), which sqlglot left for
             an alias list (a parse error). Kept as the field `SECOND(<p>)`,
-            as `_interval_field` keeps it in a typed literal; `[]` after it
-            makes the array type, as after any type. `interval(1) day`
+            as `_interval_field` keeps it in a typed literal; `[]` or
+            `ARRAY` after it makes the array type, as after any type
+            (`_array_suffix`). `interval(1) day`
             (precision before a field) is Postgres's syntax error, which
             sqlglot read as `interval day(1)`."""
             if not isinstance(parsed.this, exp.Interval):
@@ -722,10 +889,6 @@ class FaithfulPostgres(Postgres):
                 return parsed
             self._advance(3)
             last.set("this", f"SECOND({precision[1].text})")
-            while self._match_pair(TokenType.L_BRACKET, TokenType.R_BRACKET):
-                parsed = exp.DataType(
-                    this=exp.DType.ARRAY, expressions=[parsed], nested=True
-                )
             return parsed
 
         def _parse_interval_span(
@@ -1216,6 +1379,17 @@ class FaithfulPostgres(Postgres):
                 return f"INTERVAL {self.sql(expression, 'this')}"
             rendered: str = super().interval_sql(expression)
             return rendered
+
+
+def _element_type(parsed: exp.DataType) -> exp.DataType:
+    """`parsed` without the array levels sqlglot built from brackets."""
+    while (
+        parsed.this == exp.DType.ARRAY
+        and parsed.expressions
+        and isinstance(parsed.expressions[0], exp.DataType)
+    ):
+        parsed = parsed.expressions[0]
+    return parsed
 
 
 def _keep_quoted_type(parsed: exp.DataType, token: Token) -> None:
