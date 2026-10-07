@@ -319,8 +319,9 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
 
     The executor sends sqlglot's re-emission of the checked AST to
     Postgres, not `raw_sql`, so what runs is only what was checked if the
-    re-emission means the same thing to Postgres. Two known gaps (ledger
-    F32 and its variants), both present across the supported sqlglot range:
+    re-emission means the same thing to Postgres. The known gaps (ledger
+    F32 and its variants, review rounds 2-3), across the supported sqlglot
+    range:
 
     - An escape-string literal (`E'…'`, any case — sqlglot's `BYTE_STRING`
       token in the postgres dialect) is decoded on parse but re-emitted with
@@ -338,7 +339,6 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
       Every identifier must be written as a plain or double-quoted
       identifier (checked on its source text, via sqlglot's position
       metadata).
-
     - A Unicode-escape literal or identifier (`U&'…'`, `U&"…"`, any case):
       sqlglot 30.7 tokenizes it as a column `U`, a bitwise `&` and a plain
       string, and re-emits `U & '…'`, which Postgres then evaluates as
@@ -349,56 +349,25 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
     - A double-quoted function name (`"Lower"(...)`): Postgres resolves it
       case-sensitively (`Lower` does not exist), but sqlglot folds it onto
       its builtin and re-emits `LOWER(...)`, a different function. Rejected
-      wherever a double-quoted identifier is directly followed by `(` —
-      except after `AS`, where `AS "s"(c1, c2)` names a derived table's
-      columns.
+      wherever a double-quoted name is followed by `(` in call position
+      (`_is_call_position`) — not as an alias's or CTE's column list
+      (`AS "s"(c1)`, `) "s"(c1)`, `t "s"(c1)`, `WITH "q"(c1) AS (...)`) or a
+      type's modifiers (`::"numeric"(10, 2)`).
+    - Adjacent string constants (`'a' 'b'`): sqlglot always reads them as
+      `CONCAT('a', 'b')`; Postgres joins them only across a newline (on one
+      line it is a syntax error) and names the column differently.
+    - A dollar-quote tag Postgres does not accept (`$u&$...$u&$`, a tag
+      starting with a digit): sqlglot reads a string where Postgres refuses
+      the statement.
 
     The executor's round-trip check (`parser.render_for_execution`) is the
     backstop for anything else of this class.
     """
     tokens = Dialect.get_or_raise("postgres").tokenize(raw_sql)
-
-    def source(token: Token) -> str:
-        return raw_sql[token.start : token.end + 1]
-
-    for i, token in enumerate(tokens):
-        text = source(token)
-        if token.token_type == TokenType.BYTE_STRING and "\\" in text:
-            msg = (
-                "Escape-string literals containing a backslash (E'...\\...') "
-                "are not supported; use a standard string literal (use chr(10) "
-                "for a newline, chr(9) for a tab, '' for a quote)"
-            )
-            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
-        nxt = tokens[i + 1 : i + 3]
-        unicode_escape = (
-            text[:2].lower() == "u&"
-            or (
-                text.lower() == "u"
-                and len(nxt) == 2  # noqa: PLR2004 — `&` and the quoted token
-                and source(nxt[0]) == "&"
-                and nxt[0].start == token.end + 1
-                and nxt[1].start == nxt[0].end + 1
-                and source(nxt[1])[:1] in {"'", '"'}
-            )
-        )
-        if unicode_escape:
-            msg = (
-                "Unicode-escape literals and identifiers (U&'...', U&\"...\") "
-                "are not supported; write the characters directly"
-            )
-            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
-        if (
-            text.startswith('"')
-            and nxt
-            and nxt[0].token_type == TokenType.L_PAREN
-            and not (i > 0 and tokens[i - 1].token_type == TokenType.ALIAS)
-        ):
-            msg = (
-                f"Quoted function name {text} is not supported; write the "
-                "function name unquoted"
-            )
-            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+    for i in range(len(tokens)):
+        problem = _token_problem(raw_sql, tokens, i)
+        if problem is not None:
+            raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem)
     for ident in ast.find_all(exp.Identifier):
         start, end = ident.meta.get("start"), ident.meta.get("end")
         written = (
@@ -420,6 +389,119 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
                 "constant; use a plain or double-quoted identifier"
             )
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+
+
+# String-constant tokens of sqlglot's postgres dialect (on every 30.x).
+_STRING_TOKENS = frozenset(
+    {
+        TokenType.STRING,
+        TokenType.BYTE_STRING,
+        TokenType.HEREDOC_STRING,
+        TokenType.NATIONAL_STRING,
+        TokenType.RAW_STRING,
+        TokenType.BIT_STRING,
+        TokenType.HEX_STRING,
+        TokenType.UNICODE_STRING,
+    }
+)
+# A Postgres dollar-quote opener: `$$` or `$tag$`, the tag an identifier
+# without `$` (sqlglot also accepts `$u&$...$u&$`, which Postgres rejects).
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+# Tokens after which a quoted name followed by `(` is NOT a function call:
+# `AS "s"(c1)` / `) "s"(c1)` / `t "s"(c1)` (an alias with a column list),
+# `::"numeric"(10, 2)` (a type with modifiers), `WITH "q"(c1) AS (...)`.
+_NON_CALL_PREDECESSORS = frozenset(
+    {
+        TokenType.ALIAS,
+        TokenType.R_PAREN,
+        TokenType.VAR,
+        TokenType.IDENTIFIER,
+        TokenType.DCOLON,
+        TokenType.WITH,
+    }
+)
+
+
+def _token_problem(raw_sql: str, tokens: list[Token], i: int) -> str | None:
+    """Why `tokens[i]` (with its neighbours) is a source form sqlglot and
+    Postgres read differently, or `None`. See `_check_lexical_fidelity`."""
+
+    def source(token: Token) -> str:
+        return raw_sql[token.start : token.end + 1]
+
+    token = tokens[i]
+    text = source(token)
+    nxt = tokens[i + 1 : i + 3]
+    if token.token_type == TokenType.BYTE_STRING and "\\" in text:
+        return (
+            "Escape-string literals containing a backslash (E'...\\...') "
+            "are not supported; use a standard string literal (use chr(10) "
+            "for a newline, chr(9) for a tab, '' for a quote)"
+        )
+    if (
+        text[:2].lower() == "u&"
+        or (
+            text.lower() == "u"
+            and len(nxt) == 2  # noqa: PLR2004 — `&` and the quoted token
+            and source(nxt[0]) == "&"
+            and nxt[0].start == token.end + 1
+            and nxt[1].start == nxt[0].end + 1
+            and source(nxt[1])[:1] in {"'", '"'}
+        )
+    ):
+        return (
+            "Unicode-escape literals and identifiers (U&'...', U&\"...\") "
+            "are not supported; write the characters directly"
+        )
+    if text.startswith('"') and _is_call_position(tokens, i):
+        return (
+            f"{text}(...) reads as a function call with a quoted name, which "
+            "is not supported: write function names unquoted (a quoted alias "
+            "with a column list is fine)"
+        )
+    if token.token_type == TokenType.HEREDOC_STRING and not _DOLLAR_TAG_RE.match(text):
+        return (
+            f"Dollar-quote tag in {text[:20]!r} is not a valid Postgres tag "
+            "(letters, digits, underscores; not starting with a digit)"
+        )
+    if (
+        token.token_type in _STRING_TOKENS
+        and nxt
+        and nxt[0].token_type in _STRING_TOKENS
+    ):
+        return (
+            "Adjacent string constants are not supported (Postgres joins them "
+            "only across a newline, sqlglot always); concatenate with ||"
+        )
+    return None
+
+
+def _is_call_position(tokens: list[Token], i: int) -> bool:
+    """True if `tokens[i]` (a quoted name) is followed by `(` as a function
+    call would be — not as an alias's or CTE's column list or a type's
+    modifiers."""
+    if i + 1 >= len(tokens) or tokens[i + 1].token_type != TokenType.L_PAREN:
+        return False
+    if i > 0 and tokens[i - 1].token_type in _NON_CALL_PREDECESSORS:
+        return False
+    # A later CTE in a WITH list: `, "q"(c1) AS [NOT] [MATERIALIZED] (`.
+    depth, j = 0, i + 1
+    while j < len(tokens):
+        kind = tokens[j].token_type
+        depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
+        j += 1
+        if depth == 0:
+            break
+    rest = tokens[j : j + 4]
+    if rest and rest[0].token_type == TokenType.ALIAS:
+        k = 1
+        if k < len(rest) and rest[k].token_type == TokenType.NOT:
+            k += 1
+        if k < len(rest) and rest[k].text.upper() == "MATERIALIZED":
+            k += 1
+        if k < len(rest) and rest[k].token_type == TokenType.L_PAREN:
+            return False
+    return True
 
 
 def inject_limit(ast: exp.Query, n: int) -> exp.Query:

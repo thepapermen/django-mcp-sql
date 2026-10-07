@@ -117,6 +117,26 @@ class TestPostgresReadsTheSourceDifferently:
     @pytest.mark.parametrize(
         "sql",
         [
+            # Postgres: syntax error on one line; sqlglot: CONCAT('a', 'b').
+            "SELECT 'a' 'b' AS v",
+            # Postgres joins across a newline, but names the column
+            # `?column?`; sqlglot's CONCAT names it `concat`.
+            "SELECT 'a'\n'b'",
+            # Postgres refuses the tag; sqlglot reads a string.
+            "SELECT $u&$a, 2 AS y$u&$ AS v",
+        ],
+        ids=["adjacent-same-line", "adjacent-newline", "dollar-tag"],
+    )
+    def test_strings_postgres_reads_differently(self, sql):
+        naive = sqlglot.parse_one(sql, dialect="postgres").sql(dialect="postgres")
+        assert _pg_or_error(naive) != _pg_or_error(sql)
+        with pytest.raises(QueryRejectedError) as exc:
+            parse_and_validate(sql, allowed_tables=set())
+        assert exc.value.reason == OutcomeReason.UNSAFE_LITERAL
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
             "SELECT name FROM (SELECT 0 AS name, 5 AS u) s WHERE name = U&'2'",
             "SELECT (U&'2' = '2') AS ok FROM (SELECT 5 AS u) s",
             "SELECT U&'d\\0061t' AS v",

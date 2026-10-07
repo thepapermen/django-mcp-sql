@@ -883,11 +883,53 @@ class TestLexicalFidelity:
     @pytest.mark.parametrize(
         "sql",
         [
+            "SELECT 'a' 'b' AS v FROM auth_permission",
+            "SELECT 'a'\n'b' AS v FROM auth_permission",
+            "SELECT id FROM auth_permission WHERE codename = 'a' /* c */\n'b'",
+        ],
+        ids=["same-line", "newline", "comment-newline"],
+    )
+    def test_adjacent_string_constants(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT $u&$a, 2 AS y$u&$ AS v FROM auth_permission",
+            "SELECT $1t$x$1t$ AS v FROM auth_permission",
+        ],
+        ids=["ampersand", "leading-digit"],
+    )
+    def test_dollar_tag_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
             "SELECT id & 3 AS v FROM auth_permission",
             'SELECT c1 FROM (SELECT 1) AS "s"(c1)',
+            'SELECT c1 FROM (SELECT 1) "s"(c1)',
+            'SELECT c FROM auth_permission "p"(c)',
+            'WITH "q"(c1) AS (SELECT 1) SELECT c1 FROM "q"',
+            'WITH a AS (SELECT 1 AS x), "q"(c1) AS NOT MATERIALIZED (SELECT 1) '
+            'SELECT c1 FROM "q"',
+            'SELECT id::"numeric"(10, 2) AS v FROM auth_permission',
             'SELECT codename AS "Lower" FROM auth_permission',
+            "SELECT 'a' || 'b' AS v FROM auth_permission",
+            "SELECT $t1$x$t1$ AS v, $$y$$ AS w FROM auth_permission",
         ],
-        ids=["bitwise-and", "derived-column-list", "quoted-alias"],
+        ids=[
+            "bitwise-and",
+            "derived-column-list",
+            "derived-column-list-no-as",
+            "table-alias-column-list",
+            "cte-column-list",
+            "later-cte-column-list",
+            "quoted-type-modifiers",
+            "quoted-alias",
+            "concat-operator",
+            "dollar-tags",
+        ],
     )
     def test_near_misses_are_accepted(self, sql):
         parse_and_validate(sql, allowed_tables=ALLOWED)

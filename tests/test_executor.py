@@ -41,6 +41,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+import sqlglot
 from django.db import DatabaseError
 from mcp_sql.conf import Profile
 from mcp_sql.executor import ExecutorMisconfiguredError
@@ -731,9 +732,20 @@ class TestExecutorHookFailureAudit:
 
 @pytest.mark.django_db
 class TestEveryParserFailureIsAudited:
-    """Tokenizer errors (`TokenError` is not a `ParseError`) and the
-    `re.error` sqlglot 30.21 raises for some `UESCAPE` clauses escaped
-    `run_query` with no audit row (ledger F31 / F103)."""
+    """Tokenizer errors (`TokenError` is not a `ParseError`), the `re.error`
+    sqlglot 30.21 raises for some `UESCAPE` clauses, and the plain Python
+    exceptions its function builders raise escaped `run_query` with no audit
+    row (ledger F31 / F103). The `re.error` conversion itself is pinned by
+    `test_a_regex_error_inside_sqlglot_is_a_parse_error`: the `U&` rule now
+    refuses every `UESCAPE` input before sqlglot's regex could run."""
+
+    # sqlglot 30.7 cannot parse `UESCAPE` at all (a parse error); newer
+    # versions parse it and the package refuses the `U&` form.
+    _UESCAPE_REASON = (
+        OutcomeReason.PARSE_ERROR
+        if sqlglot.__version__.startswith("30.7.")
+        else OutcomeReason.UNSAFE_LITERAL
+    )
 
     @pytest.mark.parametrize(
         ("raw_sql", "reason"),
@@ -741,23 +753,25 @@ class TestEveryParserFailureIsAudited:
             ("SELECT 'unterminated", OutcomeReason.PARSE_ERROR),
             ('SELECT "unterminated', OutcomeReason.PARSE_ERROR),
             ("SELECT $$unterminated", OutcomeReason.PARSE_ERROR),
-            # Refused before sqlglot's regex runs now (U& is unsupported);
-            # either way the attempt is audited.
-            ("SELECT U&'x' UESCAPE '(' AS v", OutcomeReason.UNSAFE_LITERAL),
-            ("SELECT U&'x' UESCAPE '\\' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' UESCAPE '(' AS v", _UESCAPE_REASON),
+            ("SELECT U&'x' UESCAPE '\\' AS v", _UESCAPE_REASON),
         ],
-        ids=["string", "identifier", "dollar", "uescape-paren", "uescape-backslash"],
+        ids=[
+            "string",
+            "identifier",
+            "dollar",
+            "unicode-escape",
+            "uescape-paren",
+            "uescape-backslash",
+        ],
     )
     def test_audited(self, monkeypatch, raw_sql, reason):
         cursor = _stub_readonly_connections(monkeypatch)
         result = run_query(
             user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
         )
-        if reason is OutcomeReason.UNSAFE_LITERAL:
-            # sqlglot 30.7 already fails to parse `UESCAPE`.
-            assert result.rejection_reason in {reason.value, "parse_error"}
-        else:
-            assert result.rejection_reason == reason.value
+        assert result.rejection_reason == reason.value
         cursor.execute.assert_not_called()
         log = MCPQueryLog.objects.get()
         assert log.decision == MCPQueryLog.DECISION_REJECTED
