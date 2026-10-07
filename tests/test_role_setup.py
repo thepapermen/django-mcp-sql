@@ -8,7 +8,8 @@ the membership-GRANT dance — and nothing keeps them in sync but discipline.
 These tests pin that overlap so a change to one side (a new GUC default, a
 renamed app_role mechanism) fails loudly instead of drifting silently.
 
-No DB: the command only reads settings and prints SQL to stdout.
+The command only reads settings and prints SQL to stdout; one test runs the
+values it writes through PostgreSQL.
 """
 
 import re
@@ -16,7 +17,9 @@ from io import StringIO
 from pathlib import Path
 
 import mcp_sql
+import pytest
 from django.core.management import call_command
+from django.db import connection
 from mcp_sql.session import EXPECTED_SESSION_GUCS
 
 # The package-default profile's role (config.settings.test ships only `default`).
@@ -79,3 +82,18 @@ def test_membership_grant_shape_matches():
     ):
         assert fragment in emitted
         assert fragment in static
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("source", [_emit_sql, _static_sql])
+def test_each_default_means_the_guard_value_to_postgres(source):
+    """Each role default, as written (not normalised), sets the value the
+    runtime guard expects: `search_path` as a list of two schemas, not one
+    schema named `public, pg_temp` (review round 17)."""
+    written = dict(_GUC_RE.findall(source()))
+    assert set(written) == set(EXPECTED_SESSION_GUCS)
+    with connection.cursor() as cur:
+        for name, value in written.items():
+            cur.execute(f"SET LOCAL {name} = {value}")
+            cur.execute(f"SHOW {name}")
+            assert cur.fetchone() == (EXPECTED_SESSION_GUCS[name],), name

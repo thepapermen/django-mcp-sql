@@ -100,7 +100,7 @@ class TestGrantsCheck:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"auth_permission"}
+        patched_grants["granted_tables"].return_value = {("public", "auth_permission")}
         assert "Grants in sync" in _run()
 
     def test_fails_on_missing_grant(self, patched_grants):
@@ -114,7 +114,7 @@ class TestGrantsCheck:
 
     def test_fails_on_extra_grant(self, patched_grants):
         patched_grants["declared_tables"].return_value = {}
-        patched_grants["granted_tables"].return_value = {"orphaned_table"}
+        patched_grants["granted_tables"].return_value = {("public", "orphaned_table")}
         with pytest.raises(CommandError) as exc:
             _run()
         assert "granted but not declared: orphaned_table" in str(exc.value)
@@ -123,7 +123,7 @@ class TestGrantsCheck:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"orphaned_table"}
+        patched_grants["granted_tables"].return_value = {("public", "orphaned_table")}
         with pytest.raises(CommandError) as exc:
             _run()
         message = str(exc.value)
@@ -159,13 +159,15 @@ class TestRelationsOutsidePublic:
             "auth.Permission": "auth_permission",
         }
         patched_grants["granted_tables"].return_value = {
-            "auth_permission",
-            'analytics"."auth_permission',
+            ("public", "auth_permission"),
+            ("analytics", "auth_permission"),
         }
         out = StringIO()
         with pytest.raises(CommandError) as exc:
             call_command("mcp_sql_grants", stdout=out)
-        assert 'granted but not declared: analytics"."auth_permission' in str(exc.value)
+        assert 'granted but not declared: "analytics"."auth_permission"' in str(
+            exc.value
+        )
         assert (
             'REVOKE SELECT ON "analytics"."auth_permission" FROM mcp_readonly_role;'
             in out.getvalue()
@@ -187,9 +189,9 @@ class TestRelationsOutsidePublic:
     @pytest.mark.parametrize(
         ("db_table", "granted"),
         [
-            ('"auth_permission"', "auth_permission"),
-            ('analytics"."widget', 'analytics"."widget'),
-            ('"analytics"."widget"', 'analytics"."widget'),
+            ('"auth_permission"', ("public", "auth_permission")),
+            ('analytics"."widget', ("analytics", "widget")),
+            ('"analytics"."widget"', ("analytics", "widget")),
         ],
     )
     def test_each_db_table_spelling_is_its_relation(
@@ -202,10 +204,14 @@ class TestRelationsOutsidePublic:
     @pytest.mark.parametrize(
         ("relation", "sql"),
         [
-            ("auth_permission", '"public"."auth_permission"'),
-            ('"auth_permission"', '"public"."auth_permission"'),
-            ('analytics"."widget', '"analytics"."widget"'),
-            ('"analytics"."widget"', '"analytics"."widget"'),
+            (("public", "auth_permission"), '"public"."auth_permission"'),
+            (("analytics", "widget"), '"analytics"."widget"'),
+            (("public", 'x" FROM r; --'), '"public"."x"" FROM r; --"'),
+            (('a"."b', "c"), '"a"".""b"."c"'),
+            (
+                ("public", "a\nb\\c\u200b"),
+                '"public".U&"a\\+00000Ab\\+00005Cc\\+00200B"',
+            ),
         ],
     )
     def test_relation_sql(self, relation, sql):

@@ -152,6 +152,9 @@ SYSTEM_SCHEMAS: frozenset[str] = frozenset({"pg_catalog", "information_schema"})
 # pins `search_path` to it, then `pg_temp` (`session.SEARCH_PATH`), so a
 # same-named relation in another schema is never what `FROM t` opens.
 DEFAULT_SCHEMA = "public"
+# A whitelisted relation's column names, keyed by the relation itself:
+# `(schema, name)` as `relation_of` reads a `db_table`.
+RelationColumns = Mapping[tuple[str, str], frozenset[str]]
 # Postgres reads `x.f` / `(expr).f` as the call `f(x)` when `x` has no column
 # `f` ("attribute notation"): `('server_version'::text).current_setting` is
 # `current_setting('server_version')`. So a qualified name that is a denied
@@ -1300,14 +1303,16 @@ def _parse_and_validate(
     _check_no_fetch(ast)
     _check_no_locking_reads(ast)
     referenced_tables = _check_tables(ast, allowed_tables=allowed_tables)
-    # Keyed like `_item_columns` looks them up: one spelling per relation.
-    table_columns = {relation_key(table): cols for table, cols in table_columns.items()}
-    _check_no_denied_functions(ast, table_columns)
+    # Keyed like `_item_columns` looks them up: by relation, `(schema, name)`.
+    relation_columns = {
+        relation_of(table): cols for table, cols in table_columns.items()
+    }
+    _check_no_denied_functions(ast, relation_columns)
     _check_no_denied_calls(tokens, ast)
     _check_no_bare_keyword_columns(ast)
     if ban_select_star:
         _check_no_select_star(ast)
-        _check_no_whole_row_refs(ast, table_columns)
+        _check_no_whole_row_refs(ast, relation_columns)
 
     # The AST-walk checks above are iterative (sqlglot's `find_all` uses an
     # explicit stack), so they can't overflow. `Generator.sql()` recurses by
@@ -2028,9 +2033,7 @@ def _check_no_select_star(ast: exp.Query) -> None:
             cur = cur.parent
 
 
-def _check_no_whole_row_fields(
-    ast: exp.Query, table_columns: Mapping[str, frozenset[str]]
-) -> None:
+def _check_no_whole_row_fields(ast: exp.Query, table_columns: RelationColumns) -> None:
     """`t.to_jsonb` is `to_jsonb(t)` to Postgres (attribute notation): the
     whole row, refused like the call (review round 5) — unless `t` has a
     column of that name (`_attribute_calls`)."""
@@ -2043,9 +2046,7 @@ def _check_no_whole_row_fields(
             raise QueryRejectedError(OutcomeReason.SELECT_STAR, msg)
 
 
-def _check_no_whole_row_refs(
-    ast: exp.Query, table_columns: Mapping[str, frozenset[str]]
-) -> None:
+def _check_no_whole_row_refs(ast: exp.Query, table_columns: RelationColumns) -> None:
     """Reject bare-table-alias columns in any Select's projection list.
 
     The Star check above catches every shape with an `exp.Star` node, but
@@ -2097,9 +2098,7 @@ def _check_no_whole_row_refs(
                     raise QueryRejectedError(OutcomeReason.SELECT_STAR, msg)
 
 
-def _check_no_denied_functions(
-    ast: exp.Query, table_columns: Mapping[str, frozenset[str]]
-) -> None:
+def _check_no_denied_functions(ast: exp.Query, table_columns: RelationColumns) -> None:
     """Walk every function-call node and reject anything on the deny list.
 
     `exp.Func` is sqlglot's base class for both typed function nodes
@@ -2163,9 +2162,7 @@ def _check_no_denied_functions(
             raise QueryRejectedError(reason, msg)
 
 
-def _attribute_calls(
-    ast: exp.Query, table_columns: Mapping[str, frozenset[str]]
-) -> list[str]:
+def _attribute_calls(ast: exp.Query, table_columns: RelationColumns) -> list[str]:
     """The lowercase names Postgres may read as attribute-notation CALLS
     (`x.f` / `(expr).f` is `f(x)` when there is no column to read).
 
@@ -2205,7 +2202,7 @@ def _attribute_calls(
     return names
 
 
-def _is_field_read(dot: exp.Dot, table_columns: Mapping[str, frozenset[str]]) -> bool:
+def _is_field_read(dot: exp.Dot, table_columns: RelationColumns) -> bool:
     """`(t.*).f` / `(t).f` that Postgres provably reads as the column `f`
     of the FROM item `t` (see `_attribute_calls`)."""
     node = dot.this
@@ -2228,7 +2225,7 @@ def _is_row_field(
     node: exp.Expression,
     item: str,
     name: str,
-    table_columns: Mapping[str, frozenset[str]],
+    table_columns: RelationColumns,
     *,
     strict: bool = True,
 ) -> bool:
@@ -2256,17 +2253,6 @@ def relation_of(db_table: str) -> tuple[str, str]:
     if dot:
         return schema, name
     return DEFAULT_SCHEMA, inner
-
-
-def relation_key(db_table: str) -> str:
-    """One spelling per relation (see `_spelling`)."""
-    return _spelling(*relation_of(db_table))
-
-
-def _spelling(schema: str, name: str) -> str:
-    """A relation's one spelling: the name in `DEFAULT_SCHEMA`, else
-    `schema"."name` (as a `db_table` names it)."""
-    return name if schema == DEFAULT_SCHEMA else f'{schema}"."{name}'
 
 
 def _table_relation(table: exp.Table) -> tuple[str, str]:
@@ -2307,7 +2293,7 @@ def _is_column_of(
     node: exp.Expression,
     item: str,
     name: str,
-    table_columns: Mapping[str, frozenset[str]],
+    table_columns: RelationColumns,
 ) -> bool:
     """True if the FROM item `item`, in scope at `node` (the innermost
     match), provably has a column `name`."""
@@ -2322,7 +2308,7 @@ def _is_column_of(
 def _is_column_name_in_scope(
     node: exp.Expression,
     name: str,
-    table_columns: Mapping[str, frozenset[str]],
+    table_columns: RelationColumns,
     *,
     strict: bool,
 ) -> bool:
@@ -2371,7 +2357,7 @@ _ItemColumns = tuple[frozenset[str], frozenset[str] | None]
 
 
 def _item_columns(
-    source: exp.Expression, table_columns: Mapping[str, frozenset[str]]
+    source: exp.Expression, table_columns: RelationColumns
 ) -> _ItemColumns:
     alias = source.args.get("alias")
     renamed = (
@@ -2388,7 +2374,7 @@ def _item_columns(
         if cte is not None:
             return _renamed(renamed, _cte_columns(cte))
         certain, possible = _base_table_columns(
-            table_columns.get(_spelling(*_table_relation(source))), renamed
+            table_columns.get(_table_relation(source)), renamed
         )
         # A table's system columns are columns too, whatever the alias list
         # (a view has none, but the model does not say which it is).
