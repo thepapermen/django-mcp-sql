@@ -753,6 +753,22 @@ class TestBridgeGuard:
         response = _invoke_bounded(_guarded(returns_nothing), _bridge_request())
         assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
 
+    def test_app_raising_timeout_error_is_not_reported_as_the_deadline(
+        self, monkeypatch, caplog
+    ):
+        """Only the bridge's own deadline is a 504. A `TimeoutError` the app
+        raises itself is an app exception like any other (a2wsgi's 500),
+        and must not be logged as the 30 s deadline firing."""
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+
+        async def raises(scope, receive, send):
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)
+
+        response = _invoke_bounded(_guarded(raises), _bridge_request())
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert "did not complete within" not in caplog.text
+
     def test_endless_stream_is_closed_at_the_deadline(self, monkeypatch):
         monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
 

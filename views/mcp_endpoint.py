@@ -10,10 +10,12 @@ import functools
 import io
 import logging
 import threading
+from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import asdict
 from http import HTTPStatus
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 from wsgiref.types import WSGIApplication
 
@@ -685,43 +687,59 @@ def _guard_bridge(asgi_app):
 
         status = HTTPStatus.INTERNAL_SERVER_ERROR
         try:
-            async with asyncio.timeout(_BRIDGE_DEADLINE_SECONDS):
+            async with asyncio.timeout(_BRIDGE_DEADLINE_SECONDS) as deadline:
                 await asgi_app(scope, receive, tracked_send)
         except TimeoutError:
+            # Only the deadline firing is a 504. A `TimeoutError` the app
+            # raised itself is an app exception like any other: a2wsgi's.
+            if not deadline.expired():
+                raise
             status = HTTPStatus.GATEWAY_TIMEOUT
         if in_flight is not None:
             await in_flight
-        if finished:
-            return
-        logger.error(
-            "MCP bridge: %s %s %s; answering the client and releasing the thread",
-            scope.get("method"),
-            scope.get("path"),
-            (
-                f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
-                if status == HTTPStatus.GATEWAY_TIMEOUT
-                else "ended without completing its response"
-            ),
-        )
-        if not started:
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": status,
-                    "headers": [(b"content-type", b"text/plain; charset=utf-8")],
-                }
+        if not finished:
+            logger.error(
+                "MCP bridge: %s %s %s; answering the client and releasing the thread",
+                scope.get("method"),
+                scope.get("path"),
+                (
+                    f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
+                    if status == HTTPStatus.GATEWAY_TIMEOUT
+                    else "ended without completing its response"
+                ),
             )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": status.phrase.encode(),
-                    "more_body": False,
-                }
-            )
-            return
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+            await _complete_response(send, started=started, status=status)
 
     return call
+
+
+async def _complete_response(
+    send: Callable[[dict[str, Any]], Awaitable[None]],
+    *,
+    started: bool,
+    status: HTTPStatus,
+) -> None:
+    """Send what an unfinished response is missing so a2wsgi's WSGI half stops.
+
+    A whole `status` response if none started, else the closing empty chunk.
+    """
+    if not started:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": status.phrase.encode(),
+                "more_body": False,
+            }
+        )
+        return
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def _wrap_lifespan(asgi_app):
