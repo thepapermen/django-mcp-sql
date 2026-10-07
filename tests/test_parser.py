@@ -1700,6 +1700,84 @@ class TestReviewRound11:
         _expect_reject(sql, OutcomeReason.PARSE_ERROR)
 
 
+class TestReviewRound12:
+    """Review round 12 (final pass of A6-A11)."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres has six interval fields; any other word after the
+            # string is an alias (1 second named `week`), which sqlglot
+            # folded into the value as one of its own units (7 days).
+            ("SELECT INTERVAL '1' WEEK", "INTERVAL '1' AS WEEK"),
+            ("SELECT INTERVAL '1' DAYS", "INTERVAL '1' AS DAYS"),
+            ("SELECT INTERVAL '1' q", "INTERVAL '1' AS q"),
+            ("SELECT INTERVAL '1' hr", "INTERVAL '1' AS hr"),
+            # The string itself as written (sqlglot respelled its unit).
+            ("SELECT INTERVAL '1 week' AS v", "INTERVAL '1 week' AS v"),
+            ("SELECT INTERVAL '3 days ago' AS v", "INTERVAL '3 days ago' AS v"),
+        ],
+    )
+    def test_interval_word_is_an_alias(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres takes only an unsigned integer precision, then a
+            # string; sqlglot ran a sum or dropped parts.
+            "SELECT INTERVAL(3.0) '1.2'",
+            "SELECT INTERVAL(+3) '1.25'",
+            "SELECT INTERVAL(-1) '1 day'",
+            "SELECT INTERVAL(1 + 2) '1.2'",
+            "SELECT INTERVAL(3)",
+        ],
+    )
+    def test_interval_precision_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A quoted name is never a keyword to Postgres: the column.
+            'SELECT "user" FROM (SELECT 1 AS "user") s',
+            'SELECT "current_user", "session_user" FROM '
+            '(SELECT 1 AS "current_user", 2 AS "session_user") s',
+        ],
+    )
+    def test_quoted_builtin_name_is_a_column(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    def test_unquoted_builtin_name_stays_refused(self):
+        _expect_reject(
+            "SELECT user FROM (SELECT 1 AS id) s", OutcomeReason.DISALLOWED_FUNCTION
+        )
+
+    @pytest.mark.parametrize(
+        ("sql", "allowed"),
+        [
+            # Postgres folds only ASCII A-Z: a capital sigma is not the small
+            # one, and the Kelvin sign is not `k`.
+            ("SELECT id FROM \u03a3", {"\u03c3"}),
+            ("SELECT id FROM auth_permission_\u212a", {"auth_permission_k"}),
+            ("WITH \u03c3 AS (SELECT 1 AS id) SELECT id FROM \u03a3", {"t"}),
+        ],
+    )
+    def test_only_ascii_is_folded(self, sql, allowed):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE, allowed=allowed)
+
+    def test_limit_reads_only_the_whitespace_postgres_skips(self):
+        ast = parse_and_validate(
+            "SELECT id FROM auth_permission LIMIT '5\u00a0'", allowed_tables=ALLOWED
+        ).ast
+        assert extract_limit(ast) is None  # Postgres: invalid input for bigint
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

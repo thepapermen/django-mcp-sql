@@ -2917,6 +2917,14 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "SELECT json_object(key VALUE id) AS a, json_object(\"KEY\" VALUE id) AS b, json_object(s.key: s.id) AS c FROM (SELECT 'k' AS key, 'K' AS \"KEY\", id FROM t WHERE id < 3) s ORDER BY id",
     ),
     (
+        "intervals",
+        "SELECT INTERVAL '1' WEEK, INTERVAL '2' DAYS, INTERVAL '3' q, INTERVAL '4' MON, INTERVAL '5' hr, INTERVAL '1 week' AS w",
+    ),
+    (
+        "names",
+        'SELECT "user", "current_user" FROM (SELECT g AS "user", id AS "current_user" FROM t WHERE id < 3) s ORDER BY 2',
+    ),
+    (
         "operators",
         "SELECT '10' ^@ '1' AS a, '4' ^@ '2' AS b, 'x' || 'abc' ^@ 'a' AS c",
     ),
@@ -3209,6 +3217,9 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT INTERVAL(3) '1.5' SECOND AS a"),
     ("parse_error", "SELECT INTERVAL '1' DAY(3) AS a"),
     ("parse_error", "SELECT INTERVAL '1' DAY TO"),
+    ("parse_error", "SELECT INTERVAL(3.0) '1.2' AS a"),
+    ("parse_error", "SELECT INTERVAL(-1) '1 day' AS a"),
+    ("parse_error", "SELECT INTERVAL(3) AS a"),
     ("parse_error", "SELECT INTERVAL '25 hours' DAY HOUR"),
     (
         "disallowed_function",
@@ -3283,6 +3294,8 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",
     "SELECT id FROM t ORDER BY id LIMIT 'Infinity'::float8",
     "SELECT 4 ^@ 2 AS v",
+    'SELECT "USER" FROM t',
+    "SELECT id FROM t ORDER BY id LIMIT '5\u00a0'",
     "SELECT ! true AS v",
     "SELECT id FROM t WHERE id = $1",
     "SELECT id FROM t WHERE id = $1::int",

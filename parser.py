@@ -4,6 +4,7 @@ no Django imports). See `docs/architecture.md` for design /
 
 import itertools
 import re
+import string
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -620,23 +621,14 @@ class FaithfulPostgres(Postgres):
                         _QualifiedInterval(this=this, unit=qualifier)
                     )
                     return qualified
-                if self._curr is not None and self._curr.token_type == (
-                    TokenType.IDENTIFIER
-                ):
-                    # `INTERVAL '1' "day"`: the quoted word is an alias, which
-                    # sqlglot would read as the unit (1 day, not 1 second).
-                    plain: exp.Interval = self.expression(exp.Interval(this=this))
-                    return plain
+                # Postgres has no other qualifier: a word after the string is
+                # an alias (`INTERVAL '1' WEEK` / `"day"` is 1 second named
+                # `week` / `day`), which sqlglot read as a unit of its own
+                # list (`WEEK`, `DAYS`, `q`, ...). The string is kept as
+                # written too (sqlglot kept the first `<n> <unit>` of it).
+                plain: exp.Interval = self.expression(exp.Interval(this=this))
+                return plain
             interval: exp.Interval = super()._parse_interval_span(this, *args, **kwargs)
-            if (
-                written is not None
-                and len(exp.INTERVAL_STRING_RE.findall(written)) == 1
-                and not exp.INTERVAL_STRING_RE.fullmatch(written)
-                and not isinstance(interval.args.get("unit"), exp.IntervalSpan)
-            ):
-                # sqlglot kept only the first `<n> <unit>` of the string.
-                interval.set("this", exp.Literal.string(written))
-                interval.set("unit", None)
             return interval
 
         def _parse_at_operator(self) -> exp.Expression | None:
@@ -801,6 +793,10 @@ class FaithfulPostgres(Postgres):
                     )
                 )
                 return interval
+            if kinds[:2] == [TokenType.INTERVAL, TokenType.L_PAREN]:
+                # `INTERVAL(3.0) '1.2'`, `INTERVAL(-1) '1 day'`, `INTERVAL(3)`:
+                # Postgres's syntax error; sqlglot ran a sum or dropped parts.
+                self.raise_error("INTERVAL(p) takes an unsigned integer and a string")
             parsed: exp.Expression | None = super()._parse_interval(*args, **kwargs)
             return parsed
 
@@ -1790,7 +1786,11 @@ def extract_limit(ast: exp.Query) -> int | None:
         return None
     # `LIMIT '5'` is the bigint 5 to Postgres (its input syntax: optional
     # surrounding spaces and `+`); `LEAST('5', n)` would read it as int4.
-    text = written.name.strip().removeprefix("+") if written.is_string else written.name
+    text = (  # only the whitespace Postgres's int8 input skips (not NBSP)
+        written.name.strip(" \t\n\r\v\f").removeprefix("+")
+        if written.is_string
+        else written.name
+    )
     if _PLAIN_INTEGER_RE.fullmatch(text) and int(text) <= _BIGINT_MAX:
         return int(text)
     return None  # beyond bigint, negative, ...: Postgres's own error
@@ -2126,12 +2126,18 @@ def _is_row_field(
     ) and _is_column_of(node, item, name, table_columns)
 
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
 def _name_key(identifier: exp.Expression) -> str:
     """An identifier as Postgres compares it: quoted as written, unquoted
     folded to lowercase."""
     if isinstance(identifier, exp.Identifier) and identifier.quoted:
         return str(identifier.name)
-    return str(identifier.name).lower()
+    # ASCII A-Z only, as Postgres folds in a UTF-8 database (`str.lower`
+    # would fold a Greek capital sigma onto the small one, and the Kelvin
+    # sign onto `k`).
+    return str(identifier.name).translate(_ASCII_LOWER)
 
 
 def _scopes(node: exp.Expression) -> list[exp.Select]:
@@ -2392,10 +2398,14 @@ def _check_no_bare_keyword_columns(ast: exp.Query) -> None:
 
     Qualified Columns (`t.current_user` — i.e. an actual column happening
     to share a name with a PG keyword) are ignored: the qualifier proves
-    the reference is to a table column, not the bare keyword form.
+    the reference is to a table column, not the bare keyword form. So are
+    quoted names (`"user"`): a quoted identifier is never a keyword to
+    Postgres, only a column (or its "column does not exist" error).
     """
     for col in ast.find_all(exp.Column):
         if col.args.get("table") is not None:
+            continue
+        if isinstance(col.this, exp.Identifier) and col.this.quoted:
             continue
         name = (col.name or "").lower()
         if name in DENIED_BARE_KEYWORDS:
