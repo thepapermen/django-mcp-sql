@@ -422,7 +422,9 @@ announce themselves.
   re-validates the target against the client before every error redirect and
   shows the error page when it does not belong to the client. A consent POST
   naming a `client_id` that does not exist was a 500; it shows the same error
-  page. Both inherited from DOT, also in 0.1.0b5.
+  page, as does a `client_id` containing a NUL byte on either the GET or the
+  POST (DOT handed it to Postgres, which raised `DataError`: a 500). All
+  inherited from DOT; also affects 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

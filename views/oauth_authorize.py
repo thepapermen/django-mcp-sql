@@ -122,9 +122,9 @@ class MCPAuthorizationView(AuthorizationView):
     def form_valid(self, form):
         # DOT's `form_valid` starts with `Application.objects.get(client_id=
         # <hidden field>)`, so a consent POST naming a client that does not
-        # exist was a 500 (`DoesNotExist`; with a NUL in it, a `DataError`).
-        # Render the fatal-client error page instead, as DOT does for an
-        # unknown client on the GET.
+        # exist was a 500 (`DoesNotExist`). Render the fatal-client error
+        # page instead, as DOT does for an unknown client on the GET. (A NUL
+        # never gets here: `dispatch` refuses it first.)
         client_id = form.cleaned_data.get("client_id") or ""
         if not self._is_known_client_id(client_id):
             return super().error_response(
@@ -158,8 +158,7 @@ class MCPAuthorizationView(AuthorizationView):
 
     @staticmethod
     def _is_known_client_id(client_id: str) -> bool:
-        # A NUL never names a client and would make Postgres raise.
-        if not client_id or "\x00" in client_id:
+        if not client_id:
             return False
         return bool(
             get_application_model().objects.filter(client_id=client_id).exists()
@@ -178,7 +177,6 @@ class MCPAuthorizationView(AuthorizationView):
             not client_id
             or not isinstance(redirect_uri, str)
             or not redirect_uri
-            or "\x00" in client_id
             or not is_absolute_uri(redirect_uri)
         ):
             return False
@@ -216,6 +214,19 @@ class MCPAuthorizationView(AuthorizationView):
         query = request.GET.copy()
         query["approval_prompt"] = "force"  # replaces every value, if repeated
         request.GET = query
+        # A NUL never names a client, and DOT would hand it to Postgres in
+        # its client lookup (`validate_authorization_request` on the GET,
+        # `form_valid` on the POST), which raises `DataError`: a 500 on every
+        # retry. Refuse it here with the fatal-client error page, before any
+        # lookup (and before the gate, which queries the DB too).
+        client_ids = request.GET.getlist("client_id")
+        if request.method == "POST":
+            client_ids += request.POST.getlist("client_id")
+        if any("\x00" in value for value in client_ids):
+            return super().error_response(
+                FatalClientError(error=oauth2_errors.InvalidClientIdError()),
+                application=None,
+            )
         if request.user.is_authenticated:
             self._enforce_gate(request.user)
         # If the user is NOT authenticated, super().dispatch lets

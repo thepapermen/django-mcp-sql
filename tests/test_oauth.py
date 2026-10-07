@@ -929,6 +929,38 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         assert response["Location"].startswith(self.CALLBACK + "?")
         assert "error=invalid_target" in response["Location"]
 
+    def test_nul_client_id_on_the_get_renders_error_page_not_500(
+        self, client, mcp_user, gate_posture
+    ):
+        """DOT looks the client up (`Application.objects.get`) inside
+        `validate_authorization_request`, so a NUL in `client_id` reached
+        Postgres and raised `DataError` (a 500) on every retry. The view
+        refuses it before DOT runs."""
+        from urllib.parse import urlencode
+
+        client.force_login(mcp_user)
+        query = urlencode(
+            {
+                "client_id": "mcp-sql-cloud.claude\x00",
+                "redirect_uri": self.CALLBACK,
+                "response_type": "code",
+                "scope": "mcp:sql",
+                "state": "s",
+                "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                "code_challenge_method": "S256",
+            }
+        )
+        response = client.get(reverse("authorize") + "?" + query)
+        self._assert_error_page(response)
+
+    def test_nul_client_id_on_the_post_renders_error_page(
+        self, client, mcp_user, gate_posture
+    ):
+        response = self._post(
+            client, mcp_user, client_id="mcp-sql-cloud.claude\x00", allow="Authorize"
+        )
+        self._assert_error_page(response)
+
     def test_unknown_client_id_renders_error_page_not_500(
         self, client, mcp_user, gate_posture
     ):
