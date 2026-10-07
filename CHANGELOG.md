@@ -100,12 +100,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `-~y` (one operator to Postgres, `%-`, `=~`, `-~`), operators sqlglot
     reads but Postgres does not have (`a == b`, `<=>`, `??`, `~~~`, which
     ran as `=`, `IS NOT DISTINCT FROM`, ...) and `json_object(KEY 'a' VALUE
-    1)` (no `KEY` in Postgres) are refused. Also as written: `INTERVAL
+    1)` (no `KEY` in Postgres) are refused; a column named `key` is not that
+    keyword (`json_object(key VALUE x)`, `"KEY" VALUE x` run on PG16, where
+    sqlglot dropped the column as the keyword). Also as written: `INTERVAL
     '<string>' <field> [TO <field>]` (`INTERVAL '25 hours' DAY` is 0 days
     to Postgres; sqlglot dropped the field or read it as an alias) — only
     an unquoted word is a field (`INTERVAL '25 hours' "DAY"` is 25 hours
-    and `INTERVAL '1' "day"` one second, each with an alias), and a seconds field keeps its precision (`SECOND(2)`,
-    `DAY TO SECOND(3)`) — and `INTERVAL(3) '1.23456'` (was the sum
+    and `INTERVAL '1' "day"` one second, each with an alias), a seconds
+    field keeps its precision (`SECOND(2)`, `DAY TO SECOND(3)`), and a field
+    word or `TO` after a complete qualifier (`INTERVAL '1' DAY HOUR`, `...
+    DAY TO`) is a parse error, as in Postgres (it ran with an alias) — and `INTERVAL(3) '1.23456'` (was the sum
     `INTERVAL '3' + INTERVAL '1.23456'`); a subscripted column named
     `array` or `list` (`"array"[1]`, `t.array[1]`, `list[1]` became the
     constructor `ARRAY[1]` / `LIST(1)`),
@@ -126,7 +130,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    876 ordinary analytical queries (over data with NULLs and mixed case)
+    877 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
@@ -145,7 +149,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     the FROM item `t` has a column `f` stays a column, whatever it is
     named —
     a derived table's or CTE's output column, an alias column list, a
-    whitelisted table's column (from its model), a schema-qualified type
+    whitelisted table's column (from its model: the columns of its own
+    table — a multi-table-inheritance child's parent fields are not; a
+    table's system columns `tableoid`, `ctid`, `xmin`, … always are, so
+    `(tableoid).pg_relation_filepath` stays a call), a schema-qualified type
     name (`'0/0'::pg_catalog.pg_lsn`) — as do names of denied functions
     attribute notation cannot call (`t.version`, `t.user`, `t.has_access`).
     So does `(t).f` on the same terms, provided no FROM item in scope has,
