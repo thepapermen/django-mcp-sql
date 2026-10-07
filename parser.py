@@ -2,6 +2,7 @@
 no Django imports). See `docs/architecture.md` for design /
 "Watch out" / parser-check ordering rules."""
 
+import itertools
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -112,15 +113,19 @@ DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = ("dblink_", "lo_", "pg_", "has_")
 # unbounded DoS amplifier, the json/regexp expanders fan out by their input
 # size. sqlglot maps `generate_series`/`unnest` to TYPED nodes
 # (`exp.GenerateSeries` / `exp.UDTF`, matched structurally in
-# `_check_no_denied_functions`); every other PG SRF parses as `exp.Anonymous`
-# and is matched here by name. The LIMIT-injection + 5s `statement_timeout`
-# already bound these — rejecting them at the parser yields a clean
+# `_check_no_denied_functions`) only when written unqualified, so they are
+# listed by name too (`pg_catalog.generate_series(...)`, review round 5);
+# every other PG SRF parses as `exp.Anonymous` and is matched here by name.
+# The LIMIT-injection + 5s `statement_timeout` already bound these —
+# rejecting them at the parser yields a clean
 # `DISALLOWED_CONSTRUCT` audit reason instead of a wasted backend slot, and an
 # LLM business-table query never legitimately needs row-expansion built-ins.
 # Not exhaustive of every PG SRF (extensions add more); the timeout/LIMIT
 # backstop covers anything unlisted. Revisit if a legitimate use case appears.
 DENIED_SRF_FUNCTIONS: frozenset[str] = frozenset(
     {
+        "generate_series",
+        "unnest",
         "generate_subscripts",
         "regexp_split_to_table",
         "regexp_matches",
@@ -141,6 +146,53 @@ DENIED_SRF_FUNCTIONS: frozenset[str] = frozenset(
     }
 )
 SYSTEM_SCHEMAS: frozenset[str] = frozenset({"pg_catalog", "information_schema"})
+# Postgres reads `x.f` / `(expr).f` as the call `f(x)` when `x` has no column
+# `f` ("attribute notation"): `('server_version'::text).current_setting` is
+# `current_setting('server_version')`. So a qualified name that is a denied
+# function is refused like the call (review round 5) — except the denied
+# functions attribute notation cannot reach, because they take no argument
+# or need two or more (all of `has_*`), whose names are also ordinary column
+# names (`t.version`, `t.user`, `t.has_access`).
+_NOT_CALLABLE_AS_FIELD: frozenset[str] = frozenset(
+    {
+        "version",
+        "current_version",
+        "current_database",
+        "current_schema",
+        "current_user",
+        "session_user",
+        "user",
+        "current_role",
+        "current_catalog",
+        "inet_server_addr",
+        "inet_server_port",
+        "inet_client_addr",
+        "inet_client_port",
+        "txid_current",
+        "txid_current_snapshot",
+        "set_config",
+        "setval",
+    }
+)
+# Functions that, called on a row through attribute notation (`t.to_jsonb`),
+# return the whole row: refused as `SELECT_STAR` like `to_jsonb(t)`. (`t.text`
+# / `t.name` — the row cast to text / name — are left alone: those are
+# ordinary column names, and a column of that name takes precedence.)
+_WHOLE_ROW_FIELD_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "to_json",
+        "to_jsonb",
+        "row_to_json",
+        "json_agg",
+        "jsonb_agg",
+        "array_agg",
+        "json_build_array",
+        "jsonb_build_array",
+        "json_build_object",
+        "jsonb_build_object",
+        "hstore",
+    }
+)
 
 
 def _keep_precision(name: str) -> Callable[[Generator, exp.Func], str]:
@@ -159,6 +211,27 @@ def _json_arrow(operator: str, base: Any) -> Callable[[Generator, exp.Expression
         if isinstance(node.expression, exp.JSONPath):
             return str(base(self, node))
         return f"{self.sql(node, 'this')} {operator} {self.sql(node, 'expression')}"
+
+    return render
+
+
+# Postgres reads a run of these characters as ONE operator (`~-`, `-~`,
+# `%-`), see `_check_operator_runs`.
+_OPERATOR_CHARS = frozenset("+-*/<>=~!@#%^&|`?")
+# A multi-character operator may end in `+` / `-` only if it contains one of
+# these (otherwise Postgres drops the trailing `+` / `-` from it).
+_OPERATOR_KEEPS_SIGN = frozenset("~!@#%^&|`?")
+
+
+def _prefix_operator(symbol: str) -> Callable[[Generator, exp.Expression], str]:
+    """Render a prefix operator, with a space before an operand that starts
+    with an operator character: `~ -1` must not come back as `~-1`, which
+    Postgres reads as the (non-existent) prefix operator `~-`."""
+
+    def render(self: Generator, node: exp.Expression) -> str:
+        operand = self.sql(node, "this")
+        gap = " " if operand[:1] in _OPERATOR_CHARS else ""
+        return f"{symbol}{gap}{operand}"
 
     return render
 
@@ -297,6 +370,17 @@ class FaithfulPostgres(Postgres):
             for name, parse in Postgres.Parser.NO_PAREN_FUNCTION_PARSERS.items()
             if name in _SYNTAX_NO_PAREN_FUNCTIONS
         }
+        # `QUALIFY` is not Postgres SQL, and `qualify` is an ordinary name to
+        # Postgres (`FROM t qualify (c1)`). sqlglot read it as the clause and
+        # moved the LIMIT before the filter; it is a name here, so the clause
+        # is a syntax error, as in Postgres.
+        QUERY_MODIFIER_PARSERS = {
+            kind: parse
+            for kind, parse in Postgres.Parser.QUERY_MODIFIER_PARSERS.items()
+            if kind != TokenType.QUALIFY
+        }
+        ID_VAR_TOKENS = Postgres.Parser.ID_VAR_TOKENS | {TokenType.QUALIFY}
+        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.QUALIFY}
         PRIMARY_PARSERS = {
             **Postgres.Parser.PRIMARY_PARSERS,
             **{
@@ -323,16 +407,35 @@ class FaithfulPostgres(Postgres):
         # operand raw in whichever table this sqlglot uses.
         _ARROWS = {
             TokenType.ARROW: lambda self, this, path: self.expression(
-                exp.JSONExtract(this=this, expression=path)
+                exp.JSONExtract(this=this, expression=self._arrow_operand(path))
             ),
             TokenType.DARROW: lambda self, this, path: self.expression(
-                exp.JSONExtractScalar(this=this, expression=path)
+                exp.JSONExtractScalar(this=this, expression=self._arrow_operand(path))
             ),
         }
         if getattr(Postgres.Parser, "JSON_OPERATORS", None):
             JSON_OPERATORS = {**Postgres.Parser.JSON_OPERATORS, **_ARROWS}
         else:
             COLUMN_OPERATORS = {**Postgres.Parser.COLUMN_OPERATORS, **_ARROWS}
+
+        def _arrow_operand(self, path: exp.Expression) -> exp.Expression:
+            """The right operand of `->` / `->>`. Where sqlglot parses the
+            arrows as column operators (30.7), a `::type` right after the
+            operand was applied to the whole `j -> 'a'`; Postgres binds `::`
+            tighter (`j -> ('a'::text)`), so it is taken onto the operand."""
+            if getattr(Postgres.Parser, "JSON_OPERATORS", None):
+                return path  # 30.21: the operand was parsed as a full term
+            tokens = self._tokens
+            while (
+                self._index < len(tokens)
+                and tokens[self._index].token_type == TokenType.DCOLON
+            ):
+                self._advance()
+                to = self._parse_types()
+                if to is None:
+                    self.raise_error("Expected type after '::'")
+                path = self.expression(exp.Cast(this=path, to=to))
+            return path
 
         def _number_as_written(self, token: Token) -> exp.Expression | None:
             """A numeric constant spelled the way Postgres reads it, or
@@ -424,6 +527,11 @@ class FaithfulPostgres(Postgres):
             return interval
 
         def _parse_json_object_or_call(self) -> exp.Expression | None:
+            if self._json_key_keyword():
+                # `json_object(KEY 'a' VALUE 1)`: Postgres has no `KEY` here
+                # (it reads `KEY 'a'` as a literal of a type `key`); sqlglot
+                # would run the SQL/JSON constructor.
+                self.raise_error("KEY ... VALUE is not PostgreSQL syntax")
             if self._plain_call_arguments():
                 args = self._parse_csv(self._parse_assignment)
                 call: exp.Expression = self.expression(
@@ -432,6 +540,22 @@ class FaithfulPostgres(Postgres):
                 return call
             constructor: exp.Expression | None = self._parse_json_object()
             return constructor
+
+        def _json_key_keyword(self) -> bool:
+            tokens, depth, j = self._tokens, 0, self._index
+            while j < len(tokens):
+                kind = tokens[j].token_type
+                if kind == TokenType.R_PAREN and depth == 0:
+                    return False
+                depth += (kind == TokenType.L_PAREN) - (kind == TokenType.R_PAREN)
+                if (
+                    depth == 0
+                    and tokens[j].text.upper() == "KEY"
+                    and not _alone_in_argument(tokens, j, self._index)
+                ):
+                    return True
+                j += 1
+            return False
 
         def _plain_call_arguments(self) -> bool:
             """True if the tokens up to the closing parenthesis are plain
@@ -491,6 +615,15 @@ class FaithfulPostgres(Postgres):
                 "->>", Postgres.Generator.TRANSFORMS[exp.JSONExtractScalar]
             ),
             _IsNotNull: lambda self, node: f"{self.sql(node, 'this')} IS NOT NULL",
+            # sqlglot flattens a chain of `IS` into one operator, so
+            # `x IS NOT NULL IS TRUE` (30.13+) came back `x IS NULL IS TRUE`.
+            exp.Is: lambda self, node: (
+                f"{self.sql(node, 'this')} "
+                f"{'IS NOT' if node.args.get('negate') else 'IS'} "
+                f"{self.sql(node, 'expression')}"
+            ),
+            exp.BitwiseNot: _prefix_operator("~"),
+            exp.Neg: _prefix_operator("-"),
         }
 
 
@@ -653,16 +786,16 @@ def _parse_and_validate(
     # `exp.Returning` only appears under write nodes, which NON_SELECT_ROOT
     # rejects first). Tables before SELECT_STAR so `SELECT * FROM pg_class`
     # attributes to the system schema, not the ergonomic star rule.
-    _check_lexical_fidelity(raw_sql, ast)
+    tokens = _check_lexical_fidelity(raw_sql, ast)
     _check_ctes_read_only(ast)
     _check_no_recursive_cte(ast)
     _check_no_select_into(ast)
     _check_no_offset(ast)
     _check_no_fetch(ast)
     _check_no_locking_reads(ast)
-    _check_no_qualify(ast)
     referenced_tables = _check_tables(ast, allowed_tables=allowed_tables)
     _check_no_denied_functions(ast)
+    _check_no_denied_calls(tokens, ast)
     _check_no_bare_keyword_columns(ast)
     if ban_select_star:
         _check_no_select_star(ast)
@@ -694,7 +827,7 @@ def _parse_and_validate(
 _UNQUOTED_IDENTIFIER_RE = re.compile(r"[^\W\d]\w*(?:[$]\w*)*")
 
 
-def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
+def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> list[Token]:
     """Reject input whose re-serialization by sqlglot is not faithful.
 
     The executor sends sqlglot's re-emission of the checked AST to
@@ -741,6 +874,11 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
     - A dollar-quote tag Postgres does not accept (`$u&$...$u&$`, a tag
       starting with a digit): sqlglot reads a string where Postgres refuses
       the statement.
+    - Operator characters written together that Postgres reads as one
+      operator and sqlglot as several (`2 %-3`: Postgres `%-`, sqlglot
+      `% -`; `~-1`): `_check_operator_runs`.
+
+    Returns the tokens (the denied-call check reuses them).
 
     The executor's round-trip check (`parser.render_for_execution`) is the
     backstop for anything else of this class.
@@ -756,6 +894,7 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
         problem = _token_problem(raw_sql, tokens, i, kept_names)
         if problem is not None:
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem)
+    _check_operator_runs(raw_sql, tokens)
     for ident in ast.find_all(exp.Identifier):
         start, end = ident.meta.get("start"), ident.meta.get("end")
         written = (
@@ -777,6 +916,7 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> None:
                 "constant; use a plain or double-quoted identifier"
             )
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+    return tokens
 
 
 # String-constant tokens of sqlglot's postgres dialect (on every 30.x).
@@ -795,6 +935,89 @@ _STRING_TOKENS = frozenset(
 # A Postgres dollar-quote opener: `$$` or `$tag$`, the tag an identifier
 # without `$` (sqlglot also accepts `$u&$...$u&$`, which Postgres rejects).
 _DOLLAR_TAG_RE = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+
+
+def _check_operator_runs(raw_sql: str, tokens: list[Token]) -> None:
+    """Refuse a sign written against the operator before it where Postgres
+    lexes the two as one operator. Postgres takes the longest run of
+    operator characters as one operator name, and keeps a trailing `+` /
+    `-` in it when the run contains one of `~!@#%^&|`?`: `2 %-3` is the
+    operator `%-` (none exists, an error) and `~-1` the prefix operator
+    `~-`, while sqlglot reads `2 % -3` / `~ -1` and would run them. (Runs
+    without such a character, `x>=-1`, `j->-1`, drop the sign the same way
+    sqlglot reads it.)"""
+    for i in range(1, len(tokens)):
+        sign = tokens[i]
+        if raw_sql[sign.start : sign.end + 1] not in {"-", "+"}:
+            continue
+        j = i
+        while (
+            j > 0
+            and _is_operator_token(raw_sql, tokens[j - 1])
+            and tokens[j - 1].end + 1 == tokens[j].start
+        ):
+            j -= 1
+        if j == i:
+            continue
+        before = raw_sql[tokens[j].start : sign.start]
+        if "--" in before or "/*" in before or not _OPERATOR_KEEPS_SIGN & set(before):
+            continue
+        msg = (
+            f"{before + raw_sql[sign.start]!r} reads as one operator to "
+            "Postgres; put a space before the sign"
+        )
+        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+
+
+def _is_operator_token(raw_sql: str, token: Token) -> bool:
+    text = raw_sql[token.start : token.end + 1]
+    return bool(text) and all(char in _OPERATOR_CHARS for char in text)
+
+
+def _denial(name: str) -> tuple[OutcomeReason, str] | None:
+    """The rejection for calling the function `name` (lowercase), if it is
+    denied: a set-returning one (`DISALLOWED_CONSTRUCT`) or one on the deny
+    list (`DISALLOWED_FUNCTION`)."""
+    if name in DENIED_SRF_FUNCTIONS:
+        msg = (
+            f"Set-returning function '{name}' is not supported on the MCP "
+            "surface; query a whitelisted table instead."
+        )
+        return OutcomeReason.DISALLOWED_CONSTRUCT, msg
+    if name in DENIED_FUNCTIONS_EXACT:
+        return (
+            OutcomeReason.DISALLOWED_FUNCTION,
+            f"Function '{name}' is on the deny list",
+        )
+    for prefix in DENIED_FUNCTIONS_PREFIX:
+        if name.startswith(prefix):
+            msg = f"Function '{name}' (prefix '{prefix}*') is on the deny list"
+            return OutcomeReason.DISALLOWED_FUNCTION, msg
+    return None
+
+
+def _check_no_denied_calls(tokens: list[Token], ast: exp.Query) -> None:
+    """Refuse a denied function name written as a call (`name (`) wherever
+    the parsed tree does not show it as one. sqlglot reads some such calls
+    as something else — `copy(x)` in a subquery as a column `copy` with an
+    alias list `AS (x)` — which the tree walk in `_check_no_denied_functions`
+    never sees (review round 5). A name before `(` that the tree keeps as an
+    alias's or CTE's column list (`FROM t AS copy(a)`) is not a call."""
+    aliases = {
+        ident.meta.get("start")
+        for ident in ast.find_all(exp.Identifier)
+        if isinstance(ident.parent, exp.TableAlias)
+    }
+    for token, nxt in itertools.pairwise(tokens):
+        if (
+            nxt.token_type != TokenType.L_PAREN
+            or token.token_type in {TokenType.IDENTIFIER, *_STRING_TOKENS}
+            or token.start in aliases
+        ):
+            continue
+        denial = _denial(token.text.lower())
+        if denial is not None:
+            raise QueryRejectedError(*denial)
 
 
 def _token_problem(
@@ -881,8 +1104,14 @@ def inject_limit(ast: exp.Query, n: int) -> exp.Query:
         or (isinstance(written, exp.Column) and written.sql().upper() == "ALL")
     ):
         return root.limit(n)
+    # Cast to bigint first, as Postgres coerces a LIMIT: `LEAST` over a
+    # float would turn `'NaN'` / `'Infinity'` (an error in a LIMIT) into n.
     capped = exp.Anonymous(
-        this="LEAST", expressions=[written.copy(), exp.Literal.number(n)]
+        this="LEAST",
+        expressions=[
+            exp.Cast(this=written.copy(), to=exp.DataType.build("BIGINT")),
+            exp.Literal.number(n),
+        ],
     )
     return root.limit(capped)
 
@@ -1113,23 +1342,6 @@ def _check_no_locking_reads(ast: exp.Query) -> None:
         raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
 
 
-def _check_no_qualify(ast: exp.Query) -> None:
-    """Reject `QUALIFY` (not Postgres SQL) anywhere in the query.
-
-    sqlglot reads it and rewrites it into a subquery that filters on the
-    window result; a LIMIT in the same query then applies before that
-    filter, not after it (different rows). Postgres itself rejects the
-    statement, so this refuses nothing Postgres would run.
-    """
-    if ast.find(exp.Qualify) is not None:
-        msg = (
-            "QUALIFY is not PostgreSQL syntax; filter on the window function "
-            "in an outer query (SELECT ... FROM (SELECT ..., row_number() "
-            "OVER (...) AS rn ...) s WHERE rn = 1)"
-        )
-        raise QueryRejectedError(OutcomeReason.PARSE_ERROR, msg)
-
-
 def _check_ctes_read_only(ast: exp.Query) -> None:
     for cte in ast.find_all(exp.CTE):
         body = cte.this
@@ -1168,7 +1380,10 @@ def _check_no_select_star(ast: exp.Query) -> None:
     for star in ast.find_all(exp.Star):
         cur = star.parent
         while cur is not None:
-            if isinstance(cur, exp.Count):
+            if isinstance(cur, exp.Count) or (
+                # `pg_catalog.count(*)`: kept as written (`exp.Anonymous`).
+                isinstance(cur, exp.Anonymous) and cur.name.lower() == "count"
+            ):
                 # COUNT(*) (and COUNT(DISTINCT *)) are the only typed
                 # aggregate where `*` is the canonical argument. Every
                 # other aggregate (SUM/AVG/MIN/MAX/...) takes a column
@@ -1190,6 +1405,18 @@ def _check_no_select_star(ast: exp.Query) -> None:
                     msg = "Bare SELECT * is rejected; enumerate columns explicitly"
                 raise QueryRejectedError(OutcomeReason.SELECT_STAR, msg)
             cur = cur.parent
+
+
+def _check_no_whole_row_fields(ast: exp.Query) -> None:
+    """`t.to_jsonb` is `to_jsonb(t)` to Postgres (attribute notation): the
+    whole row, refused like the call (review round 5)."""
+    for name in _attribute_names(ast):
+        if name in _WHOLE_ROW_FIELD_FUNCTIONS:
+            msg = (
+                f"`x.{name}` is {name}(x) to Postgres and returns the whole "
+                "row; enumerate columns explicitly"
+            )
+            raise QueryRejectedError(OutcomeReason.SELECT_STAR, msg)
 
 
 def _check_no_whole_row_refs(ast: exp.Query) -> None:
@@ -1222,6 +1449,8 @@ def _check_no_whole_row_refs(ast: exp.Query) -> None:
         alias_or_name = (table.alias_or_name or "").lower()
         if alias_or_name:
             table_aliases.add(alias_or_name)
+
+    _check_no_whole_row_fields(ast)
     if not table_aliases:
         return
 
@@ -1290,22 +1519,36 @@ def _check_no_denied_functions(ast: exp.Query) -> None:
         ).lower()
         if not name:
             continue
-        if name in DENIED_SRF_FUNCTIONS:
-            # Anonymous-mapped set-returning functions (json/regexp expanders);
-            # the typed SRFs are caught by the isinstance check above. Same
-            # closed-construct audit reason so the two paths read alike.
-            msg = (
-                f"Set-returning function '{name}' is not supported on the MCP "
-                "surface; query a whitelisted table instead."
-            )
-            raise QueryRejectedError(OutcomeReason.DISALLOWED_CONSTRUCT, msg)
-        if name in DENIED_FUNCTIONS_EXACT:
-            msg = f"Function '{name}' is on the deny list"
-            raise QueryRejectedError(OutcomeReason.DISALLOWED_FUNCTION, msg)
-        for prefix in DENIED_FUNCTIONS_PREFIX:
-            if name.startswith(prefix):
-                msg = f"Function '{name}' (prefix '{prefix}*') is on the deny list"
-                raise QueryRejectedError(OutcomeReason.DISALLOWED_FUNCTION, msg)
+        # Anonymous-mapped set-returning functions (json/regexp expanders, a
+        # schema-qualified `generate_series`) get the same closed-construct
+        # reason as the typed ones above.
+        denial = _denial(name)
+        if denial is not None:
+            raise QueryRejectedError(*denial)
+    for name in _attribute_names(ast):
+        if name in _NOT_CALLABLE_AS_FIELD or name.startswith("has_"):
+            continue
+        denial = _denial(name)
+        if denial is not None:
+            reason, msg = denial
+            msg = f"{msg} (written as a field, `x.{name}`, Postgres calls {name}(x))"
+            raise QueryRejectedError(reason, msg)
+
+
+def _attribute_names(ast: exp.Query) -> list[str]:
+    """The lowercase last names of qualified references (`t.f`, `(expr).f`),
+    which Postgres may read as the call `f(t)` (attribute notation)."""
+    names = [
+        col.name.lower()
+        for col in ast.find_all(exp.Column)
+        if col.args.get("table") is not None
+    ]
+    names += [
+        dot.expression.name.lower()
+        for dot in ast.find_all(exp.Dot)
+        if isinstance(dot.expression, exp.Identifier)
+    ]
+    return names
 
 
 def _check_no_bare_keyword_columns(ast: exp.Query) -> None:

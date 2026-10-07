@@ -743,11 +743,11 @@ class TestInjectLimit:
     @pytest.mark.parametrize(
         ("limit", "capped"),
         [
-            ("3.5", "LIMIT LEAST(3.5, 11)"),
-            ("2 + 3", "LIMIT LEAST(2 + 3, 11)"),
-            ("(SELECT 3)", "LIMIT LEAST((SELECT 3), 11)"),
-            ("-1", "LIMIT LEAST(-1, 11)"),
-            ("'4'", "LIMIT LEAST('4', 11)"),
+            ("3.5", "LIMIT LEAST(CAST(3.5 AS BIGINT), 11)"),
+            ("2 + 3", "LIMIT LEAST(CAST(2 + 3 AS BIGINT), 11)"),
+            ("(SELECT 3)", "LIMIT LEAST(CAST((SELECT 3) AS BIGINT), 11)"),
+            ("-1", "LIMIT LEAST(CAST(-1 AS BIGINT), 11)"),
+            ("'4'", "LIMIT LEAST(CAST('4' AS BIGINT), 11)"),
         ],
     )
     def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
@@ -817,6 +817,113 @@ class TestExtractLimit:
         assert extract_limit(ast) is None
 
 
+class TestAttributeNotation:
+    """Review round 5: Postgres reads `x.f` / `(expr).f` as the call `f(x)`
+    when `x` has no column `f`, so a qualified name can call a function."""
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            (
+                "SELECT ('server_version'::text).current_setting AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            ("SELECT (true).current_schemas AS v", OutcomeReason.DISALLOWED_FUNCTION),
+            ("SELECT (0.1::float8).pg_sleep AS v", OutcomeReason.DISALLOWED_FUNCTION),
+            (
+                "SELECT (424242::bigint).pg_try_advisory_lock AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT auth_permission.pg_column_size AS v FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT (codename).current_setting AS v FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            ("SELECT (ARRAY[1, 2]).unnest AS v", OutcomeReason.DISALLOWED_CONSTRUCT),
+            (
+                "SELECT ('a,b'::text).regexp_split_to_table AS v",
+                OutcomeReason.DISALLOWED_CONSTRUCT,
+            ),
+            (
+                "SELECT p.to_jsonb AS v FROM auth_permission p",
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                "SELECT (p).row_to_json AS v FROM auth_permission p",
+                OutcomeReason.SELECT_STAR,
+            ),
+        ],
+    )
+    def test_denied_function_written_as_a_field(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT p.id, p.codename FROM auth_permission p",
+            # Denied functions attribute notation cannot reach (no argument,
+            # or two or more): ordinary column names.
+            "SELECT p.version, p.user, p.has_access FROM auth_permission p",
+            "SELECT (codename).upper AS v FROM auth_permission",
+        ],
+    )
+    def test_ordinary_qualified_names_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+
+class TestDeniedCallsTheTreeDoesNotShow:
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            # sqlglot reads `copy(x)` here as a column `copy` with `AS (x)`.
+            (
+                "SELECT (SELECT copy(id)) AS c FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT c FROM (VALUES (copy(x))) AS v(c)",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            # Schema-qualified, sqlglot keeps these as plain calls.
+            (
+                "SELECT pg_catalog.generate_series(1, 3) AS v",
+                OutcomeReason.DISALLOWED_CONSTRUCT,
+            ),
+            ("SELECT public.unnest(ARRAY[1]) AS v", OutcomeReason.DISALLOWED_CONSTRUCT),
+        ],
+    )
+    def test_refused(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    def test_an_alias_named_like_a_denied_function_is_not_a_call(self):
+        parse_and_validate(
+            "SELECT copy.a FROM (SELECT 1) AS copy(a)", allowed_tables=ALLOWED
+        )
+
+    def test_count_star_qualified_is_count(self):
+        parse_and_validate(
+            "SELECT pg_catalog.count(*) AS n FROM auth_permission",
+            allowed_tables=ALLOWED,
+        )
+
+
+class TestOperatorSigns:
+    @pytest.mark.parametrize("sql", ["SELECT 2 %-3 AS v", "SELECT ~-1 AS v"])
+    def test_sign_postgres_reads_into_the_operator(self, sql):
+        # Postgres: the operators `%-` / `~-` (none exist); sqlglot: `% -3`.
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT id >=-1 AS v FROM auth_permission", "SELECT 1 <<-1 AS v"],
+    )
+    def test_sign_postgres_reads_apart_is_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+
 class TestQualify:
     @pytest.mark.parametrize(
         "sql",
@@ -836,6 +943,12 @@ class TestQualify:
     def test_refused_anywhere(self, sql):
         exc = _expect_reject(sql, OutcomeReason.PARSE_ERROR)
         assert "QUALIFY" in str(exc)
+
+    def test_qualify_is_an_ordinary_name(self):
+        # Review round 5: `qualify` is a name to Postgres (`FROM t qualify`).
+        parse_and_validate(
+            "SELECT qualify.id FROM auth_permission qualify", allowed_tables=ALLOWED
+        )
 
 
 class TestTableValuedFunctionsInFrom:

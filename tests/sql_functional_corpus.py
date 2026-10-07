@@ -1505,6 +1505,119 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "limit",
         "SELECT id FROM t ORDER BY id LIMIT 0x3",
     ),
+    # Review round 5.
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id FROM t WHERE x IS NOT NULL IS TRUE ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, (x IS NOT NULL) IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NULL IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, b IS NOT TRUE IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, b IS NOT FALSE IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, b IS NOT TRUE AS a, b IS NOT FALSE AS c, b IS NOT UNKNOWN AS e FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL = true AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, NOT x IS NOT NULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x NOTNULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x ISNULL IS FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, x IS NOT NULL AND y IS NOT NULL AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, (x, y) IS NOT NULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, b IS NOT TRUE IS NOT TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, g IS NOT NULL IS NOT FALSE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT id, j IS NOT NULL IS TRUE AS a FROM t ORDER BY id",
+    ),
+    (
+        "rows",
+        "SELECT count(*) FILTER (WHERE x IS NOT NULL IS TRUE) AS a FROM t",
+    ),
+    (
+        "operators",
+        "SELECT ~ -1, - ~1, ~ ~1, - -1",
+    ),
+    (
+        "operators",
+        "SELECT id, ~ -y AS a, - ~y AS b FROM t ORDER BY id",
+    ),
+    (
+        "names",
+        "SELECT qualify.id FROM t qualify ORDER BY 1 LIMIT 2",
+    ),
+    (
+        "names",
+        "SELECT c1 FROM t qualify (c1) ORDER BY 1 LIMIT 2",
+    ),
+    (
+        "names",
+        "SELECT x FROM (SELECT c1 AS x FROM t qualify (c1)) s ORDER BY 1 LIMIT 2",
+    ),
+    (
+        "names",
+        "SELECT id, (g).upper AS a, t.g AS b FROM t ORDER BY id",
+    ),
+    (
+        "names",
+        "SELECT pg_catalog.count(*) AS n, count(*) AS m FROM t",
+    ),
+    (
+        "json",
+        "SELECT id, j -> 'a'::text AS a, j -> y::text AS c FROM t ORDER BY id",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -1602,6 +1715,78 @@ REFUSED: list[tuple[str, str]] = [
         "disallowed_construct",
         "SELECT id, generate_subscripts(arr, 1) AS s FROM t WHERE id = 1",
     ),
+    (
+        "disallowed_function",
+        "SELECT ('server_version'::text).current_setting AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT ('search_path'::text).current_setting AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (true).current_schemas AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (0.1::float8).pg_sleep AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (10::oid).pg_get_userbyid AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT ('t'::regclass).pg_relation_size AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (424242::bigint).pg_try_advisory_lock AS v",
+    ),
+    (
+        "disallowed_function",
+        "SELECT t.pg_column_size AS v FROM t WHERE id = 1",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (t.g).current_setting AS v FROM t WHERE id = 1",
+    ),
+    (
+        "select_star",
+        "SELECT t.to_jsonb AS v FROM t WHERE id = 1",
+    ),
+    (
+        "select_star",
+        "SELECT t.row_to_json FROM t LIMIT 1",
+    ),
+    (
+        "disallowed_construct",
+        "SELECT (ARRAY[1,2]).unnest AS v",
+    ),
+    (
+        "disallowed_construct",
+        "SELECT pg_catalog.generate_series(1, 3) AS v",
+    ),
+    (
+        "disallowed_construct",
+        "SELECT CASE WHEN true THEN pg_catalog.unnest(arr) END AS c FROM t",
+    ),
+    (
+        "disallowed_function",
+        "SELECT (SELECT copy(x)) AS c FROM t",
+    ),
+    (
+        "disallowed_function",
+        "SELECT c FROM t WHERE c = ANY(copy(x))",
+    ),
+    (
+        "unsafe_literal",
+        "SELECT 2 %-3 AS v",
+    ),
+    (
+        "parse_error",
+        "SELECT json_object(KEY 'a' VALUE 1) AS a",
+    ),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -1633,4 +1818,9 @@ POSTGRES_REJECTS: list[str] = [
     "SELECT current_timestamp(0, 1)",
     "SELECT percentile_cont(x, 0.5) FROM t",
     "SELECT g, string_agg(g, ',') WITHIN GROUP (ORDER BY g) FROM t GROUP BY g",
+    "SELECT id FROM t ORDER BY id LIMIT 'NaN'::float8",
+    "SELECT id, j ->> 'k'::int AS a FROM t WHERE id = 99",
+    "SELECT id, x IS NOT DISTINCT FROM y IS TRUE AS a FROM t ORDER BY id",
+    "SELECT id, x IS DISTINCT FROM y IS NOT TRUE AS a FROM t ORDER BY id",
+    "SELECT id FROM t ORDER BY id LIMIT 'Infinity'::float8",
 ]
