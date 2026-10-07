@@ -828,10 +828,9 @@ class TestBadTokenIpBlock:
         self, mcp_mfa_on, settings, monkeypatch
     ):
         """When the IP is blocked the auth class returns None BEFORE
-        calling super().authenticate() — saves the DB SELECT under
-        sustained probing."""
+        the token lookup — saves the DB SELECT under sustained probing."""
         from django.core.cache import cache
-        from oauth2_provider.contrib.rest_framework import OAuth2Authentication
+        from oauth2_provider.oauth2_validators import OAuth2Validator
 
         settings.MCP_SQL = {**settings.MCP_SQL, "BAD_TOKEN_IP_THRESHOLD": 1}
 
@@ -839,19 +838,25 @@ class TestBadTokenIpBlock:
         # probe first; we're isolating the block behavior).
         cache.set("mcp_sql:bad_token:ip:203.0.113.99", 1, timeout=3600)
 
-        # Spy on DOT's authenticate to confirm it's never invoked.
+        # Spy on DOT's token lookup to confirm it's never invoked (the
+        # bearer check no longer goes through DOT's DRF `authenticate`, so a
+        # spy there would pass vacuously). Control: the same request from an
+        # unblocked IP does reach it.
         calls = []
-        original = OAuth2Authentication.authenticate
+        original = OAuth2Validator._load_access_token
 
-        def spy(self, request):
-            calls.append(request)
-            return original(self, request)
+        def spy(self, token):
+            calls.append(token)
+            return original(self, token)
 
-        monkeypatch.setattr(OAuth2Authentication, "authenticate", spy)
+        monkeypatch.setattr(OAuth2Validator, "_load_access_token", spy)
 
         request = _bearer_request_from_ip("anything", "203.0.113.99")
         assert MCPOAuth2Authentication().authenticate(request) is None
-        assert calls == [], "DOT's authenticate must NOT be called on blocked IP"
+        assert calls == [], "DOT's token lookup must NOT run on a blocked IP"
+        request = _bearer_request_from_ip("anything", "203.0.113.100")
+        assert MCPOAuth2Authentication().authenticate(request) is None
+        assert calls == ["anything"]
 
     def test_block_does_not_apply_to_different_ip(self, mcp_mfa_on, settings):
         """One IP at threshold does not leak the block to a different IP."""

@@ -8,6 +8,7 @@ from django.http import JsonResponse
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
+from mcp_sql.audience import mcp_resource_url
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import absolute_url
 
@@ -57,8 +58,13 @@ def _resource_identifier(request: HttpRequest) -> str:
     client derives from this value reaches the same endpoint either way.
     Nothing here is attacker-controlled: `request.path` can only be one of the
     two literal routes Django matched.
+
+    The value is built by `audience.mcp_resource_url`, which is also what
+    `/o/authorize/` and `/o/token/` compare an RFC 8707 `resource` with and
+    how `/mcp/sql/` builds the URL DOT audience-checks a token against, so
+    the advertised identifier is the one a token can be bound to.
     """
-    canonical = absolute_url(request, reverse("mcp_sql_endpoint"))
+    canonical = mcp_resource_url(request)
     if request.path.endswith("/"):
         return canonical
     return canonical.removesuffix("/")

@@ -10,7 +10,7 @@ Option D session-trust, the body-cap rationale, and the isolation
 contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalDRF`.
 
 Every **resolved-user** rejection in `authenticate` (the defense-in-depth
-gates in `_evaluate_gates`, run once `super().authenticate(...)` returns a
+gates in `_evaluate_gates`, run once `_verify_bearer(...)` returns a
 user/token pair, plus `GATE_ERROR` when one of them raises) writes one
 `MCPAuthRejectionLog` row via `_audit_rejection`. A token with no user is
 refused before the gates and logged at WARNING (the table needs a user).
@@ -31,14 +31,17 @@ so the agent always sees the rejection.
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import Any
 
 from django.apps import apps
 from django.core.cache import cache
+from django.core.exceptions import SuspiciousOperation
 from django.db import DatabaseError
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import throttle
+from mcp_sql.audience import CanonicalUriOAuthLibCore
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
@@ -50,6 +53,7 @@ from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
+from oauth2_provider.settings import oauth2_settings
 from rest_framework import exceptions
 from rest_framework.exceptions import APIException
 from rest_framework.request import Request
@@ -208,7 +212,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 
     def authenticate(self, request):
-        # DOT's parent class calls `oauthlib_core.verify_request`, which
+        # `_verify_bearer` calls `oauthlib_core.verify_request`, which
         # extracts the body via `request.POST.items()`. For application/json
         # request bodies (the MCP wire protocol's content type), DRF's
         # JSONParser consumes the body stream as a side effect, leaving the
@@ -232,13 +236,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         if not hasattr(django_request, "_body"):
             _ = django_request.body
 
-        # DOT 3.2.0's `OAuth2Authentication.authenticate()` returns `None`
-        # on bad / expired / unknown / revoked tokens (it does NOT raise —
-        # it sets `request.oauth2_error` and yields the anonymous result).
-        # The only paths from super() that DO raise are `SuspiciousOperation`
-        # (hex-encoding bug) and re-raised `ValueError` from oauthlib —
-        # both indicate malformed transport, not credential probing; we
-        # let them bubble.
+        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate()` on an
+        # audience-canonical core) returns `None` on bad / expired / unknown /
+        # revoked tokens, and from DOT 3.4 on a token bound to another
+        # `resource` (it does NOT raise). The only paths that DO raise are
+        # `SuspiciousOperation` (hex-encoding bug) and re-raised `ValueError`
+        # from oauthlib — both indicate malformed transport, not credential
+        # probing; we let them bubble.
         #
         # We deliberately do NOT INSERT an `MCPAuthRejectionLog` row on
         # the `result is None` path: anonymous and bad-token traffic are
@@ -282,7 +286,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             ip, scope="bad_token", threshold=threshold
         ):
             return None
-        result = super().authenticate(request)
+        result = self._verify_bearer(request)
         if result is None:
             if has_auth_header:
                 throttle.record_attempt(
@@ -350,6 +354,34 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # attribute access to it, so the view reads `request.mcp_profile`.
         django_request.mcp_profile = verdict
         return user, token
+
+    @staticmethod
+    def _verify_bearer(request: Request) -> "tuple[Any, AccessToken] | None":
+        """DOT's `OAuth2Authentication.authenticate`, on a core that gives
+        DOT's RFC 8707 audience check the URL discovery advertises.
+
+        Same server and validator as DOT's `get_oauthlib_core()` (the
+        consumer's `OAUTH2_SERVER_CLASS` / `OAUTH2_VALIDATOR_CLASS`), but the
+        backend is `audience.CanonicalUriOAuthLibCore`: from DOT 3.4 a token
+        bound to a `resource` is compared with the request URL, and DOT's own
+        `build_absolute_uri` would say `http` behind a TLS-terminating proxy
+        that discovery (and so the token's `resource`) spells `https`. DOT's
+        version also keeps oauthlib's `oauth2_error` on the request for its
+        own challenge; `authenticate_header` here builds its own, so it is
+        not carried over.
+        """
+        server = oauth2_settings.OAUTH2_SERVER_CLASS(
+            oauth2_settings.OAUTH2_VALIDATOR_CLASS(), **oauth2_settings.server_kwargs
+        )
+        try:
+            valid, r = CanonicalUriOAuthLibCore(server).verify_request(
+                request, scopes=[]
+            )
+        except ValueError as error:
+            if str(error) == "Invalid hex encoding in query string.":
+                raise SuspiciousOperation(error) from error
+            raise
+        return (r.user, r.access_token) if valid else None
 
     @staticmethod
     def _evaluate_gates(  # noqa: PLR0911 — one return per gate reads better than a table
@@ -443,7 +475,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
     ) -> None:
         """Write an `MCPAuthRejectionLog` row for a resolved-user rejection.
 
-        Called only after `super().authenticate(request)` returned a
+        Called only after `_verify_bearer(request)` returned a
         `(user, token)` pair, so `user` and `token` are always present.
         Anonymous / bad-token rejections take the `throttle.record_attempt`
         path instead and never reach this method.

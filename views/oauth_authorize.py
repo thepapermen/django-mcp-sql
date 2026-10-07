@@ -8,9 +8,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from django.core.exceptions import PermissionDenied
+from mcp_sql.audience import foreign_resource
+from mcp_sql.audience import invalid_target_error
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
 from oauth2_provider.exceptions import FatalClientError
+from oauth2_provider.exceptions import OAuthToolkitError
 from oauth2_provider.models import get_application_model
 from oauth2_provider.views import AuthorizationView
 from oauthlib.common import Request as OAuthlibRequest
@@ -132,7 +135,69 @@ class MCPAuthorizationView(AuthorizationView):
                 FatalClientError(error=oauth2_errors.InvalidClientIdError()),
                 application=None,
             )
+        # The RFC 8707 `resource` check of the GET (see
+        # `validate_authorization_request`), again on what the POST carries:
+        # the form's hidden field (from DOT 3.4, one whitespace-joined value,
+        # blank when the GET had none) and the query string the form posts
+        # back to, which oauthlib reads as well. Before anything else DOT
+        # does, Cancel included, so no grant is stored for a foreign
+        # resource; `error_response` re-validates the form's `redirect_uri`
+        # before redirecting the error.
+        #
+        # From DOT 3.4 the two must also agree. The form's value is what DOT
+        # puts on the grant; with that field blank, oauthlib's reading of the
+        # query string (one plain string, not a list) reached the grant
+        # instead, and DOT's model refused it with a 500 (ledger F55). A
+        # browser posts the page's own query back, so a real consent POST
+        # always matches. (Below 3.4 the form has no such field and DOT
+        # ignores both.)
+        query_resources = self.request.GET.getlist("resource")
+        resources = query_resources + [
+            value
+            for field in self.request.POST.getlist("resource")
+            for value in field.split()
+        ]
+        disagree = (
+            "resource" in form.fields
+            and bool(query_resources)
+            and (form.cleaned_data.get("resource") or "").split() != query_resources
+        )
+        if disagree or foreign_resource(self.request, resources) is not None:
+            error = OAuthToolkitError(
+                error=invalid_target_error(
+                    self.request, state=form.cleaned_data.get("state")
+                ),
+                redirect_uri=form.cleaned_data.get("redirect_uri"),
+            )
+            application = get_application_model().objects.get(client_id=client_id)
+            return self.error_response(error, application)
         return super().form_valid(form)
+
+    def validate_authorization_request(self, request):
+        """DOT's validation of the authorization request, then the RFC 8707
+        `resource` check: every `resource` must be this server's MCP endpoint
+        as discovery advertises it (`audience.foreign_resource`), else
+        `invalid_target`.
+
+        From DOT 3.4 a `resource` is stored on the grant and the token, and
+        DOT audience-checks the token against `/mcp/sql/`: any other value
+        minted a token that endpoint always refuses with a bare 401. Refused
+        here instead, on every DOT version (below 3.4 DOT ignores
+        `resource`; the answer is the same). Raised after oauthlib has
+        validated `client_id` and `redirect_uri`, through DOT's own handling
+        of a failed validation (`error_response`, which re-validates the
+        redirect anyway), so the error goes back to the client's registered
+        redirect with its `state`, and no grant exists. Every DOT path that
+        validates a request comes through here: `get`, and from DOT 3.4 the
+        anonymous `prompt=none` / `prompt=create` handling too.
+        """
+        scopes, credentials = super().validate_authorization_request(request)
+        if foreign_resource(request, request.GET.getlist("resource")) is not None:
+            raise OAuthToolkitError(
+                error=invalid_target_error(request, state=credentials.get("state")),
+                redirect_uri=credentials.get("redirect_uri"),
+            )
+        return scopes, credentials
 
     def error_response(self, error, application, **kwargs):
         # DOT redirects every non-fatal error to `error.redirect_uri`. On the

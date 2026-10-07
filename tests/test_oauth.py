@@ -954,20 +954,6 @@ class TestLogoutKillsPendingCode:
             MCPOAuth2Authentication().authenticate(bearer)
 
 
-def _dot_validates_consent_resource() -> bool:
-    """DOT re-validates the consent form's RFC 8707 `resource` from 3.4.
-
-    Below that (the declared floor is 3.2) `AllowForm` has no `resource`
-    field, the value is dropped and the POST is an ordinary approval, so no
-    `invalid_target` error exists to redirect. Unconditional once the DOT
-    floor reaches 3.4.1 (PR #4).
-    """
-    from importlib.metadata import version
-
-    dot = tuple(int(p) for p in version("django-oauth-toolkit").split(".")[:2])
-    return dot >= (3, 4)
-
-
 @pytest.mark.django_db
 class TestConsentPostErrorsNeverRedirectOffClient:
     """A consent POST's error redirect goes only to a URI the client owns.
@@ -1016,11 +1002,10 @@ class TestConsentPostErrorsNeverRedirectOffClient:
     def test_bad_resource_with_tampered_redirect_renders_error_page(
         self, client, mcp_user, gate_posture
     ):
-        # On DOT >= 3.4 the invalid `resource` raises `invalid_target` before
-        # the redirect is validated (the re-validation here is what stops
-        # it); below 3.4 the field is ignored and oauthlib's own redirect
-        # check refuses the tampered target. Either way: error page, no
-        # redirect.
+        # The invalid `resource` raises `invalid_target` before oauthlib has
+        # validated the redirect (the package's check in `form_valid`, on
+        # every DOT version); the re-validation in `error_response` is what
+        # stops it. Error page, no redirect.
         response = self._post(
             client,
             mcp_user,
@@ -1038,10 +1023,6 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         assert response["Location"].startswith(self.CALLBACK + "?")
         assert "error=access_denied" in response["Location"]
 
-    @pytest.mark.skipif(
-        not _dot_validates_consent_resource(),
-        reason="DOT validates the consent form's `resource` from 3.4",
-    )
     def test_bad_resource_with_the_registered_redirect_still_redirects(
         self, client, mcp_user, gate_posture
     ):
