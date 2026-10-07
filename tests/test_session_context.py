@@ -122,8 +122,24 @@ class TestSessionDrift:
 
 
 # A statement that starts with `SET` and is not `SET LOCAL` (a session-level
-# setting). Matched at the start of a string literal or after a `;`.
-_BARE_SET = re.compile(r"(?:\A|;)\s*SET\s+(?!LOCAL\b)", re.IGNORECASE)
+# setting): the word `SET` at the start of the text (after any replacement
+# fields an f-string or a `+` chain starts with, `{…}`) or after a `;`,
+# followed by anything but `LOCAL` — the end of the text too. Comments are
+# blanked first (`_without_comments`), so one in front hides nothing.
+_BARE_SET = re.compile(
+    r"(?:\A(?:\s*\{…\})*|;)\s*SET(?=\s|;|\Z)(?!\s+LOCAL\b)", re.IGNORECASE
+)
+_SQL_COMMENT = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
+
+
+def _without_comments(text: str) -> str:
+    """`text` with each SQL comment (`/* … */`, `-- …`) replaced by a
+    space."""
+    return _SQL_COMMENT.sub(" ", text)
+
+
+def _bare_set(text: str) -> bool:
+    return _BARE_SET.search(_without_comments(text)) is not None
 
 
 def _production_files(suffix: str) -> list[Path]:
@@ -143,8 +159,10 @@ def _production_files(suffix: str) -> list[Path]:
 
 
 def _string_literals(path: Path) -> list[tuple[int, str]]:
-    """Each string literal in `path`; an f-string with `{…}` for each
-    replacement field (scanned whole, not part by part)."""
+    """Each string literal in `path`, an f-string with `{…}` for each
+    replacement field (scanned whole, not part by part), and each `+` chain
+    with a string in it as one text (`"SET" + f" x = {v}"`), any operand
+    that is not a string being `{…}`."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     parts = {
         id(value)
@@ -152,22 +170,34 @@ def _string_literals(path: Path) -> list[tuple[int, str]]:
         if isinstance(node, ast.JoinedStr)
         for value in node.values
     }
+    chained = {
+        id(operand)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+        for operand in (node.left, node.right)
+        if isinstance(operand, ast.BinOp) and isinstance(operand.op, ast.Add)
+    }
+
+    def text(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            return "".join(text(value) or "{…}" for value in node.values)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = text(node.left), text(node.right)
+            if left is None and right is None:
+                return None
+            return (left or "{…}") + (right or "{…}")
+        return None
+
     literals = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.JoinedStr):
-            text = "".join(
-                value.value
-                if isinstance(value, ast.Constant) and isinstance(value.value, str)
-                else "{…}"
-                for value in node.values
-            )
-            literals.append((node.lineno, text))
-        elif (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in parts
-        ):
-            literals.append((node.lineno, node.value))
+        if id(node) in parts or id(node) in chained:
+            continue
+        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+            found = text(node)
+            if found is not None:
+                literals.append((node.lineno, found))
     return literals
 
 
@@ -183,12 +213,14 @@ def test_no_production_code_issues_a_bare_set():
     assert {p.name for p in python} >= {"session.py", "signals.py", "executor.py"}
     for path in python:
         for line, text in _string_literals(path):
-            if _BARE_SET.search(text):
+            if _bare_set(text):
                 offenders.append(f"{path.name}:{line}: {text[:60]!r}")
-    for path in _production_files(".sql"):
-        for number, line in enumerate(path.read_text().splitlines(), 1):
-            if _BARE_SET.search(line.split("--", 1)[0]):
-                offenders.append(f"{path.name}:{number}: {line[:60]!r}")
+    sql = _production_files(".sql")
+    assert {p.name for p in sql} >= {"role_setup.sql"}
+    # The whole file: a statement may span lines (`SET\n  x = 1`).
+    offenders.extend(
+        path.name for path in sql if _bare_set(path.read_text(encoding="utf-8"))
+    )
     assert offenders == []
 
 
@@ -199,10 +231,21 @@ def test_no_production_code_issues_a_bare_set():
         "  set statement_timeout TO 0",
         "BEGIN; SET ROLE x",
         "SET SESSION ROLE x",
+        # Review round 19: a comment in front, a statement on several
+        # lines, `SET` alone, after a replacement field.
+        "/* bounded */ SET lock_timeout = '5s'",
+        "-- c\nSET lock_timeout = '5s'",
+        "SELECT 1; /* a */ -- b\n set x = 1",
+        "SET\n  lock_timeout = '5s'",
+        "SET",
+        "SET;",
+        "{…}SET lock_timeout = '5s'",
+        "SELECT {…}; SET x = 1",
+        "{…} {…}SET x = 1",
     ],
 )
 def test_the_bare_set_scan_finds(text):
-    assert _BARE_SET.search(text)
+    assert _bare_set(text)
 
 
 @pytest.mark.parametrize(
@@ -210,11 +253,37 @@ def test_the_bare_set_scan_finds(text):
     [
         "SET LOCAL lock_timeout = '5s'",
         "set local role x",
+        "SET\n  LOCAL x = 1",
+        "SET/**/LOCAL x = 1",
+        "/* SET x = 1 */ SELECT 1",
+        "-- SET x = 1\nSELECT 1",
         "ALTER ROLE r SET lock_timeout = '1s'",
         "UPDATE t SET a = 1",
         "RESET ROLE",
         "SET LOCAL never bare SET",
+        "SETTINGS",
+        "Set-returning functions are refused; SET-like words are not",
+        "ALTER ROLE {…} SET {…} = {…};",
+        "SELECT set_config('a', 'b', true)",
     ],
 )
 def test_the_bare_set_scan_ignores(text):
-    assert not _BARE_SET.search(text)
+    assert not _bare_set(text)
+
+
+@pytest.mark.parametrize(
+    ("source", "found"),
+    [
+        ('x = "SET" + f" lock_timeout = {t}"', True),
+        ('x = "SE" "T lock_timeout"', True),
+        ('x = prefix + "SET x = 1"', True),
+        ('x = f"{prefix}SET x = 1"', True),
+        ('x = f"/* {why} */ SET x = 1"', True),
+        ('x = "SET LOCAL " + name', False),
+        ('x = f"{a} {b}"', False),
+    ],
+)
+def test_the_scan_reads_python_strings_whole(tmp_path, source, found):
+    path = tmp_path / "m.py"
+    path.write_text(source + "\n", encoding="utf-8")
+    assert any(_bare_set(text) for _, text in _string_literals(path)) is found
