@@ -42,7 +42,6 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
-import sqlglot
 from django.db import DatabaseError
 from mcp_sql.conf import Profile
 from mcp_sql.executor import ExecutorMisconfiguredError
@@ -737,18 +736,11 @@ class TestEveryParserFailureIsAudited:
     sqlglot 30.21 raises for some `UESCAPE` clauses, and the plain Python
     exceptions sqlglot's function builders raised escaped `run_query` with
     no audit row (ledger F31 / F103). Inputs sqlglot's own parser raises on
-    are audited `parse_error` before any check runs; on versions whose
-    parser accepts them, the `U&` rule refuses them. The conversion of an
-    arbitrary exception is pinned by `test_any_exception_inside_sqlglot_is_
-    a_parse_error`."""
-
-    # sqlglot up to 30.12 cannot parse `UESCAPE` at all (a parse error);
-    # 30.13 and later parse it and the package refuses the `U&` form.
-    _UESCAPE_REASON = (
-        OutcomeReason.PARSE_ERROR
-        if tuple(int(part) for part in sqlglot.__version__.split(".")[:2]) < (30, 13)
-        else OutcomeReason.UNSAFE_LITERAL
-    )
+    are audited `parse_error`, unless they hold an escape literal the
+    lexical check refuses: a `U&` form is `unsafe_literal` whether this
+    sqlglot parses `UESCAPE` (30.13+) or not (round 17). The conversion of
+    an arbitrary exception is pinned by `test_any_exception_inside_sqlglot_
+    is_a_parse_error`."""
 
     @pytest.mark.parametrize(
         ("raw_sql", "reason"),
@@ -757,8 +749,8 @@ class TestEveryParserFailureIsAudited:
             ('SELECT "unterminated', OutcomeReason.PARSE_ERROR),
             ("SELECT $$unterminated", OutcomeReason.PARSE_ERROR),
             ("SELECT U&'x' AS v", OutcomeReason.UNSAFE_LITERAL),
-            ("SELECT U&'x' UESCAPE '(' AS v", _UESCAPE_REASON),
-            ("SELECT U&'x' UESCAPE '\\' AS v", _UESCAPE_REASON),
+            ("SELECT U&'x' UESCAPE '(' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' UESCAPE '\\' AS v", OutcomeReason.UNSAFE_LITERAL),
         ],
         ids=[
             "string",
