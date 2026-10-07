@@ -6,6 +6,9 @@ the reviewers' corpora (audit-verify/opus-review3/probes/corpus.txt and
 corpus2.txt), filtered to valid Postgres that the package accepts on both
 supported sqlglot versions.
 
+The data has NULLs, partly-NULL rows and mixed-case text (rows 41-43 of t,
+121-123 of u), so NULL handling, row comparisons and case are exercised too.
+
 MIN_SERVER_VERSION: entries that need a newer Postgres than the oldest one
 CI runs (functions added in 15 / 16, the PG16 numeric constants); skipped on
 older servers.
@@ -23,7 +26,7 @@ visible and reviewable.
 """
 
 # The tables the corpus reads: see `SETUP_SQL`.
-SETUP_SQL = "CREATE TABLE t (id int PRIMARY KEY, x numeric, y int, g text, d date, ts timestamptz, j jsonb, arr int[], b boolean, f float8, iv interval, tags text[]);\nINSERT INTO t SELECT i, i*1.37, i%7, chr(97 + i%4), DATE '2024-01-01' + i*3, TIMESTAMPTZ '2024-01-01 00:00+00' + i * INTERVAL '5 hours', jsonb_build_object('k', i, 'n', jsonb_build_object('m', i%3), 'a', jsonb_build_array(i, i+1)), ARRAY[i, i%3], i%2=0, i/3.0, i * INTERVAL '1 minute', ARRAY['x'||i%3, 'y'] FROM generate_series(1,40) i;\nCREATE TABLE u (id int PRIMARY KEY, t_id int, amount numeric, status text, created date);\nINSERT INTO u SELECT i, 1 + i%40, (i*7)%100 + 0.25, (ARRAY['open','closed','void'])[1+i%3], DATE '2024-01-01' + i FROM generate_series(1,120) i;\n"
+SETUP_SQL = "CREATE TABLE t (id int PRIMARY KEY, x numeric, y int, g text, d date, ts timestamptz, j jsonb, arr int[], b boolean, f float8, iv interval, tags text[]);\nINSERT INTO t SELECT i, i*1.37, i%7, chr(97 + i%4), DATE '2024-01-01' + i*3, TIMESTAMPTZ '2024-01-01 00:00+00' + i * INTERVAL '5 hours', jsonb_build_object('k', i, 'n', jsonb_build_object('m', i%3), 'a', jsonb_build_array(i, i+1)), ARRAY[i, i%3], i%2=0, i/3.0, i * INTERVAL '1 minute', ARRAY['x'||i%3, 'y'] FROM generate_series(1,40) i;\nCREATE TABLE u (id int PRIMARY KEY, t_id int, amount numeric, status text, created date);\nINSERT INTO u SELECT i, 1 + i%40, (i*7)%100 + 0.25, (ARRAY['open','closed','void'])[1+i%3], DATE '2024-01-01' + i FROM generate_series(1,120) i;\nINSERT INTO t (id, x, y, g, d, ts, j, arr, b, f, iv, tags) VALUES (41, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (42, 2.5, NULL, 'B', DATE '2024-03-01', NULL, '{\"k\": null, \"Key\": 1, \"\": 7, \"a''b\": 2, \"a\": [null, 1], \"n\": {\"\": 3, \"m\": null}}', ARRAY[NULL, 1]::int[], NULL, NULL, NULL, ARRAY['X', NULL]), (43, NULL, 3, 'Ab', NULL, TIMESTAMPTZ '2024-02-29 23:00+00', '{}', '{}', true, 0.5, NULL, '{}');\nINSERT INTO u (id, t_id, amount, status, created) VALUES (121, NULL, NULL, NULL, NULL), (122, 41, 5.5, 'Open', NULL), (123, 42, NULL, 'CLOSED', DATE '2024-02-29');\n"
 
 FUNCTIONAL: list[tuple[str, str]] = [
     (
@@ -209,7 +212,7 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "distinct-order-limit",
         "SELECT id, nullif(y, 0) AS ny FROM t ORDER BY ny DESC NULLS FIRST, id LIMIT 5",
     ),
-    ("distinct-order-limit", "SELECT id, x FROM t ORDER BY x DESC LIMIT 3"),
+    ("distinct-order-limit", "SELECT id, x FROM t ORDER BY x DESC, id LIMIT 3"),
     (
         "distinct-order-limit",
         "SELECT id, g FROM t WHERE g IS NOT NULL AND id BETWEEN 3 AND 6 ORDER BY id",
@@ -908,7 +911,7 @@ FUNCTIONAL: list[tuple[str, str]] = [
     ),
     (
         "reviewers",
-        "SELECT g, count(*) AS n FROM t GROUP BY g ORDER BY n DESC LIMIT 2",
+        "SELECT g, count(*) AS n FROM t GROUP BY g ORDER BY n DESC, g LIMIT 2",
     ),
     ("reviewers", "SELECT g, count(*) AS n FROM t GROUP BY 1 ORDER BY 2 DESC, 1"),
     ("reviewers", "SELECT g AS grp, count(*) AS n FROM t GROUP BY grp ORDER BY grp"),

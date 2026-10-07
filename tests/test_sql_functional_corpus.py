@@ -12,8 +12,8 @@ test tables, and must:
    text run directly as the read role.
 
 Both sides run inside the test's transaction, so `now()` is the same value.
-Rows are compared in order when the query has a top-level ORDER BY, and as a
-multiset otherwise. The executor's
+Rows are compared by `repr` (so `2024` is not `2024.0`), in order when the
+query has a top-level ORDER BY and as a multiset otherwise. The executor's
 per-cell coercion (`_cap_cell`) is applied to the direct rows too, since
 `run_query` returns JSON-ready cells. Entries in `MIN_SERVER_VERSION` are
 skipped on an older Postgres.
@@ -109,10 +109,11 @@ def test_query_runs_unchanged(sql):
     assert not result.truncated
     columns, rows = _direct(sql)
     assert result.columns == columns
+    got, expected = list(map(repr, result.rows)), list(map(repr, rows))
     if _is_ordered(sql):
-        assert result.rows == rows
+        assert got == expected
     else:
-        assert sorted(map(repr, result.rows)) == sorted(map(repr, rows))
+        assert sorted(got) == sorted(expected)
 
 
 @pytest.mark.django_db
