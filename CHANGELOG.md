@@ -71,17 +71,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `to_number`, `initcap(s, '-')`) now fail in Postgres instead of being
     translated into something that runs. A LIMIT that is not a plain
     integer (`LIMIT 3.5`, `LIMIT 2 + 3`, `LIMIT (SELECT …)`, `LIMIT -1`) is
-    kept and capped (`LIMIT LEAST(<as written>, n)`) instead of being
-    replaced by the cap, and `(SELECT … LIMIT 5)` no longer fails with a
-    second LIMIT. `QUALIFY` (not Postgres SQL) is refused as `parse_error`
-    wherever it appears. The guarantee is about what sqlglot reads in the
+    kept, cast to bigint as Postgres coerces it, and capped (`LIMIT
+    LEAST(CAST(<as written> AS BIGINT), n)`) instead of being replaced by
+    the cap, and `(SELECT … LIMIT 5)` no longer fails with a second LIMIT.
+    `QUALIFY` (not Postgres SQL) is a syntax error and `qualify` an ordinary
+    name, as in Postgres. Also rendered as written: `x IS NOT NULL IS TRUE`
+    (sqlglot 30.13+ dropped the `NOT`), `~ -1` / `- ~1` (rendered `~-1`,
+    which Postgres reads as the operator `~-`) and, on 30.7, `j -> 'a'::text`
+    (the cast was applied to the whole `j -> 'a'`); `2 %-3` (the operator
+    `%-` to Postgres) and `json_object(KEY 'a' VALUE 1)` (no `KEY` in
+    Postgres) are refused. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    517 ordinary analytical queries (over data with NULLs and mixed case)
+    545 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call to every function in `pg_catalog` and requires it unchanged.
+  - Denied functions could be reached in ways the deny list did not see
+    (review round 5): Postgres's attribute notation calls `f(x)` for
+    `x.f` / `(expr).f` (`('server_version'::text).current_setting`,
+    `(0.1::float8).pg_sleep`, `t.pg_column_size`), a schema-qualified
+    `pg_catalog.generate_series(...)` / `unnest(...)` was not recognised,
+    and sqlglot read `copy(x)` inside a subquery as a column with an alias
+    list. All are now refused with the deny list's reason
+    (`disallowed_function` / `disallowed_construct`); `t.to_jsonb` /
+    `t.row_to_json` (the whole row) as `select_star`. Ordinary qualified
+    columns are unaffected, including names of denied functions attribute
+    notation cannot call (`t.version`, `t.user`, `t.has_access`).
   - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
     `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
@@ -120,7 +137,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with `SESSION_MODEL=None`. Django's login-time password-hash upgrade is
   not treated as a change — only the save `check_password` (or
   `acheck_password`) makes while it runs, which the package marks by
-  wrapping those two methods of `AbstractBaseUser` in `ready()`; any other
+  wrapping those two methods of `AbstractBaseUser` in `ready()`, and only
+  when the hash it checked is the one stored (a legacy hash for a new
+  password, assigned in memory and then checked, is a change); any other
   new hash, even one saved the same way (`set_password(...)`,
   `save(update_fields=["password"])` — SSO / LDAP sync, imports), is a
   change. Bulk `QuerySet.update(password=...)` and
