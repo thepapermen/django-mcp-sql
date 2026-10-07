@@ -175,12 +175,16 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
       database; on two, it commits just before them); it is written in a
       savepoint, so a failure to write it — a database error or any other
       exception — is rolled back to that savepoint, logged with
-      `logger.exception` (Sentry), and does not undo the deletes;
+      `logger.exception` (Sentry), and does not undo the deletes. When
+      that savepoint cannot be rolled back either (the connection failed),
+      the deletes cannot commit: that is a failed deletion;
     - a failed deletion (a database error, a row lock held past the
-      bounded wait) rolls back all three deletes and writes no audit row:
-      the access did not end. It is logged with `logger.exception` only and
-      nothing is retried: the tokens then live until they expire, and an
-      operator must delete them;
+      bounded wait, the connection lost before the commit) rolls back all
+      three deletes and writes no audit row: the access did not end. It is
+      logged with `logger.exception` only and nothing is retried: the
+      tokens then live until they expire, and an operator must delete
+      them. "Revoked ..." is logged (INFO) only after the deletes
+      committed;
     - no exception leaves this function. When no transaction is open the
       callback runs inside `logout()` (before the session is flushed) or
       inside the user's `save()`; an error escaping would turn the
@@ -257,6 +261,14 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
                             started_at=at,
                         )
                 except Exception:
+                    if connections[tokens].needs_rollback:
+                        # The savepoint could not be rolled back (the
+                        # connection failed; Django also sets the flag when
+                        # it closes a connection inside `atomic`): the
+                        # deletes' transaction can only roll back now, which
+                        # Django would do without raising on leaving it. A
+                        # failed revocation, not a missing audit row.
+                        raise
                     audit_failed = True
                     logger.exception(
                         "Revoking MCP tokens on %s for user %s: failed to write "

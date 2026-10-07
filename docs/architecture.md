@@ -1030,9 +1030,12 @@ The load-bearing invariants and footguns, grouped by layer:
   error or any other exception — is rolled back to it and logged, and
   does not undo the deletes; on a separate audit database the audit row
   commits just before the deletes). A failed deletion (a database error,
-  the bounded lock wait below running out) rolls back all three deletes,
-  is logged with `logger.exception` only (no audit row: the access did
-  not end) and is not retried. Nothing raised leaves `_revoke_and_audit`:
+  the bounded lock wait below running out, the connection lost — also
+  while the audit row is written: the savepoint cannot be rolled back
+  then, and Django would roll the deletes back silently on leaving the
+  block) rolls back all three deletes, is logged with `logger.exception`
+  only (no audit row: the access did not end) and is not retried;
+  "Revoked …" is logged only once the deletes committed. Nothing raised leaves `_revoke_and_audit`:
   with no transaction open the callback runs inside `logout()` (before
   the session is flushed) or inside the user's `save()`. If this thread has a transaction open on that
   database and it is not the triggering one (`ATOMIC_REQUESTS`, an

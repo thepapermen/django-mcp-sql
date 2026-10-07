@@ -584,3 +584,61 @@ class TestAFailedAuditWriteKeepsTheDeletes:
         assert _remaining_credentials(user) == 0
         assert "failed to write the audit row" in caplog.text
         assert "(no audit row)" in caplog.text
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("_session_gate_off")
+class TestAConnectionLostDuringTheAuditWrite:
+    """Review round 19. The connection dies while the audit row is written
+    (one database): the savepoint cannot be rolled back, so Django rolls
+    the deletes' transaction back on leaving it — without raising. That
+    used to be logged as "Revoked N MCP token(s) ... (no audit row)" while
+    every token survived; it is a failed revocation."""
+
+    def test_the_failure_is_logged_as_a_failed_revocation(self, monkeypatch, caplog):
+        import mcp_sql.signals as signals_mod
+        from django.db import connection
+        from django.db import connections
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        real = MCPAuthRejectionLog.objects
+
+        class _KillsItsConnection:
+            """`.using(alias).create(...)` terminates the alias's backend
+            first (from another connection), then writes."""
+
+            def using(self, alias):
+                manager = real.using(alias)
+
+                class _Create:
+                    def create(self, **fields):
+                        with connections[alias].cursor() as cursor:
+                            cursor.execute("SELECT pg_backend_pid()")
+                            pid = cursor.fetchone()[0]
+                        other = connections.create_connection(alias)
+                        try:
+                            with other.cursor() as cursor:
+                                cursor.execute("SELECT pg_terminate_backend(%s)", [pid])
+                        finally:
+                            other.close()
+                        return manager.create(**fields)
+
+                return _Create()
+
+        monkeypatch.setattr(
+            signals_mod.MCPAuthRejectionLog, "objects", _KillsItsConnection()
+        )
+        with caplog.at_level(logging.INFO, logger="mcp_sql.signals"):
+            user_logged_out.send(
+                sender=type(user), request=_logged_in_request(user), user=user
+            )
+        connection.close()  # the next query reconnects
+        assert _remaining_credentials(user) == 3  # nothing was revoked
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any(message.startswith("Revoked") for message in messages)
+        [failure] = caplog.records
+        assert failure.levelno == logging.ERROR
+        assert failure.getMessage().startswith("Failed to revoke MCP tokens on logout")
+        assert failure.exc_info is not None

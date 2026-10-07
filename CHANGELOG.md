@@ -386,7 +386,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   connection there, waiting at most 5 s for a row lock that transaction
   holds; a failure is logged, not retried, and writes no audit row — the
   access did not end). The audit row is written in a savepoint: a failure
-  to write it, of any kind, is logged and does not undo the deletes. No
+  to write it, of any kind, is logged and does not undo the deletes —
+  unless the connection itself fails there, which ends the deletes'
+  transaction too: that is logged as a failed revocation (it was logged
+  as "Revoked N MCP token(s)" while every token survived). No
   exception the revocation raises leaves it (with no transaction open it
   runs inside `logout()` before the session is flushed, or inside the
   user's `save()`). The three deletes run on the
