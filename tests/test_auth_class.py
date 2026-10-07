@@ -403,6 +403,53 @@ class TestAuthRejectionAuditLog:
         assert MCPAuthRejectionLog.objects.count() == 0
 
 
+@pytest.mark.django_db(transaction=True)
+class TestRejectionAuditSurvivesAtomicRequests:
+    """Rejection rows must outlive DRF's rollback under `ATOMIC_REQUESTS`.
+
+    The documented deployment runs the default alias with
+    `ATOMIC_REQUESTS=True`, and DRF's exception handler marks every
+    `ATOMIC_REQUESTS` transaction for rollback on ANY `APIException`,
+    including the `AuthenticationFailed` each gate raises right after writing
+    its audit row. Inside the request transaction, every gate denial was
+    therefore rolled back while the 401 still went out. `mcp_endpoint` is
+    `non_atomic_requests`, so the row is written in autocommit and survives.
+
+    Transactional (`transaction=True`) because a rollback only shows when the
+    request's transaction is a real one, not a savepoint in the test's.
+    """
+
+    def test_inactive_user_rejection_row_is_committed(
+        self, client, mcp_user, mcp_access_token, gate_posture, monkeypatch
+    ):
+        from django.db import connections
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        monkeypatch.setitem(
+            connections["default"].settings_dict, "ATOMIC_REQUESTS", value=True
+        )
+        mcp_user.is_active = False
+        mcp_user.save(update_fields=["is_active"])
+
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+        )
+
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+        assert response["WWW-Authenticate"].startswith('Bearer realm="api"')
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.INACTIVE
+        assert row.user_id == mcp_user.pk
+
+    def test_endpoint_opts_out_of_atomic_requests(self):
+        from mcp_sql.views.mcp_endpoint import mcp_endpoint
+
+        assert "default" in mcp_endpoint._non_atomic_requests
+
+
 def _bearer_request_from_ip(token: str, ip: str):
     """Build a DRF request carrying `Authorization: Bearer <token>` + REMOTE_ADDR.
 

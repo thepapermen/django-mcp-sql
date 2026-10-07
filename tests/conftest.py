@@ -240,6 +240,32 @@ def mcp_mfa_off(monkeypatch, settings):
     _patch_consumer_mfa(monkeypatch)
 
 
+@pytest.fixture(params=["session_gate", "minimal"])
+def gate_posture(request, monkeypatch, settings):
+    """Run a test under both supported gate postures.
+
+    Every access-control guarantee must hold without the optional layers, so
+    tests of them take this fixture and run twice:
+
+    - `session_gate`: the suite's settings (`SESSION_MODEL` set) with an MFA
+      checker that passes;
+    - `minimal`: MFA not enforced (an allow-all `MFA_CHECKER`, how an install
+      without MFA runs) AND `SESSION_MODEL=None`, the in-package default.
+
+    Returns the posture name. A test that must reach the end of the gate
+    chain under `session_gate` still needs `mcp_active_session`.
+    """
+    config = {
+        **settings.MCP_SQL,
+        "MFA_CHECKER": "mcp_sql.tests.conftest._mfa_checker_truthy",
+    }
+    if request.param == "minimal":
+        config["SESSION_MODEL"] = None
+    settings.MCP_SQL = config
+    _patch_consumer_mfa(monkeypatch)
+    return request.param
+
+
 @pytest.fixture
 def mcp_access_token(db, mcp_user, mcp_app):
     """A valid `mcp:sql` AccessToken bound to `mcp_user` + the `mcp-sql` Application."""

@@ -20,6 +20,7 @@ from a2wsgi import ASGIMiddleware
 from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.db import close_old_connections
+from django.db import transaction
 from django.http import HttpRequest
 from django.http import HttpResponse
 from django.http import HttpResponseNotAllowed
@@ -475,6 +476,7 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     return response
 
 
+@transaction.non_atomic_requests
 @csrf_exempt
 def mcp_endpoint(request: HttpRequest) -> HttpResponse:
     """The /mcp/sql/ entry point: POST only, refused before DRF otherwise.
@@ -495,6 +497,15 @@ def mcp_endpoint(request: HttpRequest) -> HttpResponse:
     `Mcp-Session-Id`, which a stateless server never does.
 
     POST goes on to `_mcp_transport`, the DRF view that authenticates.
+
+    `non_atomic_requests`: the view never runs inside a consumer's
+    `ATOMIC_REQUESTS` transaction. Nothing here needs one (the tools run on
+    pool threads with their own connections and write their audit rows in
+    autocommit), and inside one the gates' `MCPAuthRejectionLog` rows were
+    lost: DRF's exception handler marks every `ATOMIC_REQUESTS` transaction
+    for rollback on any `APIException`, the gates' `AuthenticationFailed`
+    included. Outside it, each row commits as it is written. It also keeps
+    the main thread from holding an open transaction for the whole exchange.
     """
     if request.method != "POST":
         return HttpResponseNotAllowed(["POST"])

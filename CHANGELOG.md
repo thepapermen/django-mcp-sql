@@ -369,6 +369,13 @@ announce themselves.
   now cancels an exchange after 30 seconds and always completes the response
   (`504` if cut off before it started, `500` if the app ended without one), so
   no future path that leaves a response unfinished can pin a thread either.
+- **Under `ATOMIC_REQUESTS=True` no auth rejection was ever recorded.** DRF
+  rolls back the request transaction on every `APIException`, including the
+  `AuthenticationFailed` each per-request gate raises right after writing its
+  `MCPAuthRejectionLog` row, so with the documented default-alias setting the
+  table stayed empty (the 401 was still sent). `/mcp/sql/` is now
+  `non_atomic_requests`: the rows commit as written, and the view no longer
+  holds a transaction open for the whole exchange. Also present in 0.1.0b5.
 
 ## 0.1.0b5 - 2026-07-01
 

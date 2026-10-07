@@ -43,7 +43,10 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
   Postgres role grants (the actual access boundary), statement-level GUCs.
 - **Connection isolation**: dedicated `mcp_readonly` DB alias, `ATOMIC_REQUESTS=False`,
   `CONN_MAX_AGE=0`, small pool (~4). Default alias has `ATOMIC_REQUESTS=True`
-  so it must NEVER be used by the executor.
+  so it must NEVER be used by the executor. `/mcp/sql/` itself opts out of
+  `ATOMIC_REQUESTS` (`non_atomic_requests`), so its auth-rejection audit rows
+  commit as they are written instead of being rolled back with the 401 (see
+  "Watch out").
 
 ## File map
 
@@ -629,6 +632,18 @@ The load-bearing invariants and footguns, grouped by layer:
   `Mcp-Session-Id`, which a stateless server never does). Do not re-add GET
   or DELETE to `_mcp_transport`'s `@api_view`. Pinned by
   `test_mcp_endpoint.py::TestOnlyPostReachesTheTransport`.
+- **`/mcp/sql/` is `non_atomic_requests`; keep it that way.** DRF's
+  exception handler marks every `ATOMIC_REQUESTS` transaction for rollback
+  on any `APIException`, so inside the request transaction each gate's
+  `MCPAuthRejectionLog` row was rolled back together with the
+  `AuthenticationFailed` that followed it: under the documented
+  `ATOMIC_REQUESTS=True` the table recorded no denials at all, while the 401
+  still went out. Nothing on the view needs a request transaction (the tools
+  run on pool threads with their own autocommit connections), so the view
+  opts out and every row commits on insert. Do not wrap the gate chain in
+  `transaction.atomic()` either; `on_commit` is no substitute, since rollback
+  drops its callbacks. Pinned by
+  `test_auth_class.py::TestRejectionAuditSurvivesAtomicRequests`.
 - **The bridge always completes, within a deadline.** a2wsgi's WSGI half
   blocks until the ASGI app sends its next message and stops only on a final
   body, so any app path that leaves a response unfinished pins the thread.
