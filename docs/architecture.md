@@ -673,7 +673,15 @@ The load-bearing invariants and footguns, grouped by layer:
   `interval second(2)`, `interval day to second(3)`, as arrays too; sqlglot
   rendered `INTERVAL 3` and read `second(2)` as an alias list — refused
   before round 17); a precision before a field (`interval(1) day`) or on a
-  field other than `SECOND` is a parse error, as in Postgres. A subscript
+  field other than `SECOND` is a parse error, as in Postgres. A word after
+  an interval type that is not one of Postgres's six fields is an alias
+  (`'90'::interval days`, `'1.5'::interval(1) secs`; `_interval_alias`,
+  review round 18 — sqlglot read a unit of its own list there and
+  normalised it, so `days` ran as `INTERVAL DAY`, a wrong value), and
+  what follows parses as in Postgres (`CAST(x AS interval h)`, `interval
+  min to sec`, `interval h[]` are parse errors). `'{1.234}'::interval(1)[1]`
+  (an array type with a bound) is read as a subscript of the cast, which
+  Postgres then rejects (fail-closed, same class as the next). A subscript
   after an array type (`'{1,2}'::int[][1]`) is refused (sqlglot cannot
   read it); `INTERVAL(3) '…'` (the precision form, with any form of
   string constant) is kept as written,

@@ -143,7 +143,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     (`'12.345'::interval(1)`, `CAST(x AS interval(3))`, `interval
     second(2)`, `interval day to second(3)`, their arrays; refused before
     as `roundtrip_mismatch` / `parse_error`); `interval(1) day` and
-    `interval minute(2)` stay parse errors, as in Postgres. A refused
+    `interval minute(2)` stay parse errors, as in Postgres. A word after an
+    interval type in a cast that is not one of Postgres's fields (YEAR,
+    MONTH, DAY, HOUR, MINUTE, SECOND) is an alias, as Postgres reads it:
+    sqlglot read a unit of its own list and normalised it, so
+    `'90'::interval days` ran as `INTERVAL DAY` (90 days, where Postgres
+    returns 90 seconds named `days`), `h` / `d` / `mins` / `mon` and the
+    like as their fields (a wrong value), `week` as `INTERVAL WEEK`
+    (Postgres's syntax error), and `'1.5'::interval(1) secs` was refused.
+    Where Postgres then rejects the text (`CAST(x AS interval h)`, the
+    word in a `WHERE`, `interval min to sec`, `interval h[]`) it is now a
+    parse error (it ran). A refused
     escape literal is the audit reason (`unsafe_literal`) also when the
     text fails to parse (`interval day E'a\b'` had become `parse_error`).
     Also as written: a subscripted

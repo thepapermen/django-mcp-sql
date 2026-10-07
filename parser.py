@@ -650,8 +650,51 @@ class FaithfulPostgres(Postgres):
             ):
                 _keep_quoted_type(parsed, token)
             if isinstance(parsed, exp.DataType):
+                parsed = self._interval_alias(parsed, index)
                 return self._second_precision(parsed)
             return parsed
+
+        def _interval_alias(self, parsed: exp.DataType, index: int) -> exp.DataType:
+            """`'90'::interval days`, `'1.5'::interval(1) secs`: Postgres's
+            interval type takes only the fields YEAR, MONTH, DAY, HOUR,
+            MINUTE, SECOND (and their spans), so another word after it is
+            an alias, as after a typed literal. sqlglot read a unit of its
+            own list there and normalised it: `days` ran as `INTERVAL DAY`
+            (90 days, where Postgres returns 90 seconds named `days`), `h`
+            as `HOUR`; `week` became `INTERVAL WEEK` (Postgres's syntax
+            error) and `interval(1) secs` was refused. The type then ends
+            before the word, and what follows parses as it does in
+            Postgres (an alias; `[]` or `to` after it is an error)."""
+            inner = parsed
+            while (
+                inner.this == exp.DType.ARRAY
+                and inner.expressions
+                and isinstance(inner.expressions[0], exp.DataType)
+            ):
+                inner = inner.expressions[0]
+            tokens = self._tokens
+            if (
+                not isinstance(inner.this, exp.Interval)
+                or tokens[index].token_type != TokenType.INTERVAL
+            ):
+                return parsed
+            i = index + 1
+            if [token.token_type for token in tokens[i : i + 3]] == [
+                TokenType.L_PAREN,
+                TokenType.NUMBER,
+                TokenType.R_PAREN,
+            ]:
+                i += 3
+            unit = inner.this.args.get("unit")
+            words = (i, i + 2) if isinstance(unit, exp.IntervalSpan) else (i,)
+            if all(
+                self._is_unquoted(word)
+                and _keyword(tokens[word].text) in _INTERVAL_FIELDS
+                for word in words
+            ):
+                return parsed
+            self._retreat(i)
+            return exp.DataType(this=exp.DType.INTERVAL, expressions=inner.expressions)
 
         def _second_precision(self, parsed: exp.DataType) -> exp.DataType:
             """`interval second(2)` / `interval day to second(3)`: the

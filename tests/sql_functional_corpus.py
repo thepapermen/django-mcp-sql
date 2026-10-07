@@ -3090,6 +3090,12 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "intervals",
         "SELECT '1.25'::INTERVAL ( 1 ) + '1' AS a, '1.25'::interval(1)::text AS b, '7.5'::interval(0) AS c",
     ),
+    # Review round 18: a word after an interval type that is not a field is
+    # an alias (sqlglot ran `days` as `INTERVAL DAY`, `h` as `HOUR`).
+    (
+        "intervals",
+        "SELECT id, '90'::interval days, '1'::interval h, '1.234'::interval(1) secs, iv::interval week FROM t ORDER BY id",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3383,6 +3389,13 @@ REFUSED: list[tuple[str, str]] = [
     ("parse_error", "SELECT '1.234'::interval(1) day AS a"),
     ("parse_error", "SELECT '1'::interval minute(2) AS a"),
     ("parse_error", "SELECT interval[] AS v FROM (SELECT ARRAY[5] AS interval) s"),
+    # Review round 18: an alias after an interval type where Postgres takes
+    # none, or something after it (Postgres's syntax errors; they ran as an
+    # `INTERVAL HOUR` / `MINUTE TO SECOND` / `WEEK` type before).
+    ("parse_error", "SELECT CAST('1' AS interval h) AS a"),
+    ("parse_error", "SELECT id FROM t WHERE iv < '1'::interval days"),
+    ("parse_error", "SELECT '1'::interval min to sec AS a"),
+    ("parse_error", "SELECT '{1}'::interval h[] AS a"),
     # The refused escape literal is the reason, though the text does not
     # parse either (`interval day '…'` is Postgres's syntax error).
     ("unsafe_literal", "SELECT interval day E'a\\b' AS v"),

@@ -2198,6 +2198,65 @@ class TestReviewRound17:
             self._rendered(sql)
 
 
+class TestReviewRound18:
+    """A word after `interval` / `interval(p)` in a cast that is not one of
+    Postgres's fields (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) is an alias.
+    sqlglot read a unit of its own list and normalised it: `'90'::interval
+    days` ran as `INTERVAL DAY` (90 days; Postgres: 90 seconds named
+    `days`), `h` as `HOUR`; `week` rendered `INTERVAL WEEK` (Postgres's
+    syntax error); `interval(1) secs` was refused. A fractional precision
+    is never a field's (`second(1.5)`)."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            ("'90'::interval days", "CAST('90' AS INTERVAL) AS days"),
+            ("'1'::interval h", "CAST('1' AS INTERVAL) AS h"),
+            ("'1'::interval week", "CAST('1' AS INTERVAL) AS week"),
+            ("'1'::interval Week, 2 AS b", "CAST('1' AS INTERVAL) AS Week, 2 AS b"),
+            ("'1'::interval s", "CAST('1' AS INTERVAL) AS s"),
+            ("'1.234'::interval(1) secs", "CAST('1.234' AS INTERVAL(1)) AS secs"),
+            ("'1.234'::interval ( 1 ) mins", "CAST('1.234' AS INTERVAL(1)) AS mins"),
+            ("'1'::interval \"day\"", "CAST('1' AS INTERVAL) AS \"day\""),
+            # Fields stay fields.
+            ("'1'::interval Day AS v", "CAST('1' AS INTERVAL DAY) AS v"),
+            ("'1'::interval second secs", "CAST('1' AS INTERVAL SECOND) AS secs"),
+            (
+                "'1'::interval day to second(3) AS v",
+                "CAST('1' AS INTERVAL DAY TO SECOND(3)) AS v",
+            ),
+            ("'{1}'::interval day[] AS v", "CAST('{1}' AS INTERVAL DAY[]) AS v"),
+        ],
+    )
+    def test_a_word_that_is_no_field_is_an_alias(self, written, rendered):
+        assert self._rendered(f"SELECT {written}") == (f"SELECT {rendered} LIMIT 11")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors (an alias where none may stand, or
+            # something after the alias), which ran before.
+            "SELECT CAST('1' AS interval h) AS v",
+            "SELECT 1 AS v FROM t WHERE '1'::interval week > '0'::interval",
+            "SELECT '1'::interval min to sec AS v",
+            "SELECT '1'::interval day to sec AS v",
+            "SELECT '1'::interval day to \"second\" AS v",
+            "SELECT '{1}'::interval h[] AS v",
+            "SELECT '1'::interval week::text",
+            "SELECT '1'::interval(1) secs[1]",
+            # A fractional precision (the `isdigit` guards).
+            "SELECT '1'::interval second(1.5) AS v",
+            "SELECT '1'::interval day to second(2.0) AS v",
+            "SELECT interval '1' second(1.5) AS v",
+        ],
+    )
+    def test_postgres_syntax_errors_are_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual
