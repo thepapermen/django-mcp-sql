@@ -37,6 +37,7 @@ from datetime import timedelta
 from http import HTTPStatus
 from importlib.metadata import version
 from urllib.parse import parse_qs
+from urllib.parse import unquote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 
@@ -106,6 +107,14 @@ NON_CANONICAL_HOSTS = [
     "TESTSERVER",
     "TestServer:443",
     "testserver:0443",
+]
+
+# A value no answer may carry back (RFC 8707 errors go into a redirect).
+ECHO_MARKER = "NoEchoMarker" + "Q" * 300
+ECHOED = [
+    f"https://somewhere.example/{ECHO_MARKER}",
+    f"https://testserver/mcp/sql/?{ECHO_MARKER}=1",
+    f"https://{ECHO_MARKER.lower()}.example/mcp/sql/",
 ]
 
 
@@ -727,6 +736,59 @@ class TestBearerAudienceCheck:
         assert _ping(client, token.token).status_code == HTTPStatus.OK
         token = self._token(mcp_user, mcp_app, [SLASHED])
         assert _ping(client, token.token).status_code == HTTPStatus.UNAUTHORIZED
+
+
+@pytest.mark.django_db
+class TestInvalidTargetNeverEchoesTheValue:
+    """`invalid_target` names the accepted value only: the client's own
+    `resource` is never carried back — not in `error_description`, not in
+    the redirect, not in a page or JSON body."""
+
+    @staticmethod
+    def _assert_not_echoed(response) -> None:
+        location = response.get("Location", "")
+        assert ECHO_MARKER not in location
+        assert ECHO_MARKER not in unquote(location)
+        assert ECHO_MARKER.lower() not in unquote(location).lower()
+        assert ECHO_MARKER.lower() not in response.content.decode().lower()
+
+    @pytest.mark.parametrize("resource", ECHOED)
+    def test_authorize_get(self, client, mcp_app, mcp_user, gate_posture, resource):
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [resource]))
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + query)
+        _assert_invalid_target_redirect(response)
+        self._assert_not_echoed(response)
+
+    @pytest.mark.parametrize("in_query", [False, True])
+    @pytest.mark.parametrize("resource", ECHOED)
+    def test_consent_post(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self, client, mcp_app, mcp_user, gate_posture, resource, in_query
+    ):
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [resource] if in_query else []))
+        client.force_login(mcp_user)
+        response = _consent(client, query, SLASHED if in_query else resource)
+        _assert_invalid_target_redirect(response)
+        self._assert_not_echoed(response)
+
+    @pytest.mark.parametrize("in_query", [False, True])
+    @pytest.mark.parametrize("resource", ECHOED)
+    def test_token(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self, client, mcp_app, mcp_user, gate_posture, resource, in_query
+    ):
+        path = reverse("token")
+        data = {"grant_type": "authorization_code", "code": "x", "client_id": "mcp-sql"}
+        if in_query:
+            path += "?" + urlencode({"resource": resource})
+        else:
+            data["resource"] = resource
+        response = client.post(path, data=data)
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_target"
+        assert SLASHED in response.json()["error_description"]
+        self._assert_not_echoed(response)
 
 
 @pytest.mark.django_db
