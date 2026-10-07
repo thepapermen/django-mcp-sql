@@ -174,8 +174,8 @@ def _number_as_written_or(base: Any) -> Callable[[Any, Token], Any]:
 
 
 class _IsNotNull(exp.Expression, exp.Condition):
-    """`x IS NOT NULL` / `x NOTNULL` as written. sqlglot before 30.x's
-    `Is(negate=...)` builds `NOT x IS NULL` for both, which Postgres
+    """`x IS NOT NULL` / `x NOTNULL` as written. sqlglot versions without
+    `Is(negate=...)` (30.7) build `NOT x IS NULL` for both, which Postgres
     evaluates differently for a row value (`(1, NULL) IS NOT NULL` is false,
     `NOT (1, NULL) IS NULL` is true)."""
 
@@ -468,8 +468,8 @@ class FaithfulPostgres(Postgres):
                 return super().expression(instance, *args, **kwargs)
 
             def _wrote_is_not_null(self) -> bool:
-                last = self._tokens[: self._index][-3:]
-                kinds = [token.token_type for token in last]
+                tokens, end = self._tokens, self._index
+                kinds = [tokens[k].token_type for k in range(max(0, end - 3), end)]
                 return kinds[-1:] == [TokenType.NOTNULL] or kinds == [
                     TokenType.IS,
                     TokenType.NOT,
