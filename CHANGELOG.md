@@ -71,20 +71,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `to_number`, `initcap(s, '-')`) now fail in Postgres instead of being
     translated into something that runs. A LIMIT that is not a plain
     integer (`LIMIT 3.5`, `LIMIT 2 + 3`, `LIMIT (SELECT …)`, `LIMIT -1`) is
-    kept, cast to bigint as Postgres coerces it, and capped (`LIMIT
-    LEAST(CAST(<as written> AS BIGINT), n)`) instead of being replaced by
-    the cap, and `(SELECT … LIMIT 5)` no longer fails with a second LIMIT.
+    kept and capped (`LIMIT LEAST(<as written>, n)`) instead of being
+    replaced by the cap; a value numeric as written (number literals,
+    arithmetic on them, a cast to a numeric type) is cast to bigint first,
+    which for those is exactly Postgres's LIMIT coercion (`'NaN'::float8`,
+    an integer beyond bigint: Postgres's error), while anything else is
+    left to Postgres's type resolution (`LIMIT '3'::text` stays an error).
+    `(SELECT … LIMIT 5)` no longer fails with a second LIMIT.
     `QUALIFY` (not Postgres SQL) is a syntax error and `qualify` an ordinary
     name, as in Postgres. Also rendered as written: `x IS NOT NULL IS TRUE`
-    (sqlglot 30.13+ dropped the `NOT`), `~ -1` / `- ~1` (rendered `~-1`,
-    which Postgres reads as the operator `~-`) and, on 30.7, `j -> 'a'::text`
-    (the cast was applied to the whole `j -> 'a'`); `2 %-3` (the operator
-    `%-` to Postgres) and `json_object(KEY 'a' VALUE 1)` (no `KEY` in
-    Postgres) are refused. The guarantee is about what sqlglot reads in the
+    (sqlglot 30.13+ dropped the `NOT`), `IS NOT TRUE` / `IS NOT FALSE` /
+    `IS NOT UNKNOWN` inside a comparison or an IS chain (`y > 2 IS NOT TRUE`
+    came back `y > NOT 2 IS TRUE`), a negated operator inside one on 30.7
+    (`g NOT LIKE 'a%' IS TRUE` came back `NOT g LIKE 'a%' IS TRUE`; any `NOT`
+    that is an operand now keeps its parentheses), `a ^ b` (was `POWER(a,
+    b)`: another column name and sqlglot's precedence), `~ -1` / `- ~1`
+    (rendered `~-1`, which Postgres reads as the operator `~-`) and, on
+    30.7, a cast right after the right operand of `->`, `->>`, `#>`, `#>>`,
+    `?` (`j #> '{a}'::text[]` cast the whole expression); `2 %-3`, `y=~1`,
+    `-~y` (one operator to Postgres, `%-`, `=~`, `-~`) and
+    `json_object(KEY 'a' VALUE 1)` (no `KEY` in Postgres) are refused. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    545 ordinary analytical queries (over data with NULLs and mixed case)
+    844 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call to every function in `pg_catalog` and requires it unchanged.
@@ -96,9 +106,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     and sqlglot read `copy(x)` inside a subquery as a column with an alias
     list. All are now refused with the deny list's reason
     (`disallowed_function` / `disallowed_construct`); `t.to_jsonb` /
-    `t.row_to_json` (the whole row) as `select_star`. Ordinary qualified
-    columns are unaffected, including names of denied functions attribute
-    notation cannot call (`t.version`, `t.user`, `t.has_access`).
+    `t.row_to_json`, `t.concat`, `t.quote_literal`, `t.record_out`, ... (the
+    whole row) as `select_star`. Only actual calls: a qualified name that
+    is a column of its FROM item stays a column, whatever it is named —
+    a derived table's or CTE's output column, an alias column list, a
+    whitelisted table's column (from its model), a schema-qualified type
+    name (`'0/0'::pg_catalog.pg_lsn`) — as do names of denied functions
+    attribute notation cannot call (`t.version`, `t.user`, `t.has_access`).
   - Any exception while parsing — the tokenizer's `TokenError` for an
     unterminated literal, the `re.error` sqlglot 30.21 raises for some
     `UESCAPE` clauses, the plain `ValueError` / `TypeError` / `IndexError`
