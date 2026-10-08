@@ -23,6 +23,7 @@ from typing import Any
 
 from django.conf import settings
 from django.http import HttpRequest
+from mcp_sql.clients import DCR_SUFFIX_LENGTH
 from mcp_sql.clients import ClientIdentity
 from mcp_sql.clients import ClientKind
 from mcp_sql.conf import mcp_sql_settings
@@ -140,14 +141,14 @@ def client_ip(request: HttpRequest) -> str | None:
 
 
 # DCR mints Application names as
-# `f"{APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"`, and
-# `token_urlsafe(16)` is always 22 URL-safe-base64 chars. Validating the
+# `f"{APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(DCR_TOKEN_BYTES)}"`, and
+# that is always `DCR_SUFFIX_LENGTH` (22) URL-safe-base64 chars. Validating the
 # suffix *shape* (not just the prefix) means only the canonical name and
 # genuinely DCR-minted names are recognised as MCP-purpose: a hand-created
 # `mcp-sql-superuser` or a path-traversal-shaped `mcp-sql-../../x` does not
 # match, where a bare `startswith` would accept them. Tracks
 # registration's token size.
-_DCR_SUFFIX_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+_DCR_SUFFIX_RE = re.compile(rf"[A-Za-z0-9_-]{{{DCR_SUFFIX_LENGTH}}}")
 
 
 def classify_application_name(name: str) -> ClientKind | None:
@@ -191,8 +192,8 @@ def classify_application_name(name: str) -> ClientKind | None:
 def classify_application(application: Any) -> ClientKind | None:
     """`classify_application_name` for a DOT `Application` row, or None.
 
-    Recognition keys on the name, but provisioning, the redirect checks and
-    the consent label key on the `client_id` — and every row this package
+    Recognition and the consent label key on the name, but provisioning and
+    the redirect checks key on the `client_id` — and every row this package
     writes carries one string in both (migration 0005, `/o/register`,
     `signals.provision_mcp_clients`). Nothing in DOT enforces that, so a row
     whose `client_id` differs from its `name` is recognised as nothing,

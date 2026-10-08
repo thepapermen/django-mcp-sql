@@ -1179,3 +1179,116 @@ class TestOauthAdminUnregistered:
                 f"{model_cls.__name__} is registered on the admin — the "
                 f"`mcp_sql/admin.py` unregister did not fire."
             )
+
+
+@pytest.mark.django_db
+class TestUnparseableRedirectPortIsRefused:
+    """A `redirect_uri` whose port no parser takes is refused on EVERY client.
+
+    DOT's matcher reads the request's port while comparing it with a stored
+    `localhost` callback (`http://localhost:4567/cb` is not port-wildcarded
+    the way `127.0.0.1` / `::1` are), and `urllib.parse` raises `ValueError`
+    for `:99999` or `:notaport`. Only the declared-client branch caught it:
+    the curated row and every DCR client let it escape `/o/authorize/` as a
+    500. Every branch now treats it as a refusal — oauthlib's fatal
+    redirect-mismatch error page, no redirect, nothing stored.
+    """
+
+    STORED = "http://localhost:4567/cb"
+    DCR_ID = "mcp-sql-" + "B" * 22
+
+    @pytest.fixture(params=["curated", "dcr", "dcr_registered"])
+    def client_id(self, request, mcp_app):
+        import json
+
+        from django.test import Client
+        from oauth2_provider.models import Application
+
+        if request.param == "curated":
+            mcp_app.redirect_uris = self.STORED
+            mcp_app.save(update_fields=["redirect_uris"])
+            return mcp_app.client_id
+        if request.param == "dcr_registered":
+            # Through `/o/register`, as an MCP SDK / Cursor client registers
+            # its fixed `localhost:<port>` callback.
+            request.getfixturevalue("_isolated_mcp_cache")
+            response = Client().post(
+                reverse("oauth_dynamic_client_registration"),
+                data=json.dumps({"redirect_uris": [self.STORED]}),
+                content_type="application/json",
+            )
+            assert response.status_code == HTTPStatus.CREATED, response.content
+            assert response.json()["redirect_uris"] == [self.STORED]
+            return response.json()["client_id"]
+        Application.objects.create(
+            name=self.DCR_ID,
+            client_id=self.DCR_ID,
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            skip_authorization=False,
+            redirect_uris=self.STORED,
+            algorithm="",
+        )
+        return self.DCR_ID
+
+    @staticmethod
+    def _query(client_id, redirect_uri):
+        return {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "mcp:sql",
+            "state": "s",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+
+    @pytest.mark.parametrize(
+        "bad", ["http://localhost:99999/cb", "http://localhost:notaport/cb"]
+    )
+    def test_validator_refuses_instead_of_raising(self, client_id, bad):
+        from oauthlib.common import Request as OAuthlibRequest
+
+        validator = MCPOAuth2Validator()
+        request = OAuthlibRequest("")
+        assert validator.validate_client_id(client_id, request)
+        assert validator.validate_redirect_uri(client_id, bad, request) is False
+        # The stored callback itself still matches: only the bad port is refused.
+        assert validator.validate_redirect_uri(client_id, self.STORED, request)
+
+    @pytest.mark.parametrize(
+        "bad", ["http://localhost:99999/cb", "http://localhost:notaport/cb"]
+    )
+    def test_authorize_get_renders_the_error_page_not_500(
+        self, client, mcp_user, gate_posture, client_id, bad
+    ):
+        from urllib.parse import urlencode
+
+        from oauth2_provider.models import Grant
+
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize") + "?" + urlencode(self._query(client_id, bad))
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert "Location" not in response
+        assert b'id="authorizationForm"' not in response.content
+        assert not Grant.objects.exists()
+
+    def test_consent_post_renders_the_error_page_not_500(
+        self, client, mcp_user, gate_posture, client_id
+    ):
+        from oauth2_provider.models import Grant
+
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"),
+            data={
+                **self._query(client_id, "http://localhost:99999/cb"),
+                "allow": "Authorize",
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert "Location" not in response
+        assert not Grant.objects.exists()

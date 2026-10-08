@@ -565,9 +565,10 @@ def _mcp_transport(request):
     token = request.auth
     token_id = str(token.pk) if token is not None else ""
     # Which OAuth client presented this token — its Application name, the
-    # derived `ClientKind`, and its registered callbacks — recorded on every
-    # audit row this request produces. `token.application` is a non-null FK on
-    # every DOT AccessToken, so this is safe whenever a token is set.
+    # derived `ClientKind`, and its allowed callbacks (declared or registered)
+    # — recorded on every audit row this request produces. `token.application`
+    # is a non-null FK on every DOT AccessToken, so this is safe whenever a
+    # token is set.
     client = identify_application(token.application) if token is not None else NO_CLIENT
     # Behind a reverse proxy the consumer's real-IP middleware (if wired —
     # see docs/architecture.md "the per-IP throttle trusts YOUR deployment's

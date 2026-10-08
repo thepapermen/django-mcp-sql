@@ -146,28 +146,40 @@ class MCPOAuth2Validator(OAuth2Validator):
         EVERY other client — the canonical `mcp-sql` row and every loopback
         DCR client — gets DOT's stock matching against its own row, untouched.
 
+        A `ValueError` from DOT's matching is a refusal, not a 500, on every
+        branch: DOT parses the request's port (and a stored `localhost`
+        candidate's) while matching, so `http://localhost:99999/cb` asked of
+        the curated row or a DCR client raised out of `/o/authorize/` — the
+        declared branch (`_declared_redirect_allowed`) already refused it.
+
         Why declared clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Clients".
         """
         declared = mcp_sql_settings.clients().get(client_id)
         if declared is not None:
             return _declared_redirect_allowed(declared, redirect_uri)
-        return super().validate_redirect_uri(
-            client_id, redirect_uri, request, *args, **kwargs
-        )
+        try:
+            return super().validate_redirect_uri(
+                client_id, redirect_uri, request, *args, **kwargs
+            )
+        except ValueError:
+            return False
 
     def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
         """A declared client's default redirect comes from settings too.
 
-        oauthlib asks for it only when an authorization request omits
+        oauthlib asks for it when an authorization request omits
         `redirect_uri`, and uses it WITHOUT calling `validate_redirect_uri`
-        (a later non-fatal error is 302'd to it too). DOT's default reads the
+        (a later non-fatal error is 302'd to it too); and when a token request
+        omits it, as the value `confirm_redirect_uri` compares with the
+        grant's (a mismatch refuses the exchange). DOT's default reads the
         provisioned row, which would bring back a callback since changed or
         removed in settings. A declared client has a default only when it
         declares exactly one rule and that rule is exact — as DOT gives one
         only for a single stored URI; a prefix is not a callback. Otherwise
-        `None`, and oauthlib raises its fatal `MissingRedirectURIError` (error
-        page, no redirect). Every other client keeps DOT's default.
+        `None`, and oauthlib raises its fatal `MissingRedirectURIError` (at
+        `/o/authorize/` the error page, no redirect). Every other client keeps
+        DOT's default.
         """
         declared = mcp_sql_settings.clients().get(client_id)
         if declared is None:

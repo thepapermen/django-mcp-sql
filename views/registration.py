@@ -24,6 +24,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from mcp_sql import throttle
+from mcp_sql.clients import DCR_TOKEN_BYTES
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import absolute_url
@@ -731,7 +732,10 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         )
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).
-    client_id = f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}{secrets.token_urlsafe(16)}"
+    client_id = (
+        f"{mcp_sql_settings.APPLICATION_NAME_PREFIX}"
+        f"{secrets.token_urlsafe(DCR_TOKEN_BYTES)}"
+    )
 
     # Silent per-IP block (shared with the bad-token throttle on `/mcp/sql/`;
     # same `BAD_TOKEN_IP_THRESHOLD` / `_WINDOW_SECONDS` knobs, scope-separated
