@@ -48,7 +48,11 @@ ALTER ROLE mcp_readonly_role SET statement_timeout = '5s';
 ALTER ROLE mcp_readonly_role SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE mcp_readonly_role SET lock_timeout = '1s';
 ALTER ROLE mcp_readonly_role SET standard_conforming_strings = on;
-ALTER ROLE mcp_readonly_role SET search_path = public, pg_temp;
+-- Only for installs that set MCP_SQL["PIN_SEARCH_PATH"] = True (off by
+-- default; `mcp_sql_role_setup --emit-sql` emits this line exactly then).
+-- Like the defaults above it is inert under SET ROLE: the runtime guard is
+-- the per-transaction `SET LOCAL search_path`, which applies without it.
+-- ALTER ROLE mcp_readonly_role SET search_path = public, pg_temp;
 
 BEGIN;
 

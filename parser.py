@@ -148,9 +148,12 @@ DENIED_SRF_FUNCTIONS: frozenset[str] = frozenset(
     }
 )
 SYSTEM_SCHEMAS: frozenset[str] = frozenset({"pg_catalog", "information_schema"})
-# The schema an unqualified relation name resolves to: the read transaction
-# pins `search_path` to it, then `pg_temp` (`session.SEARCH_PATH`), so a
-# same-named relation in another schema is never what `FROM t` opens.
+# The schema an unqualified relation name is checked as. With
+# `MCP_SQL["PIN_SEARCH_PATH"]` on, the read transaction pins `search_path` to
+# it, then `pg_temp` (`session.PINNED_SEARCH_PATH`), so a same-named relation
+# in another schema is never what `FROM t` opens; off (the default),
+# Postgres resolves `FROM t` through the database's own `search_path` and the
+# profile role's grants decide what a shadowing relation can expose.
 DEFAULT_SCHEMA = "public"
 # A whitelisted relation's column names, keyed by the relation itself:
 # `(schema, name)` as `relation_of` reads a `db_table`.
@@ -1650,9 +1653,9 @@ def parse_and_validate(
     A table reference matches the way Postgres resolves it: the schema and
     the name each quoted exactly, unquoted folded to lowercase, and an
     unqualified name in `DEFAULT_SCHEMA`, which the read transaction pins
-    as its `search_path` (`_check_tables`). A same-named relation in
-    another schema is not on the whitelist, and a system schema is rejected
-    unconditionally.
+    as its `search_path` when `PIN_SEARCH_PATH` is on (`_check_tables`).
+    A same-named relation in another schema is not on the whitelist, and a
+    system schema is rejected unconditionally.
 
     `table_columns` maps a whitelisted `db_table` (spelled as in
     `allowed_tables`) to its column names as spelled in the database, so
@@ -2780,7 +2783,8 @@ def relation_of(db_table: str) -> tuple[str, str]:
 def _table_relation(table: exp.Table) -> tuple[str, str]:
     """The relation a table reference opens, as Postgres resolves it: a
     schema-qualified name in its schema (quoted exactly, unquoted folded),
-    an unqualified one in `DEFAULT_SCHEMA` (the pinned `search_path`). A
+    an unqualified one in `DEFAULT_SCHEMA` (what Postgres opens with
+    `PIN_SEARCH_PATH` on; off, the database's own `search_path` decides). A
     database qualifier (`db.schema.t`) Postgres accepts only for the
     current database."""
     schema = table.args.get("db")
@@ -3141,8 +3145,8 @@ def _check_tables(
     A reference matches a whitelist entry (a `db_table`, the relation
     `relation_of` reads from it) the way Postgres resolves it to a
     relation: schema and name quoted exactly, unquoted folded to lowercase,
-    an unqualified name in `DEFAULT_SCHEMA` (the pinned `search_path`), a
-    qualified one in the schema it names — `analytics.t` is not the
+    an unqualified name in `DEFAULT_SCHEMA` (exact with `PIN_SEARCH_PATH`
+    on; see there), a qualified one in the schema it names — `analytics.t` is not the
     whitelisted `t`, whatever grants the role holds on it. A database
     qualifier (`db.public.t`) is left to Postgres, which accepts only the
     current database. References that resolve to an IN-SCOPE CTE are
@@ -3185,7 +3189,7 @@ def _check_tables(
         if _resolves_to_cte(table):
             continue
         # The relation Postgres opens: schema and name quoted as written,
-        # unquoted folded; no schema is the pinned `search_path`'s.
+        # unquoted folded; no schema is `DEFAULT_SCHEMA` (see there).
         in_schema, relation = _table_relation(table)
         entry = whitelist.get((in_schema, relation))
         if entry is None:

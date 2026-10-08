@@ -197,7 +197,7 @@ class Command(BaseCommand):
                 msg = (
                     "Session GUC drift after enter_readonly_session: "
                     f"{drift}. The role / SET LOCAL contract is not in sync "
-                    "with sql/role_setup.sql; review session.EXPECTED_SESSION_GUCS."
+                    "with sql/role_setup.sql; review session.session_gucs()."
                 )
                 raise CommandError(msg)
             cur.execute("SELECT 1")

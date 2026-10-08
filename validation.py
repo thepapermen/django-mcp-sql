@@ -38,6 +38,7 @@ else:
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
+from pydantic import ConfigDict
 from pydantic import TypeAdapter
 
 
@@ -69,6 +70,11 @@ class CloudClientEntry(TypedDict):
 
 
 class McpSqlSettings(TypedDict):
+    # No unknown top-level key: a typo'd one (`PIN_SEARCHPATH`) would
+    # otherwise be ignored and the default used in its place, with nothing in
+    # the logs — for an opt-in guard, the guard silently off.
+    __pydantic_config__ = ConfigDict(extra="forbid")  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
     # Required: every consumer must declare these.
     # One entry per access tier; keys are profile names (e.g. "default").
     PROFILES: dict[str, ProfileEntry]
@@ -94,6 +100,9 @@ class McpSqlSettings(TypedDict):
     CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
     # Opt-in refresh tokens: chain cap in seconds; 0 / absent = off.
     REFRESH_TOKEN_MAX_AGE_SECONDS: NotRequired[int]
+    # Opt-in `search_path = public, pg_temp` per read transaction; absent =
+    # off. Bool only (checked on the raw value below).
+    PIN_SEARCH_PATH: NotRequired[bool]
 
 
 # Upper bound for MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]: ten years.
@@ -331,7 +340,8 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
     """Validate the `MCP_SQL` settings dict on startup.
 
     - Pydantic TypeAdapter enforces the TypedDict shape (required keys
-      present and typed, optional keys typed when present).
+      present and typed, optional keys typed when present, no unknown
+      top-level key); `PIN_SEARCH_PATH` must be a real bool.
     - Numeric values must be positive; `DEFAULT_LIMIT` must not exceed
       `HARD_LIMIT`.
     - Each profile in `PROFILES` has non-empty unique ROLE /
@@ -387,6 +397,13 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
             f"(refresh tokens off) to {_REFRESH_TOKEN_MAX_AGE_LIMIT} (10 years); "
             f"got {refresh_cap!r}"
         )
+        raise ImproperlyConfigured(msg)
+
+    # On the raw value, like the refresh cap: pydantic's lax mode would take
+    # `"yes"`, `"off"`, `1` (an env-var string, a number) as a bool.
+    pin = cfg.get("PIN_SEARCH_PATH", False)
+    if type(pin) is not bool:
+        msg = f"MCP_SQL.PIN_SEARCH_PATH must be True or False; got {pin!r}"
         raise ImproperlyConfigured(msg)
 
     _validate_profiles(cfg["PROFILES"])

@@ -6,9 +6,11 @@ the bare name only, so `SELECT secret FROM analytics.<whitelisted name>` read
 a same-named relation in another schema whenever the role held SELECT on it
 (an accidental `GRANT SELECT ON ALL TABLES IN SCHEMA analytics`), and the
 drift check, which listed `public` only, never reported that grant. An
-unqualified name resolved through the login's `search_path` (`"$user"`,
-database / role settings, a temporary table first), which the read
-transaction now pins to `public, pg_temp`.
+unqualified name resolves through the login's `search_path` (`"$user"`,
+database / role settings, a temporary table first) unless
+`MCP_SQL["PIN_SEARCH_PATH"]` is on (round 21: opt-in, default off), when
+the read transaction pins it to `public, pg_temp`. The qualified-name
+refusal and the every-schema drift inventory hold in both modes.
 
 End to end on Postgres: a real second schema holding a same-named table the
 read role can SELECT.
@@ -62,13 +64,24 @@ def shadowed(settings, monkeypatch):
         _make_copy(cur, _SHADOW, "shadow")
 
 
+@pytest.fixture
+def pinned(settings):
+    settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": True}
+
+
+@pytest.fixture(params=[False, True], ids=["unpinned", "pinned"])
+def pin_mode(request, settings):
+    settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": request.param}
+    return request.param
+
+
 def _run(sql: str):
     return run_query(
         user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=sql, limit=10
     )
 
 
-@pytest.mark.usefixtures("shadowed")
+@pytest.mark.usefixtures("shadowed", "pin_mode")
 class TestQualifiedReferences:
     @pytest.mark.parametrize(
         "sql",
@@ -102,10 +115,10 @@ class TestQualifiedReferences:
         assert result.rows == [["public"]]
 
 
-@pytest.mark.usefixtures("shadowed")
+@pytest.mark.usefixtures("shadowed", "pinned")
 class TestUnqualifiedNamesResolveToPublic:
-    """`FROM <t>` is the relation in `public` whatever the login's
-    `search_path` says: the read transaction pins it."""
+    """With `PIN_SEARCH_PATH` on, `FROM <t>` is the relation in `public`
+    whatever the login's `search_path` says: the read transaction pins it."""
 
     def test_the_profile_roles_own_schema(self):
         # The default `search_path` is `"$user", public`; under `SET ROLE`,
@@ -135,6 +148,58 @@ class TestUnqualifiedNamesResolveToPublic:
             enter_readonly_session(cur, role=_ROLE)
             cur.execute("SHOW search_path")
             assert cur.fetchone() == ("public, pg_temp",)
+
+
+@pytest.mark.usefixtures("shadowed")
+class TestUnpinnedNamesFollowTheDatabasesSearchPath:
+    """`PIN_SEARCH_PATH` off (the default): the read transaction leaves
+    `search_path` alone, so `FROM <t>` is whatever the login's `search_path`
+    finds first — a relation the profile role may read. The parser's check
+    still treats the name as the `public` relation, and the qualified
+    spelling of the other one is still refused."""
+
+    def test_the_default_search_path_reads_public(self):
+        assert _run("SELECT name FROM mcp_sql_a16_t").rows == [["public"]]
+
+    def test_the_profile_roles_own_schema(self):
+        with connection.cursor() as cur:
+            _make_copy(cur, _ROLE, "user-schema")
+        assert _run("SELECT name FROM mcp_sql_a16_t").rows == [["user-schema"]]
+        result = _run("SELECT name FROM mcp_readonly_role.mcp_sql_a16_t")
+        assert result.rejection_reason == OutcomeReason.DISALLOWED_TABLE
+
+    def test_a_login_search_path(self):
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL search_path = mcp_sql_a16_shadow, public")
+        result = _run("SELECT name FROM mcp_sql_a16_t")
+        assert result.rows == [["shadow"]], (result.rejection_reason, result.error)
+
+    def test_a_temporary_table(self):
+        with connection.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE mcp_sql_a16_t (id int, name text)")
+            cur.execute("INSERT INTO pg_temp.mcp_sql_a16_t VALUES (1, 'temp')")
+            cur.execute("GRANT SELECT ON pg_temp.mcp_sql_a16_t TO mcp_readonly_role")
+        assert _run("SELECT name FROM mcp_sql_a16_t").rows == [["temp"]]
+
+    def test_a_shadowing_relation_the_role_cannot_read_is_an_error(self):
+        # Name resolution ignores privileges: the first match is used, and
+        # without SELECT on it the read fails rather than falling through.
+        with connection.cursor() as cur:
+            cur.execute(
+                "REVOKE SELECT ON mcp_sql_a16_shadow.mcp_sql_a16_t"
+                " FROM mcp_readonly_role"
+            )
+            cur.execute("SET LOCAL search_path = mcp_sql_a16_shadow, public")
+        result = _run("SELECT name FROM mcp_sql_a16_t")
+        assert result.rows == []
+        assert result.error
+
+    def test_the_session_leaves_it_alone(self):
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL search_path = mcp_sql_a16_shadow, public")
+            enter_readonly_session(cur, role=_ROLE)
+            cur.execute("SHOW search_path")
+            assert cur.fetchone() == ("mcp_sql_a16_shadow, public",)
 
 
 @pytest.mark.usefixtures("shadowed")

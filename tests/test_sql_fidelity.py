@@ -428,7 +428,7 @@ def test_every_catalog_function_call_is_rendered_as_written():
 @pytest.mark.django_db
 def test_every_catalog_operator_in_operator_form_is_rendered_as_written():
     """Review round 20: `OPERATOR(schema.op)` is the way to an operator
-    outside the pinned `search_path`, and the spelling of any operator
+    outside `search_path` (pinned or not), and the spelling of any operator
     sqlglot cannot read bare (`~<~`, `|/`, `*=`, ...). sqlglot rebuilt the
     name from its tokens' texts (a quoted qualifier came back unquoted, the
     prefix form did not parse, the operator characters of 26 binary

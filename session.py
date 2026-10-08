@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from typing import Protocol
 
+from mcp_sql.conf import mcp_sql_settings
+
 
 class SQLCursor(Protocol):
     """The cursor surface this module needs: any DB-API cursor satisfies it
@@ -40,16 +42,20 @@ EXPECTED_SESSION_GUCS: dict[str, str] = {
     # no longer mean what was checked (`'a\' AS x, '...'` shifts quotes).
     # Pinned per transaction, like every guard.
     "standard_conforming_strings": "on",
-    # Where an unqualified relation name resolves. The parser matches `FROM t`
-    # against the whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`);
-    # the login's own `search_path` (a `"$user"` schema — under `SET ROLE`,
-    # one named after the profile role — a database- or role-level setting,
-    # a connection option) could otherwise resolve it to a same-named
-    # relation elsewhere. `pg_temp` is listed last so a temporary table
-    # cannot shadow it either (unlisted, it is searched first). A list: see
-    # `guc_value_sql`.
-    "search_path": "public, pg_temp",
 }
+
+# Opt-in (`MCP_SQL["PIN_SEARCH_PATH"]`, default off): where an unqualified
+# relation name resolves. The parser matches `FROM t` against the whitelisted
+# relation in `public` (`parser.DEFAULT_SCHEMA`); the login's own
+# `search_path` (a `"$user"` schema — under `SET ROLE`, one named after the
+# profile role — a database- or role-level setting, a connection option) can
+# otherwise resolve it to a same-named relation elsewhere that the profile
+# role may read. `pg_temp` is listed last so a temporary table cannot shadow
+# it either (unlisted, it is searched first). A list: see `guc_value_sql`.
+# Off, `search_path` is the database's own and the role's grants are the
+# boundary for such a relation; on, an extension outside `public` loses its
+# unqualified names (docs/architecture.md "`search_path`").
+PINNED_SEARCH_PATH: dict[str, str] = {"search_path": "public, pg_temp"}
 
 # Per-transaction only, never a role default. `default_transaction_read_only`
 # above is read when a transaction STARTS, and the executor's transaction has
@@ -67,13 +73,25 @@ TRANSACTION_GUCS: dict[str, str] = {"transaction_read_only": "on"}
 # into the dict should fail at module load, not at the next cursor open.
 _SAFE_GUC_NAME = re.compile(r"^[a-z_]+$")
 _SAFE_GUC_VALUE = re.compile(r"^[a-z0-9_]+(, [a-z0-9_]+)*$")
-for _name, _value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
+_ALL_GUCS = EXPECTED_SESSION_GUCS | PINNED_SEARCH_PATH | TRANSACTION_GUCS
+for _name, _value in _ALL_GUCS.items():
     if not _SAFE_GUC_NAME.fullmatch(_name):
         _msg = f"unsafe GUC name in EXPECTED_SESSION_GUCS: {_name!r}"
         raise ValueError(_msg)
     if not _SAFE_GUC_VALUE.fullmatch(_value):
         _msg = f"unsafe GUC value in EXPECTED_SESSION_GUCS: {_value!r}"
         raise ValueError(_msg)
+
+
+def session_gucs() -> dict[str, str]:
+    """The guards `enter_readonly_session` sets and `session_drift` checks
+    (with `TRANSACTION_GUCS`), and the role defaults `mcp_sql_role_setup`
+    emits: `EXPECTED_SESSION_GUCS`, plus `PINNED_SEARCH_PATH` when
+    `MCP_SQL["PIN_SEARCH_PATH"]` is on. Read per call, so a settings
+    override applies to the next transaction."""
+    if mcp_sql_settings.PIN_SEARCH_PATH:
+        return EXPECTED_SESSION_GUCS | PINNED_SEARCH_PATH
+    return dict(EXPECTED_SESSION_GUCS)
 
 
 def guc_value_sql(value: str) -> str:
@@ -121,7 +139,9 @@ def enter_readonly_session(
     role: str,
     session_context: Mapping[str, str] | None = None,
 ) -> None:
-    """`SET LOCAL ROLE <role>` + each guard, then any per-profile context.
+    """`SET LOCAL ROLE <role>` + each guard (`session_gucs()`: the pinned
+    `search_path` only with `MCP_SQL["PIN_SEARCH_PATH"]` on), then any
+    per-profile context.
 
     Must be called inside a transaction. `role` is the bound profile's
     Postgres role. `session_context` is the already-resolved output of the
@@ -131,7 +151,7 @@ def enter_readonly_session(
     (never interpolated), name restricted to the `mcp_sql.*` namespace.
     """
     cursor.execute(f"SET LOCAL ROLE {role}")
-    for name, value in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
+    for name, value in (session_gucs() | TRANSACTION_GUCS).items():
         cursor.execute(f"SET LOCAL {name} = {guc_value_sql(value)}")
     if session_context:
         validate_session_context(session_context)
@@ -144,7 +164,7 @@ def session_drift(cursor: SQLCursor, expected_role: str) -> dict[str, tuple[str,
 
     `expected_role` is the profile role the caller entered via
     `enter_readonly_session`. Empty dict means the session matches both that
-    role, `EXPECTED_SESSION_GUCS` and `TRANSACTION_GUCS` — the LIVE
+    role, `session_gucs()` and `TRANSACTION_GUCS` — the LIVE
     `transaction_read_only` flag included, not only its default. Use this in
     smoke / executor pre-flight to catch a connection that did not enter the
     session correctly.
@@ -156,7 +176,7 @@ def session_drift(cursor: SQLCursor, expected_role: str) -> dict[str, tuple[str,
     actual_role = str(row[0])
     if actual_role != expected_role:
         drift["current_user"] = (expected_role, actual_role)
-    for name, expected in (EXPECTED_SESSION_GUCS | TRANSACTION_GUCS).items():
+    for name, expected in (session_gucs() | TRANSACTION_GUCS).items():
         cursor.execute(f"SHOW {name}")
         row = cursor.fetchone()
         assert row is not None  # SHOW always returns exactly one row
