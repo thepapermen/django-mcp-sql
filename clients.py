@@ -69,6 +69,14 @@ LOOPBACK_HOST = "localhost"
 # entirely. Pinned to the model in `tests/test_clients.py`.
 REDIRECT_MAX_LENGTH = 1024
 
+# `/o/register` mints a DCR client_id (and name) as
+# `<APPLICATION_NAME_PREFIX><secrets.token_urlsafe(DCR_TOKEN_BYTES)>`; 16
+# random bytes are always 22 URL-safe-base64 characters. Recognition
+# (`consts._DCR_SUFFIX_RE`) checks that suffix shape, and boot validation
+# bounds the prefix so the minted id fits the `Application` columns.
+DCR_TOKEN_BYTES = 16
+DCR_SUFFIX_LENGTH = 22
+
 
 class ClientKind(StrEnum):
     """Closed vocabulary written to `MCPQueryLog.client_kind`.

@@ -40,6 +40,7 @@ else:
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
+from mcp_sql.clients import DCR_SUFFIX_LENGTH
 from mcp_sql.clients import LOOPBACK_HOST
 from mcp_sql.clients import MATCH_EXACT
 from mcp_sql.clients import MATCH_PREFIX
@@ -635,19 +636,14 @@ def _validate_localhost_loopback(kinds: set[ClientKind]) -> None:
         raise ImproperlyConfigured(msg)
 
 
-def _validate_client_id_lengths(names: Iterable[str], prefix: str) -> None:
-    """Every derived client_id must fit the `Application` columns it is
-    written to.
-
-    Provisioning writes the derived `<prefix><kind>.<slug>` to both
-    `Application.client_id` (255 on the supported DOT >= 3.4.1; 100 before
-    3.4) and `Application.name` (255), and recognition reads the name back — so a
-    longer id passed boot and then failed `migrate` with a `DataError` inside
-    `signals.provision_mcp_clients`. The limit is read off the installed
-    (possibly swapped) model, the smaller of the two columns, minus the
-    longest derived prefix — so a slug that fits as `local` also fits as
-    `cloud` and the bound does not depend on the redirect scheme. A column
-    without a `max_length` (a swapped model's `TextField`) imposes none.
+def _application_id_width() -> int | None:
+    """The longest client_id this package may write: the smaller of the
+    installed (possibly swapped) `Application` model's `client_id` (255 on
+    the supported DOT >= 3.4.1; 100 before 3.4) and `name` (255) columns,
+    because every row the package writes carries one string in both
+    (migration 0005, `/o/register`, `signals.provision_mcp_clients`) and
+    recognition reads the name back. A column without a `max_length` (a swapped model's
+    `TextField`) imposes none; `None` when neither does.
     """
     from oauth2_provider.models import get_application_model
 
@@ -660,19 +656,68 @@ def _validate_client_id_lengths(names: Iterable[str], prefix: str) -> None:
         )
         if width is not None
     ]
-    if not widths:
+    return min(widths) if widths else None
+
+
+def _validate_application_name_lengths(application_name: str, prefix: str) -> None:
+    """The curated and DCR client_ids must fit the `Application` columns.
+
+    Migration 0005 writes `APPLICATION_NAME` verbatim to both columns, and
+    `/o/register` writes `<APPLICATION_NAME_PREFIX><22-char token>`
+    (`clients.DCR_SUFFIX_LENGTH`). An over-long value passed boot and then
+    failed the write with a `DataError` — `migrate` for the curated row, and
+    a 500 from the anonymous `/o/register` for every DCR client. Refused at
+    boot instead, against `_application_id_width()`.
+    """
+    width = _application_id_width()
+    if width is None:
+        return
+    if len(application_name) > width:
+        msg = (
+            f"MCP_SQL.APPLICATION_NAME is {len(application_name)} characters; "
+            f"it is written as the curated client's client_id and name, which "
+            f"must fit the installed OAuth Application's client_id and name "
+            f"columns, so it may be at most {width} characters"
+        )
+        raise ImproperlyConfigured(msg)
+    max_prefix = width - DCR_SUFFIX_LENGTH
+    if len(prefix) > max_prefix:
+        msg = (
+            f"MCP_SQL.APPLICATION_NAME_PREFIX is {len(prefix)} characters; a "
+            f"dynamically-registered client_id is the prefix plus a "
+            f"{DCR_SUFFIX_LENGTH}-character token, which must fit the installed "
+            f"OAuth Application's client_id and name columns ({width} "
+            f"characters), so the prefix may be at most {max(max_prefix, 0)} "
+            f"characters"
+        )
+        raise ImproperlyConfigured(msg)
+
+
+def _validate_client_id_lengths(names: Iterable[str], prefix: str) -> None:
+    """Every derived client_id must fit the `Application` columns it is
+    written to.
+
+    Provisioning writes the derived `<prefix><kind>.<slug>` to both
+    `Application.client_id` and `Application.name` — so a longer id passed
+    boot and then failed `migrate` with a `DataError` inside
+    `signals.provision_mcp_clients`. The limit is `_application_id_width()`
+    minus the longest derived prefix — so a slug that fits as `local` also
+    fits as `cloud` and the bound does not depend on the redirect scheme.
+    """
+    width = _application_id_width()
+    if width is None:
         return
     longest_prefix = max(
         len(f"{prefix}{kind.value}.") for kind in (ClientKind.CLOUD, ClientKind.LOCAL)
     )
-    max_slug = min(widths) - longest_prefix
+    max_slug = width - longest_prefix
     for name in names:
         if len(name) > max_slug:
             msg = (
                 f"MCP_SQL.CLIENTS key {name!r} is {len(name)} characters; its "
                 f"derived client_id ({prefix}<kind>.{name}) must fit the "
                 f"installed OAuth Application's client_id and name columns "
-                f"({min(widths)} characters), so a slug may be at most "
+                f"({width} characters), so a slug may be at most "
                 f"{max(max_slug, 0)} characters with APPLICATION_NAME_PREFIX "
                 f"{prefix!r}"
             )
@@ -762,6 +807,9 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
     - Each profile in `PROFILES` has non-empty unique ROLE /
       PERMISSION_CODENAME / GROUP_NAME and `app_label.ModelName`-shaped
       `ALLOWED_MODELS`; model resolution is deferred to runtime.
+    - `APPLICATION_NAME`, a DCR client_id (`APPLICATION_NAME_PREFIX` plus
+      its 22-character token) and every derived declared client_id fit the
+      installed `Application` model's `client_id` and `name` columns.
     - Each entry in `CLIENTS` normalises through the same builder the
       runtime accessor uses, and the redirect schemes it needs are allowed.
 
@@ -810,6 +858,9 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
 
     _validate_raw_types(cfg)
     _validate_profiles(cfg["PROFILES"])
+    _validate_application_name_lengths(
+        cfg["APPLICATION_NAME"], cfg["APPLICATION_NAME_PREFIX"]
+    )
     _validate_clients(cfg["CLIENTS"], cfg["APPLICATION_NAME_PREFIX"])
 
 

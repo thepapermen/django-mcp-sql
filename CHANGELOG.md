@@ -83,9 +83,9 @@ they do **not** announce themselves.
   time):
   - `executor.run_query(client_redirect=<str>)` → `run_query(client=<ClientIdentity>)`,
     and the same for `executor.audit_tool_call`. A `clients.ClientIdentity`
-    carries the client's name, derived kind and registered callbacks; build one
-    with `consts.identify_application(application)`, or omit the argument
-    (`clients.NO_CLIENT`, blank attribution).
+    carries the client's name, derived kind and allowed callbacks (declared or
+    registered); build one with `consts.identify_application(application)`, or
+    omit the argument (`clients.NO_CLIENT`, blank attribution).
   - `conf.mcp_sql_settings.cloud_clients()` → `mcp_sql_settings.clients()`
     (still `{client_id: …}`, now covering both declared kinds).
   - `conf.CloudClient` → `clients.DeclaredClient` (moved module; the single
@@ -238,9 +238,9 @@ they do **not** announce themselves.
   WARNING. It still never deletes them — that would cascade live tokens in the
   middle of a `migrate`.
 - **Recognition requires an `Application`'s `client_id` to equal its `name`.**
-  Recognition keyed on the name while provisioning, the redirect checks and
-  the consent label keyed on the `client_id`, and nothing enforced that the two
-  agree. A row whose two differ is now recognised as nothing, on every branch
+  Recognition and the consent label keyed on the name while provisioning and
+  the redirect checks keyed on the `client_id`, and nothing enforced that the
+  two agree. A row whose two differ is now recognised as nothing, on every branch
   (curated, declared, DCR): refused at `/o/authorize/`, its tokens a
   `bad_application` 401 with a blank `client_kind`. Every row the package
   writes carries one string in both (migration 0005, `/o/register` and
@@ -275,7 +275,13 @@ they do **not** announce themselves.
   `DataError` inside `provision_mcp_clients`. Boot now refuses it with
   `ImproperlyConfigured` naming the maximum slug length, read from the
   installed model's columns minus the longest derived prefix (241 characters
-  with the default `mcp-sql-` prefix).
+  with the default `mcp-sql-` prefix). The same holds for
+  `MCP_SQL["APPLICATION_NAME"]` (written verbatim as the curated row's
+  `client_id` and `name` by migration 0005) and `APPLICATION_NAME_PREFIX` (a
+  DCR client_id is the prefix plus a 22-character token, written by the
+  anonymous `/o/register`, which answered a 500): boot refuses a name longer
+  than the columns (255 characters), and a prefix longer than the columns
+  minus 22 (233 characters).
 - **The RFC 9728 discovery document advertised a resource identifier that did
   not match the path it was served at, making the surface unreachable from
   clients that validate it.** `resource` was built straight off

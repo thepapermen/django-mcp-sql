@@ -673,14 +673,19 @@ on its row (provisioning still writes them there, but refreshes them only on
 `migrate`, and nothing reads that copy for a declared client — the audit
 trail's `client_redirect` comes from the entry too). Change or remove a rule and
 redeploy: the new callback is accepted and the old one refused at the next
-`/o/authorize/` request, without a `migrate`. When a request omits
+`/o/authorize/` request, without a `migrate` — as long as the change keeps the
+entry's redirect scheme. A change that flips it (https ↔ `http://localhost`)
+changes the derived kind and so the client_id (`mcp-sql-cloud.<slug>` ↔
+`mcp-sql-local.<slug>`): the new id has no `Application` row, and is refused,
+until `migrate` provisions it, and the old row is left orphaned (named in
+provisioning's WARNING). When a request omits
 `redirect_uri`, the default is the entry's callback if it declares exactly one
 rule and that rule is `"exact"`; otherwise there is none and the request gets
 the error page (a prefix is not a callback).
 
-**Recognition also requires `client_id == name`.** Every check that reads
-settings keys on the `client_id`, while recognition reads the `Application`'s
-`name`; every row this package writes (migration 0005, `/o/register`,
+**Recognition also requires `client_id == name`.** Provisioning and the
+redirect checks key on the `client_id`, while recognition and the consent
+label read the `Application`'s `name`; every row this package writes (migration 0005, `/o/register`,
 provisioning) carries the same string in both. A row whose two differ — say,
 one named `mcp-sql-cloud.claude` created by hand with another `client_id` — is
 not an MCP client at all: refused at `/o/authorize/`, and its tokens get a
@@ -828,7 +833,9 @@ The token's RFC 8707 audience does not depend on them: the accepted
    request, and `migrate` only refreshes the row's unread copy. A slug
    must be short enough for `<prefix><kind>.<slug>` to fit DOT's
    `Application.client_id` and `name` columns (255 characters); a longer one
-   refuses to boot.
+   refuses to boot. So does an `APPLICATION_NAME` longer than those columns,
+   or an `APPLICATION_NAME_PREFIX` longer than them minus the 22-character
+   DCR token.
 2. Ensure `"https"` is in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` —
    with any https client declared the app **refuses to boot** without it. DOT's
    default already includes `https`; you only hit this if you narrowed the list

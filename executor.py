@@ -75,8 +75,8 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     `role` is entered via `SET LOCAL ROLE`, its optional `SESSION_CONTEXT`
     hook sets per-row GUCs, and its name is recorded on the audit row).
     `token_id`, `client_ip`, and `client` (which OAuth client presented the
-    token — name, derived kind, and registered callbacks, recorded for
-    attribution) are optional. `limit` is clamped to
+    token — name, derived kind, and allowed callbacks (declared or
+    registered), recorded for attribution) are optional. `limit` is clamped to
     `[DEFAULT_LIMIT, HARD_LIMIT]` from `MCP_SQL["LIMITS"]`.
     """
     started_at = timezone.now()
