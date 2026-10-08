@@ -539,7 +539,7 @@ def _audit_safely(**fields: Unpack[AuditFields]) -> None:
     `DatabaseError` handler catches (review round 20). Every
     `MCPQueryLog` row is written here.
     """
-    fields["client_ip"] = audit_client_ip(fields["client_ip"])
+    fields["client_ip"] = audit_client_ip(fields.get("client_ip"))
     try:
         MCPQueryLog.objects.create(**fields)
     except DatabaseError:
