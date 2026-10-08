@@ -412,9 +412,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   unless the connection itself fails there, which ends the deletes'
   transaction too: that is logged as a failed revocation (it was logged
   as "Revoked N MCP token(s)" while every token survived). No
-  exception the revocation raises leaves it (with no transaction open it
+  exception the revocation raises leaves it, its setup included (a
+  consumer router failing in `db_for_write`); with no transaction open it
   runs inside `logout()` before the session is flushed, or inside the
-  user's `save()`). The three deletes run on the
+  user's `save()`. A `post_save` sent without `using` (by hand) counts as
+  the default database, as Django's `on_commit` does. The three deletes run on the
   database DOT writes its access tokens to, whatever a router says per
   model. The cohort-grant alert reads the user on the database the
   membership change was written to.

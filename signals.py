@@ -192,27 +192,33 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
     Not covered: tokens the open transaction itself created and has not
     committed (the own connection cannot see them).
     """
-    # Lazy import keeps `apps.ready()` import-graph small.
-    from oauth2_provider.models import AccessToken
-    from oauth2_provider.models import Grant
-    from oauth2_provider.models import RefreshToken
-
-    # Match BOTH the curated `mcp-sql` Application (exact name) AND every
-    # DCR-minted `mcp-sql-<token>` Application (prefix). The prefix carries
-    # a trailing dash, so a `startswith` on it does NOT match the canonical
-    # name — that's why the Q-OR is required here.
-    mcp_apps = Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
-        application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
-    )
-    # DOT's token models reference each other and their Application by
-    # foreign key, so they live in one database; DOT opens its own token
-    # transactions on `db_for_write(AccessToken)` (`save_bearer_token`,
-    # `RefreshToken.revoke`). All three deletes run there, explicitly, so
-    # they are one transaction whatever a router says per model.
-    tokens = router.db_for_write(AccessToken)
-    audit = router.db_for_write(MCPAuthRejectionLog)
     audit_failed = False
     try:
+        # Everything, the setup included, inside the handler: a consumer
+        # router raising in `db_for_write` escaped `logout()` before
+        # (review round 20).
+        # Lazy imports keep `apps.ready()`'s import graph small.
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+        from oauth2_provider.models import RefreshToken
+
+        # Match BOTH the curated `mcp-sql` Application (exact name) AND every
+        # DCR-minted `mcp-sql-<token>` Application (prefix). The prefix carries
+        # a trailing dash, so a `startswith` on it does NOT match the canonical
+        # name — that's why the Q-OR is required here.
+        mcp_apps = Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
+            application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
+        )
+        # DOT's OAuth models live in one database: the tokens reference
+        # each other, and all three (`Grant` included, which references no
+        # token) reference the user and the Application by foreign key, so
+        # an install that splits them fails at DOT's own inserts. DOT opens
+        # its token transactions on `db_for_write(AccessToken)`
+        # (`save_bearer_token`, `RefreshToken.revoke`). All three deletes
+        # run there, explicitly, so they are one transaction whatever a
+        # router says per model.
+        tokens = router.db_for_write(AccessToken)
+        audit = router.db_for_write(MCPAuthRejectionLog)
         with ExitStack() as stack:
             own = {
                 alias: stack.enter_context(_outside_open_transaction(alias, committed))
@@ -439,8 +445,12 @@ def revoke_mcp_tokens_on_password_change(sender, instance, created, **kwargs):
     # On the alias the user was saved to: the revocation waits for THAT
     # transaction, and runs only if it commits. A transaction open on
     # another alias does not hold it back or undo it
-    # (`_outside_open_transaction`).
-    using = kwargs.get("using")
+    # (`_outside_open_transaction`). A `post_save` sent without `using`
+    # (by hand) means the default database, as `on_commit(using=None)`
+    # does: `committed=None` would match no alias, and the revocation would
+    # run on a separate connection that cannot see the open transaction's
+    # rows (review round 20).
+    using = kwargs.get("using") or DEFAULT_DB_ALIAS
     transaction.on_commit(
         lambda: _revoke_and_audit(
             user=instance,

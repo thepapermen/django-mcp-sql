@@ -1048,9 +1048,11 @@ The load-bearing invariants and footguns, grouped by layer:
   transaction commits: the password change's on the alias the user was
   saved to, logout's on `default` (the signal carries no alias; a router
   that puts sessions elsewhere means a rollback there does not hold it
-  back). It deletes on `db_for_write(AccessToken)` — DOT's token models
-  share one database (foreign keys) and DOT opens its token transactions
-  there — explicitly for all three models, and writes the audit row in
+  back). It deletes on `db_for_write(AccessToken)` — DOT's OAuth models
+  share one database (the tokens reference each other, and all three,
+  `Grant` included, reference the user and the Application, so an install
+  that splits them fails at DOT's own inserts) and DOT opens its token
+  transactions there — explicitly for all three models, and writes the audit row in
   the same transaction (a savepoint, so a failed audit write — a database
   error or any other exception — is rolled back to it and logged, and
   does not undo the deletes; on a separate audit database the audit row
@@ -1060,7 +1062,7 @@ The load-bearing invariants and footguns, grouped by layer:
   then, and Django would roll the deletes back silently on leaving the
   block) rolls back all three deletes, is logged with `logger.exception`
   only (no audit row: the access did not end) and is not retried;
-  "Revoked …" is logged only once the deletes committed. Nothing raised leaves `_revoke_and_audit`:
+  "Revoked …" is logged only once the deletes committed. Nothing raised leaves `_revoke_and_audit`, its setup included (a router raising in `db_for_write`):
   with no transaction open the callback runs inside `logout()` (before
   the session is flushed) or inside the user's `save()`. If this thread has a transaction open on that
   database and it is not the triggering one (`ATOMIC_REQUESTS`, an

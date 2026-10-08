@@ -535,6 +535,37 @@ class TestNothingEscapesIntoLogout:
         assert "Failed to revoke MCP tokens on logout" in caplog.text
         assert not Session.objects.filter(session_key=session_key).exists()
 
+    def test_an_error_before_the_deletes(self, settings, caplog):
+        """Review round 20: the code before the deletes (a consumer router
+        raising in `db_for_write`) ran outside the handler, so its error
+        escaped `logout()` (a 500, the session kept)."""
+        from django.contrib.auth import logout
+        from django.contrib.sessions.models import Session
+
+        user = UserFactory()
+        _mcp_credentials(user)
+        request = _logged_in_request(user)
+        session_key = request.session.session_key
+        settings.DATABASE_ROUTERS = [
+            "mcp_sql.tests.test_signals._ExplodingTokenRouter",
+            *settings.DATABASE_ROUTERS,
+        ]
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.signals"):
+            logout(request)
+        assert "Failed to revoke MCP tokens on logout" in caplog.text
+        assert "a consumer router" in caplog.text  # the traceback is logged
+        assert not Session.objects.filter(session_key=session_key).exists()
+        assert _remaining_credentials(user) == 3  # nothing was revoked
+
+
+class _ExplodingTokenRouter:
+    """A consumer router that fails for DOT's token model."""
+
+    def db_for_write(self, model, **hints):
+        if model._meta.label == "oauth2_provider.AccessToken":
+            msg = "a consumer router exploded"
+            raise RuntimeError(msg)
+
 
 @pytest.mark.django_db
 class TestAFailedAuditWriteKeepsTheDeletes:
@@ -642,3 +673,27 @@ class TestAConnectionLostDuringTheAuditWrite:
         assert failure.levelno == logging.ERROR
         assert failure.getMessage().startswith("Failed to revoke MCP tokens on logout")
         assert failure.exc_info is not None
+
+
+@pytest.mark.django_db
+class TestASaveSignalWithoutAnAlias:
+    """Review round 20: a `post_save` sent without `using` (by hand, by a
+    consumer) passed `committed=None`, so the revocation never counted as
+    running on the database that committed: with a transaction open it
+    ran on a separate connection, which does not see that transaction's
+    rows. Django's own `on_commit(using=None)` means the default database;
+    so does the revocation now."""
+
+    def test_revokes_as_on_the_default_database(
+        self, django_capture_on_commit_callbacks
+    ):
+        from django.db.models.signals import post_save
+        from django.db.models.signals import pre_save
+
+        user = UserFactory()
+        _mcp_credentials(user)  # written by the test's open transaction
+        user.set_password("a different one")
+        with django_capture_on_commit_callbacks(execute=True):
+            pre_save.send(sender=type(user), instance=user)
+            post_save.send(sender=type(user), instance=user, created=False)
+        assert _remaining_credentials(user) == 0
