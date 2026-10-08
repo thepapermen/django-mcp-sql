@@ -610,6 +610,70 @@ class TestExactCloudClientMatchedExactly:
         assert response.status_code == 200, response.content
 
 
+class TestDeclaredLocalClientLoopbackRecheck:
+    """Only a declared CLOUD client is exempt from the loopback re-check in
+    `MCPOAuth2Validator.validate_redirect_uri`. A declared `local` client's
+    callbacks are loopback by derivation, but its Application row is plain
+    data: one hand-edited to carry an off-machine redirect must not get a
+    code sent there, even though DOT's own matching accepts the stored
+    value."""
+
+    OFF_MACHINE = "https://evil.example/cb"
+
+    @staticmethod
+    def _params(redirect_uri):
+        return {
+            "client_id": CURSOR_DESKTOP_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+
+    def _provision_edited(self, settings):
+        from oauth2_provider.models import Application
+
+        _provision(settings, {"cursor-desktop": CURSOR_DESKTOP})
+        app = Application.objects.get(client_id=CURSOR_DESKTOP_ID)
+        app.redirect_uris = f"{app.redirect_uris} {self.OFF_MACHINE}"
+        app.save(update_fields=["redirect_uris"])
+
+    @pytest.mark.parametrize("method", ["get", "post"])
+    def test_off_machine_redirect_on_a_local_row_is_the_error_page(
+        self, client, settings, mcp_user, mcp_mfa_on, method
+    ):
+        from django.urls import reverse
+        from oauth2_provider.models import Grant
+
+        self._provision_edited(settings)
+        client.force_login(mcp_user)
+        params = self._params(self.OFF_MACHINE)
+        if method == "get":
+            response = client.get(reverse("authorize"), data=params)
+        else:
+            response = client.post(
+                reverse("authorize"), data={**params, "allow": "Authorize"}
+            )
+        assert response.status_code == 400, response.content
+        assert "Location" not in response
+        assert not Grant.objects.exists()
+
+    def test_declared_loopback_callback_still_gets_the_consent_page(
+        self, client, settings, mcp_user, mcp_mfa_on
+    ):
+        from django.urls import reverse
+
+        self._provision_edited(settings)
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize"),
+            data=self._params(CURSOR_DESKTOP["REDIRECTS"][0]["URI"]),
+        )
+        assert response.status_code == 200, response.content
+
+
 class TestValidateRedirectUriOverride:
     def test_prefix_client_admits_under_prefix(self, settings):
         settings.MCP_SQL = _cfg({"chatgpt": CHATGPT})

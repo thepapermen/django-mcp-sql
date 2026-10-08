@@ -632,8 +632,8 @@ def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
 def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
     """The whole-request refusals of `redirect_uris`, before the subset filter.
 
-    Returns an `invalid_redirect_uri` error response, or None. Two kinds of
-    input refuse the whole request, even beside a clean URI, instead of
+    Returns an `invalid_redirect_uri` error response, or None. Three kinds
+    of input refuse the whole request, even beside a clean URI, instead of
     dropping out of the loopback subset:
 
     - a request of the wrong shape: not a non-empty array, longer than

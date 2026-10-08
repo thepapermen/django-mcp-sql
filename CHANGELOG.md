@@ -474,8 +474,9 @@ separately below precisely because they do **not** announce themselves.
   not-an-ip` made psycopg 3 raise `ValueError` at the insert: queries still
   ran but left no `MCPQueryLog` row (nor a tripwire count), and gate denials
   became 500s with no rejection row. On psycopg2 the rows were dropped
-  silently. Every audit writer now stores a normalised address, or `NULL`
-  when the value is not one. Also affects 0.1.0b5.
+  silently. Every audit writer now stores the value as given when it is
+  exactly one IP address without a scope id, and `NULL` otherwise (a scoped
+  IPv6 address such as `fe80::1%eth0` included). Also affects 0.1.0b5.
 - **A per-request gate that raised was an unaudited 500.** An exception from
   the consumer's `MFA_CHECKER`, from profile resolution (a DB blip) or from
   the `SESSION_MODEL` lookup escaped the auth class: fail-closed, but with no

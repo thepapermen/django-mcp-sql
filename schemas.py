@@ -62,14 +62,19 @@ class AuthRejectionReason(StrEnum):
     # traceback goes to the log (`auth.MCPOAuth2Authentication.authenticate`).
     GATE_ERROR = "gate_error"
     # Not a denial: the `user_logged_out` signal's revocation of the user's
-    # MCP access tokens and pending authorization codes. The row records the
-    # attempt; its `error` text carries the outcome — the counts revoked, and
-    # FAILED for a delete that raised (a codes-only or failed revocation is
-    # recorded too). Kept alongside the gate denials so the audit table carries
-    # a complete access-ending timeline — see `signals.revoke_mcp_tokens_on_logout`.
+    # MCP access and refresh tokens and pending authorization codes. One
+    # transaction deletes all three and writes the row with them, and only
+    # when something was deleted (a codes-only revocation included); its
+    # `error` text carries the counts revoked. A failed deletion rolls all
+    # of it back and writes no row (the access did not end; it is logged
+    # with `logger.exception`). Kept alongside the gate denials so the audit
+    # table carries a complete access-ending timeline — see
+    # `signals.revoke_mcp_tokens_on_logout` and `signals._revoke_and_audit`.
     SESSION_LOGOUT = "session_logout"
     # Not a denial either: the user's password changed, so their MCP access
-    # and refresh tokens were revoked (`signals.revoke_mcp_tokens_on_password_change`).
+    # and refresh tokens and pending authorization codes were revoked —
+    # written under the same rules as SESSION_LOGOUT
+    # (`signals.revoke_mcp_tokens_on_password_change`).
     PASSWORD_CHANGE = "password_change"  # noqa: S105 — an audit reason code, not a credential.
 
 
