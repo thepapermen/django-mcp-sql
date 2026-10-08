@@ -541,8 +541,9 @@ stops working until the two match again.
   installed DOT version, only the list comes from `CLIENTS`. That is not
   strict string equality everywhere: DOT 3.2 / 3.3 only require the
   registered callback's query parameters to be present in the request's, so
-  extra query parameters on the registered callback are admitted there
-  (DOT 3.4.1 requires the query string to match exactly).
+  a requested callback carrying extra query parameters beyond the registered
+  one's is admitted there (DOT 3.4.1 requires the query string to match
+  exactly).
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
