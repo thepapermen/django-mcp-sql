@@ -37,4 +37,25 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   tool.
 - **Curated-view migrations** live in the OWNING app, use
   `CREATE OR REPLACE VIEW` forward SQL (column-additive) and carry
-  `state_operations=[CreateModel(..., managed=False)]`.
+  `state_operations=[CreateModel(..., managed=False)]`; a view that filters
+  rows is created `WITH (security_barrier)`.
+- **The package's OAuth views use `MCPServerViewMixin`** (narrow
+  `oauth_server.MCPServer`, `OAuthLibCore`, core built per call) and
+  **`MCPOAuth2Authentication` verifies through `get_mcp_oauthlib_core()`** —
+  never DOT's `get_oauthlib_core()` / `super().authenticate()`, which use the
+  consumer's `OAUTH2_SERVER_CLASS`. `MCPTokenView.post`'s grant-type guard
+  runs before DOT's own handling.
+- **The executor sends only `parser.render_for_execution` output**: the
+  rendered text (no comments) itself passes the full `parse_and_validate`
+  and re-renders (by sqlglot) to the same string — validated as sqlglot
+  reads it, not a proof about Postgres's lexer. Never send `ast.sql()` to
+  the database directly. Parse and render only with `FaithfulPostgres`
+  (renders SQL as written: function calls stay `exp.Anonymous` unless the
+  checks need sqlglot's node); source forms sqlglot and
+  Postgres read differently are refused by the lexical-fidelity check (keep
+  that list current). `tests/test_sql_functional_corpus.py` must keep
+  passing: ordinary analytics return exactly what Postgres returns.
+- **The read transaction is read-only while it runs and always rolled
+  back** (`SET LOCAL transaction_read_only = on` in
+  `session.enter_readonly_session`; `default_transaction_read_only` alone
+  does not cover a transaction that has already begun).

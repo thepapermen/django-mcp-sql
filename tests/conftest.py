@@ -36,6 +36,12 @@ def _mfa_checker_falsy(_user, types=None):
     return False
 
 
+def allow_all_mfa(_user, types=None):
+    """The minimal-posture settings' MFA checker (`tests/settings.py`):
+    every user passes, as with no MFA at all."""
+    return True
+
+
 def _patch_consumer_mfa(monkeypatch):
     """Patch each consumer-declared MFA symbol to a truthy checker.
 
@@ -182,7 +188,11 @@ def mcp_session_factory():
     from mcp_sql.conf import mcp_sql_settings
 
     def _make(*, user, expire_date=None):
-        session_model = apps.get_model(mcp_sql_settings.SESSION_MODEL)
+        # The test app's stand-in when the gate is off (the minimal posture),
+        # so happy-path tests can request a session either way.
+        session_model = apps.get_model(
+            mcp_sql_settings.SESSION_MODEL or TEST_SESSION_MODEL
+        )
         return session_model.objects.create(
             session_key=secrets.token_urlsafe(20),
             session_data="",
@@ -191,6 +201,17 @@ def mcp_session_factory():
         )
 
     return _make
+
+
+# The in-package session-with-user stand-in (`tests/testapp`).
+TEST_SESSION_MODEL = "mcp_sql_testapp.TestSession"
+
+
+@pytest.fixture
+def session_gate_on(settings):
+    """Turn the opt-in session-existence gate on, whatever posture the suite
+    runs under — for the tests that assert on the gate itself."""
+    settings.MCP_SQL = {**settings.MCP_SQL, "SESSION_MODEL": TEST_SESSION_MODEL}
 
 
 @pytest.fixture

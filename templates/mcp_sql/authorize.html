@@ -7,13 +7,15 @@ Package default consent page. Layout-agnostic (extends DOT's bundled base);
 consumers re-theme by overriding `mcp_sql/authorize.html` in their own
 template dir. Shows `resource_name` (the configured MCP server display name,
 injected by `MCPAuthorizationView.render_to_response`) instead of DOT's
-opaque per-client `application.name`.
+opaque per-client `application.name`. `firstof`, not `default:`: a filter
+argument is resolved eagerly and DOT's `form_invalid` re-render carries no
+`application`, which made `default:application.name` raise a 500.
 {% endcomment %}
 {% block content %}
   <div class="block-center">
     {% if not error %}
       <form id="authorizationForm" method="post">
-        <h3 class="block-center-heading">{% trans "Authorize" %} {{ resource_name|default:application.name }}?</h3>
+        <h3 class="block-center-heading">{% trans "Authorize" %} {% firstof resource_name application.name %}?</h3>
         {% csrf_token %}
         {% for field in form %}
           {% if field.is_hidden %}{{ field }}{% endif %}
