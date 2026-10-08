@@ -15,11 +15,13 @@ made the request.
 
 ### Breaking
 
-All but the last three fail loudly at startup, and none require any client to
-reconnect (client_ids are unchanged, provisioning never deletes rows, and
-tokens are 6-hour anyway). The default-ON flip, the dropped `is_staff`
-requirement and the curated client's new consent page are called out
-separately below precisely because they do **not** announce themselves.
+All but the last four fail loudly — at startup, or for the Python API renames
+at import or call time — and none require any client to reconnect (client_ids
+are unchanged, provisioning never deletes rows, and tokens are 6-hour anyway).
+The default-ON flip, the dropped `is_staff` requirement, the curated client's
+new consent page and the consent page no longer skippable by
+`REQUEST_APPROVAL_PROMPT` are called out separately below precisely because
+they do **not** announce themselves.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -76,6 +78,27 @@ separately below precisely because they do **not** announce themselves.
   as well as warnings; checked against DOT 3.4.1). DOT says the gate defaults
   flip to `True` in its 4.0; this package caps DOT at `<4`.
 
+- **Python API renames** (for code that calls into the package directly; an
+  `ImportError` / `AttributeError` / `TypeError` names each at import or call
+  time):
+  - `executor.run_query(client_redirect=<str>)` → `run_query(client=<ClientIdentity>)`,
+    and the same for `executor.audit_tool_call`. A `clients.ClientIdentity`
+    carries the client's name, derived kind and registered callbacks; build one
+    with `consts.identify_application(application)`, or omit the argument
+    (`clients.NO_CLIENT`, blank attribution).
+  - `conf.mcp_sql_settings.cloud_clients()` → `mcp_sql_settings.clients()`
+    (still `{client_id: …}`, now covering both declared kinds).
+  - `conf.CloudClient` → `clients.DeclaredClient` (moved module; the single
+    `redirect_match` / `redirect_uri` pair became a `redirects` tuple of
+    `clients.RedirectRule`, plus `kind` and `label`), and the settings
+    TypedDict `validation.CloudClientEntry` → `validation.ClientEntry`.
+  - `signals.provision_mcp_cloud_clients` → `signals.provision_mcp_clients`
+    (a consumer that disconnected or re-dispatched the receiver by name).
+  - `consts.is_mcp_application_name(name)` → `consts.is_mcp_application(application)`:
+    recognition now needs the row, since it also requires `client_id == name`
+    (see "Changed"). `consts.classify_application_name(name)` remains as the
+    name-shape half; it is not a recognition check on its own.
+
 - **Declared clients now ship ON.** `CLOUD_CLIENTS` defaulted to `[]`; `CLIENTS`
   defaults to `claude`, `chatgpt` and `cursor`. A consumer who declared the old
   key hits the `ImproperlyConfigured` above and makes a deliberate choice — but
@@ -126,6 +149,16 @@ separately below precisely because they do **not** announce themselves.
   lifetime. Claude Code's `claude mcp add` registers its own client through
   `/o/register` and already saw the consent page, so it is unaffected. Also
   affects 0.1.0b5.
+
+- **`OAUTH2_PROVIDER["REQUEST_APPROVAL_PROMPT"] = "auto"` no longer applies to
+  the package's authorization view.** `/o/authorize/` now always shows the
+  consent page, for every client kind: `MCPAuthorizationView` pins DOT's
+  `approval_prompt` to `force` whatever the setting or the query string says
+  (see "Fixed" → "`approval_prompt=auto` could skip the consent page"). A
+  consumer who set `"auto"` so that a user re-authorizing the same client
+  before the token expires skipped the page will now see it every time; there
+  is no setting to bring the skip back. Other OAuth applications served by
+  DOT's own views in the same project keep the setting.
 
 ### Added
 
@@ -204,9 +237,42 @@ separately below precisely because they do **not** announce themselves.
 - Provisioning now names orphaned declared-client `Application` rows in a
   WARNING. It still never deletes them — that would cascade live tokens in the
   middle of a `migrate`.
+- **Recognition requires an `Application`'s `client_id` to equal its `name`.**
+  Recognition keyed on the name while provisioning, the redirect checks and
+  the consent label keyed on the `client_id`, and nothing enforced that the two
+  agree. A row whose two differ is now recognised as nothing, on every branch
+  (curated, declared, DCR): refused at `/o/authorize/`, its tokens a
+  `bad_application` 401 with a blank `client_kind`. Every row the package
+  writes carries one string in both (migration 0005, `/o/register` and
+  provisioning, in every release), so only a hand-made or hand-edited row is
+  affected — e.g. a curated `mcp-sql` row whose `client_id` was changed in the
+  admin stops working until the two match again.
 
 ### Fixed
 
+- **A declared client's redirects followed its `Application` row, not
+  settings.** Its exact callbacks were matched by DOT against the row's
+  `redirect_uris`, which provisioning refreshes only in `post_migrate`. So
+  after a callback was changed in `CLIENTS` and the process redeployed without
+  `migrate`, the old callback was still accepted and the new one refused, and
+  a removed rule stayed admissible until the next `migrate` — while
+  recognition already followed settings at every request. Now a declared
+  client's redirect is decided from its `CLIENTS` entry alone: exact rules by
+  DOT's own matcher (`redirect_to_uri_allowed`) on the declared exact URIs (so
+  unchanged settings get the same answers as before), prefix rules as before,
+  anything else refused — no fall-back to the row. The default redirect used
+  when a request omits `redirect_uri` comes from settings too: the callback of
+  an entry with exactly one rule that is `"exact"`, otherwise none (the error
+  page; a lone prefix rule used to make the prefix itself the default). The
+  row still gets the URIs on `migrate`, for the admin and the audit trail. The
+  curated client and DCR clients keep DOT's row-backed matching.
+- **A long `CLIENTS` slug passed boot and failed `migrate`.** The derived
+  `<prefix><kind>.<slug>` is written to DOT's `Application.client_id` and
+  `name` (255 characters each on DOT 3.4), so an overlong slug raised a
+  `DataError` inside `provision_mcp_clients`. Boot now refuses it with
+  `ImproperlyConfigured` naming the maximum slug length, read from the
+  installed model's columns minus the longest derived prefix (241 characters
+  with the default `mcp-sql-` prefix).
 - **The RFC 9728 discovery document advertised a resource identifier that did
   not match the path it was served at, making the surface unreachable from
   clients that validate it.** `resource` was built straight off
@@ -427,9 +493,10 @@ separately below precisely because they do **not** announce themselves.
   registration (Cursor presents a hosted callback beside its loopback one, and
   that URL can carry a long `state`).
 - **`validate_redirect_uri` rejected the exact callbacks of any client that
-  also had a prefix rule.** It returned the prefix verdict instead of falling
-  through to DOT's stock exact matching. Unreachable in 0.1.0b5 (one rule per
-  entry); reachable the moment a client carries both.
+  also had a prefix rule.** It returned the prefix verdict instead of also
+  checking the exact rules (now DOT's exact matcher on the declared exact URIs,
+  see the settings-driven redirects entry above). Unreachable in 0.1.0b5 (one
+  rule per entry); reachable the moment a client carries both.
 - **Over-long `redirect_uris` silently discarded audit rows.** Both writers
   passed the Application's registered list straight into a 1024-char column; an
   overflow raised `DataError`, which the best-effort audit wrappers swallow —
