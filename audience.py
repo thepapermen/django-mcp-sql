@@ -17,7 +17,14 @@ advertises (`views/discovery.py`), built here by `mcp_resource_url`:
   slash (the two spellings discovery serves) — and answer anything else
   `invalid_target` (`foreign_resource`, `invalid_target_error`). Enforced by
   the package's views on every DOT version, so DOT below 3.4 (which ignores
-  `resource`) answers the same.
+  `resource`) answers the same. Every accepted value is then rewritten to
+  ONE spelling, `canonical_resource_url` (`canonical_resources`), before DOT
+  reads it, at both steps: DOT 3.4+ compares the token request's `resource`
+  with the grant's as a string, and a client that sends one spelling to
+  `/o/authorize/` and another to `/o/token/` (Cursor: the slashed one, then
+  the slash-less one) was otherwise refused. A grant or refresh token stored
+  before that rewrite, under another accepted spelling, is matched by
+  `use_granted_spelling` (the validator, at token issuance).
 - verification: `/mcp/sql/` hands DOT's audience check the request URL built
   the same way (`CanonicalUriOAuthLibCore`), not Django's
   `build_absolute_uri`, so a token bound to the advertised identifier always
@@ -34,6 +41,7 @@ from django.http import HttpRequest
 from django.urls import reverse
 from mcp_sql.consts import absolute_url
 from mcp_sql.consts import canonical_authority
+from oauth2_provider.models import get_grant_model
 from oauth2_provider.oauth2_backends import OAuthLibCore
 from oauthlib.oauth2.rfc6749.errors import CustomOAuth2Error
 
@@ -43,6 +51,23 @@ def mcp_resource_url(request: HttpRequest) -> str:
     included — the spelling `reverse()` builds; discovery serves it with and
     without the slash."""
     return absolute_url(request, reverse("mcp_sql_endpoint"))
+
+
+def canonical_resource_url(request: HttpRequest) -> str:
+    """The one spelling every accepted `resource` is rewritten to before DOT
+    stores or compares it: `mcp_resource_url` without its trailing slash
+    (`https://<host>/mcp/sql`, the host canonical).
+
+    Slash-less because that is the form the MCP authorization spec asks
+    implementations to use for the server URI, and because it is a prefix
+    of both transport spellings: DOT's default audience validator matches it
+    on `/mcp/sql` and `/mcp/sql/` (it compares parsed paths up to the
+    trailing slash; so would the slashed form), and so does a validator
+    that compares raw strings by prefix (which the slashed form fails on
+    `/mcp/sql`). Discovery still echoes the spelling the client asked for
+    (RFC 9728 §3.3); both are accepted and stored as this one.
+    """
+    return mcp_resource_url(request).removesuffix("/")
 
 
 # The longest port spelling accepted (`65535`, or `0443`/`00443`): the
@@ -111,21 +136,149 @@ def foreign_resource(request: HttpRequest, values: Iterable[str]) -> str | None:
     port and path the same way) against the request URL
     `CanonicalUriOAuthLibCore` builds, which is the canonical one.
     """
-    endpoint = _resource_key(mcp_resource_url(request))
-    accepted: set[tuple[str, str, str]] = set()
-    if endpoint is not None:
-        scheme, authority, path = endpoint
-        accepted = {endpoint, (scheme, authority, path.removesuffix("/"))}
+    accepted = _accepted_keys(request)
     return next(
-        (
-            value
-            for value in values
-            # Non-ASCII first: `str.lower` folds some of it to ASCII (the
-            # Kelvin sign U+212A to `k`).
-            if not value.isascii() or _resource_key(value) not in accepted
-        ),
+        (value for value in values if not _names_the_resource(value, accepted)),
         None,
     )
+
+
+def _accepted_keys(request: HttpRequest) -> set[tuple[str, str, str]]:
+    """The `_resource_key`s of the two spellings `foreign_resource` accepts:
+    the advertised identifier with and without its trailing slash. Empty when
+    the request's own host carries a port the package does not take."""
+    endpoint = _resource_key(mcp_resource_url(request))
+    if endpoint is None:
+        return set()
+    scheme, authority, path = endpoint
+    return {endpoint, (scheme, authority, path.removesuffix("/"))}
+
+
+def _names_the_resource(value: str, accepted: set[tuple[str, str, str]]) -> bool:
+    # Non-ASCII first: `str.lower` folds some of it to ASCII (the Kelvin
+    # sign U+212A to `k`).
+    return value.isascii() and _resource_key(value) in accepted
+
+
+def canonical_resources(request: HttpRequest, values: Iterable[str]) -> list[str]:
+    """`values`, each one that names this server's MCP resource (what
+    `foreign_resource` accepts) replaced by `canonical_resource_url`, and
+    every other value left exactly as it is — still foreign, so the check
+    that follows refuses it: the rewrite never turns a refused value into an
+    accepted one, nor the reverse. Order and repeats are kept.
+
+    The views run it on every `resource` before DOT reads one: at
+    `/o/authorize/` on the query string and the consent form's field, so
+    the grant stores this spelling, and at `/o/token/` on the form body (a
+    token POST with a query string is refused by oauthlib), so the token
+    request carries the same string as the grant (DOT 3.4+ compares the two
+    as strings) and a token minted from a resource-less grant is bound to it
+    too.
+    """
+    accepted = _accepted_keys(request)
+    canonical = canonical_resource_url(request)
+    return [
+        canonical if _names_the_resource(value, accepted) else value for value in values
+    ]
+
+
+def _resource_identity(value: str) -> tuple[str, str, str] | None:
+    """`_resource_key` of `value` with one trailing slash dropped from the
+    path; None for a non-ASCII value, an unparseable port or no authority."""
+    if not value.isascii():
+        return None
+    key = _resource_key(value)
+    if key is None or not key[1]:
+        return None
+    scheme, authority, path = key
+    return scheme, authority, path.removesuffix("/")
+
+
+def same_resource(first: str, second: str) -> bool:
+    """True when `first` and `second` are two spellings of one resource by
+    the rule `foreign_resource` applies: scheme and host case-insensitive,
+    the default port explicit or omitted, the path equal up to one trailing
+    slash (nothing else normalised)."""
+    identity = _resource_identity(first)
+    return identity is not None and identity == _resource_identity(second)
+
+
+def _requested_resources(request: Any) -> list[str]:
+    """The token request's `resource` values as DOT (3.4+) reads them in
+    `_check_and_set_request_resource`: oauthlib keeps one value (the form
+    body's last, else the query string's), and DOT recovers repeated body
+    values from `decoded_body`."""
+    resource = getattr(request, "resource", None)
+    if isinstance(resource, list):
+        return resource
+    if not isinstance(resource, str) or not resource.strip():
+        return []
+    body = [
+        value
+        for key, value in (getattr(request, "decoded_body", None) or [])
+        if key == "resource"
+    ]
+    return body if len(body) > 1 else [resource]
+
+
+def _stored_resources(request: Any) -> list[str]:
+    """The `resource` list DOT (3.4+) holds this token request to: the
+    authorization code's grant's (looked up as DOT does), or the refresh
+    token's. Empty below DOT 3.4 (no such field) and when it carries none."""
+    stored: Any = None
+    if request.grant_type == "authorization_code":
+        grant_model = get_grant_model()
+        if hasattr(grant_model, "resource"):
+            stored = (
+                grant_model.objects.filter(
+                    code=request.code, application=request.client
+                )
+                .values_list("resource", flat=True)
+                .first()
+            )
+    elif request.grant_type == "refresh_token":
+        instance = getattr(request, "refresh_token_instance", None)
+        stored = getattr(instance, "resource", None)
+    if not isinstance(stored, list):
+        return []
+    return [value for value in stored if isinstance(value, str)]
+
+
+def use_granted_spelling(request: Any) -> None:
+    """At token issuance, put each requested `resource` in the grant's (or
+    refresh token's) own spelling when it is another spelling of one of
+    them (`same_resource`).
+
+    `MCPTokenView` sends DOT `canonical_resource_url`, and a grant or
+    refresh token issued since then stores that same string. One issued
+    before (an authorization code granted just before the upgrade, a
+    refresh token from an earlier build) may store another accepted
+    spelling — the slashed one, an uppercase host — and DOT compares the
+    two as strings: without this the exchange would get DOT's
+    `invalid_target`. Values that name nothing stored are left for DOT to
+    refuse; the token is bound to the stored string, which names the same
+    resource. Called by `oauth.MCPOAuth2Validator.save_bearer_token`, before
+    DOT reads `request.resource`; a no-op below DOT 3.4.
+    """
+    requested = _requested_resources(request)
+    if not requested:
+        return
+    stored = _stored_resources(request)
+    if not stored:
+        return
+    matched = [
+        next(
+            (
+                value
+                for value in stored
+                if isinstance(wanted, str) and same_resource(wanted, value)
+            ),
+            wanted,
+        )
+        for wanted in requested
+    ]
+    if matched != requested:
+        request.resource = matched
 
 
 def invalid_target_error(request: HttpRequest, **kwargs: Any) -> CustomOAuth2Error:

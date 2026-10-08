@@ -366,23 +366,31 @@ they do **not** announce themselves.
     endpoint (GET, and the consent POST's form field and query string), a
     400 at the token endpoint (`MCPTokenView`, now mounted at `/o/token/`;
     the code is not consumed). The package's `invalid_target` names the
-    accepted value, never the client's (DOT's own errors, such as the
-    token-step one below, may name it). A NUL `resource` at the
+    accepted value, never the client's (DOT's own errors may name it, such
+    as its token-step `invalid_target` for a code granted for another
+    resource). A NUL `resource` at the
     authorization GET, in the consent POST's query string or at the token
     endpoint gets the same answer instead of a 500; in the consent form's
     own `resource` field (DOT 3.4 and later) Django's form validation
     refuses it first, and the consent page is re-rendered with a form error
     (no redirect, nothing stored).
-  - Equivalent spellings are equivalent at each step, not across steps:
-    from DOT 3.4, when the grant carries a `resource`, `/o/token/` also
-    requires each `resource` sent there to be one of the grant's, compared
-    as strings. Exchange the code with the same `resource` string the
-    authorization request carried, or with none (the token then carries the
-    grant's); another spelling gets DOT's own `invalid_target`, which names
-    the value sent, and the code is not consumed. When the grant carries
-    none, DOT stores the token request's value (already limited to the
-    advertised identifier by the package) on the token as sent. The MCP
-    SDKs send the same value at both steps.
+  - Every accepted spelling is stored as one string, the advertised
+    identifier without its trailing slash (`https://<host>/mcp/sql`): both
+    endpoints rewrite each accepted `resource` to it before DOT reads it
+    (`/o/authorize/`: the query string and the consent form's field;
+    `/o/token/`: the form body); a foreign value is never rewritten. From
+    DOT 3.4, `/o/token/` requires each `resource` to be one of the grant's,
+    compared as strings, and Cursor sends `…/mcp/sql/` to `/o/authorize/`
+    and `…/mcp/sql` to `/o/token/`: the exchange got DOT's `invalid_target`
+    ("cannot escalate resource permissions"). Any accepted spelling now
+    works at either step; the grant, the token request and the token carry
+    the same string, and the token passes DOT's audience check on both
+    `/mcp/sql` and `/mcp/sql/`. A code or refresh token issued before the
+    upgrade under another accepted spelling still exchanges: the validator
+    (`MCPOAuth2Validator.save_bearer_token`) puts the request's value in the
+    stored spelling, and the token is bound to it. A custom string-comparing
+    `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` now sees the slash-less
+    value.
   - Discovery, and every other absolute URL the package builds, spells the
     host canonically: lowercased, without the scheme's default port. A proxy
     forwarding `Host: <name>:443` (nginx `proxy_set_header Host

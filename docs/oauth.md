@@ -124,18 +124,32 @@ spelled out (`https://<HOST>:443/mcp/sql/` is the same resource, as RFC 3986
 endpoint's exactly, with or without the trailing slash. Repeating it is
 fine; omitting it is fine (the token is then not resource-bound, as before).
 
-Equivalent spellings are equivalent at each step, not across steps. From
-DOT 3.4, when the grant carries a `resource`, `/o/token/` also requires each
-`resource` sent there to be one of the grant's, compared as strings:
-exchange the code with the same `resource` string the authorization request
-carried, or with none (the token then carries the grant's). Another
-spelling, even an equivalent one, passes the package's check and then gets
-DOT's own `invalid_target`, whose `error_description` names the value sent;
-the code is not consumed, so the client can retry. When the grant carries
-none (the authorization request sent no `resource`), DOT compares nothing
-and stores the token request's value on the token as sent — which the
-package's check has already limited to the advertised identifier. The MCP
-SDKs send the same value at both steps.
+Every accepted spelling is stored as **one** string,
+`https://<host>/mcp/sql` — the advertised identifier without its trailing
+slash (the MCP authorization spec's preferred form of a server URI). Both
+OAuth endpoints rewrite each accepted `resource` to it before DOT reads the
+value: `/o/authorize/` on the query string and in the consent page's form
+field (so the grant stores it), `/o/token/` in the form body. That matters
+because from DOT 3.4, when the grant carries a `resource`, `/o/token/`
+requires each `resource` sent there to be one of the grant's, compared as
+strings — and clients do not always repeat the authorization request's
+spelling: Cursor sends `…/mcp/sql/` to `/o/authorize/` and `…/mcp/sql` to
+`/o/token/`, which DOT refused ("Token request cannot escalate resource
+permissions…"). Now any accepted spelling may be sent at either step, or
+none at the token step (the token then carries the grant's). With a
+resource-less grant the token is bound to the same canonical string. The
+token passes DOT's audience check on `/mcp/sql` and on `/mcp/sql/`.
+Discovery still echoes the spelling the client asked for (RFC 9728 §3.3
+requires it); either one is accepted.
+
+A code granted (or a refresh token issued) before this release may carry
+another accepted spelling. At the token step `MCPOAuth2Validator` puts the
+request's value in the stored spelling when the two name the same resource,
+so the exchange still succeeds and the token is bound to the stored string
+(which passes DOT's default audience check on both transport spellings).
+This needs `OAUTH2_VALIDATOR_CLASS = "mcp_sql.oauth.MCPOAuth2Validator"`, as
+the rest of the setup does. A foreign value is never rewritten: it stays
+`invalid_target`.
 
 Anything else — the bare origin `https://<host>`, another path, host, port
 or scheme, a port the package does not take (two ports or above 65535,
@@ -180,11 +194,14 @@ TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`, because DOT built
 the request URL from `request.scheme` (`http`). `/mcp/sql/` now hands DOT's check the request URL
 built the same way discovery builds `resource` (https whenever `DEBUG` is
 off, the host canonical), so a token bound to the advertised value always
-passes, with or without `SECURE_PROXY_SSL_HEADER`. A token bound to another
-accepted spelling (uppercase, `:443`) passes DOT's default audience
-validator, which compares parsed URLs; a custom
-`RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings would
-accept only the canonical one. DOT's check is not switched off: a token
+passes, with or without `SECURE_PROXY_SSL_HEADER`. New tokens carry the
+canonical slash-less spelling; one bound to another accepted spelling
+(uppercase, `:443`, the slashed one — issued before this release) passes
+DOT's default audience validator, which compares parsed URLs. A custom
+`RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings sees
+`https://<host>/mcp/sql` against the request URL (`…/mcp/sql/` on the
+slashed transport), so it must allow for the trailing slash or compare by
+prefix. DOT's check is not switched off: a token
 bound to a URL that is not a prefix of the endpoint's (one issued before
 this release) still gets a 401 until it expires. DOT's default validator
 is a URL-prefix match, so a token bound to a prefix of the endpoint URL —

@@ -23,6 +23,11 @@ is spelled canonically whatever the Host header says (`<name>:443`, an
 uppercase name), so a client that parses discovery's value and sends back
 the normalised form is accepted end to end on that host.
 
+Every accepted spelling is stored as ONE string, `CANONICAL` (the advertised
+identifier without its trailing slash), at both steps: DOT 3.4+ compares the
+token request's `resource` with the grant's as a string, and Cursor sends the
+slashed spelling to `/o/authorize/` and the slash-less one to `/o/token/`.
+
 DOT below 3.4 ignores `resource` (no field on the grant or token); the
 package's checks run on every version, so the answers are the same there and
 a token is simply unrestricted.
@@ -49,6 +54,9 @@ from django.utils import timezone
 REDIRECT = "http://127.0.0.1:3456"
 SLASHED = "https://testserver/mcp/sql/"
 SLASHLESS = "https://testserver/mcp/sql"
+# The one spelling every accepted `resource` is stored as
+# (`audience.canonical_resource_url`).
+CANONICAL = SLASHLESS
 
 FOREIGN = [
     "https://somewhere.example/api",
@@ -123,6 +131,12 @@ def exact_audience_validator(request_uri: str, audiences: list[str]) -> bool:
     """A `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` comparing strings (bar
     the trailing slash), stricter than DOT's default."""
     return request_uri.rstrip("/") in {audience.rstrip("/") for audience in audiences}
+
+
+def string_prefix_validator(request_uri: str, audiences: list[str]) -> bool:
+    """A `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` comparing raw strings by
+    prefix, no URL parsing."""
+    return any(request_uri.startswith(audience) for audience in audiences)
 
 
 def _dot_stores_resource() -> bool:
@@ -292,7 +306,7 @@ class TestMatchingResourceWorksEndToEnd:
 
         row = AccessToken.objects.get(token=access_token)
         if _dot_stores_resource():
-            assert row.resource == [resource]
+            assert row.resource == [CANONICAL]
         else:
             assert not hasattr(row, "resource")
 
@@ -380,7 +394,7 @@ class TestEquivalentSpellingsAreAccepted:
         from oauth2_provider.models import AccessToken
 
         if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == [resource]
+            assert AccessToken.objects.get(token=access_token).resource == [CANONICAL]
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
     def test_mixed_spellings_in_one_request(
@@ -429,37 +443,48 @@ class TestConsentPageRoundTrip:
         client.force_login(mcp_user)
         page = client.get(page_url)
         assert page.status_code == HTTPStatus.OK
-        code = _code_from(_submit_consent_page(client, page_url, page))
         if _dot_stores_resource():
-            assert Grant.objects.get(code=code).resource == resources
+            # The page's hidden field already carries the canonical spelling.
+            parser = _HiddenFields()
+            parser.feed(page.content.decode())
+            field = dict(parser.fields)["resource"]
+            assert field.split() == [CANONICAL] * len(resources)
+        code = _code_from(_submit_consent_page(client, page_url, page))
+        stored = [CANONICAL] * len(resources)
+        if _dot_stores_resource():
+            assert Grant.objects.get(code=code).resource == stored
         # No `resource` at the token endpoint: the token inherits the grant's.
         token = _exchange(client, code, verifier)
         assert token.status_code == HTTPStatus.OK, token.content
         access_token = token.json()["access_token"]
         if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == resources
+            assert AccessToken.objects.get(token=access_token).resource == stored
         assert _ping(client, access_token).status_code == HTTPStatus.OK
+
+
+ACROSS_STEPS = [
+    # Cursor: the slashed spelling at /o/authorize/, the slash-less one at
+    # /o/token/ (DOT 3.4.1 answered `invalid_target`, "cannot escalate").
+    (SLASHED, SLASHLESS),
+    (SLASHLESS, SLASHED),
+    ("https://TESTSERVER/mcp/sql/", SLASHED),
+    ("https://testserver:443/mcp/sql/", SLASHED),
+    (SLASHED, "https://TestServer:443/mcp/sql"),
+    ("HTTPS://testserver/mcp/sql", "https://TESTSERVER:0443/mcp/sql/"),
+]
 
 
 @pytest.mark.django_db
 class TestSpellingsAcrossSteps:
-    """Equivalent spellings are equivalent at each step on its own, not
-    across steps: from DOT 3.4, `/o/token/` also requires each `resource`
-    to be one of the grant's, compared as strings
-    (`_check_and_set_request_resource`). Another accepted spelling passes
-    the package's check and then gets DOT's own `invalid_target` (which
-    names the value sent); the code is not consumed, and the exchange
-    works with the authorization request's own string, or with none."""
+    """A client may spell the resource differently at the two steps: both
+    store and compare the one canonical string, so the exchange succeeds and
+    the token works on either transport spelling. (Before, DOT 3.4+ compared
+    the token request's string with the grant's and refused another
+    spelling — the Opus B10 probe `test_equivalent_spellings_across_steps`
+    expected the 200 this now gives.)"""
 
-    @pytest.mark.parametrize(
-        ("at_authorize", "at_token"),
-        [
-            (SLASHED, SLASHLESS),
-            ("https://TESTSERVER/mcp/sql/", SLASHED),
-            ("https://testserver:443/mcp/sql/", SLASHED),
-        ],
-    )
-    def test_the_token_step_wants_the_granted_string(  # noqa: PLR0913 — fixtures + two parameters
+    @pytest.mark.parametrize(("at_authorize", "at_token"), ACROSS_STEPS)
+    def test_the_exchange_succeeds(  # noqa: PLR0913 — fixtures + two parameters
         self,
         client,
         mcp_app,
@@ -469,25 +494,298 @@ class TestSpellingsAcrossSteps:
         at_authorize,
         at_token,
     ):
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+
+        verifier, challenge = _pkce()
+        page_url = (
+            reverse("authorize")
+            + "?"
+            + urlencode(_authorize_params(challenge, [at_authorize]))
+        )
+        client.force_login(mcp_user)
+        page = client.get(page_url)
+        assert page.status_code == HTTPStatus.OK
+        # The consent page as the browser submits it.
+        code = _code_from(_submit_consent_page(client, page_url, page))
+        if _dot_stores_resource():
+            assert Grant.objects.get(code=code).resource == [CANONICAL]
+        response = _exchange(client, code, verifier, [at_token])
+        assert response.status_code == HTTPStatus.OK, response.content
+        access_token = response.json()["access_token"]
+        if _dot_stores_resource():
+            assert AccessToken.objects.get(token=access_token).resource == [CANONICAL]
+        for transport in ("/mcp/sql", "/mcp/sql/"):
+            assert _ping(client, access_token, transport).status_code == HTTPStatus.OK
+
+    @pytest.mark.parametrize(("at_authorize", "at_token"), ACROSS_STEPS[:2])
+    def test_without_the_packages_validator_at_the_token_step(  # noqa: PLR0913 — fixtures + two parameters
+        self,
+        client,
+        settings,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        at_authorize,
+        at_token,
+    ):
+        """The token view's own rewrite makes the two steps agree; it does
+        not lean on `MCPOAuth2Validator` (whose stored-spelling match is
+        for grants from before the rewrite)."""
+        verifier, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [at_authorize]))
+        client.force_login(mcp_user)
+        code = _code_from(_consent(client, query, at_authorize))
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "OAUTH2_VALIDATOR_CLASS": (
+                "oauth2_provider.oauth2_validators.OAuth2Validator"
+            ),
+        }
+        response = _exchange(client, code, verifier, [at_token])
+        assert response.status_code == HTTPStatus.OK, response.content
+        if _dot_stores_resource():
+            from oauth2_provider.models import AccessToken
+
+            token = AccessToken.objects.get(token=response.json()["access_token"])
+            assert token.resource == [CANONICAL]
+
+    @pytest.mark.parametrize(("at_authorize", "at_token"), ACROSS_STEPS[:2])
+    def test_hand_built_consent_post(  # noqa: PLR0913 — fixtures + two parameters
+        self,
+        client,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        at_authorize,
+        at_token,
+    ):
+        """The consent POST's query string and form field in the client's own
+        spelling (not the page's): agreed, stored canonically."""
         verifier, challenge = _pkce()
         query = urlencode(_authorize_params(challenge, [at_authorize]))
         client.force_login(mcp_user)
         assert client.get(reverse("authorize") + "?" + query).status_code == 200
         code = _code_from(_consent(client, query, at_authorize))
         response = _exchange(client, code, verifier, [at_token])
-        if not _dot_stores_resource():
-            # Below 3.4 DOT ignores `resource`.
-            assert response.status_code == HTTPStatus.OK, response.content
-            return
-        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
-        # DOT's answer, not the package's (whose check the value passed);
-        # DOT labels its JSON body `text/html`.
-        body = json.loads(response.content)
-        assert body["error"] == "invalid_target"
-        assert "Token request cannot escalate" in body["error_description"]
-        response = _exchange(client, code, verifier, [at_authorize])
         assert response.status_code == HTTPStatus.OK, response.content
         assert _ping(client, response.json()["access_token"]).status_code == 200
+
+    def test_repeated_and_mixed_spellings_at_the_token_step(
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture
+    ):
+        from oauth2_provider.models import AccessToken
+
+        verifier, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED]))
+        client.force_login(mcp_user)
+        code = _code_from(_consent(client, query, SLASHED))
+        response = _exchange(client, code, verifier, [SLASHLESS, *EQUIVALENT])
+        assert response.status_code == HTTPStatus.OK, response.content
+        access_token = response.json()["access_token"]
+        if _dot_stores_resource():
+            row = AccessToken.objects.get(token=access_token)
+            assert set(row.resource) == {CANONICAL}
+        assert _ping(client, access_token, "/mcp/sql").status_code == HTTPStatus.OK
+
+    def test_query_string_resource_at_the_token_step_never_reaches_dot(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        """The token view rewrites the form body only: an accepted value in
+        the query string passes the package's check and is then refused by
+        oauthlib's token endpoint, which takes no query string on a POST
+        (`invalid_request`); the code is not consumed."""
+        from oauth2_provider.models import Grant
+
+        verifier, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED]))
+        client.force_login(mcp_user)
+        code = _code_from(_consent(client, query, SLASHED))
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT,
+            "client_id": "mcp-sql",
+            "code_verifier": verifier,
+        }
+        response = client.post(
+            reverse("token") + "?" + urlencode({"resource": SLASHLESS}),
+            data=urlencode(data),
+            content_type="application/x-www-form-urlencoded",
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        body = json.loads(response.content)
+        assert body["error"] == "invalid_request"
+        assert "query parameters" in body["error_description"]
+        assert Grant.objects.filter(code=code).exists()
+        assert _exchange(client, code, verifier, [SLASHLESS]).status_code == 200
+
+    @pytest.mark.parametrize(
+        "foreign", ["https://somewhere.example/api", "https://testserver/mcp"]
+    )
+    def test_a_foreign_value_beside_an_accepted_one_is_still_refused(
+        self, client, mcp_app, mcp_user, gate_posture, foreign
+    ):
+        """The rewrite touches accepted values only: a foreign one stays
+        foreign at both steps, with the package's answer (which never names
+        it), no grant, and the code not consumed."""
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Grant
+
+        verifier, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED, foreign]))
+        client.force_login(mcp_user)
+        response = client.get(reverse("authorize") + "?" + query)
+        _assert_invalid_target_redirect(response)
+        assert foreign not in unquote(response["Location"]).replace(SLASHED, "")
+        response = _consent(client, query, f"{SLASHED} {foreign}")
+        _assert_invalid_target_redirect(response)
+        assert _grant_count() == 0
+
+        query = urlencode(_authorize_params(challenge, [SLASHED]))
+        code = _code_from(_consent(client, query, SLASHED))
+        response = _exchange(client, code, verifier, [SLASHLESS, foreign])
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        body = response.json()
+        assert body["error"] == "invalid_target"
+        assert foreign not in body["error_description"].replace(SLASHED, "")
+        assert not AccessToken.objects.exists()
+        assert Grant.objects.filter(code=code).exists()
+        assert _exchange(client, code, verifier, [SLASHLESS]).status_code == 200
+
+
+def _legacy_grant(mcp_app, mcp_user, stored: list[str]) -> tuple[str, str]:
+    """An authorization code granted before the canonical rewrite: its
+    `resource` stored in the spelling the client sent."""
+    from oauth2_provider.models import Grant
+
+    verifier, challenge = _pkce()
+    code = secrets.token_urlsafe(32)
+    Grant.objects.create(
+        user=mcp_user,
+        code=code,
+        application=mcp_app,
+        expires=timezone.now() + timedelta(minutes=1),
+        redirect_uri=REDIRECT,
+        scope="mcp:sql",
+        code_challenge=challenge,
+        code_challenge_method="S256",
+        resource=stored,
+    )
+    return code, verifier
+
+
+@pytest.mark.django_db
+@pytest.mark.skipif(
+    not _dot_stores_resource(), reason="grants store `resource` from DOT 3.4"
+)
+class TestGrantsStoredBeforeTheRewrite:
+    """A grant (or refresh token) stored under another accepted spelling,
+    before the rewrite existed, still exchanges whatever spelling the token
+    request uses: the validator puts the request in the stored spelling
+    (`audience.use_granted_spelling`), and the token is bound to it."""
+
+    @pytest.mark.parametrize(
+        ("stored", "at_token"),
+        [
+            (SLASHED, SLASHLESS),
+            (SLASHED, SLASHED),
+            (SLASHED, "https://TESTSERVER:443/mcp/sql"),
+            ("https://TESTSERVER/mcp/sql/", SLASHLESS),
+            ("https://testserver:443/mcp/sql", SLASHED),
+        ],
+    )
+    def test_the_exchange_succeeds(  # noqa: PLR0913 — fixtures + two parameters
+        self,
+        client,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        stored,
+        at_token,
+    ):
+        from oauth2_provider.models import AccessToken
+
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [stored])
+        response = _exchange(client, code, verifier, [at_token])
+        assert response.status_code == HTTPStatus.OK, response.content
+        access_token = response.json()["access_token"]
+        assert AccessToken.objects.get(token=access_token).resource == [stored]
+        for transport in ("/mcp/sql", "/mcp/sql/"):
+            assert _ping(client, access_token, transport).status_code == HTTPStatus.OK
+
+    def test_without_resource_the_token_inherits_the_stored_spelling(
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture
+    ):
+        from oauth2_provider.models import AccessToken
+
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [SLASHED])
+        response = _exchange(client, code, verifier)
+        assert response.status_code == HTTPStatus.OK, response.content
+        token = AccessToken.objects.get(token=response.json()["access_token"])
+        assert token.resource == [SLASHED]
+
+    def test_a_foreign_value_is_still_refused(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        from oauth2_provider.models import Grant
+
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [SLASHED])
+        response = _exchange(client, code, verifier, ["https://testserver/mcp"])
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "invalid_target"
+        assert Grant.objects.filter(code=code).exists()
+
+    def test_a_grant_for_another_resource_is_not_matched(
+        self, client, mcp_app, mcp_user, gate_posture
+    ):
+        """A grant whose stored value names something else (a pre-B9 row)
+        is not rewritten into a match: DOT still refuses the exchange."""
+        from oauth2_provider.models import Grant
+
+        code, verifier = _legacy_grant(
+            mcp_app, mcp_user, ["https://somewhere.example/api"]
+        )
+        response = _exchange(client, code, verifier, [SLASHED])
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        # DOT's own answer (it labels its JSON body `text/html`).
+        body = json.loads(response.content)
+        assert body["error"] == "invalid_target"
+        assert "cannot escalate" in body["error_description"]
+        assert Grant.objects.filter(code=code).exists()
+
+    @pytest.mark.parametrize("at_refresh", [SLASHLESS, SLASHED])
+    def test_a_refresh_token_stored_before_the_rewrite(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, at_refresh
+    ):
+        """DOT compares a refresh request's `resource` with the refresh
+        token's as a string too (the suite's `REFRESH_TOKEN_EXPIRE_SECONDS=0`
+        leaves refresh usable on DOT 3.4)."""
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import RefreshToken
+
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [SLASHED])
+        issued = _exchange(client, code, verifier, [SLASHED]).json()
+        RefreshToken.objects.filter(user=mcp_user).update(resource=[SLASHED])
+        response = client.post(
+            reverse("token"),
+            data=urlencode(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": issued["refresh_token"],
+                    "client_id": "mcp-sql",
+                    "resource": at_refresh,
+                }
+            ),
+            content_type="application/x-www-form-urlencoded",
+        )
+        assert response.status_code == HTTPStatus.OK, response.content
+        access_token = response.json()["access_token"]
+        assert AccessToken.objects.get(token=access_token).resource == [SLASHED]
+        assert _ping(client, access_token, "/mcp/sql").status_code == HTTPStatus.OK
 
 
 @pytest.mark.django_db
@@ -722,7 +1020,7 @@ class TestForeignResourceIsRefusedAtAuthorize:
         _assert_invalid_target_redirect(_consent(client, query, SLASHED))
         assert _grant_count() == 0
 
-    @pytest.mark.parametrize("form_resource", ["", SLASHLESS])
+    @pytest.mark.parametrize("form_resource", ["", f"{SLASHED} {SLASHED}"])
     def test_consent_post_query_and_form_must_agree(
         self, client, mcp_app, mcp_user, gate_posture, form_resource
     ):
@@ -730,7 +1028,10 @@ class TestForeignResourceIsRefusedAtAuthorize:
         let oauthlib's string reading reach the grant: a 500 (ledger F55)
         even for the advertised value. A browser posts the page's own query
         back, so the two always agree; when they do not, `invalid_target`.
-        Below 3.4 the form has no field and DOT ignores both."""
+        Both sides are compared after the canonical rewrite, so another
+        spelling of the same values agrees (below); a different number of
+        values does not. Below 3.4 the form has no field and DOT ignores
+        both."""
         _, challenge = _pkce()
         query = urlencode(_authorize_params(challenge, [SLASHED]))
         client.force_login(mcp_user)
@@ -740,6 +1041,21 @@ class TestForeignResourceIsRefusedAtAuthorize:
             assert _grant_count() == 0
         else:
             assert _code_from(response)
+
+    @pytest.mark.parametrize(
+        "form_resource", [SLASHLESS, "https://TESTSERVER:443/mcp/sql/"]
+    )
+    def test_consent_post_query_and_form_in_two_spellings_agree(
+        self, client, mcp_app, mcp_user, gate_posture, form_resource
+    ):
+        from oauth2_provider.models import Grant
+
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED]))
+        client.force_login(mcp_user)
+        code = _code_from(_consent(client, query, form_resource))
+        if _dot_stores_resource():
+            assert Grant.objects.get(code=code).resource == [CANONICAL]
 
     def test_cancel_with_a_foreign_resource_is_invalid_target(
         self, client, mcp_app, mcp_user, gate_posture
@@ -843,7 +1159,7 @@ class TestForeignResourceIsRefusedAtToken:
         assert response.status_code == HTTPStatus.OK, response.content
         access_token = response.json()["access_token"]
         if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == [resource]
+            assert AccessToken.objects.get(token=access_token).resource == [CANONICAL]
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
 
@@ -925,6 +1241,43 @@ class TestBearerAudienceCheck:
         token = self._token(mcp_user, mcp_app, [resource])
         response = _ping(client, token.token)
         assert response.status_code == HTTPStatus.OK, response.content
+
+    @pytest.mark.parametrize("transport", ["/mcp/sql", "/mcp/sql/"])
+    def test_the_canonical_spelling_passes_on_both_transports(  # noqa: PLR0913 — fixtures + parameter
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, transport
+    ):
+        """The spelling every token is now bound to passes DOT's default
+        validator on both transport spellings (as the slashed one does)."""
+        for resource in (CANONICAL, SLASHED):
+            token = self._token(mcp_user, mcp_app, [resource])
+            response = _ping(client, token.token, transport)
+            assert response.status_code == HTTPStatus.OK, (resource, response.content)
+
+    @pytest.mark.parametrize("transport", ["/mcp/sql", "/mcp/sql/"])
+    def test_why_slash_less_a_string_prefix_validator(  # noqa: PLR0913 — fixtures + two parameters
+        self,
+        client,
+        settings,
+        mcp_app,
+        mcp_user,
+        mcp_active_session,
+        gate_posture,
+        transport,
+    ):
+        """Under a `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares
+        raw strings by prefix, the slash-less spelling still passes on both
+        transports; the slashed one would fail on `/mcp/sql`."""
+        settings.OAUTH2_PROVIDER = {
+            **settings.OAUTH2_PROVIDER,
+            "RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR": (
+                "mcp_sql.tests.test_resource_audience.string_prefix_validator"
+            ),
+        }
+        token = self._token(mcp_user, mcp_app, [CANONICAL])
+        assert _ping(client, token.token, transport).status_code == HTTPStatus.OK
+        token = self._token(mcp_user, mcp_app, [SLASHED])
+        expected = HTTPStatus.OK if transport.endswith("/") else 401
+        assert _ping(client, token.token, transport).status_code == expected
 
     def test_debug_on_uses_the_request_scheme(  # noqa: PLR0913 — fixtures, all load-bearing
         self, client, settings, mcp_app, mcp_user, mcp_active_session, gate_posture
@@ -1063,6 +1416,69 @@ def test_non_ascii_that_lowercases_to_the_host_is_foreign(settings, rf, value):
     request = rf.get("/", HTTP_HOST="kelvin.example")
     assert foreign_resource(request, ["https://KELVIN.example/mcp/sql/"]) is None
     assert foreign_resource(request, [value]) == value
+
+
+@pytest.mark.parametrize("host", ["testserver", *NON_CANONICAL_HOSTS])
+def test_canonical_resources(rf, host):
+    """Every accepted spelling becomes the one canonical string; every
+    foreign value comes back exactly as it was (still foreign), in order."""
+    from mcp_sql.audience import canonical_resource_url
+    from mcp_sql.audience import canonical_resources
+    from mcp_sql.audience import foreign_resource
+
+    request = rf.get("/", HTTP_HOST=host)
+    assert canonical_resource_url(request) == CANONICAL
+    accepted = [SLASHED, SLASHLESS, *EQUIVALENT]
+    assert canonical_resources(request, accepted) == [CANONICAL] * len(accepted)
+    assert canonical_resources(request, FOREIGN) == FOREIGN
+    mixed = [FOREIGN[0], SLASHED, FOREIGN[1], "https://TESTSERVER/mcp/sql"]
+    rewritten = canonical_resources(request, mixed)
+    assert rewritten == [FOREIGN[0], CANONICAL, FOREIGN[1], CANONICAL]
+    assert foreign_resource(request, rewritten) == FOREIGN[0]
+    assert canonical_resources(request, []) == []
+
+
+def test_canonical_resources_on_an_unparseable_host_port(rf):
+    """A request whose own Host carries a port the package does not take
+    accepts nothing, so nothing is rewritten."""
+    from mcp_sql.audience import canonical_resources
+
+    host = "testserver:99999"
+    request = rf.get("/", HTTP_HOST=host)
+    values = [f"https://{host}/mcp/sql/", SLASHED]
+    assert canonical_resources(request, values) == values
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        (SLASHED, SLASHLESS, True),
+        ("https://TESTSERVER:443/mcp/sql/", SLASHLESS, True),
+        ("HTTPS://testserver:0443/mcp/sql", SLASHED, True),
+        ("https://other.example/mcp/sql/", "https://OTHER.example:443/mcp/sql", True),
+        (SLASHED, "https://testserver/mcp/sql//", False),
+        (SLASHED, "https://testserver/MCP/SQL/", False),
+        (SLASHED, "http://testserver/mcp/sql/", False),
+        (SLASHED, "https://testserver:8443/mcp/sql/", False),
+        (SLASHED, "https://testserver/mcp/sql/?x=1", False),
+        (SLASHED, "https://user@testserver/mcp/sql/", False),
+        (SLASHED, "https://testserver/mcp", False),
+        (SLASHED, "https://testserver:99999/mcp/sql/", False),
+        (
+            "https://testserver:99999/mcp/sql/",
+            "https://testserver:99999/mcp/sql/",
+            False,
+        ),
+        ("https://\u212aelvin.example/", "https://kelvin.example/", False),
+        ("not a uri", "NOT A URI", False),
+        ("", "", False),
+    ],
+)
+def test_same_resource(first, second, same):
+    from mcp_sql.audience import same_resource
+
+    assert same_resource(first, second) is same
+    assert same_resource(second, first) is same
 
 
 @pytest.mark.parametrize(

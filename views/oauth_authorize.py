@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from django.core.exceptions import PermissionDenied
+from mcp_sql.audience import canonical_resources
 from mcp_sql.audience import foreign_resource
 from mcp_sql.audience import invalid_target_error
 from mcp_sql.conf import ResolutionOutcome
@@ -307,6 +308,7 @@ class MCPAuthorizationView(AuthorizationView):
         query = request.GET.copy()
         query["approval_prompt"] = "force"  # replaces every value, if repeated
         request.GET = query
+        self._use_canonical_resource(request)
         # A NUL never names a client. On the GET, DOT hands it to Postgres in
         # its client lookup (`validate_authorization_request`), which raises
         # `DataError`: a 500 on every retry. Refuse it here with the
@@ -329,6 +331,43 @@ class MCPAuthorizationView(AuthorizationView):
         # LoginRequiredMixin redirect to the login URL; allauth handles
         # the login + MFA flow there and brings the user back here.
         return super().dispatch(request, *args, **kwargs)
+
+    @staticmethod
+    def _use_canonical_resource(request: Any) -> None:
+        """Rewrite every accepted RFC 8707 `resource` to the one spelling the
+        package stores, `audience.canonical_resource_url`, wherever DOT
+        reads it here; a foreign value is left as it is, for the checks to
+        refuse (`audience.canonical_resources`).
+
+        DOT (3.4+) takes the grant's `resource` from `request.GET` on the
+        GET (the consent page's hidden field, and the skip-authorization
+        path) and from that hidden field on the consent POST — one
+        whitespace-joined value, rewritten item by item. oauthlib also
+        parses the raw query string, but the form's value replaces what it
+        read before anything is stored, and a blank field beside a query
+        `resource` is refused (`form_valid`), so the raw query string is
+        left alone. `form_valid`'s "the two must agree" check compares the
+        rewritten values on both sides, so the page's own POST (the query
+        string in the client's spelling, the field in the canonical one)
+        agrees. The token step stores and compares the same string
+        (`MCPTokenView`), so a client may spell the resource differently at
+        the two steps.
+        """
+        if "resource" in request.GET:
+            query = request.GET.copy()
+            query.setlist(
+                "resource", canonical_resources(request, query.getlist("resource"))
+            )
+            request.GET = query
+        if "resource" in request.POST:
+            fields = []
+            for field in request.POST.getlist("resource"):
+                items = field.split()
+                rewritten = canonical_resources(request, items)
+                fields.append(" ".join(rewritten) if rewritten != items else field)
+            form = request.POST.copy()
+            form.setlist("resource", fields)
+            request.POST = form
 
     @staticmethod
     def _enforce_gate(user: "AbstractBaseUser") -> None:

@@ -1,9 +1,11 @@
 """DOT's `TokenView` plus the RFC 8707 `resource` check at `/o/token/`.
-See `audience.py` for why a `resource` must name this server's MCP endpoint."""
+See `audience.py` for why a `resource` must name this server's MCP endpoint,
+and why every accepted one is rewritten to one spelling."""
 
 from typing import Any
 
 from django.http import HttpResponse
+from mcp_sql.audience import canonical_resources
 from mcp_sql.audience import foreign_resource
 from mcp_sql.audience import invalid_target_error
 from oauth2_provider.oauth2_backends import OAuthLibCore
@@ -20,6 +22,20 @@ def _error_response(error: errors.OAuth2Error) -> HttpResponse:
     response["Cache-Control"] = "no-store"
     response["Pragma"] = "no-cache"
     return response
+
+
+def _use_canonical_resource(request: Any) -> None:
+    """Rewrite every `resource` in this token request's form body — the
+    body DOT parses is `request.POST` (`OAuthLibCore.extract_body`) — to
+    `audience.canonical_resource_url` (`canonical_resources`; the caller has
+    refused a foreign one already). A `resource` in the query string is not
+    rewritten: oauthlib's token endpoint refuses every POST that carries a
+    query string (`invalid_request`, "URL query parameters are not
+    allowed") before it reads one."""
+    if "resource" in request.POST:
+        body = request.POST.copy()
+        body.setlist("resource", canonical_resources(request, body.getlist("resource")))
+        request.POST = body
 
 
 class MCPTokenView(TokenView):
@@ -56,12 +72,20 @@ class MCPTokenView(TokenView):
         DOT version (below 3.4 `resource` is otherwise ignored), so the
         authorization code is not consumed and the client can retry.
 
-        The check accepts any equivalent spelling (`foreign_resource`); when
-        the grant carries a `resource` (DOT 3.4+), DOT then also requires each
-        value to be one of the grant's, as a string, and answers its own
-        `invalid_target` (naming the value) otherwise.
+        The check accepts any equivalent spelling (`foreign_resource`), and
+        every accepted value is then rewritten to the one spelling the
+        authorization step stored on the grant
+        (`audience.canonical_resource_url`) before DOT reads it: when the
+        grant carries a `resource` (DOT 3.4+), DOT requires each value to be
+        one of the grant's, as a string, so a client that sends another
+        spelling here than at `/o/authorize/` (Cursor) was refused with
+        DOT's own `invalid_target`. A grant stored before that rewrite under
+        another spelling is matched by the validator
+        (`audience.use_granted_spelling`). With a resource-less grant the
+        token is bound to the same canonical string.
         """
         resources = request.GET.getlist("resource") + request.POST.getlist("resource")
         if foreign_resource(request, resources) is not None:
             return _error_response(invalid_target_error(request))
+        _use_canonical_resource(request)
         return super().post(request, *args, **kwargs)

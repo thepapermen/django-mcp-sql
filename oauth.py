@@ -6,6 +6,7 @@
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
+from mcp_sql.audience import use_granted_spelling
 from mcp_sql.clients import DeclaredClient
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application
@@ -198,6 +199,20 @@ class MCPOAuth2Validator(OAuth2Validator):
         return super().validate_scopes(
             client_id, scopes, client, request, *args, **kwargs
         )
+
+    def save_bearer_token(self, token, request, *args, **kwargs):
+        """DOT's, after putting the token request's `resource` in the
+        grant's (or refresh token's) own spelling when it is another
+        spelling of it (`audience.use_granted_spelling`).
+
+        `MCPTokenView` sends DOT one canonical spelling, and grants issued
+        since store that same string; one stored before under another
+        accepted spelling (the slashed one, an uppercase host) would
+        otherwise fail DOT's (3.4+) string comparison in
+        `_check_and_set_request_resource`, which this method runs first.
+        """
+        use_granted_spelling(request)
+        return super().save_bearer_token(token, request, *args, **kwargs)
 
     def validate_code_challenge_method(self, request, code_challenge_method):
         """Accept only `S256`; reject `plain` (and any other method).

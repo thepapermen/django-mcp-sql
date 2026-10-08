@@ -44,9 +44,16 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   builds `resource`. Build any new OAuth absolute URL with
   `consts.absolute_url`; never verify the bearer with DOT's stock core, and
   keep `MCPTokenView` on DOT's form-body `OAuthLibCore` (a JSON backend
-  would parse a `resource` the check never read). Equivalence is per step:
-  when the grant carries a `resource`, DOT's token step compares the
-  token request's with it as a string.
+  would parse a `resource` the check never read). Every accepted value is
+  rewritten to ONE spelling, `audience.canonical_resource_url` (the
+  advertised URL without its trailing slash), before DOT reads it — at
+  `/o/authorize/` (`request.GET` and the consent form's field) and in
+  `/o/token/`'s form body — because DOT's token step compares the token
+  request's `resource` with the grant's as a string (Cursor sends one
+  spelling to each step); `MCPOAuth2Validator.save_bearer_token` matches a
+  grant / refresh token stored before that in another accepted spelling
+  (`audience.use_granted_spelling`). The rewrite touches accepted values
+  only: a foreign one stays foreign.
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over
   the authenticated user). Tools are `async def`, dispatch ORM work via
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is
