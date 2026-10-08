@@ -508,8 +508,9 @@ surgery.
 
 **So are its redirects.** A declared client's callbacks are checked against
 its `CLIENTS` entry on every request, never against the `redirect_uris` stored
-on its row (provisioning still writes them there, for the admin and the audit
-trail, but refreshes them only on `migrate`). Change or remove a rule and
+on its row (provisioning still writes them there, but refreshes them only on
+`migrate`, and nothing reads that copy for a declared client — the audit
+trail's `client_redirect` comes from the entry too). Change or remove a rule and
 redeploy: the new callback is accepted and the old one refused at the next
 `/o/authorize/` request, without a `migrate`. When a request omits
 `redirect_uri`, the default is the entry's callback if it declares exactly one
@@ -656,7 +657,7 @@ The token's RFC 8707 audience does not depend on them: the accepted
    `python manage.py migrate` (a no-op run still fires the receiver). A new
    entry needs its row (DOT's grants and tokens point at one); a changed or
    removed callback on an existing entry does not — it applies at the next
-   request, and `migrate` only refreshes the copy shown in the admin. A slug
+   request, and `migrate` only refreshes the row's unread copy. A slug
    must be short enough for `<prefix><kind>.<slug>` to fit DOT's
    `Application.client_id` column (100 characters on DOT 3.2/3.3, 255 on
    3.4); a longer one refuses to boot.
@@ -741,9 +742,14 @@ the `mcp:sql` check refuses (pinned by
 **Audit.** Every `MCPQueryLog` and `MCPAuthRejectionLog` row carries three
 attribution columns: `application_name` (the client_id), `client_kind` (the
 derived `curated` / `dcr` / `cloud` / `local`), and `client_redirect` — the
-Application's **registered** `redirect_uris`, truncated to the column width.
+callbacks the client may use, truncated to the column width: for a declared
+client the URIs its `CLIENTS` entry declares at request time (what its
+redirects are checked against, not the row's copy, which lags until
+`migrate`), for any other Application its **registered** `redirect_uris`
+(including a declared client removed from `CLIENTS`, whose row is all that
+is left).
 Read `client_redirect` as "one of these", not "this one": DOT does not persist
-which redirect a given authorization used, so the registered set is the
+which redirect a given authorization used, so the allowed set is the
 closest attribution available at request time. `client_kind` is blank when the
 Application classifies as nothing, which is the de-recognised case (DOT
 resolved the token; the client is no longer part of the MCP surface). The

@@ -122,8 +122,10 @@ class DeclaredClient:
     @property
     def redirect_uris(self) -> tuple[str, ...]:
         """Every rule's URI — space-joined onto the `Application` by
-        provisioning, for the admin and the audit trail. Redirect decisions
-        never read that copy (it is refreshed only on `migrate`)."""
+        provisioning, and the same way into the audit trail's
+        `client_redirect` (`consts.identify_application`). Neither redirect
+        decisions nor the audit trail read the row's copy (it is refreshed
+        only on `migrate`)."""
         return tuple(r.uri for r in self.redirects)
 
     @property
@@ -152,10 +154,12 @@ class ClientIdentity:
     `consts.identify_application` (the single construction point, and
     therefore the single place `redirect` is truncated).
 
-    `redirect` is the Application's REGISTERED `redirect_uris` value — the
-    space-joined set the client may use, not the single URI a particular
-    authorization actually delivered to. DOT does not persist the used
-    redirect on `AccessToken`, so the registered set is the strongest
+    `redirect` is the space-joined set of callbacks the client may use — for
+    a recognised settings-declared client the URIs its `CLIENTS` entry
+    declares (what its redirects are checked against), for every other
+    Application its REGISTERED `redirect_uris` — not the single URI a
+    particular authorization actually delivered to. DOT does not persist the
+    used redirect on `AccessToken`, so the allowed set is the strongest
     attribution available at request time.
 
     The empty default is the "no token in hand" case (e.g. the logout-driven

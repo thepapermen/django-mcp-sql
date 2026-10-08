@@ -82,10 +82,13 @@ class MCPQueryLog(models.Model):
     # nothing (a rejection path — DOT resolved the token but the client is no
     # longer part of the MCP surface).
     client_kind = models.CharField(max_length=16, blank=True, default="")
-    # The presenting Application's REGISTERED `redirect_uris` — the
-    # space-joined set of callbacks that client may use, truncated to fit.
+    # The space-joined set of callbacks the presenting client may use,
+    # truncated to fit: for a recognised settings-declared client the URIs its
+    # `CLIENTS` entry declares (what its redirects are checked against), for
+    # any other Application its REGISTERED `redirect_uris`
+    # (`consts.identify_application`).
     # NOT the single URI a given authorization actually delivered to: DOT does
-    # not persist that on `AccessToken`, so the registered set is the closest
+    # not persist that on `AccessToken`, so the allowed set is the closest
     # available attribution. For a one-callback client the distinction is
     # moot; for a multi-callback one, read it as "one of these".
     client_redirect = models.CharField(max_length=1024, blank=True, default="")
@@ -197,8 +200,8 @@ class MCPAuthRejectionLog(models.Model):
     # `MCPQueryLog.client_kind`, so "which clients are generating rejections?"
     # slices the same way on both tables.
     client_kind = models.CharField(max_length=16, blank=True, default="")
-    # The token's Application registered `redirect_uris` at rejection time —
-    # the same attribution (and truncation) as `MCPQueryLog.client_redirect`.
+    # The token's client's callbacks at rejection time — the same
+    # attribution (and truncation) as `MCPQueryLog.client_redirect`.
     # Blank when there is no token in hand (e.g. the SESSION_LOGOUT revocation
     # rows).
     client_redirect = models.CharField(max_length=1024, blank=True, default="")

@@ -744,6 +744,25 @@ class TestValidateRedirectUriOverride:
     @pytest.mark.parametrize(
         "uri",
         [
+            "https://u@chatgpt.com/connector/oauth/",
+            "https://u:p@chatgpt.com/connector/oauth/",
+        ],
+    )
+    def test_userinfo_at_the_prefix_rules_own_path_is_refused(self, settings, uri):
+        """A prefix rule is not an exact callback: only `_redirect_under_prefix`
+        sees its URI, and it refuses any userinfo. DOT's matcher must not be
+        handed it — on DOT 3.2/3.3 that matcher compares the parsed hostname
+        and ignores userinfo, so it would admit this URI sitting exactly at
+        the prefix's own path."""
+        settings.MCP_SQL = _cfg({"chatgpt": CHATGPT})
+        assert (
+            MCPOAuth2Validator().validate_redirect_uri(CHATGPT_ID, uri, request=None)
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
             # DOT's matcher parses the request's port only when the host
             # matches; a port no parser takes is a refusal, not a 500.
             "https://claude.ai:99999/api/mcp/auth_callback",
@@ -1188,39 +1207,80 @@ class TestClientsCommand:
 
 
 class TestClientIdentity:
-    def test_registered_redirect_is_truncated_to_the_column_width(self, db, settings):
+    def test_registered_redirect_is_truncated_to_the_column_width(self, settings):
         # An Application with many registered URIs would otherwise overflow the
         # audit column, raise DataError inside the best-effort writers, and
-        # lose the row entirely.
+        # lose the row entirely. A DCR row: its stored list is what is recorded.
         from mcp_sql.models import MCPAuthRejectionLog
         from mcp_sql.models import MCPQueryLog
-        from oauth2_provider.models import Application
 
         for model in (MCPQueryLog, MCPAuthRejectionLog):
             assert (
                 model._meta.get_field("client_redirect").max_length
                 == REDIRECT_MAX_LENGTH
             )
-        # `update_or_create`: the shipped default clients are provisioned into
-        # the test database by the real `post_migrate` receiver, so this row
-        # already exists.
-        app, _ = Application.objects.update_or_create(
-            client_id=CLAUDE_ID,
-            defaults={
-                "name": CLAUDE_ID,
-                "client_secret": "",
-                "client_type": Application.CLIENT_PUBLIC,
-                "authorization_grant_type": Application.GRANT_AUTHORIZATION_CODE,
-                "redirect_uris": " ".join(
-                    f"https://claude.ai/cb/{i:04d}" for i in range(200)
+        settings.MCP_SQL = _cfg({})
+        identity = identify_application(
+            _row(
+                "mcp-sql-" + "d" * 22,
+                redirect_uris=" ".join(
+                    f"http://127.0.0.1:{4000 + i}/callback" for i in range(200)
                 ),
-                "algorithm": "",
-            },
+            )
         )
-        settings.MCP_SQL = _cfg({"claude": CLAUDE})
-        identity = identify_application(app)
         assert len(identity.redirect) == REDIRECT_MAX_LENGTH
+        assert identity.kind == ClientKind.DCR
+
+    def test_declared_redirects_are_truncated_to_the_column_width(self, settings):
+        # The settings-built set goes through the same truncation.
+        many = _exact(*(f"https://claude.ai/cb/{i:04d}" for i in range(200)))
+        settings.MCP_SQL = _cfg({"claude": many})
+        identity = identify_application(_row(CLAUDE_ID, redirect_uris=CLAUDE_URI))
+        assert len(identity.redirect) == REDIRECT_MAX_LENGTH
+        assert identity.redirect.startswith("https://claude.ai/cb/0000 ")
         assert identity.kind == ClientKind.CLOUD
+
+    def test_declared_redirect_comes_from_settings_not_the_row(self, settings):
+        """The row's `redirect_uris` is refreshed only by `post_migrate`, and
+        nothing decides a declared client's redirects from it. The audit
+        attribution follows what is enforced: the `CLIENTS` entry, every
+        rule's URI in declaration order, space-joined as provisioning joins
+        them."""
+        both = {
+            "REDIRECTS": [
+                *CHATGPT["REDIRECTS"],
+                {"MATCH": "exact", "URI": "https://chatgpt.com/aip/connect/oauth"},
+            ]
+        }
+        settings.MCP_SQL = _cfg({"claude": _exact(NEW_CB), "chatgpt": both})
+        assert identify_application(_row(CLAUDE_ID, redirect_uris=OLD_CB)).redirect == (
+            NEW_CB
+        )
+        assert (
+            identify_application(_row(CHATGPT_ID, redirect_uris="stale")).redirect
+            == f"{CHATGPT_PREFIX} https://chatgpt.com/aip/connect/oauth"
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "client_id"),
+        [
+            pytest.param(CLAUDE_ID, CLAUDE_ID, id="removed-from-settings"),
+            pytest.param(CLAUDE_ID, "rogue-client-id", id="client-id-mismatch"),
+            pytest.param("mcp-sql", "mcp-sql", id="curated"),
+        ],
+    )
+    def test_any_other_row_records_its_stored_redirects(
+        self, settings, name, client_id
+    ):
+        # Only a RECOGNISED declared client reads settings: a declared name
+        # under another client_id is not that client, and a removed entry has
+        # nothing left in settings to read.
+        clients = {} if client_id == CLAUDE_ID else {"claude": _exact(NEW_CB)}
+        settings.MCP_SQL = _cfg(clients)
+        identity = identify_application(
+            _row(name, client_id=client_id, redirect_uris=OLD_CB)
+        )
+        assert identity.redirect == OLD_CB
 
     def test_no_application_yields_the_blank_identity(self):
         # The "no token in hand" case (e.g. the logout-driven revocation rows),
@@ -1258,6 +1318,27 @@ class TestAuthRejectionAttribution:
         # De-recognised, so it classifies as nothing — recorded honestly rather
         # than back-filled with the kind it used to have.
         assert row.client_kind == ""
+
+    def test_changed_callback_is_attributed_without_migrate(
+        self, db, settings, mcp_user
+    ):
+        """A callback changed in settings is enforced at once; the audit row
+        names it at once too, not the row's copy left by the last `migrate`."""
+        from mcp_sql.models import MCPAuthRejectionLog
+        from oauth2_provider.models import Application
+
+        _provision(settings, {"claude": _exact(OLD_CB)})
+        token = _declared_token(mcp_user, CLAUDE_ID)
+        token.scope = "read"
+        token.save(update_fields=["scope"])
+        settings.MCP_SQL = _cfg({"claude": _exact(NEW_CB)})  # no re-provision
+        assert Application.objects.get(client_id=CLAUDE_ID).redirect_uris == OLD_CB
+        with pytest.raises(exceptions.AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.BAD_SCOPE
+        assert row.client_kind == ClientKind.CLOUD
+        assert row.client_redirect == NEW_CB
 
     @pytest.mark.parametrize(
         "name",

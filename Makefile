@@ -74,7 +74,7 @@ test-install: ## Build the wheel, install into a fresh venv, run import smoke (e
 	echo "--- Import smoke (Django-independent modules only) ---"; \
 	$$VENV_PY -c 'import mcp_sql, importlib.metadata as m; assert m.version("django-mcp-sql") == mcp_sql.__version__, (m.version("django-mcp-sql"), mcp_sql.__version__)'; \
 	$$VENV_PY -c 'from mcp_sql.conf import mcp_sql_settings, DEFAULTS, IMPORT_STRINGS'; \
-	$$VENV_PY -c 'from mcp_sql.consts import is_mcp_application_name'; \
+	$$VENV_PY -c 'from mcp_sql.consts import is_mcp_application'; \
 	$$VENV_PY -c 'from mcp_sql.schemas import OutcomeReason, QueryResult, HINTS, AuthRejectionReason'; \
 	$$VENV_PY -c 'from mcp_sql.validation import validate_mcp_sql_settings, McpSqlSettings, McpSqlLimits'; \
 	$$VENV_PY -c 'from mcp_sql.parser import parse_and_validate, inject_limit, extract_limit, QueryRejectedError'; \

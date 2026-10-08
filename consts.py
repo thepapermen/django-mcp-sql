@@ -221,7 +221,7 @@ def identify_application(application: Any) -> ClientIdentity:
     """Package an `Application` into the `ClientIdentity` carried on audit rows.
 
     The single construction point — and therefore the single place the
-    registered redirect list is truncated to the audit column's width. A
+    redirect list is truncated to the audit column's width. A
     `None` application (no token in hand, e.g. logout-driven revocation)
     yields the blank identity, matching the models' blank defaults.
 
@@ -230,12 +230,31 @@ def identify_application(application: Any) -> ClientIdentity:
     (or is no longer) part of the MCP surface. That is a rejection path, and
     recording it blank is the honest answer — "we don't recognise this
     client" — rather than inventing a kind for it.
+
+    The redirect set follows what decides the client's redirects. For a
+    recognised settings-declared client that is its `CLIENTS` entry
+    (`oauth._declared_redirect_allowed` never reads the row), joined the way
+    provisioning joins it — not the row's `redirect_uris`, which is
+    refreshed only by `post_migrate` and so would name a callback changed in
+    settings until the next `migrate`. Every other row (curated, DCR, and a
+    declared client no longer in settings, whose entry is gone) records the
+    row's stored value: for the first two it is what DOT matches; for the
+    last it is the only record left.
     """
     if application is None:
         return ClientIdentity()
     kind = classify_application(application)
+    declared = (
+        mcp_sql_settings.clients().get(application.name)
+        if kind in (ClientKind.CLOUD, ClientKind.LOCAL)
+        else None
+    )
     return ClientIdentity.build(
         name=application.name,
         kind=kind.value if kind is not None else "",
-        redirect_uris=application.redirect_uris,
+        redirect_uris=(
+            " ".join(declared.redirect_uris)
+            if declared is not None
+            else application.redirect_uris
+        ),
     )
