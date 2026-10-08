@@ -408,37 +408,55 @@ the package (importable consumers find them under `mcp_sql/docs/`):
 
 ## Compatibility
 
-- **Python**: 3.11–3.13
-- **Postgres**: 14+ recommended (uses `pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW` — all of which work on earlier versions, but the test matrix runs on 14+).
+- **Python**: 3.11–3.14 (which ones depends on the Django line — see the table below)
+- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
 
 ### Supported combinations
 
 The package's own surface is Django-version-agnostic; the version coupling
-comes entirely from **DRF**, which gained each Django line in a later release.
-Support is therefore a **staircase** — a higher Django needs a higher minimum
-DRF:
+comes from **DRF**, which gained each Django line in a later release, plus
+Django's own PostgreSQL floor. Support is therefore a **staircase** — a higher
+Django needs a higher minimum DRF:
 
-| Django  | Python      | DRF (supported) | django-oauth-toolkit |
-|---------|-------------|-----------------|----------------------|
-| 4.2 LTS | 3.11, 3.12  | 3.14 – 3.17     | 3.4.1+               |
-| 5.2 LTS | 3.11 – 3.13 | 3.15 – 3.17     | 3.4.1+               |
-| 6.0     | 3.12, 3.13  | 3.17            | 3.4.1+               |
+| Django  | Python      | PostgreSQL | DRF (supported) | django-oauth-toolkit |
+|---------|-------------|------------|-----------------|----------------------|
+| 4.2 LTS | 3.11, 3.12  | 14+        | 3.14 – 3.17     | 3.4.1+               |
+| 5.2 LTS | 3.11 – 3.13 | 14+        | 3.15 – 3.18     | 3.4.1+               |
+| 6.0     | 3.12 – 3.14 | 14+        | 3.17 – 3.18     | 3.4.1+               |
+| 6.1     | 3.12 – 3.14 | 15+        | 3.18            | 3.4.1+               |
 
 - The DRF floor is **3.14** — the lowest we support, i.e. what a legacy
   Django 4.2 app is likely already pinning. Each Django line has its own DRF
-  minimum (5.x from 3.15, 6.0 from 3.17). A fresh `pip install` always
-  resolves the **newest** in-range DRF (3.17) for whatever Django you run; the
-  older DRF columns matter only when adopting the package into an app that
-  already pins one.
-- **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13** — hence
-  the ragged Python columns.
+  minimum (5.x from 3.15, 6.0 from 3.17, 6.1 from 3.18). A fresh `pip
+  install` always resolves the **newest** DRF your Django allows (3.18 on
+  5.2+; 3.17 on 4.2, since DRF 3.18 requires Django ≥ 5.2); the older DRF
+  columns matter only when adopting the package into an app that already pins
+  one.
+- **Django 6.1 needs DRF ≥ 3.18, and pip will not enforce it.** DRF ≤ 3.17
+  fails to import on Django 6.1 (`rest_framework.views` imports
+  `django.utils.cache.cc_delim_re`, which 6.1 removed), yet declares
+  `django>=4.2` with no upper cap — so upgrading Django to 6.1 under an
+  existing DRF ≤ 3.17 pin installs cleanly and then fails with an
+  `ImportError` as soon as the URLconf loads (e.g. `manage.py check`). This
+  package can't declare it either: a DRF floor that depends on the Django
+  version isn't expressible in package metadata, and a flat `>=3.18` floor
+  would drop Django 4.2. Upgrade DRF together with Django.
+- **Django 6.1 requires PostgreSQL 15+**: it refuses to connect to 14
+  (`NotSupportedError`). Django 4.2–6.0 run on 14+.
+- **Django 6.0 drops Python 3.11**; **Django 4.2 has no Python 3.13**; Python
+  3.14 is tested on Django 6.0 and 6.1 only — hence the ragged Python columns.
+- **Django 4.2 is end-of-life upstream.** Its last release, 4.2.30, shipped on
+  2026-04-07; security fixes published since then ship only for Django 5.2
+  and later. The package keeps supporting 4.2 for apps that can't move yet,
+  but running it is a risk you carry — plan the upgrade.
 - `django-oauth-toolkit`, `oauthlib`, `mcp`, `sqlglot`, `a2wsgi`, and
   `pydantic` are not Django-version-coupled within their declared ranges.
   django-oauth-toolkit is floored at **3.4.1** on every row: earlier releases
   have an unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed
   in 3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
-  §2.1). `oauthlib` (3.3.0+, below 5) is declared directly because the
-  package builds its OAuth server from oauthlib's classes.
+  §2.1). No DOT release declares Django 6.1 yet; the suite passes on 6.1
+  with DOT 3.4.1. `oauthlib` (3.3.0+, below 5) is declared directly because
+  the package builds its OAuth server from oauthlib's classes.
 
 ### Dropping into an existing app with an older pinned DRF
 
@@ -460,7 +478,8 @@ The `allauth` extra (`django-mcp-sql[allauth]`) wires the TOTP gate to
 
 The standalone suite (`make test`, settings in `tests/settings.py`) runs in CI
 (`.github/workflows/ci.yml`) across every row above, plus pinned floor legs and
-the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14.
+the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14 (Django ≤ 6.0),
+15 (Django 6.1, plus one 6.0 leg) and 16 (one 6.0 leg).
 
 ## Postgres role setup
 
