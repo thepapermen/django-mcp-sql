@@ -7,7 +7,7 @@ a same-named relation in another schema whenever the role held SELECT on it
 (an accidental `GRANT SELECT ON ALL TABLES IN SCHEMA analytics`), and the
 drift check, which listed `public` only, never reported that grant. An
 unqualified name resolves through the login's `search_path` (`"$user"`,
-database / role settings, a temporary table first) unless
+database / role settings, a temporary relation first) unless
 `MCP_SQL["PIN_SEARCH_PATH"]` is on (round 21: opt-in, default off), when
 the read transaction pins it to `public, pg_temp`. The qualified-name
 refusal and the every-schema drift inventory hold in both modes.
@@ -220,8 +220,11 @@ class TestDriftSeesEverySchema:
         assert _SHADOWED in granted
 
     def test_the_inventory_skips_temporary_relations(self):
-        # A grant on a temporary table (schema `pg_temp_<n>`) is not drift:
-        # the relation ends with the session that made it.
+        # A grant on a temporary relation (schema `pg_temp_<n>`) is not
+        # drift: the relation ends with the backend that made it — which,
+        # under transaction-mode pooling, can outlive the client session, so
+        # with the pin off it can shadow a whitelisted name unreported
+        # (docs/architecture.md "`search_path` is pinned only on request").
         with connection.cursor() as cur:
             cur.execute("CREATE TEMP TABLE mcp_sql_a17_tmp (id int)")
             cur.execute(f"GRANT SELECT ON pg_temp.mcp_sql_a17_tmp TO {_ROLE}")
@@ -267,6 +270,68 @@ class TestDriftSeesEverySchema:
         granted = grants.granted_tables(_ROLE)
         assert _PUBLIC in granted
         assert _SHADOWED not in granted
+
+
+_PLANTER = "mcp_sql_a23_planter"
+
+
+class TestUnpinnedShadowPlantedWithoutRights:
+    """Review round 23 — a characterisation of the default (`PIN_SEARCH_PATH`
+    off), not a guard: what docs/architecture.md "`search_path` is pinned
+    only on request" says it exposes. A role holding nothing but `CREATE` on
+    the database (no right on the whitelisted table) creates a schema named
+    after the profile role — `"$user"` under `SET ROLE` — with a same-named
+    table, and grants it to `PUBLIC`. Unpinned, the agent's unqualified name
+    reads the planted rows, a column only the planted table has included;
+    pinned, the relation in `public`. The drift check reports nothing: its
+    inventory does not see grants to `PUBLIC`."""
+
+    @pytest.fixture(autouse=True)
+    def _planted(self, settings, monkeypatch):
+        settings.MCP_SQL = {**settings.MCP_SQL, "DB_ALIAS": "default"}
+        for target in ("mcp_sql.executor", "mcp_sql.grants"):
+            monkeypatch.setattr(
+                f"{target}.declared_tables", lambda _profile: {"x.T": _TABLE}
+            )
+        monkeypatch.setattr("mcp_sql.grants._verify_view_parity", lambda _profile: None)
+        # Everything below, the role and the database grant included, rolls
+        # back with the test.
+        with connection.cursor() as cur:
+            cur.execute(f"CREATE TABLE public.{_TABLE} (id int, name text)")
+            cur.execute("INSERT INTO public.mcp_sql_a16_t VALUES (1, 'public')")
+            cur.execute(f"GRANT SELECT ON public.{_TABLE} TO {_ROLE}")
+            cur.execute(f"CREATE ROLE {_PLANTER} NOLOGIN")
+            cur.execute("SELECT current_database()")
+            database = grants.quote_ident(cur.fetchone()[0])
+            cur.execute(f"GRANT CREATE ON DATABASE {database} TO {_PLANTER}")
+            cur.execute(f"SET LOCAL ROLE {_PLANTER}")
+            cur.execute(f"CREATE SCHEMA {_ROLE}")
+            cur.execute(f"CREATE TABLE {_ROLE}.{_TABLE} (id int, name text, note text)")
+            cur.execute(f"INSERT INTO {_ROLE}.{_TABLE} VALUES (1, 'planted', 'extra')")  # noqa: S608
+            cur.execute(f"GRANT USAGE ON SCHEMA {_ROLE} TO PUBLIC")
+            cur.execute(f"GRANT SELECT ON {_ROLE}.{_TABLE} TO PUBLIC")
+            cur.execute("RESET ROLE")
+            cur.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')",
+                [_PLANTER, f"public.{_TABLE}"],
+            )
+            assert cur.fetchone() == (False,)
+
+    def test_the_default_reads_the_planted_rows_and_drift_is_clean(self, settings):
+        assert "PIN_SEARCH_PATH" not in settings.MCP_SQL  # the shipped default
+        result = _run("SELECT name FROM mcp_sql_a16_t")
+        assert result.rows == [["planted"]], (result.rejection_reason, result.error)
+        # Column names are not checked against the model.
+        result = _run("SELECT note FROM mcp_sql_a16_t")
+        assert result.rows == [["extra"]], (result.rejection_reason, result.error)
+
+        drift = grants._reconcile_profile(_DEFAULT_PROFILE, strict=True, apply=False)
+        assert (drift.granted, drift.revoked, drift.changed) == ([], [], False)
+        assert (_ROLE, _TABLE) not in grants.granted_tables(_ROLE)
+
+        settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": True}
+        result = _run("SELECT name FROM mcp_sql_a16_t")
+        assert result.rows == [["public"]], (result.rejection_reason, result.error)
 
 
 @pytest.mark.usefixtures("shadowed")
