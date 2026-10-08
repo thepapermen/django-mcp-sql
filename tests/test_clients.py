@@ -30,9 +30,10 @@ from mcp_sql.clients import RedirectRule
 from mcp_sql.clients import derive_kind
 from mcp_sql.clients import redirect_rules
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import classify_application
 from mcp_sql.consts import classify_application_name
 from mcp_sql.consts import identify_application
-from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.consts import is_mcp_application
 from mcp_sql.oauth import MCPOAuth2Validator
 from mcp_sql.oauth import _redirect_under_prefix
 from mcp_sql.schemas import AuthRejectionReason
@@ -80,6 +81,18 @@ def _provision(settings, clients):
     `two_profiles` fixture drives `provision_mcp_profiles`)."""
     settings.MCP_SQL = _cfg(clients)
     provision_mcp_clients(sender=django_apps.get_app_config("mcp_sql"))
+
+
+def _row(name, client_id=None, redirect_uris=""):
+    """An Application stand-in carrying what recognition and attribution
+    read; `client_id` defaults to the name, as provisioning writes it."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name=name,
+        client_id=name if client_id is None else client_id,
+        redirect_uris=redirect_uris,
+    )
 
 
 def _bearer_request(token: str):
@@ -294,6 +307,48 @@ class TestClientValidation:
         with pytest.raises(ImproperlyConfigured, match="mixes https and loopback"):
             validate_mcp_sql_settings(_cfg(mixed))
 
+    @staticmethod
+    def _max_slug(prefix="mcp-sql-"):
+        from oauth2_provider.models import get_application_model
+
+        meta = get_application_model()._meta
+        width = min(
+            meta.get_field("client_id").max_length, meta.get_field("name").max_length
+        )
+        return width - len(f"{prefix}cloud.")
+
+    def test_slug_at_the_column_limit_is_accepted(self):
+        slug = "a" * self._max_slug()
+        validate_mcp_sql_settings(_cfg({slug: CLAUDE}))  # no raise
+        validate_mcp_sql_settings(_cfg({slug: CURSOR_DESKTOP}))  # no raise
+
+    @pytest.mark.parametrize("entry", [CLAUDE, CURSOR_DESKTOP], ids=["cloud", "local"])
+    def test_slug_overflowing_the_client_id_column_is_refused_at_boot(self, entry):
+        """A derived client_id longer than DOT's `Application.client_id`
+        (255 on DOT 3.4) or `name` (255) used to pass boot and
+        fail `migrate` with a DataError in `provision_mcp_clients`."""
+        slug = "a" * (self._max_slug() + 1)
+        with pytest.raises(ImproperlyConfigured, match="at most"):
+            validate_mcp_sql_settings(_cfg({slug: entry}))
+
+    def test_limit_accounts_for_the_prefix(self):
+        prefix = "a-much-longer-application-prefix-"
+        slug = "a" * (self._max_slug(prefix) + 1)
+        validate_mcp_sql_settings(_cfg({slug: CLAUDE}))  # fits the default prefix
+        with pytest.raises(ImproperlyConfigured, match="at most"):
+            validate_mcp_sql_settings(
+                {**_cfg({slug: CLAUDE}), "APPLICATION_NAME_PREFIX": prefix}
+            )
+
+    def test_the_largest_accepted_slug_really_provisions(self, db, settings):
+        from oauth2_provider.models import Application
+
+        slug = "a" * self._max_slug()
+        validate_mcp_sql_settings(_cfg({slug: CLAUDE}))
+        _provision(settings, {slug: CLAUDE})
+        app = Application.objects.get(client_id=f"mcp-sql-cloud.{slug}")
+        assert app.name == app.client_id
+
     def test_removed_cloud_clients_key_is_a_loud_error(self):
         # Silently ignoring the old key would empty CLIENTS, de-recognise the
         # consumer's declared clients, and start rejecting their live tokens at
@@ -427,10 +482,10 @@ class TestClientDerivation:
 class TestRecognition:
     def test_recognised_only_while_in_settings(self, settings):
         settings.MCP_SQL = _cfg({"claude": CLAUDE})
-        assert is_mcp_application_name(CLAUDE_ID) is True
+        assert is_mcp_application(_row(CLAUDE_ID)) is True
         # Fail-closed: removing the entry de-recognises it at the next read.
         settings.MCP_SQL = _cfg({})
-        assert is_mcp_application_name(CLAUDE_ID) is False
+        assert is_mcp_application(_row(CLAUDE_ID)) is False
 
     def test_classification_covers_every_kind(self, settings):
         settings.MCP_SQL = _cfg({"claude": CLAUDE, "cursor-desktop": CURSOR_DESKTOP})
@@ -444,8 +499,26 @@ class TestRecognition:
         # The '.' after the kind means the suffix can never be a 22-char DCR
         # token, so a removed client can't leak back in via the DCR branch.
         settings.MCP_SQL = _cfg({})
-        assert is_mcp_application_name(CLAUDE_ID) is False
-        assert is_mcp_application_name(CURSOR_DESKTOP_ID) is False
+        assert is_mcp_application(_row(CLAUDE_ID)) is False
+        assert is_mcp_application(_row(CURSOR_DESKTOP_ID)) is False
+
+    @pytest.mark.parametrize(
+        ("name", "client_id"),
+        [
+            pytest.param(CLAUDE_ID, "mcp-sql-cloud.other", id="cloud-other-id"),
+            pytest.param(CLAUDE_ID, "random-client-id", id="cloud-random-id"),
+            pytest.param(CURSOR_DESKTOP_ID, CLAUDE_ID, id="local-named-cloud-id"),
+        ],
+    )
+    def test_declared_name_with_another_client_id_is_not_recognised(
+        self, settings, name, client_id
+    ):
+        # Recognition keys on the name, provisioning / redirects / the consent
+        # label on the client_id: a row whose two disagree is nothing, even
+        # when BOTH strings are declared clients.
+        settings.MCP_SQL = _cfg({"claude": CLAUDE, "cursor-desktop": CURSOR_DESKTOP})
+        assert classify_application(_row(name, client_id=client_id)) is None
+        assert is_mcp_application(_row(name, client_id=client_id)) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -615,8 +688,10 @@ class TestDeclaredLocalClientLoopbackRecheck:
     `MCPOAuth2Validator.validate_redirect_uri`. A declared `local` client's
     callbacks are loopback by derivation, but its Application row is plain
     data: one hand-edited to carry an off-machine redirect must not get a
-    code sent there, even though DOT's own matching accepts the stored
-    value."""
+    code sent there, even though DOT's own matching of the row would accept
+    the stored value. Refused twice over since declared redirects are decided
+    from settings (the row is never read) — the loopback re-check stays as
+    the second guard."""
 
     OFF_MACHINE = "https://evil.example/cb"
 
@@ -689,10 +764,10 @@ class TestValidateRedirectUriOverride:
     def test_prefix_client_rejects_off_prefix(self, settings, monkeypatch):
         from oauth2_provider.oauth2_validators import OAuth2Validator
 
-        # Pin super() to False so this asserts the override's own verdict, not
-        # DOT's stock lookup of a client_id with no Application row.
+        # Pin super() to True: a declared client's verdict is the settings
+        # one, so DOT's row-backed matching must never be consulted.
         monkeypatch.setattr(
-            OAuth2Validator, "validate_redirect_uri", lambda self, *a, **k: False
+            OAuth2Validator, "validate_redirect_uri", lambda self, *a, **k: True
         )
         settings.MCP_SQL = _cfg({"chatgpt": CHATGPT})
         assert (
@@ -702,12 +777,13 @@ class TestValidateRedirectUriOverride:
             is False
         )
 
-    def test_exact_client_delegates_to_super_never_prefix_matching(
+    def test_exact_client_is_decided_by_settings_never_super_nor_prefix(
         self, settings, monkeypatch
     ):
-        # Load-bearing scoping: a client with no prefix rules must fall through
-        # to DOT's stock (exact) matching. Widening the override to every
-        # declared client would silently loosen exact clients — this pins it.
+        # A client with only exact rules gets DOT's exact matcher on its
+        # declared URIs — never the prefix helper (that would loosen it), and
+        # never `super()` (that reads the provisioned row, refreshed only on
+        # `migrate`).
         from oauth2_provider.oauth2_validators import OAuth2Validator
 
         settings.MCP_SQL = _cfg({"claude": CLAUDE})
@@ -716,16 +792,17 @@ class TestValidateRedirectUriOverride:
             "mcp_sql.oauth._redirect_under_prefix",
             lambda *a, **k: prefix_calls.append(a) or True,
         )
-        monkeypatch.setattr(
-            OAuth2Validator,
-            "validate_redirect_uri",
-            lambda self, *a, **k: "DELEGATED-TO-SUPER",
+
+        def _no_super(self, *a, **k):
+            pytest.fail("declared client fell through to super()")
+
+        monkeypatch.setattr(OAuth2Validator, "validate_redirect_uri", _no_super)
+        validator = MCPOAuth2Validator()
+        assert validator.validate_redirect_uri(CLAUDE_ID, CLAUDE_URI, request=None)
+        assert not validator.validate_redirect_uri(
+            CLAUDE_ID, "https://claude.ai/api/mcp/other", request=None
         )
-        result = MCPOAuth2Validator().validate_redirect_uri(
-            CLAUDE_ID, CLAUDE_URI, request=None
-        )
-        assert result == "DELEGATED-TO-SUPER"  # rode DOT stock matching
-        assert prefix_calls == []  # the prefix override was never touched
+        assert prefix_calls == []  # the prefix helper was never touched
 
     @pytest.mark.parametrize(
         "attacker_uri",
@@ -782,11 +859,9 @@ class TestValidateRedirectUriOverride:
             is True
         )
 
-    def test_mixed_rules_still_accept_the_exact_callback(self, settings, monkeypatch):
-        # Regression pin for the `or super()` fallthrough. A client carrying
-        # BOTH prefix and exact rules has its exact callbacks matched by DOT,
-        # not by the prefix helper — returning the prefix verdict alone would
-        # reject them.
+    def test_mixed_rules_accept_both_kinds_from_settings(self, settings, monkeypatch):
+        # A client carrying BOTH prefix and exact rules: each rule kind is
+        # matched by its own helper, from settings, with no `super()` at all.
         from oauth2_provider.oauth2_validators import OAuth2Validator
 
         both = {
@@ -799,14 +874,280 @@ class TestValidateRedirectUriOverride:
         }
         settings.MCP_SQL = _cfg(both)
         monkeypatch.setattr(
-            OAuth2Validator, "validate_redirect_uri", lambda self, *a, **k: True
+            OAuth2Validator, "validate_redirect_uri", lambda self, *a, **k: False
+        )
+        validator = MCPOAuth2Validator()
+        for uri in (
+            "https://chatgpt.com/aip/connect/oauth",
+            "https://chatgpt.com/connector/oauth/inst-42",
+        ):
+            assert validator.validate_redirect_uri(CHATGPT_ID, uri, request=None)
+        assert not validator.validate_redirect_uri(
+            CHATGPT_ID, "https://chatgpt.com/aip/connect/oauth/x", request=None
+        )
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            # DOT's matcher parses the request's port only when the host
+            # matches; a port no parser takes is a refusal, not a 500.
+            "https://claude.ai:99999/api/mcp/auth_callback",
+            "https://claude.ai:notaport/api/mcp/auth_callback",
+        ],
+    )
+    def test_unparseable_port_on_a_declared_host_is_refused(self, settings, uri):
+        settings.MCP_SQL = _cfg({"claude": CLAUDE})
+        assert (
+            MCPOAuth2Validator().validate_redirect_uri(CLAUDE_ID, uri, request=None)
+            is False
+        )
+
+
+# A declared client's callbacks as provisioned, and as later edited in
+# settings WITHOUT a `migrate` (so the row still carries the old ones).
+OLD_CB = "https://claude.ai/api/mcp/auth_callback"
+NEW_CB = "https://claude.com/api/mcp/auth_callback"
+EXTRA_CB = "https://claude.ai/api/mcp/second_callback"
+
+
+def _exact(*uris):
+    return {
+        "LABEL": "Claude.ai",
+        "REDIRECTS": [{"MATCH": "exact", "URI": u} for u in uris],
+    }
+
+
+@pytest.mark.django_db
+class TestDeclaredRedirectsFollowSettings:
+    """Recognition is settings-gated per request; so are a declared client's
+    redirects. The provisioned row is refreshed only by `post_migrate`, so a
+    verdict read from it lagged settings until the next `migrate`."""
+
+    def _validator_request(self, client_id):
+        """What oauthlib holds when it asks: the row bound by
+        `validate_client_id`."""
+        from types import SimpleNamespace
+
+        from oauth2_provider.models import Application
+
+        return SimpleNamespace(client=Application.objects.get(client_id=client_id))
+
+    def test_changed_exact_callback_applies_without_migrate(self, settings):
+        from oauth2_provider.models import Application
+
+        _provision(settings, {"claude": _exact(OLD_CB)})
+        settings.MCP_SQL = _cfg({"claude": _exact(NEW_CB)})  # no re-provision
+        assert Application.objects.get(client_id=CLAUDE_ID).redirect_uris == OLD_CB
+        request = self._validator_request(CLAUDE_ID)
+        validator = MCPOAuth2Validator()
+        assert validator.validate_redirect_uri(CLAUDE_ID, NEW_CB, request) is True
+        assert validator.validate_redirect_uri(CLAUDE_ID, OLD_CB, request) is False
+
+    def test_removed_exact_rule_is_refused_at_once(self, settings):
+        _provision(settings, {"claude": _exact(OLD_CB, EXTRA_CB)})
+        settings.MCP_SQL = _cfg({"claude": _exact(OLD_CB)})
+        request = self._validator_request(CLAUDE_ID)
+        validator = MCPOAuth2Validator()
+        assert validator.validate_redirect_uri(CLAUDE_ID, OLD_CB, request) is True
+        assert validator.validate_redirect_uri(CLAUDE_ID, EXTRA_CB, request) is False
+
+    def test_removed_prefix_rule_is_refused_at_once(self, settings):
+        exact = {"MATCH": "exact", "URI": "https://chatgpt.com/aip/connect/oauth"}
+        _provision(settings, {"chatgpt": {"REDIRECTS": [*CHATGPT["REDIRECTS"], exact]}})
+        settings.MCP_SQL = _cfg({"chatgpt": {"REDIRECTS": [exact]}})
+        request = self._validator_request(CHATGPT_ID)
+        validator = MCPOAuth2Validator()
+        assert validator.validate_redirect_uri(CHATGPT_ID, exact["URI"], request)
+        for uri in (CHATGPT_PREFIX, f"{CHATGPT_PREFIX}inst-42"):
+            assert validator.validate_redirect_uri(CHATGPT_ID, uri, request) is False
+
+    def test_unchanged_settings_keep_dots_exact_semantics(self, settings):
+        # Same verdicts as DOT's matching of the provisioned row: the exact
+        # rule is DOT's own matcher, only fed from settings.
+        from oauth2_provider.models import Application
+
+        _provision(settings, {"claude": CLAUDE})
+        row = Application.objects.get(client_id=CLAUDE_ID)
+        request = self._validator_request(CLAUDE_ID)
+        validator = MCPOAuth2Validator()
+        for uri in (
+            CLAUDE_URI,
+            f"{CLAUDE_URI}/",
+            f"{CLAUDE_URI}?extra=1",
+            "https://CLAUDE.ai/api/mcp/auth_callback",
+            "https://claude.ai:443/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/AUTH_CALLBACK",
+            "http://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai.evil.example/api/mcp/auth_callback",
+        ):
+            assert validator.validate_redirect_uri(
+                CLAUDE_ID, uri, request
+            ) is row.redirect_uri_allowed(uri), uri
+
+    def test_default_redirect_comes_from_settings(self, settings):
+        _provision(settings, {"claude": _exact(OLD_CB)})
+        settings.MCP_SQL = _cfg({"claude": _exact(NEW_CB)})
+        request = self._validator_request(CLAUDE_ID)
+        assert (
+            MCPOAuth2Validator().get_default_redirect_uri(CLAUDE_ID, request) == NEW_CB
+        )
+
+    @pytest.mark.parametrize(
+        "clients",
+        [
+            pytest.param({"claude": _exact(OLD_CB, EXTRA_CB)}, id="two-exact"),
+            pytest.param(
+                {
+                    "claude": {
+                        "REDIRECTS": [
+                            {"MATCH": "prefix", "URI": "https://claude.ai/api/mcp/"}
+                        ]
+                    }
+                },
+                id="prefix-only",
+            ),
+        ],
+    )
+    def test_no_default_unless_one_exact_rule(self, settings, clients):
+        # As DOT gives a default only for a single stored URI; a prefix is
+        # not a callback, so it is never one.
+        _provision(settings, {"claude": _exact(OLD_CB)})
+        settings.MCP_SQL = _cfg(clients)
+        request = self._validator_request(CLAUDE_ID)
+        assert MCPOAuth2Validator().get_default_redirect_uri(CLAUDE_ID, request) is None
+
+    def test_curated_and_dcr_keep_the_row_backed_answers(self, settings, mcp_app):
+        from oauth2_provider.models import Application
+
+        dcr_id = "mcp-sql-" + "b" * 22
+        Application.objects.create(
+            name=dcr_id,
+            client_id=dcr_id,
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="http://127.0.0.1:4567/cb",
+        )
+        settings.MCP_SQL = _cfg({"claude": CLAUDE})
+        validator = MCPOAuth2Validator()
+        curated = self._validator_request("mcp-sql")
+        dcr = self._validator_request(dcr_id)
+        # Curated: DOT's any-port loopback match on its stored `http://127.0.0.1`.
+        assert validator.validate_redirect_uri(
+            "mcp-sql", "http://127.0.0.1:9999", curated
+        )
+        assert not validator.validate_redirect_uri("mcp-sql", CLAUDE_URI, curated)
+        assert (
+            validator.get_default_redirect_uri("mcp-sql", curated) == "http://127.0.0.1"
+        )
+        assert validator.validate_redirect_uri(dcr_id, "http://127.0.0.1:4567/cb", dcr)
+        assert not validator.validate_redirect_uri(
+            dcr_id, "http://127.0.0.1:4567/x", dcr
         )
         assert (
-            MCPOAuth2Validator().validate_redirect_uri(
-                CHATGPT_ID, "https://chatgpt.com/aip/connect/oauth", request=None
-            )
-            is True
+            validator.get_default_redirect_uri(dcr_id, dcr)
+            == "http://127.0.0.1:4567/cb"
         )
+
+
+@pytest.mark.django_db
+class TestDeclaredRedirectsFollowSettingsEndToEnd:
+    """The same through `/o/authorize/`: consent page, error page, code."""
+
+    def _query(self, redirect_uri=None):
+        query = {
+            "client_id": CLAUDE_ID,
+            "response_type": "code",
+            "scope": "mcp:sql",
+            "state": "s",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        if redirect_uri is not None:
+            query["redirect_uri"] = redirect_uri
+        return query
+
+    def _get(self, client, redirect_uri=None):
+        from urllib.parse import urlencode
+
+        from django.urls import reverse
+
+        return client.get(
+            reverse("authorize") + "?" + urlencode(self._query(redirect_uri))
+        )
+
+    def _changed(self, settings):
+        _provision(settings, {"claude": _exact(OLD_CB, EXTRA_CB)})
+        settings.MCP_SQL = _cfg({"claude": _exact(NEW_CB)})  # no `migrate`
+
+    def test_new_callback_gets_the_consent_page(
+        self, client, settings, mcp_user, gate_posture
+    ):
+        self._changed(settings)
+        client.force_login(mcp_user)
+        response = self._get(client, NEW_CB)
+        assert response.status_code == 200
+        assert b'id="authorizationForm"' in response.content
+
+    @pytest.mark.parametrize("stale", [OLD_CB, EXTRA_CB])
+    def test_stale_callback_gets_the_error_page(
+        self, client, settings, mcp_user, gate_posture, stale
+    ):
+        from oauth2_provider.models import Grant
+
+        self._changed(settings)
+        client.force_login(mcp_user)
+        response = self._get(client, stale)
+        # oauthlib's fatal redirect-mismatch: an error page, never a redirect
+        # to the URI the request named.
+        assert response.status_code == 400
+        assert "Location" not in response
+        assert b'id="authorizationForm"' not in response.content
+        assert not Grant.objects.exists()
+
+    def test_omitted_redirect_uses_the_settings_callback(
+        self, client, settings, mcp_user, gate_posture
+    ):
+        self._changed(settings)
+        client.force_login(mcp_user)
+        response = self._get(client)
+        assert response.status_code == 200
+        assert NEW_CB.encode() in response.content
+        assert OLD_CB.encode() not in response.content
+
+    def test_consent_post_delivers_the_code_to_the_new_callback(
+        self, client, settings, mcp_user, gate_posture
+    ):
+        from urllib.parse import parse_qs
+        from urllib.parse import urlparse
+
+        from django.urls import reverse
+
+        self._changed(settings)
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"),
+            data={**self._query(NEW_CB), "allow": "Authorize"},
+        )
+        assert response.status_code == 302
+        location = urlparse(response["Location"])
+        assert f"{location.scheme}://{location.netloc}{location.path}" == NEW_CB
+        assert "code" in parse_qs(location.query)
+
+    def test_consent_post_to_a_stale_callback_issues_nothing(
+        self, client, settings, mcp_user, gate_posture
+    ):
+        from django.urls import reverse
+        from oauth2_provider.models import Grant
+
+        self._changed(settings)
+        client.force_login(mcp_user)
+        response = client.post(
+            reverse("authorize"),
+            data={**self._query(OLD_CB), "allow": "Authorize"},
+        )
+        assert not response.get("Location", "").startswith(OLD_CB)
+        assert not Grant.objects.exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -889,8 +1230,8 @@ class TestProvisioning:
 
         _provision(settings, {"claude": CLAUDE})
         settings.MCP_SQL = _cfg({})  # remove; row is deliberately NOT deleted
-        assert Application.objects.filter(client_id=CLAUDE_ID).exists()
-        assert is_mcp_application_name(CLAUDE_ID) is False
+        app = Application.objects.get(client_id=CLAUDE_ID)
+        assert is_mcp_application(app) is False
 
     def test_stale_row_is_named_in_a_warning(self, db, settings, caplog):
         # Deleting would cascade live tokens mid-migrate, so provisioning
@@ -1033,11 +1374,9 @@ class TestClientIdentity:
         assert (identity.name, identity.kind, identity.redirect) == ("", "", "")
 
     def test_unrecognised_application_gets_a_blank_kind(self, settings):
-        from types import SimpleNamespace
-
         settings.MCP_SQL = _cfg({})
         identity = identify_application(
-            SimpleNamespace(name="some-other-app", redirect_uris="https://x/cb")
+            _row("some-other-app", redirect_uris="https://x/cb")
         )
         assert identity.kind == ""
         assert identity.name == "some-other-app"
@@ -1065,6 +1404,55 @@ class TestAuthRejectionAttribution:
         # than back-filled with the kind it used to have.
         assert row.client_kind == ""
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param(CLAUDE_ID, id="declared"),
+            pytest.param("mcp-sql", id="curated"),
+            pytest.param("mcp-sql-" + "c" * 22, id="dcr"),
+        ],
+    )
+    def test_row_named_like_an_mcp_client_under_another_client_id_is_refused(
+        self, db, settings, mcp_user, name
+    ):
+        """Recognition keys on the name; provisioning, redirects and the
+        consent label on the client_id. A row carrying a recognised NAME under
+        a different client_id is not an MCP client: no authorization, and its
+        tokens 401 as `bad_application` with a blank kind."""
+        from mcp_sql.models import MCPAuthRejectionLog
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Application
+        from oauthlib.common import Request as OAuthlibRequest
+
+        _provision(settings, {"claude": CLAUDE})
+        rogue = Application.objects.create(
+            name=name,
+            client_id="rogue-client-id",
+            client_secret="",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://evil.example/cb",
+        )
+        assert (
+            MCPOAuth2Validator().validate_client_id(
+                "rogue-client-id", OAuthlibRequest("")
+            )
+            is False
+        )
+        token = AccessToken.objects.create(
+            user=mcp_user,
+            token="test_" + secrets.token_urlsafe(24),
+            application=rogue,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+        with pytest.raises(exceptions.AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.BAD_APPLICATION
+        assert row.application_name == name
+        assert row.client_kind == ""
+
 
 class TestQueryAuditAttribution:
     """The client identity reaches `MCPQueryLog` through the executor
@@ -1072,11 +1460,7 @@ class TestQueryAuditAttribution:
 
     def _identity(self, settings):
         settings.MCP_SQL = _cfg({"claude": CLAUDE})
-        from types import SimpleNamespace
-
-        return identify_application(
-            SimpleNamespace(name=CLAUDE_ID, redirect_uris=CLAUDE_URI)
-        )
+        return identify_application(_row(CLAUDE_ID, redirect_uris=CLAUDE_URI))
 
     def test_allowed_row_carries_client_attribution(
         self, db, settings, monkeypatch, mcp_user

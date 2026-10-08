@@ -667,10 +667,33 @@ cascade live tokens mid-`migrate`); it names orphaned ones in a WARNING so you
 can clean up deliberately. De-authorizing a client is a settings edit, not DB
 surgery.
 
+**So are its redirects.** A declared client's callbacks are checked against
+its `CLIENTS` entry on every request, never against the `redirect_uris` stored
+on its row (provisioning still writes them there, for the admin and the audit
+trail, but refreshes them only on `migrate`). Change or remove a rule and
+redeploy: the new callback is accepted and the old one refused at the next
+`/o/authorize/` request, without a `migrate`. When a request omits
+`redirect_uri`, the default is the entry's callback if it declares exactly one
+rule and that rule is `"exact"`; otherwise there is none and the request gets
+the error page (a prefix is not a callback).
+
+**Recognition also requires `client_id == name`.** Every check that reads
+settings keys on the `client_id`, while recognition reads the `Application`'s
+`name`; every row this package writes (migration 0005, `/o/register`,
+provisioning) carries the same string in both. A row whose two differ — say,
+one named `mcp-sql-cloud.claude` created by hand with another `client_id` — is
+not an MCP client at all: refused at `/o/authorize/`, and its tokens get a
+`bad_application` 401 at `/mcp/sql/`. This applies to the curated and DCR rows
+too: a curated `mcp-sql` row whose `client_id` was edited away from its name
+stops working until the two match again.
+
 **Exact vs. prefix redirect matching.**
 
-- `"exact"` (Claude, Cursor): a fixed callback. DOT's native exact match
-  against the provisioned `redirect_uris` handles it; there is no override.
+- `"exact"` (Claude, Cursor): a fixed callback, matched by DOT's own exact
+  matcher (`redirect_to_uri_allowed`, the function behind
+  `Application.redirect_uri_allowed`) run on the entry's exact URIs from
+  settings — so "exact" means what it means for any DOT application on the
+  installed DOT version, only the list comes from `CLIENTS`.
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
@@ -682,16 +705,17 @@ surgery.
   port matches, it has no `..` segment and no backslash (which a browser
   reads as `/`, so `..\` is traversal too), and its path starts with the
   allowlisted prefix path — anchored at a `/` boundary, so `.../oauthEVIL`
-  cannot pass as `.../oauth`. A client may carry both kinds of rule; its
-  exact callbacks still ride DOT's stock matching. Every other client —
-  clients with no prefix rules, the canonical row, every loopback DCR
-  client — falls through to that stock matching; every client that is not
-  a declared cloud client (the canonical row, every DCR client, every
-  declared local client) only after the requested redirect passes the
-  `/o/register` loopback predicate (`_is_loopback_redirect`), and its
-  stored default (used when a request omits `redirect_uri`) is held to the
-  same predicate. So for such a client, the validator refuses a
-  non-loopback redirect whether it was requested or stored.
+  cannot pass as `.../oauth`. A client may carry both kinds of rule; each is
+  matched by its own check, both from settings. A redirect that matches
+  neither is refused — a declared client never falls back to the row-backed
+  matching. The canonical row and every loopback DCR client keep DOT's stock
+  matching against their own rows. Every client that is not a declared cloud
+  client (the canonical row, every DCR client, every declared local client)
+  is checked only after the requested redirect passes the `/o/register`
+  loopback predicate (`_is_loopback_redirect`), and its default (used when a
+  request omits `redirect_uri`) is held to the same predicate. So for such a
+  client, the validator refuses a non-loopback redirect whether it was
+  requested or stored.
 
 ### Cursor: three surfaces, two paths
 
@@ -797,7 +821,13 @@ The token's RFC 8707 audience does not depend on them: the accepted
 1. Run `migrate`. Provisioning is a `post_migrate` receiver — it runs on any
    deploy that migrates and is idempotent, but a plain web-process restart does
    **not** provision it. If you added an entry without migrating, run
-   `python manage.py migrate` (a no-op run still fires the receiver).
+   `python manage.py migrate` (a no-op run still fires the receiver). A new
+   entry needs its row (DOT's grants and tokens point at one); a changed or
+   removed callback on an existing entry does not — it applies at the next
+   request, and `migrate` only refreshes the copy shown in the admin. A slug
+   must be short enough for `<prefix><kind>.<slug>` to fit DOT's
+   `Application.client_id` and `name` columns (255 characters); a longer one
+   refuses to boot.
 2. Ensure `"https"` is in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` —
    with any https client declared the app **refuses to boot** without it. DOT's
    default already includes `https`; you only hit this if you narrowed the list

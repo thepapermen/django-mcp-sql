@@ -437,9 +437,11 @@ class MCPSQLSettings:
         """Resolve `MCP_SQL["CLIENTS"]` into `{client_id: DeclaredClient}`.
 
         Keyed by the derived `client_id` so recognition
-        (`consts.is_mcp_application_name`) and the redirect validator
-        (`oauth.MCPOAuth2Validator.validate_redirect_uri`) can look it up by
-        the client_id DOT presents. Cached until `reload()`, so
+        (`consts.classify_application`) and the redirect validator
+        (`oauth.MCPOAuth2Validator.validate_redirect_uri` /
+        `get_default_redirect_uri`, which decide a declared client's
+        redirects from this, never from the provisioned row) can look it up
+        by the client_id DOT presents. Cached until `reload()`, so
         `@override_settings(MCP_SQL=...)` re-reads between tests.
 
         Normalisation lives in `clients.build_clients`, which boot validation
