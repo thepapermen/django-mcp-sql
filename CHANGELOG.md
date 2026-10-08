@@ -424,13 +424,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with `ipaddress.ip_address`, which raises `ValueError` — not a database
   error, so nothing caught it — for a forwarded list (`10.0.0.1,
   10.0.0.2`, from a real-IP middleware that copies `X-Forwarded-For`
-  whole), a hostname or `unknown`; PostgreSQL's `inet` refuses a scoped
-  IPv6 address (`fe80::1%eth0`). A rejected bearer token then answered 500
+  whole), a hostname or `unknown` (on psycopg2 PostgreSQL refuses the
+  value: a `DataError`, caught, and the audit row was lost). A bearer
+  token the gate refused after resolving it (inactive user, no MFA, no
+  permission, ...: the refusals that write an `MCPAuthRejectionLog` row;
+  an unknown token writes none and got its 401) then answered 500
   instead of 401, a tool call failed, and logout raised from inside
   `logout()`, before the session was flushed (the user stayed logged in).
   Every audit row now records such a value as no address (`client_ip`
-  NULL; `models.audit_client_ip`). The per-IP throttle still keys on the
-  raw value.
+  NULL; `models.audit_client_ip`), whoever writes it: also a consumer
+  calling `executor.run_query` / `executor.audit_tool_call` with
+  `REMOTE_ADDR` as is. A scoped IPv6 address (`fe80::1%eth0`, which
+  Django stored without its zone) is recorded as NULL too. The per-IP
+  throttle still keys on the raw value.
 - **The app booted with any DOT validator.** The package's OAuth server is
   built with the install's `OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]`, and
   the client pinning, the `mcp:sql`-only scope, mandatory PKCE and the

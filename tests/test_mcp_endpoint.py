@@ -436,8 +436,10 @@ class TestMcpEndpointHappyPath:
         [
             ("203.0.113.9", "203.0.113.9"),
             # Review round 18: a value that is not one IP address (a
-            # forwarded list, a scoped IPv6) made every audit insert raise
-            # `ValueError` / `DataError` (a 500 from the tool call).
+            # forwarded list) made the audit insert raise `ValueError`
+            # (psycopg 3: a 500 from the tool call) or `DataError`
+            # (psycopg2: the row lost); a scoped IPv6 address was stored
+            # without its zone.
             ("10.0.0.1, 10.0.0.2", None),
             ("fe80::1%eth0", None),
             ("", None),

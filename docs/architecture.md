@@ -1021,11 +1021,14 @@ The load-bearing invariants and footguns, grouped by layer:
   trusted-proxy list) instead. The same proxy invariant underpins the
   discovery-views bullet above (`ALLOWED_HOSTS` +
   `SECURE_PROXY_SSL_HEADER`). The audit rows' `client_ip` takes
-  `REMOTE_ADDR` only when it is one IP address (`models.audit_client_ip`;
-  else NULL): on psycopg 3 Django adapts an `inet` value with
+  `REMOTE_ADDR` only when it is one IP address without a zone
+  (`models.audit_client_ip`, applied by every writer — `executor._audit_safely`
+  for `MCPQueryLog`, whoever calls `run_query` / `audit_tool_call`; else
+  NULL): on psycopg 3 Django adapts an `inet` value with
   `ipaddress.ip_address`, whose `ValueError` for a forwarded list
-  (`a, b`) no `DatabaseError` handler catches — it turned a 401 into a
-  500 and broke logout.
+  (`a, b`) no `DatabaseError` handler catches — it turned a gate's 401
+  into a 500 and broke logout (on psycopg2 PostgreSQL refused it and the
+  row was lost).
 ### OAuth tokens & client identity
 
 - **Logout revokes the user's MCP tokens** — scoped via

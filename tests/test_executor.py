@@ -48,6 +48,7 @@ from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import _cap_cell
 from mcp_sql.executor import _cap_rows
 from mcp_sql.executor import _classify_db_error
+from mcp_sql.executor import audit_tool_call
 from mcp_sql.executor import run_query
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.schemas import OutcomeReason
@@ -428,6 +429,63 @@ class TestAuditWriteResilience:
             "MCP audit row write failed" in record.getMessage()
             for record in caplog.records
         )
+
+
+@pytest.mark.django_db
+class TestClientIpAtTheExecutorBoundary:
+    """Review round 20: `run_query` and `audit_tool_call` are callable by a
+    consumer, which may pass `REMOTE_ADDR` as is. A forwarded list made the
+    audit insert raise `ValueError` on psycopg 3 (not a `DatabaseError`:
+    it escaped, a 500 with no audit row; on psycopg2 PostgreSQL refused it
+    and the row was lost). Every `MCPQueryLog` row goes through
+    `_audit_safely`, which stores one IP address or NULL."""
+
+    CASES = [
+        ("10.0.0.1, 10.0.0.2", None),
+        ("fe80::1%eth0", None),
+        ("example.com", None),
+        ("", None),
+        ("203.0.113.7", "203.0.113.7"),
+        ("2001:db8::7", "2001:db8::7"),
+    ]
+
+    @pytest.mark.parametrize(("given", "stored"), CASES)
+    def test_run_query(self, given, stored):
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            result = run_query(
+                user=UserFactory(),
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT * FROM auth_permission",
+                client_ip=given,
+            )
+        assert result.rejection_reason == OutcomeReason.SELECT_STAR.value
+        assert MCPQueryLog.objects.get().client_ip == stored
+
+    @pytest.mark.parametrize(("given", "stored"), CASES)
+    def test_audit_tool_call(self, given, stored):
+        audit_tool_call(
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            tool="list_tables",
+            client_ip=given,
+        )
+        assert MCPQueryLog.objects.get().client_ip == stored
+
+    def test_misconfigured_alias(self):
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}}
+            with pytest.raises(ExecutorMisconfiguredError):
+                run_query(
+                    user=UserFactory(),
+                    profile=_DEFAULT_PROFILE,
+                    raw_sql="SELECT id FROM auth_permission",
+                    client_ip="10.0.0.1, 10.0.0.2",
+                )
+        log = MCPQueryLog.objects.get()
+        assert log.rejection_reason == OutcomeReason.MISCONFIGURED.value
+        assert log.client_ip is None
 
 
 @pytest.mark.django_db

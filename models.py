@@ -10,12 +10,12 @@ def audit_client_ip(remote_addr: object) -> str | None:
     when it is one IP address, else None.
 
     `REMOTE_ADDR` is whatever the server or a real-IP middleware put there
-    (a forwarded list `"a, b"`, a hostname, a scoped `fe80::1%eth0`).
-    Django adapts a `GenericIPAddressField` value with
-    `ipaddress.ip_address` on psycopg 3 (`ValueError`, not a
-    `DatabaseError`) and PostgreSQL's `inet` rejects a scope id, so such a
-    value would make the audit insert fail. The row is kept, without the
-    address."""
+    (a forwarded list `"a, b"`, a hostname). Django adapts a
+    `GenericIPAddressField` value with `ipaddress.ip_address` on psycopg 3
+    (`ValueError`, not a `DatabaseError`); on psycopg2 PostgreSQL refuses
+    it (`DataError`): the audit insert failed. The row is kept, without the
+    address. A scoped IPv6 address (`fe80::1%eth0`) is None too: Django
+    would store it without its zone, another address."""
     if not isinstance(remote_addr, str):
         return None
     try:

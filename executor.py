@@ -23,6 +23,7 @@ from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import declared_tables
 from mcp_sql.models import MCPQueryLog
+from mcp_sql.models import audit_client_ip
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
 from mcp_sql.parser import parse_and_validate
@@ -530,7 +531,15 @@ def _audit_safely(**fields: Unpack[AuditFields]) -> None:
 
     No retry: a `default`-DB outage usually lasts longer than any
     reasonable retry budget. The Sentry signal is the actionable channel.
+
+    `client_ip` is stored only when it is one IP address
+    (`models.audit_client_ip`), whoever passed it: a consumer calling
+    `run_query` / `audit_tool_call` with `REMOTE_ADDR` as is (a forwarded
+    list `a, b`) made the insert raise `ValueError` on psycopg 3, which no
+    `DatabaseError` handler catches (review round 20). Every
+    `MCPQueryLog` row is written here.
     """
+    fields["client_ip"] = audit_client_ip(fields["client_ip"])
     try:
         MCPQueryLog.objects.create(**fields)
     except DatabaseError:
