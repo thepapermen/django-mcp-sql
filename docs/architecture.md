@@ -114,16 +114,24 @@ MCP_SQL = {
         "allowed": {3600: 50, 86400: 150},
         "rejected": {3600: 50, 86400: 150},
     },
-    # "PIN_SEARCH_PATH": False,  # opt-in: SET LOCAL search_path = public, pg_temp
+    "PIN_SEARCH_PATH": True,  # recommended; default False (see below)
 }
 ```
 
 `PIN_SEARCH_PATH` (bool, default `False`; anything but `True` / `False`
 refuses to boot): whether every read transaction pins `search_path` to
-`public, pg_temp`. Off, unqualified names resolve through the database's
-own `search_path`; on, extensions outside `public` must be qualified. What
-each mode guarantees, and when to turn it on: "Watch out" → "`search_path`
-is pinned only on request".
+`public, pg_temp`. **Set it to `True`** unless an extension the agents use
+lives outside `public` (and even then, with the pin on, they can call it
+as `ext.f(…)` / `OPERATOR(ext.op)`). Off, unqualified names resolve
+through the database's own `search_path`, and a party with no right on
+any whitelisted table — any role with `CREATE` on the database, or
+another session on the same backend (e.g. under transaction-mode
+pooling) — can plant a same-named relation, readable through a grant to
+`PUBLIC`, whose rows the agent then reads under the whitelisted name;
+`mcp_sql_grants` does not detect it. A DBA's database- or login-level
+`search_path` listing another schema first does the same without any
+attacker. What each mode guarantees: "Watch out" → "`search_path` is
+pinned only on request".
 
 ## Profiles (access tiers)
 
@@ -437,8 +445,9 @@ The load-bearing invariants and footguns, grouped by layer:
   level `off` would make the executed SQL mean something else (quotes
   shift). It is one of the per-transaction guards.
 - **`search_path` is pinned only on request (`MCP_SQL["PIN_SEARCH_PATH"]`,
-  default `False`).** The parser checks an unqualified `FROM t` as the
-  whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`); which
+  default `False`) — set it to `True` unless an extension the agents use
+  lives outside `public`.** The parser checks an unqualified `FROM t` as
+  the whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`); which
   relation Postgres opens depends on the mode.
   - **Off (default):** the read transaction does not touch `search_path`
     (and `session_drift` does not check it), so Postgres opens the first
@@ -449,28 +458,59 @@ The load-bearing invariants and footguns, grouped by layer:
     the profile role (`"$user"` is `current_user`, the profile role under
     `SET ROLE`; skipped unless the role has `USAGE` on it), a schema an
     operator lists ahead of `public`, and a temporary relation (table or
-    view), which is searched first when `pg_temp` is not listed. Each
-    takes an operator, DBA or other-client action: the agent cannot create
-    one — its SQL is a single SELECT, its transaction is read-only
-    (`CREATE TEMP TABLE`, `CREATE TEMP VIEW` and `SELECT … INTO` fail with
-    "cannot execute … in a read-only transaction"), `CREATE SCHEMA` needs
-    a privilege the profile role is not given, and `set_config` is on the
-    deny list. A temporary relation needs a client on the same backend
-    session: the alias's own connections are not reused with the
-    documented `CONN_MAX_AGE = 0`, but behind transaction-mode pgbouncer a
-    backend is shared with every client of that pool, and a temporary view
-    or an `ON COMMIT PRESERVE ROWS` temporary table lives as long as the
-    backend. `ALTER ROLE <profile role> SET search_path` has no effect
-    either way (role defaults are inert under `SET ROLE`). Name resolution
-    ignores privileges, so when such a relation shadows a whitelisted one
-    the query reads it only if the profile role may SELECT it, and
-    otherwise fails ("permission denied"; it does not fall through to
-    `public`). **The profile role's grants are the boundary:**
-    `mcp_sql_grants` reports (and `--apply` revokes) a SELECT grant to the
-    role in any non-system schema, a relation the role owns included; it
-    does not see a grant to `PUBLIC`, one held through role membership, a
-    materialized view, or a temporary relation (inventory limits below).
-    The qualified spelling of the shadowing relation (`s.t`) stays refused.
+    view), which is searched first when `pg_temp` is not listed. The agent
+    cannot create one — its SQL is a single SELECT, its transaction is
+    read-only (`CREATE TEMP TABLE`, `CREATE TEMP VIEW` and `SELECT … INTO`
+    fail with "cannot execute … in a read-only transaction"),
+    `CREATE SCHEMA` needs a privilege the profile role is not given, and
+    `set_config` is on the deny list. `ALTER ROLE <profile role> SET
+    search_path` has no effect either way (role defaults are inert under
+    `SET ROLE`). Name resolution ignores privileges: when such a relation
+    shadows a whitelisted one, the query reads it if the profile role may
+    SELECT it, a grant to `PUBLIC` included, and otherwise fails
+    ("permission denied"; it does not fall through to `public`).
+    **What this exposes:** a party with no right on any whitelisted table
+    can make the agent read *its* rows under the whitelisted name
+    (verified on PostgreSQL 15; pinned by
+    `test_schema_scoping.TestUnpinnedShadowPlantedWithoutRights`):
+    - any role with `CREATE` on the database (by default its owner — often
+      the app's own login — plus any role granted it, e.g. a co-tenant app)
+      creates a schema named after the profile role, a same-named table in
+      it, and grants `USAGE` on the schema and `SELECT` on the table to
+      `PUBLIC`;
+    - another session on the same backend, e.g. under transaction-mode
+      pooling, creates a temporary relation (a view, or a table
+      `ON COMMIT PRESERVE ROWS`; `TEMP` on a database is granted to
+      `PUBLIC` by default) and grants `SELECT` on it to `PUBLIC`. The
+      alias's own connections are not reused with the documented
+      `CONN_MAX_AGE = 0`, but transaction-mode pgbouncer shares a backend
+      among every client of a pool (one database and server login), and
+      the relation lives as long as the backend. Confirmed on a single
+      backend; not reproduced through pgbouncer;
+    - without any attacker, a DBA or operator lists another schema ahead
+      of `public` (database- or login-level `search_path`, a connection
+      option) that holds a same-named relation the profile role can read.
+
+    The agent's `SELECT name FROM t` then returns the shadowing relation's
+    rows: an integrity / result-spoofing problem, and planted text can
+    carry prompt-injection content (the rows are still fenced as untrusted
+    data). `SELECT *` and whole-row references in a projection are
+    refused, so the agent reads only columns it names, but column names
+    are not checked against the model: a column only the shadow has is
+    read when a query names it. **`mcp_sql_grants` does not detect it:**
+    its inventory (`information_schema.role_table_grants WHERE grantee =
+    <profile role>`) does not see a grant to `PUBLIC`, one held through
+    role membership, a materialized view, or a temporary relation
+    (temporary schemas are skipped), nor the schema-level `USAGE` grant —
+    so the check stays clean while the shadow is served. It reports (and
+    `--apply` revokes) only a direct SELECT grant to the profile role on
+    a relation in a non-system schema, a relation the role owns included:
+    an operator's same-named copy readable through such a grant is the
+    one case above it catches. The profile role's own grants are
+    therefore not the boundary in this mode — what `PUBLIC` and the
+    role's memberships can read counts too, and nothing in the package
+    checks those. The qualified spelling of the shadowing relation
+    (`s.t`) stays refused.
     Functions and operators still resolve in `pg_catalog` first, unless
     the configured `search_path` lists `pg_catalog` explicitly after
     another schema, which lets that schema's `lower(…)` replace the
@@ -479,21 +519,30 @@ The load-bearing invariants and footguns, grouped by layer:
   - **On:** `SET LOCAL search_path = 'public', 'pg_temp'` is one of the
     per-transaction guards (a list, written element by element:
     `session.guc_value_sql`) and `session_drift` checks it, so an
-    unqualified name is always the relation in `public` and a temporary
-    relation never shadows it. The cost: functions, operators and types of
+    unqualified name is the relation in `public` whenever one of that
+    name exists there, and no `"$user"` or operator-listed schema is
+    searched. `pg_temp` is listed last, not left out: when the whitelisted
+    relation is missing from `public` (dropped, not yet migrated, a
+    lagging replica), a temporary relation of that name on the backend is
+    opened instead (verified) — the same-backend case above, narrowed to a
+    whitelisted relation that does not exist. The cost: functions,
+    operators and types of
     an extension installed in another schema are not found unqualified —
     call the function qualified (`ext.similarity(…)`) and the operator as
     `OPERATOR(ext.=)` / prefix `OPERATOR(ext.@) x` (`FaithfulPostgres`
     keeps the name exactly as written, a quoted schema quoted, review
     round 20); a bare `=` on a `citext` column in schema `ext` compares as
     `text`, silently.
-  - **When to turn it on:** whenever every extension the agents use lives
-    in `public` or `pg_catalog` (`SELECT extname,
-    extnamespace::regnamespace FROM pg_extension`; Django's
-    `CreateExtension` installs into the first schema on the app's
-    `search_path`, normally `public`) — then the pin costs nothing and
-    takes the shadowing cases above off the table. A database whose only
-    schema is `public` loses nothing by it.
+  - **When to turn it on:** recommended for every install, and it costs
+    nothing whenever every extension the agents use lives in `public` or
+    `pg_catalog` (`SELECT extname, extnamespace::regnamespace FROM
+    pg_extension`; Django's `CreateExtension` installs into the first
+    schema on the app's `search_path`, normally `public`). A database
+    whose only schema is `public` loses nothing by it. An install whose
+    agents use an extension elsewhere can still turn it on and have them
+    write `ext.f(…)` / `OPERATOR(ext.op)`; left off, the exposure above
+    stays, and only the database's own privileges (who holds `CREATE` on
+    it, who shares a pooled backend, what `PUBLIC` may read) limit it.
   - In both modes: an operator calls its function without naming it, so the
     function deny list does not apply to operators, bare or in
     `OPERATOR()`: in a stock catalog the only operators whose function it

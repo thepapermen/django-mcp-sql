@@ -260,22 +260,30 @@ DEFAULTS: dict[str, Any] = {
     # Logout and a password change revoke refresh tokens with the access
     # tokens. See docs/oauth.md "Refresh tokens (opt-in)".
     "REFRESH_TOKEN_MAX_AGE_SECONDS": 0,
-    # === search_path pin (opt-in) ===
+    # === search_path pin (opt-in; turning it on is recommended) ===
     #
     # `True` adds `SET LOCAL search_path = 'public', 'pg_temp'` to the guards
     # every read transaction sets (`session.session_gucs`), and
     # `session_drift` (the `mcp_sql_smoke` check) expects it. An unqualified
     # name in an agent query is then the relation in `public` — the one the
-    # parser's whitelist check matched — whatever the login's `search_path`.
+    # parser's whitelist check matched — whatever the login's `search_path`
+    # (if no relation of that name exists in `public`, a temporary relation
+    # of that name on the backend is found instead: `pg_temp` is last).
     # `False` (the default) leaves `search_path` alone: an unqualified name
-    # resolves through the database's own `search_path`, so a schema an
-    # operator puts ahead of `public` (a `"$user"` schema named after the
-    # profile role, a database- / role-level setting, a connection option) or
-    # a temporary table on the backend can shadow a whitelisted `public`
-    # table wherever the profile role may read it — the role's grants stay
-    # the boundary. Turn it on when every extension the agent needs lives in
-    # `public` (or `pg_catalog`): with it on, an extension elsewhere loses
-    # its unqualified functions and operators (`ext.f(...)`,
+    # resolves through the database's own `search_path`, so a schema ahead
+    # of `public` (a `"$user"` schema named after the profile role, a
+    # database- / role-level setting, a connection option) or a temporary
+    # relation on the backend shadows a whitelisted `public` table wherever
+    # the profile role may read it — a grant to `PUBLIC` is enough. A party
+    # with no right on the whitelisted tables can plant one: any role with
+    # CREATE on the database (the `"$user"` schema), or another session on
+    # the same backend, e.g. under transaction-mode pooling (a temporary
+    # relation); the agent then reads its rows under the whitelisted name,
+    # and the grants drift check does not see it (it lists direct grants to
+    # the profile role only: not `PUBLIC`, membership, materialized views or
+    # temporary relations). Leave it off only if an extension the agent
+    # needs lives outside `public` (or `pg_catalog`): with it on, such an
+    # extension loses its unqualified functions and operators (`ext.f(...)`,
     # `OPERATOR(ext.op)`). The schema-qualified whitelist check and the
     # every-schema grants inventory apply either way. See
     # docs/architecture.md "`search_path`".

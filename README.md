@@ -147,6 +147,14 @@ the package itself never imports `sentry_sdk`.
 >   whitelist at [curated, column-limited PostgreSQL views](docs/architecture.md#curated-view-pattern)
 >   that drop the attacker-controllable free-text columns, rather than at raw
 >   tables.
+> - **Set `MCP_SQL["PIN_SEARCH_PATH"] = True`.** With the default (`False`),
+>   a party with no right on your tables — any role with `CREATE` on the
+>   database, or another session on the same pooled backend — can plant a
+>   same-named relation readable by `PUBLIC` and have the agent read *its*
+>   rows under a whitelisted name (curated view included), which
+>   `mcp_sql_grants` does not report. See
+>   [docs/architecture.md](docs/architecture.md) "`search_path` is pinned
+>   only on request".
 > - **Don't expose this surface to a privileged agent.** Keep the read-only
 >   SQL context separate from any agent that also holds act/exfiltrate tools,
 >   so a malicious row has nothing to pivot into.
@@ -323,15 +331,20 @@ MCP_SQL = {
     # many seconds have passed since the user's consent. See docs/oauth.md
     # "Refresh tokens (opt-in)".
     # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
-    # Opt-in search_path pin (default False): every read transaction runs
-    # SET LOCAL search_path = public, pg_temp, so an unqualified table name is
-    # always the whitelisted one in `public`. Off, names resolve through the
-    # database's own search_path (a schema listed ahead of `public` or a temp
-    # table can shadow a whitelisted table the profile role may also read).
-    # Turn it on when every extension the agent uses lives in `public`; with
-    # it on, extensions elsewhere need `ext.f(x)` / `OPERATOR(ext.op)`.
+    # search_path pin — RECOMMENDED, but off by default (False). On, every
+    # read transaction runs SET LOCAL search_path = public, pg_temp, so an
+    # unqualified table name is the whitelisted one in `public`. Off, names
+    # resolve through the database's own search_path: any role with CREATE
+    # on the database (a schema named after the profile role) or another
+    # session on the same backend (a temporary relation, e.g. under
+    # transaction-mode pgbouncer) can plant a same-named relation readable
+    # through a grant to PUBLIC, without any right on your tables, and the
+    # agent reads its rows under the whitelisted name; mcp_sql_grants does
+    # not detect it. Leave it off only if an extension the agent uses lives
+    # outside `public` — and even then, with it on, the agent can write
+    # `ext.f(x)` / `OPERATOR(ext.op)`.
     # See docs/architecture.md "`search_path` is pinned only on request".
-    # "PIN_SEARCH_PATH": True,
+    "PIN_SEARCH_PATH": True,
 }
 
 OAUTH2_PROVIDER = {

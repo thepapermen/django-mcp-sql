@@ -308,18 +308,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     three-part `db.pg_catalog.x` included;
   - an unqualified name is checked as the relation in `public`, and which
     relation Postgres opens for it depends on the new opt-in
-    `MCP_SQL["PIN_SEARCH_PATH"]` (default `False`, see Added). Off, as in
-    0.1.0b5, it resolves through the database's own `search_path`: a
-    schema an operator puts ahead of `public` (a `"$user"` schema named
-    after the profile role, a database-, login-role- or connection-level
-    setting) or a temporary relation (table or view) on the backend
-    (searched first) shadows a whitelisted table — read only where the
-    profile role may SELECT the shadowing relation, an error otherwise. None of these can be created
-    by an agent's query (a single SELECT in a read-only transaction); the
-    profile role's grants, which the inventory below now covers in every
-    schema, are the boundary. On, the read transaction pins `search_path`
-    to `public, pg_temp` (`SET LOCAL`, one of the per-transaction guards),
-    so an unqualified name is always the relation in `public`;
+    `MCP_SQL["PIN_SEARCH_PATH"]` (default `False`, see Added) — **set it
+    to `True`** unless an extension the agents use lives outside `public`.
+    Off, as in 0.1.0b5 and every earlier release, it resolves through the
+    database's own `search_path`: a schema named after the profile role
+    (`"$user"`), a schema a database-, login-role- or connection-level
+    setting puts ahead of `public`, or a temporary relation (table or
+    view) on the backend (searched first) shadows a whitelisted table —
+    read wherever the profile role may SELECT the shadowing relation, a
+    grant to `PUBLIC` included, an error otherwise. An agent's query
+    cannot create one (a single SELECT in a read-only transaction), but a
+    party with no right on any whitelisted table can: any role with
+    `CREATE` on the database (a schema named after the profile role), or
+    another session on the same backend, e.g. under transaction-mode
+    pooling (a temporary relation `ON COMMIT PRESERVE ROWS`), each
+    granting `SELECT` to `PUBLIC`. The agent then reads the planted rows
+    under the whitelisted name (result spoofing; the text can carry
+    prompt injection, still fenced as untrusted data), and the drift
+    check below does not report it (it does not see grants to `PUBLIC`,
+    through membership, on materialized views or temporary relations).
+    A DBA's `search_path` listing another schema first does the same
+    without an attacker. On, the read transaction pins `search_path` to
+    `public, pg_temp` (`SET LOCAL`, one of the per-transaction guards),
+    so an unqualified name is the relation in `public` whenever one of
+    that name exists there (if it is missing, a temporary relation of
+    that name on the backend is found instead);
   - `mcp_sql_grants` (and the `post_migrate` drift WARNING) lists the
     profile role's SELECT grants in every schema but the system ones
     (`pg_catalog`, `information_schema`, `pg_*`, temporary schemas
@@ -352,8 +365,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     prefix `OPERATOR(ext.@) x`; a quoted schema stays quoted). Written
     bare, its operators either fail or resolve to a `pg_catalog` one
     through a cast (a `citext` column compared with `=` compares as
-    `text`, case-sensitively). Turn the pin on when every extension the
-    agents use lives in `public` (or `pg_catalog`).
+    `text`, case-sensitively). The pin is recommended in any case and
+    costs nothing when every extension the agents use lives in `public`
+    (or `pg_catalog`).
     **Behaviour change (both modes):** a whitelisted table that lives in
     another schema through the login's `search_path` (and not in its
     `db_table`) is not the whitelisted relation: spell the schema in
@@ -688,11 +702,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `False`; `True` / `False` only, anything else refuses to boot). On, every
   read transaction sets `SET LOCAL search_path = 'public', 'pg_temp'` and
   `mcp_sql_smoke`'s session check expects it, so an unqualified table name
-  is always the whitelisted relation in `public`; a temporary relation
-  (table or view) or a schema ahead of `public` on the database's
-  `search_path` can no longer shadow it. Off, `search_path` is the database's own, as in 0.1.0b5 (the
-  profile role's grants are the boundary for a shadowing relation). The
-  cost of turning it on: an extension installed outside `public` must be
+  is the whitelisted relation in `public`: a `"$user"` schema or a schema
+  ahead of `public` on the database's `search_path` can no longer shadow
+  it, nor can a temporary relation (table or view) while the whitelisted
+  relation exists in `public` (`pg_temp` is listed last, so a missing one
+  falls through to a temporary relation of that name). **Turning it on
+  is recommended:** off, `search_path` is the database's own, as in
+  0.1.0b5, and any role with `CREATE` on the database or another session
+  on the same backend (e.g. under transaction-mode pooling) can plant a
+  same-named relation, readable through a grant to `PUBLIC`, whose rows
+  the agent reads under the whitelisted name — without any right on the
+  whitelisted tables, and unseen by `mcp_sql_grants` (Security, above).
+  The cost of turning it on: an extension installed outside `public` must be
   qualified (`ext.f(...)`, `OPERATOR(ext.op)`; a bare `=` on its `citext`
   column silently compares as `text`). `mcp_sql_role_setup --emit-sql`
   prints the matching role default only when the pin is on;
@@ -708,9 +729,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - An unknown `MCP_SQL` key at any level now refuses to boot
-  (`ImproperlyConfigured`, "Extra inputs are not permitted", naming the
-  key's path: `PIN_SEARCHPATH`, `LIMITS.EXTRA`, `PROFILES.default.EXTRA`,
-  `CLOUD_CLIENTS.0.EXTRA`) instead of being ignored, so a misspelt opt-in
+  (`ImproperlyConfigured: Invalid MCP_SQL settings`, raised from pydantic's
+  `ValidationError` — shown as its cause in the traceback — which names
+  the key's path with "Extra inputs are not permitted": `PIN_SEARCHPATH`,
+  `LIMITS.EXTRA`, `PROFILES.default.EXTRA`, `CLOUD_CLIENTS.0.EXTRA`)
+  instead of being ignored, so a misspelt opt-in
   (`PIN_SEARCHPATH`) cannot leave its feature silently off. Remove or
   correct any stray key, top-level or nested.
 - `oauthlib` is now a declared dependency (`>=3.3.0,<5`): the package builds

@@ -337,16 +337,27 @@ schema-qualified table; the role then also needs `USAGE` on that schema,
 which the package does not grant). The parser refuses a qualified
 reference to a relation in any other schema. An unqualified name is the
 relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
-read path then pins `search_path` to `public, pg_temp`); with the default
-(`False`) Postgres resolves it through the database's own `search_path`,
-so a schema listed ahead of `public` (or a `"$user"` schema named after
-the profile role, or a temporary relation — table or view — on the
-backend) can shadow a whitelisted table wherever the profile role may
-read the shadowing relation — the grants below are then the boundary (see
-`docs/architecture.md` → "`search_path` is pinned only on request" for
-what each mode guarantees and when to turn the pin on). In both modes a
-SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
-TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
+read path then pins `search_path` to `public, pg_temp`) — **set it**,
+unless an extension the agents use lives outside `public` (with the pin
+on they can still call it as `ext.f(…)` / `OPERATOR(ext.op)`). With the
+default (`False`) Postgres resolves it through the database's own
+`search_path`, so a schema listed ahead of `public`, a `"$user"` schema
+named after the profile role, or a temporary relation (table or view) on
+the backend shadows a whitelisted table wherever the profile role may
+read the shadowing relation — and a grant to `PUBLIC` is enough for
+that. Without any right on the whitelisted tables, any role with
+`CREATE` on the database (by default its owner, often the app's login)
+can create the `"$user"` schema, and another session on the same backend
+(e.g. under transaction-mode pooling) can create the temporary relation;
+a DBA's database- or login-level `search_path` does the same by
+accident. The drift check (`mcp_sql_grants`) does **not** see such a
+shadow: its inventory lists only direct grants to the profile role, not
+grants to `PUBLIC`, through role membership, on materialized views or
+on temporary relations. See `docs/architecture.md` → "`search_path` is
+pinned only on request" for what each mode guarantees. In both modes a
+direct SELECT grant to the profile role on a relation in another schema
+(a `GRANT SELECT ON ALL TABLES IN SCHEMA …`, a same-named copy of a
+whitelisted table) is drift:
 the check reports it as "granted but not declared" (shown quoted,
 `"schema"."name"`) and `--apply` revokes it. The names come from whoever
 owns the relations, so the command quotes each identifier (an embedded

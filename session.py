@@ -50,11 +50,17 @@ EXPECTED_SESSION_GUCS: dict[str, str] = {
 # `search_path` (a `"$user"` schema — under `SET ROLE`, one named after the
 # profile role — a database- or role-level setting, a connection option) can
 # otherwise resolve it to a same-named relation elsewhere that the profile
-# role may read. `pg_temp` is listed last so a temporary table cannot shadow
-# it either (unlisted, it is searched first). A list: see `guc_value_sql`.
-# Off, `search_path` is the database's own and the role's grants are the
-# boundary for such a relation; on, an extension outside `public` loses its
-# unqualified names (docs/architecture.md "`search_path`").
+# role may read (a grant to `PUBLIC` is enough). `pg_temp` is listed last so
+# a temporary relation cannot shadow it either (unlisted, it is searched
+# first) — while the relation exists in `public`; a missing one falls
+# through to a temporary relation of that name. A list: see `guc_value_sql`.
+# Off (the default; turning it on is recommended), `search_path` is the
+# database's own, so any role with CREATE on the database (a `"$user"`
+# schema) or another session on the same backend (a temporary relation)
+# can plant rows the agent reads under a whitelisted name, without any
+# right on the whitelisted tables and unseen by the grants drift check; on,
+# an extension outside `public` loses its unqualified names
+# (docs/architecture.md "`search_path`").
 PINNED_SEARCH_PATH: dict[str, str] = {"search_path": "public, pg_temp"}
 
 # Per-transaction only, never a role default. `default_transaction_read_only`

@@ -215,7 +215,11 @@ def granted_tables(role: str) -> set[Relation]:
     Limits of the inventory (`information_schema.role_table_grants`):
     materialized views are not listed, nor are grants to `PUBLIC` or grants
     the role holds only through membership in another role (ledger F42 /
-    F64)."""
+    F64); relations in temporary schemas are skipped. With
+    `PIN_SEARCH_PATH` off, a relation shadowing a whitelisted name and
+    readable through any of these is served to the agent and never
+    reported (docs/architecture.md "`search_path` is pinned only on
+    request")."""
     _verify_default_alias()
     with connection.cursor() as cur:
         cur.execute(
