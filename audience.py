@@ -45,16 +45,20 @@ def mcp_resource_url(request: HttpRequest) -> str:
     return absolute_url(request, reverse("mcp_sql_endpoint"))
 
 
-# The longest port spelling accepted (`65535`, or `0443`/`00443`). Python's
-# `urlsplit` (DOT's parser) refuses a port above 65535, and one of more than
-# 4300 digits (`int()`'s string limit) whatever its value.
+# The longest port spelling accepted (`65535`, or `0443`/`00443`): the
+# package's own cap, not a parser's. Python's `urlsplit` (DOT's parser)
+# refuses a port above 65535 and one of more than 4300 digits (`int()`'s
+# string limit), but takes any shorter zero-padded spelling (`:000443`);
+# the cap keeps this check's `int()` small and every accepted value well
+# inside what DOT parses.
 _MAX_PORT_DIGITS = 5
 _MAX_PORT = 65535
 
 
 def _has_parseable_port(authority: str) -> bool:
-    """False when `authority` ends in `:<ASCII digits>` that are not a port:
-    more than five digits, or a value above 65535."""
+    """False when `authority` ends in `:<ASCII digits>` the package does not
+    take as a port: more than five digits (its own cap), or a value above
+    65535."""
     _, colon, port = authority.rpartition(":")
     if not (colon and port.isascii() and port.isdigit()):
         return True
@@ -95,8 +99,9 @@ def foreign_resource(request: HttpRequest, values: Iterable[str]) -> str | None:
     two spellings discovery serves): no case folding, percent-decoding or
     dot segments. A query or fragment (even empty), userinfo, an empty
     value, the bare origin, any other path, host, port or scheme is
-    foreign; so is a port no URL parser takes (two ports, more than five
-    digits, above 65535 — on a request whose own Host carries such a port,
+    foreign; so is a port the package does not take (two ports or above
+    65535, which URL parsers refuse too, or more than five digits, the
+    package's own cap — on a request whose own Host carries such a port,
     every value is foreign).
 
     Every accepted spelling is one DOT (3.4+) parses as a resource indicator

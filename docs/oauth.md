@@ -125,17 +125,23 @@ endpoint's exactly, with or without the trailing slash. Repeating it is
 fine; omitting it is fine (the token is then not resource-bound, as before).
 
 Equivalent spellings are equivalent at each step, not across steps. From
-DOT 3.4, `/o/token/` also requires each `resource` to be one of the
-grant's, compared as strings: exchange the code with the same `resource`
-string the authorization request carried, or with none (the token then
-carries the grant's). Another spelling, even an equivalent one, passes the
-package's check and then gets DOT's own `invalid_target`, whose
-`error_description` names the value sent; the code is not consumed, so the
-client can retry. The MCP SDKs send the same value at both steps.
+DOT 3.4, when the grant carries a `resource`, `/o/token/` also requires each
+`resource` sent there to be one of the grant's, compared as strings:
+exchange the code with the same `resource` string the authorization request
+carried, or with none (the token then carries the grant's). Another
+spelling, even an equivalent one, passes the package's check and then gets
+DOT's own `invalid_target`, whose `error_description` names the value sent;
+the code is not consumed, so the client can retry. When the grant carries
+none (the authorization request sent no `resource`), DOT compares nothing
+and stores the token request's value on the token as sent — which the
+package's check has already limited to the advertised identifier. The MCP
+SDKs send the same value at both steps.
 
 Anything else — the bare origin `https://<host>`, another path, host, port
-or scheme, a port no URL parser takes (two ports, more than five digits,
-above 65535), a query, a fragment, userinfo, an empty value — is refused
+or scheme, a port the package does not take (two ports or above 65535,
+which URL parsers refuse too; more than five digits, the package's own cap,
+although `urlsplit` and DOT take a zero-padded `:000443`), a query, a
+fragment, userinfo, an empty value — is refused
 with **`invalid_target`** (RFC 8707 §2), naming the accepted value in
 `error_description` (the package's answer never names the value the client
 sent):

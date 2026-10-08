@@ -79,7 +79,7 @@ def canonical_authority(scheme: str, authority: str) -> str:
     has two ports, is no `host[:port]` at all, and splitting it at the last
     colon made it equal `name:P`. Pure string work, no `int()`: a Host
     header's port is unbounded digits (`audience.foreign_resource` refuses a
-    port no URL parser takes).
+    port the package does not take).
 
     Used by `absolute_url` on `request.get_host()` and by
     `audience.foreign_resource` on a client's `resource`, so both sides of

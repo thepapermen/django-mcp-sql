@@ -36,15 +36,17 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   host case-insensitive and the default port optional (both sides through
   `consts.canonical_authority`; the path, query, fragment and userinfo are
   never normalised — the bare origin and other prefixes stay foreign; a
-  port no URL parser takes is foreign, so DOT never sees a value it would
-  refuse naming it), and
+  port the package does not take — two ports or above 65535, which URL
+  parsers refuse too, or over five digits, the package's own cap — is
+  foreign, so DOT never sees a value it would refuse naming it), and
   `/mcp/sql/` verifies bearers through `audience.CanonicalUriOAuthLibCore`,
   so DOT's (3.4+) audience check sees the URL built the way discovery
   builds `resource`. Build any new OAuth absolute URL with
   `consts.absolute_url`; never verify the bearer with DOT's stock core, and
   keep `MCPTokenView` on DOT's form-body `OAuthLibCore` (a JSON backend
   would parse a `resource` the check never read). Equivalence is per step:
-  DOT's token step compares `resource` with the grant's as a string.
+  when the grant carries a `resource`, DOT's token step compares the
+  token request's with it as a string.
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over
   the authenticated user). Tools are `async def`, dispatch ORM work via
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is

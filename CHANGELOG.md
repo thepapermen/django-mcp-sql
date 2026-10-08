@@ -274,8 +274,9 @@ separately below precisely because they do **not** announce themselves.
     host in any case, the scheme's default port spelled out or omitted, the
     path exactly the endpoint's, with or without the trailing slash. Anything
     else (including an empty value, the bare origin `https://<host>`, another
-    path, port, host or scheme, a port no URL parser takes — two ports, more
-    than five digits, above 65535 — a query, a fragment, userinfo) is
+    path, port, host or scheme, a port the package does not take — two
+    ports or above 65535, which URL parsers refuse too, or more than five
+    digits, the package's own cap — a query, a fragment, userinfo) is
     **`invalid_target`** — a redirect to the client's validated
     `redirect_uri` with its `state` and no grant at the authorization
     endpoint (GET, and the consent POST's form field and query string), a
@@ -289,12 +290,15 @@ separately below precisely because they do **not** announce themselves.
     refuses it first, and the consent page is re-rendered with a form error
     (no redirect, nothing stored).
   - Equivalent spellings are equivalent at each step, not across steps:
-    from DOT 3.4, `/o/token/` also requires each `resource` to be one of the
-    grant's, compared as strings. Exchange the code with the same `resource`
-    string the authorization request carried, or with none (the token then
-    carries the grant's); another spelling gets DOT's own `invalid_target`,
-    which names the value sent, and the code is not consumed. The MCP SDKs
-    send the same value at both steps.
+    from DOT 3.4, when the grant carries a `resource`, `/o/token/` also
+    requires each `resource` sent there to be one of the grant's, compared
+    as strings. Exchange the code with the same `resource` string the
+    authorization request carried, or with none (the token then carries the
+    grant's); another spelling gets DOT's own `invalid_target`, which names
+    the value sent, and the code is not consumed. When the grant carries
+    none, DOT stores the token request's value (already limited to the
+    advertised identifier by the package) on the token as sent. The MCP
+    SDKs send the same value at both steps.
   - Discovery, and every other absolute URL the package builds, spells the
     host canonically: lowercased, without the scheme's default port. A proxy
     forwarding `Host: <name>:443` (nginx `proxy_set_header Host
@@ -512,7 +516,8 @@ separately below precisely because they do **not** announce themselves.
   re-validates the target against the client before every error redirect and
   shows the error page when it does not belong to the client. A consent POST
   naming a `client_id` that does not exist was a 500; it shows the same error
-  page. So does a `client_id` containing a NUL byte: on the GET, DOT handed it
+  page, also when the client is deleted while the POST is in flight (on
+  every path, Authorize or Cancel, with or without a `resource`). So does a `client_id` containing a NUL byte: on the GET, DOT handed it
   to Postgres, which raised `DataError` (a 500); on the consent POST, Django's
   form validation already rejected it and the consent page was re-rendered
   (a 200), so the POST check is defence in depth. All inherited from DOT; also
