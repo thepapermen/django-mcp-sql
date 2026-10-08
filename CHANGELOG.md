@@ -264,8 +264,11 @@ they do **not** announce themselves.
   when a request omits `redirect_uri` comes from settings too: the callback of
   an entry with exactly one rule that is `"exact"`, otherwise none (the error
   page; a lone prefix rule used to make the prefix itself the default). The
-  row still gets the URIs on `migrate`, for the admin and the audit trail. The
-  curated client and DCR clients keep DOT's row-backed matching.
+  row still gets the URIs on `migrate`, but nothing reads that copy for a
+  declared client: the audit trail's `client_redirect` is built from its
+  `CLIENTS` entry too, so audit rows name the callbacks actually enforced
+  rather than the row's until the next `migrate`. The curated client and DCR
+  clients keep DOT's row-backed matching (and their rows' `client_redirect`).
 - **A long `CLIENTS` slug passed boot and failed `migrate`.** The derived
   `<prefix><kind>.<slug>` is written to DOT's `Application.client_id` and
   `name` (255 characters each on DOT 3.4), so an overlong slug raised a
