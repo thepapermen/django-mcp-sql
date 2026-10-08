@@ -8,6 +8,7 @@ it. The schema-scoped whitelist (`test_schema_scoping.py`) holds either way.
 """
 
 import copy
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,9 +25,25 @@ from mcp_sql.session import session_gucs
 from mcp_sql.tests.test_validation import VALID
 from mcp_sql.validation import McpSqlSettings
 from mcp_sql.validation import validate_mcp_sql_settings
+from pydantic import ValidationError
 
 _ROLE = "mcp_readonly_role"
 _PIN_SQL = "SET LOCAL search_path = 'public', 'pg_temp'"
+_CLOUD_CLIENT = {
+    "NAME": "example",
+    "REDIRECT_MATCH": "exact",
+    "REDIRECT_URI": "https://example.com/callback",
+}
+# Each an unknown key's path into the settings dict (a list index for a
+# CLOUD_CLIENTS entry), as pydantic reports it.
+_UNKNOWN_KEYS: list[tuple[str | int, ...]] = [
+    ("PIN_SEARCHPATH",),
+    ("pin_search_path",),
+    ("SEARCH_PATH",),
+    ("LIMITS", "EXTRA"),
+    ("PROFILES", "default", "EXTRA"),
+    ("CLOUD_CLIENTS", 0, "EXTRA"),
+]
 
 
 @pytest.fixture
@@ -64,13 +81,34 @@ class TestSetting:
             validate_mcp_sql_settings(cfg)
 
     @pytest.mark.parametrize(
-        "key", ["PIN_SEARCHPATH", "pin_search_path", "SEARCH_PATH"]
+        "path", _UNKNOWN_KEYS, ids=[".".join(map(str, p)) for p in _UNKNOWN_KEYS]
     )
-    def test_an_unknown_key_refuses_to_boot(self, key):
-        # A typo would otherwise leave the pin silently off.
-        cfg = {**copy.deepcopy(VALID), key: True}
-        with pytest.raises(ImproperlyConfigured, match="Invalid MCP_SQL settings"):
+    def test_an_unknown_key_refuses_to_boot(self, path):
+        # A typo would otherwise leave the pin silently off. Refused at any
+        # level: `extra="forbid"` on `McpSqlSettings` reaches the nested
+        # TypedDicts (LIMITS, a PROFILES entry, a CLOUD_CLIENTS entry) too.
+        cfg = {**copy.deepcopy(VALID), "CLOUD_CLIENTS": [dict(_CLOUD_CLIENT)]}
+        container: Any = cfg
+        for step in path[:-1]:
+            container = container[step]
+        container[path[-1]] = True
+        with pytest.raises(
+            ImproperlyConfigured, match="Invalid MCP_SQL settings"
+        ) as excinfo:
             validate_mcp_sql_settings(cfg)
+        cause = excinfo.value.__cause__
+        assert isinstance(cause, ValidationError)
+        # The error names the key's path, and nothing else is wrong.
+        assert [(e["loc"], e["type"]) for e in cause.errors()] == [
+            (path, "extra_forbidden")
+        ]
+        assert ".".join(map(str, path)) in str(cause)
+
+    def test_the_unknown_key_baseline_is_valid(self):
+        # The cases above differ from this only by the unknown key.
+        validate_mcp_sql_settings(
+            {**copy.deepcopy(VALID), "CLOUD_CLIENTS": [dict(_CLOUD_CLIENT)]}
+        )
 
 
 class TestGuards:

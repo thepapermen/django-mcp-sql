@@ -12,8 +12,10 @@ import pytest
 from django.db import connection
 from django.db import transaction
 from mcp_sql.session import EXPECTED_SESSION_GUCS
+from mcp_sql.session import PINNED_SEARCH_PATH
 from mcp_sql.session import enter_readonly_session
 from mcp_sql.session import session_drift
+from mcp_sql.session import session_gucs
 
 
 def _executed_sql(cursor: MagicMock) -> list[str]:
@@ -87,6 +89,23 @@ def test_hook_rejects_boundary_shaped_guc_names(name):
 
 _ROLE = "mcp_readonly_role"
 
+# The guards `session_drift` checks in each `PIN_SEARCH_PATH` mode, and for
+# each guard a value other than its own, as `SHOW` spells it. A guard added
+# to `session.py` without a value here fails `test_guc_drift_detected`.
+_GUARDS = {
+    "unpinned": EXPECTED_SESSION_GUCS,
+    "pinned": EXPECTED_SESSION_GUCS | PINNED_SEARCH_PATH,
+}
+_DRIFTED = {
+    "statement_timeout": "99s",
+    "lock_timeout": "7s",
+    "idle_in_transaction_session_timeout": "9s",
+    "default_transaction_read_only": "off",
+    "standard_conforming_strings": "off",
+    "search_path": "public",
+}
+_DRIFT_CASES = [(mode, name) for mode, guards in _GUARDS.items() for name in guards]
+
 
 class TestSessionDrift:
     """`session_drift` is the smoke/executor pre-flight check that the read
@@ -110,15 +129,20 @@ class TestSessionDrift:
         assert set(drift) == {"current_user"}
 
     @pytest.mark.django_db
-    def test_guc_drift_detected(self):
+    @pytest.mark.parametrize(
+        ("mode", "name"), _DRIFT_CASES, ids=[f"{m}-{n}" for m, n in _DRIFT_CASES]
+    )
+    def test_guc_drift_detected(self, settings, mode, name):
+        # Every guard, in both modes: one the check skipped would let a
+        # database- or login-level value through unreported.
+        settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": mode == "pinned"}
+        assert session_gucs() == _GUARDS[mode]
         with transaction.atomic(), connection.cursor() as cur:
             enter_readonly_session(cur, role=_ROLE)
             # Override one guard transaction-locally to force a mismatch.
-            cur.execute("SET LOCAL statement_timeout = '99s'")
+            cur.execute(f"SET LOCAL {name} = '{_DRIFTED[name]}'")
             drift = session_drift(cur, _ROLE)
-        expected = EXPECTED_SESSION_GUCS["statement_timeout"]
-        assert drift["statement_timeout"] == (expected, "99s")
-        assert "current_user" not in drift
+        assert drift == {name: (_GUARDS[mode][name], _DRIFTED[name])}
 
 
 # A statement that starts with `SET` and is not `SET LOCAL` (a session-level
