@@ -175,11 +175,26 @@ class MCPAuthorizationView(AuthorizationView):
             if application is None:
                 return self._unknown_client_response()
             return self.error_response(error, application)
-        return super().form_valid(form)
+        # Every other path (Authorize or Cancel, with or without a matching
+        # `resource`) is DOT's `form_valid`, whose first line is that same
+        # `Application.objects.get`: a client deleted since the check above
+        # was a `DoesNotExist` 500 there too. Nothing is stored before that
+        # lookup, and in the authorization step DOT (3.2 to 3.4) has no other
+        # `get` that can raise it (its validator's own client lookup catches
+        # it). Still, only a client that is really gone gets the error page;
+        # any other `DoesNotExist` of the Application model is re-raised.
+        application_model = get_application_model()
+        try:
+            return super().form_valid(form)
+        except application_model.DoesNotExist:
+            if self._is_known_client_id(client_id):
+                raise
+            return self._unknown_client_response()
 
     def _unknown_client_response(self):
         """The fatal-client error page for a `client_id` that names no
-        Application, as DOT renders it for an unknown client on the GET."""
+        Application, as DOT renders it for an unknown client on the GET.
+        Never a redirect."""
         return super().error_response(
             FatalClientError(error=oauth2_errors.InvalidClientIdError()),
             application=None,

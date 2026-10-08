@@ -974,7 +974,7 @@ class TestConsentPostErrorsNeverRedirectOffClient:
     CALLBACK = "https://claude.ai/api/mcp/auth_callback"
     EVIL = "https://evil.example/steal"
 
-    def _post(self, client, mcp_user, **overrides):
+    def _post(self, client, mcp_user, query="", **overrides):
         data = {
             "client_id": self.CLIENT_ID,
             "redirect_uri": self.CALLBACK,
@@ -986,7 +986,7 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         }
         data.update(overrides)
         client.force_login(mcp_user)
-        return client.post(reverse("authorize"), data=data)
+        return client.post(reverse("authorize") + query, data=data)
 
     @staticmethod
     def _assert_error_page(response):
@@ -1076,21 +1076,48 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         )
         self._assert_error_page(response)
 
+    MATCHING = "https://testserver/mcp/sql/"
+
+    # Every consent-POST branch, each with the client deleted right after the
+    # view's unknown-client check. `foreign`: the package's `invalid_target`
+    # path (B11). The rest reach DOT's own `form_valid`, whose
+    # `Application.objects.get` raised `DoesNotExist` (a 500) on DOT 3.2 and
+    # 3.4 alike: Authorize with a matching `resource`, Authorize with none,
+    # Cancel with none, and a matching `resource` only in the query string
+    # with no form field (DOT 3.2 has no such field, so it is DOT's path
+    # there; from 3.4 the blank field disagrees with the query, the package's
+    # path).
+    VANISHED_CASES = {
+        "foreign": {"resource": "not a uri", "allow": "Authorize"},
+        "matching": {"resource": MATCHING, "allow": "Authorize"},
+        "none": {"allow": "Authorize"},
+        "cancel": {},
+        "query_only": {
+            "query": "?resource=https%3A%2F%2Ftestserver%2Fmcp%2Fsql%2F",
+            "allow": "Authorize",
+        },
+    }
+
+    @pytest.mark.parametrize("case", list(VANISHED_CASES))
     def test_client_deleted_mid_request_renders_error_page_not_500(
-        self, client, mcp_user, gate_posture, monkeypatch
+        self, client, mcp_user, gate_posture, monkeypatch, case
     ):
-        """The `invalid_target` path loads the Application after the
-        unknown-client check; a client deleted in between (an operator
-        removing it while a consent POST is in flight) was a `DoesNotExist`
-        500. Now the same error page as an unknown client."""
+        """A client deleted between the view's unknown-client check and the
+        Application lookup after it (an operator removing it while a consent
+        POST is in flight) was a `DoesNotExist` 500. Now the same error page
+        as an unknown client: no redirect, nothing stored."""
         from mcp_sql.views.oauth_authorize import MCPAuthorizationView
+        from oauth2_provider.models import Grant
         from oauth2_provider.models import get_application_model
 
         known = MCPAuthorizationView._is_known_client_id
+        deleted = []
 
         def known_then_deleted(client_id):
             result = known(client_id)
-            get_application_model().objects.filter(client_id=client_id).delete()
+            if not deleted:
+                get_application_model().objects.filter(client_id=client_id).delete()
+                deleted.append(client_id)
             return result
 
         monkeypatch.setattr(
@@ -1098,9 +1125,31 @@ class TestConsentPostErrorsNeverRedirectOffClient:
             "_is_known_client_id",
             staticmethod(known_then_deleted),
         )
-        response = self._post(client, mcp_user, resource="not a uri", allow="Authorize")
+        response = self._post(client, mcp_user, **self.VANISHED_CASES[case])
         self._assert_error_page(response)
         assert b"Invalid client_id" in response.content
+        assert deleted == [self.CLIENT_ID]
+        assert not Grant.objects.exists()
+
+    def test_other_does_not_exist_from_dots_form_valid_is_not_masked(
+        self, client, mcp_user, gate_posture, monkeypatch
+    ):
+        """The error page is only for a client that is really gone: an
+        Application `DoesNotExist` from DOT's `form_valid` while the client
+        still exists propagates instead of being reported as an unknown
+        client."""
+        from oauth2_provider.models import get_application_model
+        from oauth2_provider.views import AuthorizationView
+
+        application_model = get_application_model()
+
+        def raises(self, form):
+            raise application_model.DoesNotExist
+
+        monkeypatch.setattr(AuthorizationView, "form_valid", raises)
+        with pytest.raises(application_model.DoesNotExist):
+            self._post(client, mcp_user, allow="Authorize")
+        assert application_model.objects.filter(client_id=self.CLIENT_ID).exists()
 
 
 class TestOauthAdminUnregistered:
