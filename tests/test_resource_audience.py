@@ -659,6 +659,24 @@ class TestForeignResourceIsRefusedAtAuthorize:
         else:
             _assert_invalid_target_redirect(response)
 
+    @pytest.mark.parametrize("form_resource", [None, SLASHED])
+    def test_consent_query_string_with_a_nul_is_invalid_target_not_500(
+        self, client, mcp_app, mcp_user, gate_posture, form_resource
+    ):
+        """A NUL `resource` in the query string the consent form posts back
+        to (oauthlib reads it as well as the form field) is the package's
+        `invalid_target`, whatever the form field holds: no 500, nothing
+        stored, on every DOT version. (From DOT 3.4 the form field then
+        disagrees with the query, unless it carries the NUL too, which
+        Django's form validation refuses first; below 3.4 the form has no
+        such field and `foreign_resource` refuses the NUL itself.)"""
+        _, challenge = _pkce()
+        query = urlencode(_authorize_params(challenge, [SLASHED + "\x00"]))
+        client.force_login(mcp_user)
+        response = _consent(client, query, form_resource)
+        _assert_invalid_target_redirect(response)
+        assert _grant_count() == 0
+
     def test_get_with_one_foreign_among_repeated_values(
         self, client, mcp_app, mcp_user, gate_posture
     ):
@@ -1080,10 +1098,12 @@ def test_canonical_authority(scheme, authority, canonical):
     assert canonical_authority(scheme, authority) == canonical
 
 
-# Spellings of a `host[:port]` request's own endpoint that no URL parser
-# takes: two ports, or a port out of range or overlong. DOT (3.4+) refuses
-# such a value at `/o/authorize/` with an `invalid_target` of its own that
-# names the client's value; the package refuses it first, with its own.
+# Spellings of a `host[:port]` request's own endpoint whose port the package
+# does not take: two ports or a port out of range (no URL parser takes them:
+# DOT (3.4+) refuses such a value at `/o/authorize/` with an `invalid_target`
+# of its own that names the client's value), or one over five digits (the
+# package's own cap: `urlsplit` takes `:000443`, not `:` + 4300 digits). The
+# package refuses them first, with its own `invalid_target`.
 UNPARSEABLE_PORTS = [
     ("testserver:8443", "https://testserver:8443:443/mcp/sql/"),
     ("testserver:8443", "https://testserver:8443:0443/mcp/sql"),
