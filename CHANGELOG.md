@@ -297,11 +297,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   same-named relation in any other schema the profile role could SELECT
   (an accidental `GRANT SELECT ON ALL TABLES IN SCHEMA analytics`, an
   archived copy) — every column of it, past the reviewed whitelist and any
-  curated view; and an unqualified name resolved through the login's
-  `search_path` (a `"$user"` schema, which under `SET ROLE` is one named
-  after the profile role; a database- or role-level setting; a temporary
-  table, searched first). The grants drift check listed `public` only, so
-  it never reported such a grant. Now:
+  curated view. The grants drift check listed `public` only, so it never
+  reported such a grant. Now:
   - an entry is a relation in a schema: `public`, or the schema a
     `db_table` written `schema"."name` (or `"schema"."name"`) names. A
     reference matches it only there — the schema and the name each
@@ -309,10 +306,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     so `analytics.t` beside a whitelisted `t` is `disallowed_table`;
     `public.t` and `t` still read it. System schemas are refused as before,
     three-part `db.pg_catalog.x` included;
-  - the read transaction pins `search_path` to `public, pg_temp` (`SET
-    LOCAL`, one of the per-transaction guards; also a role default in
-    `sql/role_setup.sql`), so an unqualified name is the relation in
-    `public`;
+  - an unqualified name is checked as the relation in `public`, and which
+    relation Postgres opens for it depends on the new opt-in
+    `MCP_SQL["PIN_SEARCH_PATH"]` (default `False`, see Added). Off, as in
+    0.1.0b5, it resolves through the database's own `search_path`: a
+    schema an operator puts ahead of `public` (a `"$user"` schema named
+    after the profile role, a database-, login-role- or connection-level
+    setting) or a temporary table on the backend (searched first) shadows
+    a whitelisted table — read only where the profile role may SELECT the
+    shadowing relation, an error otherwise. None of these can be created
+    by an agent's query (a single SELECT in a read-only transaction); the
+    profile role's grants, which the inventory below now covers in every
+    schema, are the boundary. On, the read transaction pins `search_path`
+    to `public, pg_temp` (`SET LOCAL`, one of the per-transaction guards),
+    so an unqualified name is always the relation in `public`;
   - `mcp_sql_grants` (and the `post_migrate` drift WARNING) lists the
     profile role's SELECT grants in every schema but the system ones
     (`pg_catalog`, `information_schema`, `pg_*`, temporary schemas
@@ -335,24 +342,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     profile refused for an overlong or self-referential entry, view
     drift or a missing role no longer leaves the profiles before it
     applied.
-  - **Behaviour change:** names in agent queries resolve in `pg_catalog`
-    and `public` only. An extension installed in another schema (Django's
-    `CreateExtension` installs into the first schema on the app's
-    `search_path`, normally `public`) loses its unqualified names: call
-    its functions qualified (`extensions.similarity(...)`) and its
-    operators with `OPERATOR(schema.op)` (`name OPERATOR(extensions.=)
-    'alice'`, `s OPERATOR(extensions.%) 'cafe'`, prefix `OPERATOR(ext.@)
-    x`; a quoted schema stays quoted). Written bare, its
-    operators either fail or resolve to a `pg_catalog` one through a cast
-    (a `citext` column compared with `=` compares as `text`,
-    case-sensitively). Install such extensions in `public` if the agent
-    should not need to qualify them.
-    A whitelisted table that lives in another schema through the login's
-    `search_path` (and not in its `db_table`) is no longer found; spell the
-    schema in `db_table`. **Action:** re-run `sql/role_setup.sql` (or
-    `mcp_sql_role_setup`) for the new role default (the per-transaction
-    guard applies without it), then `mcp_sql_grants`: a grant it now
-    reports in another schema was readable through the parser.
+  - **With `PIN_SEARCH_PATH` on**, names in agent queries resolve in
+    `pg_catalog` and `public` only. An extension installed in another
+    schema (Django's `CreateExtension` installs into the first schema on
+    the app's `search_path`, normally `public`) loses its unqualified
+    names: call its functions qualified (`extensions.similarity(...)`) and
+    its operators with `OPERATOR(schema.op)` (`name
+    OPERATOR(extensions.=) 'alice'`, `s OPERATOR(extensions.%) 'cafe'`,
+    prefix `OPERATOR(ext.@) x`; a quoted schema stays quoted). Written
+    bare, its operators either fail or resolve to a `pg_catalog` one
+    through a cast (a `citext` column compared with `=` compares as
+    `text`, case-sensitively). Turn the pin on when every extension the
+    agents use lives in `public` (or `pg_catalog`).
+    **Behaviour change (both modes):** a whitelisted table that lives in
+    another schema through the login's `search_path` (and not in its
+    `db_table`) is not the whitelisted relation: spell the schema in
+    `db_table` (with the pin on it is not found at all; off, the parser
+    accepts the unqualified name but `mcp_sql_grants` grants and checks
+    the relation in `public`). **Action:** run `mcp_sql_grants`: a grant it
+    now reports in another schema was readable through the parser. With
+    the pin on, the `search_path` role default (`mcp_sql_role_setup
+    --emit-sql`, or the commented-out line in `sql/role_setup.sql`) is
+    optional: the per-transaction guard applies without it.
 - **`mcp_sql_grants --apply` could run SQL named by a relation (affects
   every release up to and including 0.1.0b5).** The drift inventory read
   relation names from the catalog and interpolated them into GRANT /
@@ -673,6 +684,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   responses list `refresh_token` while it is on. Logout and password change
   revoke refresh tokens. Runbook: `docs/oauth.md` "Refresh tokens
   (opt-in)".
+- **Opt-in `search_path` pin**: `MCP_SQL["PIN_SEARCH_PATH"]` (default
+  `False`; `True` / `False` only, anything else refuses to boot). On, every
+  read transaction sets `SET LOCAL search_path = 'public', 'pg_temp'` and
+  `mcp_sql_smoke`'s session check expects it, so an unqualified table name
+  is always the whitelisted relation in `public`; a temporary table or a
+  schema ahead of `public` on the database's `search_path` can no longer
+  shadow it. Off, `search_path` is the database's own, as in 0.1.0b5 (the
+  profile role's grants are the boundary for a shadowing relation). The
+  cost of turning it on: an extension installed outside `public` must be
+  qualified (`ext.f(...)`, `OPERATOR(ext.op)`; a bare `=` on its `citext`
+  column silently compares as `text`). `mcp_sql_role_setup --emit-sql`
+  prints the matching role default only when the pin is on;
+  `sql/role_setup.sql` carries it commented out. The schema-scoped
+  whitelist and grants inventory (Security, above) apply in both modes.
+  Details: `docs/architecture.md` "`search_path` is pinned only on
+  request".
 - CI runs the whole suite a second time under a minimal security posture
   (allow-all `MFA_CHECKER`, no `SESSION_MODEL`; `MCP_SQL_TEST_POSTURE=minimal`,
   `make test-minimal`), and `docs/oauth.md` has a table of what MFA, the
@@ -680,6 +707,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- An unknown top-level `MCP_SQL` key now refuses to boot
+  (`ImproperlyConfigured`, "Extra inputs are not permitted") instead of
+  being ignored, so a misspelt opt-in (`PIN_SEARCHPATH`) cannot leave its
+  feature silently off. Remove or correct any stray key.
 - `oauthlib` is now a declared dependency (`>=3.3.0,<5`): the package builds
   its OAuth server from oauthlib's classes and relies on two internals,
   pinned by a test. CI's minimum-versions job pins `oauthlib==3.3.0`.

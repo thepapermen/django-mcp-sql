@@ -55,7 +55,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 |---|---|
 | `sql/role_setup.sql` | Idempotent SQL to create `mcp_readonly_role` + role-level GUC defaults + the membership GRANT. The app role name is supplied via the psql variable `app_role` (`-v app_role=<role>`); the GRANT lives inside a `DO $$ ... $$` block (so psql variable substitution does not reach it directly), so the script wraps the GRANT in an explicit `BEGIN ... COMMIT` and uses `SET LOCAL mcp_sql.app_role = :'app_role'` (psql substitutes the variable at the call site, and the DO block reads the value via `current_setting(...)` + `EXECUTE format('GRANT mcp_readonly_role TO %I', target_role)`). `SET LOCAL` (not bare `SET`) keeps the library-wide invariant — no session-scope SET in mcp_sql code, even on bootstrap paths that don't traverse pgbouncer today. Portable across environments whose `POSTGRES_USER` differs (the caller passes the matching value via `-v app_role=<role>`). |
 | `sql/10_mcp_role.sh` | Init-dir wrapper for fresh dev clusters. Mounted at `/docker-entrypoint-initdb.d/10_mcp_role.sh`; the Postgres image entrypoint runs it once after `POSTGRES_USER` is created. It `exec`s psql with `-v app_role="$POSTGRES_USER"` against `role_setup.sql` (mounted at `/mcp_sql/role_setup.sql`, deliberately OUTSIDE the init dir so the entrypoint does not also auto-run the SQL without the variable substitution). For long-lived deployments the DBA applies the SQL manually with the matching `-v app_role=<role>` value (see `docs/role-setup.md`). |
-| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. `EXPECTED_SESSION_GUCS` (timeouts, `default_transaction_read_only`, `standard_conforming_strings`, `search_path = public, pg_temp`; also the role defaults in `role_setup.sql`) plus `TRANSACTION_GUCS` (`transaction_read_only`, per transaction only); `session_drift` checks both, the live read-only flag included. |
+| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. `session_gucs()` — `EXPECTED_SESSION_GUCS` (timeouts, `default_transaction_read_only`, `standard_conforming_strings`; also the role defaults in `role_setup.sql`), plus `PINNED_SEARCH_PATH` (`search_path = public, pg_temp`) only with `MCP_SQL["PIN_SEARCH_PATH"]` on — plus `TRANSACTION_GUCS` (`transaction_read_only`, per transaction only); `session_drift` checks both, the live read-only flag included. |
 | `db_router.py` | One universal invariant, nothing else: `allow_migrate` returns `False` for `MCP_SQL["DB_ALIAS"]` so **no** app ever builds or tracks schema through the read-only execution alias — it is a lens onto a database `default` owns (or a read replica), which Django can't infer and would otherwise migrate per-alias (a `migrate --database=<alias>`, or the test runner's per-alias setup). Abstains (`None`) on every other decision: audit writes/reads land on `default` via Django's fallback (no explicit pin needed), and the executor reaches the read alias via an explicit `connections[DB_ALIAS]` that routers don't intercept. Deliberately bakes in **no** consumer-topology assumption (no literal `"default"` home for `mcp_sql`'s own tables — a multi-DB consumer manages that with their own routers). Keyed on the `DB_ALIAS` setting, so it holds whether the alias is the same DB via a read-only role or a separate replica. |
 | `models.py` | Two audit tables (their `client_ip` comes through `audit_client_ip`: `REMOTE_ADDR` when it is one IP address, else NULL). `MCPQueryLog` — every `executor.run_query` call (parser-reject / executor-misconfig / timeout / execution-error / `limit=0` short-circuit / success). `MCPAuthRejectionLog` — every `MCPOAuth2Authentication.authenticate` rejection (bad-token / bad-application / bad-scope / inactive-or-non-staff / no-MFA / no-perm / no-session). Separate tables by design: auth rejections happen before query evaluation, conflating them in `MCPQueryLog` would pollute the daily-volume "queries per user" aggregation with bot-probe rejection counts. The planned revoked-credential probing alert reads `MCPAuthRejectionLog`. Both tables append-only by convention; admin has no write paths; both have `REVOKE SELECT ... FROM mcp_readonly_role` (migrations 0002 + 0008). `MCPAuthRejectionLog` also records the logout and password-change revocations (`session_logout`, `password_change`) — when one deleted a token or pending code; a user who held none gets no row. `MCPRefreshTokenFamily` (migration 0013) records the consent time of each refresh-token chain, used only when `REFRESH_TOKEN_MAX_AGE_SECONDS` enables refresh tokens. |
 | `management/commands/mcp_sql_grants.py` | The single grants-pipeline command. Default mode is read-only: prints the drift diff and exits non-zero if any profile role's grants don't match its `MCP_SQL["PROFILES"][...]["ALLOWED_MODELS"]` whitelist (pre-deploy gate) — SELECT grants in every schema but the system ones, so a grant on a relation outside `public` is drift too; GRANT / REVOKE name the relation schema-qualified, each identifier quoted (see "Watch out: catalog names are untrusted SQL"). With `--apply`, executes GRANT / REVOKE — intended as the deploy-pipeline step right after `migrate`, and also runnable against an ephemeral CI test cluster to fail PRs that add a model to a profile's `ALLOWED_MODELS` without the migration that creates its table. Strict in both modes: raises if the role is missing, the app role lacks membership, OR any curated MCPxxx view's column list drifts from its unmanaged-model declaration (verified inside `reconcile_grants` via `_verify_view_parity` so the same gate runs on the deploy command + the post_migrate signal). The `post_migrate` signal (see `signals.py`) only DETECTS drift and logs a WARNING; this command is the only code path that mutates. |
@@ -90,8 +90,9 @@ A single nested dict `MCP_SQL`, validated on startup by
 numerics, `DEFAULT_LIMIT <= HARD_LIMIT`, at-least-one profile with
 non-empty + cross-profile-unique ROLE / PERMISSION_CODENAME / GROUP_NAME,
 and the `app_label.ModelName` format on every profile's `ALLOWED_MODELS`
-entry. Model resolution itself is deferred to runtime so optional installs
-and load-order edge cases don't crash boot.
+entry. An unknown top-level key refuses to boot (a typo would otherwise be
+ignored and the default used). Model resolution itself is deferred to
+runtime so optional installs and load-order edge cases don't crash boot.
 
 ```python
 MCP_SQL = {
@@ -111,8 +112,16 @@ MCP_SQL = {
         "allowed": {3600: 50, 86400: 150},
         "rejected": {3600: 50, 86400: 150},
     },
+    # "PIN_SEARCH_PATH": False,  # opt-in: SET LOCAL search_path = public, pg_temp
 }
 ```
+
+`PIN_SEARCH_PATH` (bool, default `False`; anything but `True` / `False`
+refuses to boot): whether every read transaction pins `search_path` to
+`public, pg_temp`. Off, unqualified names resolve through the database's
+own `search_path`; on, extensions outside `public` must be qualified. What
+each mode guarantees, and when to turn it on: "Watch out" → "`search_path`
+is pinned only on request".
 
 ## Profiles (access tiers)
 
@@ -425,27 +434,72 @@ The load-bearing invariants and footguns, grouped by layer:
   `'a\b'` the way Postgres does only with it on; a database- or login-role
   level `off` would make the executed SQL mean something else (quotes
   shift). It is one of the per-transaction guards.
-- **`search_path` is pinned to `public, pg_temp`.** The parser matches an
-  unqualified `FROM t` against the whitelisted relation in `public`; the
-  login's own `search_path` could resolve it elsewhere — a `"$user"`
-  schema (under `SET ROLE` the profile role's name), a database- or
-  role-level setting, a connection option, and a temporary table, which
-  is searched first unless `pg_temp` is listed. Pinned per transaction
-  like every guard (a list, written `'public', 'pg_temp'`:
-  `session.guc_value_sql`). The cost: functions, operators and types of
-  an extension installed in another schema are not found unqualified —
-  call the function qualified (`ext.similarity(…)`) and the operator as
-  `OPERATOR(ext.=)` / prefix `OPERATOR(ext.@) x` (`FaithfulPostgres`
-  keeps the name exactly as written, a quoted schema quoted, review
-  round 20); a bare `=` on a `citext` column in schema `ext` compares as
-  `text`. An operator calls its function without naming it, so the
-  function deny list does not apply to operators, bare or in
-  `OPERATOR()`: in a stock catalog the only operators whose function it
-  would refuse by name are the immutable `pg_lsn` comparisons and
-  arithmetic (pinned by
-  `test_sql_fidelity.test_no_catalog_operator_runs_a_function_the_deny_list_refuses`);
-  an extension's operators in a schema the role can use are the DBA's to
-  vet, like its functions. Pinned by `tests/test_schema_scoping.py`.
+- **`search_path` is pinned only on request (`MCP_SQL["PIN_SEARCH_PATH"]`,
+  default `False`).** The parser checks an unqualified `FROM t` as the
+  whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`); which
+  relation Postgres opens depends on the mode.
+  - **Off (default):** the read transaction does not touch `search_path`
+    (and `session_drift` does not check it), so Postgres opens the first
+    `t` on the login session's `search_path` — the database's default
+    (`"$user", public` unless configured), an `ALTER DATABASE` /
+    `ALTER ROLE <app login>` setting, a connection option. What can come
+    before `public` (each verified on PostgreSQL 15): a schema named after
+    the profile role (`"$user"` is `current_user`, the profile role under
+    `SET ROLE`; skipped unless the role has `USAGE` on it), a schema an
+    operator lists ahead of `public`, and a temporary table, which is
+    searched first when `pg_temp` is not listed. Each takes an operator,
+    DBA or other-client action: the agent cannot create one — its SQL is a
+    single SELECT, its transaction is read-only (`CREATE TEMP TABLE` and
+    `SELECT … INTO` fail with "cannot execute … in a read-only
+    transaction"), `CREATE SCHEMA` needs a privilege the profile role is
+    not given, and `set_config` is on the deny list. A temporary table
+    needs a client on the same backend session: the alias's own
+    connections are not reused (`CONN_MAX_AGE = 0`), but behind
+    transaction-mode pgbouncer a backend is shared with every client of
+    that pool, and an `ON COMMIT PRESERVE ROWS` temporary table lives as
+    long as the backend. `ALTER ROLE <profile role> SET search_path` has no
+    effect either way (role defaults are inert under `SET ROLE`). Name
+    resolution ignores privileges, so when such a relation shadows a
+    whitelisted one the query reads it only if the profile role may SELECT
+    it, and otherwise fails ("permission denied"; it does not fall through
+    to `public`). **The profile role's grants are the boundary:**
+    `mcp_sql_grants` reports (and `--apply` revokes) a SELECT grant to the
+    role in any non-system schema, a relation the role owns included; it
+    does not see a grant to `PUBLIC`, one held through role membership, a
+    materialized view, or a temporary table (inventory limits below). The
+    qualified spelling of the shadowing relation (`s.t`) stays refused.
+    Functions and operators still resolve in `pg_catalog` first, unless
+    the configured `search_path` lists `pg_catalog` explicitly after
+    another schema, which lets that schema's `lower(…)` replace the
+    built-in one for every query (verified; the deny list matches names,
+    so it would not see the swap).
+  - **On:** `SET LOCAL search_path = 'public', 'pg_temp'` is one of the
+    per-transaction guards (a list, written element by element:
+    `session.guc_value_sql`) and `session_drift` checks it, so an
+    unqualified name is always the relation in `public` and a temporary
+    table never shadows it. The cost: functions, operators and types of
+    an extension installed in another schema are not found unqualified —
+    call the function qualified (`ext.similarity(…)`) and the operator as
+    `OPERATOR(ext.=)` / prefix `OPERATOR(ext.@) x` (`FaithfulPostgres`
+    keeps the name exactly as written, a quoted schema quoted, review
+    round 20); a bare `=` on a `citext` column in schema `ext` compares as
+    `text`, silently.
+  - **When to turn it on:** whenever every extension the agents use lives
+    in `public` or `pg_catalog` (`SELECT extname,
+    extnamespace::regnamespace FROM pg_extension`; Django's
+    `CreateExtension` installs into the first schema on the app's
+    `search_path`, normally `public`) — then the pin costs nothing and
+    takes the shadowing cases above off the table. A database whose only
+    schema is `public` loses nothing by it.
+  - In both modes: an operator calls its function without naming it, so the
+    function deny list does not apply to operators, bare or in
+    `OPERATOR()`: in a stock catalog the only operators whose function it
+    would refuse by name are the immutable `pg_lsn` comparisons and
+    arithmetic (pinned by
+    `test_sql_fidelity.test_no_catalog_operator_runs_a_function_the_deny_list_refuses`);
+    an extension's operators in a schema the role can use are the DBA's to
+    vet, like its functions. Pinned by `tests/test_schema_scoping.py` and
+    `tests/test_search_path_pin.py`.
 - **Only `SET LOCAL`, never bare `SET`.** Library-wide invariant: every SQL
   `SET` issued by `mcp_sql` code (runtime read path AND bootstrap script)
   uses `SET LOCAL` inside an explicit transaction. Deployments commonly
@@ -459,8 +513,8 @@ The load-bearing invariants and footguns, grouped by layer:
   popped at commit, and would persist on the reused backend as pgbouncer
   hands it to the next client. The only SQL `SET`s in the library are:
   `session.py` (`SET LOCAL ROLE` + one `SET LOCAL <guc>` per entry of
-  `EXPECTED_SESSION_GUCS` and `TRANSACTION_GUCS` — the runtime read
-  path), `signals.py` (`SET LOCAL lock_timeout` on the revocation's own
+  `session_gucs()` — `EXPECTED_SESSION_GUCS`, plus `PINNED_SEARCH_PATH`
+  with the pin on — and `TRANSACTION_GUCS`: the runtime read path), `signals.py` (`SET LOCAL lock_timeout` on the revocation's own
   connection, `_transaction`, PostgreSQL only — the multi-database
   revocation path), and `sql/role_setup.sql` (`SET LOCAL
   mcp_sql.app_role` inside an explicit `BEGIN ... COMMIT` — the
@@ -527,8 +581,10 @@ The load-bearing invariants and footguns, grouped by layer:
   `schema"."name` names (`parser.relation_of`; Django's own spelling of a
   schema-qualified table). `_check_tables` resolves each reference as
   Postgres does — schema and name quoted exactly, unquoted folded, an
-  unqualified name in `public` because `search_path` is pinned (above) —
-  and accepts it only when that relation is on the whitelist:
+  unqualified name as the one in `public` (what Postgres opens with
+  `PIN_SEARCH_PATH` on; off, see "`search_path` is pinned only on
+  request" above) — and accepts it only when that relation is on the
+  whitelist:
   `analytics.t` beside a whitelisted `t` is `DISALLOWED_TABLE`, whatever
   grants the role holds on it. Before round 16 the bare name matched in any
   schema (ledger F04 / F132). A database qualifier (`db.public.t`) is left

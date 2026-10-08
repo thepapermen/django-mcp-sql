@@ -162,7 +162,8 @@ the package itself never imports `sentry_sdk`.
 The package depends on Postgres features that don't port: `SET LOCAL ROLE`
 into a NOLOGIN role, `statement_timeout` / `lock_timeout` /
 `idle_in_transaction_session_timeout` / `default_transaction_read_only` /
-`standard_conforming_strings` / `search_path` GUCs, PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
+`standard_conforming_strings` GUCs (and `search_path`, with the opt-in
+pin), PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
 semantics, sqlglot's `dialect='postgres'`. There is no design path to
 MySQL / SQLite without a parallel implementation — hence `django-mcp-sql`
 not `django-mcp-mysql` etc.
@@ -322,6 +323,15 @@ MCP_SQL = {
     # many seconds have passed since the user's consent. See docs/oauth.md
     # "Refresh tokens (opt-in)".
     # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
+    # Opt-in search_path pin (default False): every read transaction runs
+    # SET LOCAL search_path = public, pg_temp, so an unqualified table name is
+    # always the whitelisted one in `public`. Off, names resolve through the
+    # database's own search_path (a schema listed ahead of `public` or a temp
+    # table can shadow a whitelisted table the profile role may also read).
+    # Turn it on when every extension the agent uses lives in `public`; with
+    # it on, extensions elsewhere need `ext.f(x)` / `OPERATOR(ext.op)`.
+    # See docs/architecture.md "`search_path` is pinned only on request".
+    # "PIN_SEARCH_PATH": True,
 }
 
 OAUTH2_PROVIDER = {
@@ -445,8 +455,11 @@ Once per environment, a DBA with PG superuser rights applies
 `sql/role_setup.sql` to create the `mcp_readonly_role` role + the
 role-level guard GUCs (`statement_timeout`, `lock_timeout`,
 `idle_in_transaction_session_timeout`, `default_transaction_read_only`,
-`standard_conforming_strings`, `search_path = public, pg_temp` — the
-executor also sets each per transaction with `SET LOCAL`) and grant the role membership to the consuming app's PG user. The script
+`standard_conforming_strings` — the executor also sets each per
+transaction with `SET LOCAL`; the `search_path = public, pg_temp` default,
+commented out in the file, is for installs that turn on
+`MCP_SQL["PIN_SEARCH_PATH"]`) and grant the role membership to the
+consuming app's PG user. The script
 is idempotent and is parameterised by a `-v app_role=<role>` psql
 variable so a single SQL file works across deployments whose app role
 differs.

@@ -174,13 +174,23 @@ docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> 
     -c "SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'mcp_readonly_role';"
 ```
 
-Expected (one row, six GUCs):
+Expected (one row, five GUCs):
 
 ```
       rolname      |                              rolconfig
 -------------------+----------------------------------------------------------------------
- mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on,"search_path=public, pg_temp"}
+ mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on}
 ```
+
+With `MCP_SQL["PIN_SEARCH_PATH"] = True`, a sixth,
+`"search_path=public, pg_temp"`, if you applied the role default for it
+(`mcp_sql_role_setup --emit-sql` prints it then; in `sql/role_setup.sql` it
+is the commented-out line — uncomment it). Optional either way: these
+defaults are inert under `SET ROLE` (the read path sets every guard with
+`SET LOCAL`, the pinned `search_path` included), and `mcp_sql_smoke`'s
+session check passes without it. An older role carrying the
+`search_path` default with the pin off is harmless for the same reason;
+`ALTER ROLE mcp_readonly_role RESET search_path` removes it.
 
 **3. App role is a member of `mcp_readonly_role`:**
 
@@ -324,10 +334,18 @@ Expected (with `auth.Permission` whitelisted):
 A whitelisted `db_table` is the relation in `public`, unless the
 `db_table` names a schema (`schema"."name`, Django's spelling of a
 schema-qualified table; the role then also needs `USAGE` on that schema,
-which the package does not grant). The read path pins `search_path` to
-`public, pg_temp`, so an agent's unqualified name is always the relation
-in `public`, and the parser refuses a qualified one in any other schema.
-A SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
+which the package does not grant). The parser refuses a qualified
+reference to a relation in any other schema. An unqualified name is the
+relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
+read path then pins `search_path` to `public, pg_temp`); with the default
+(`False`) Postgres resolves it through the database's own `search_path`,
+so a schema listed ahead of `public` (or a `"$user"` schema named after
+the profile role, or a temporary table on the backend) can shadow a
+whitelisted table wherever the profile role may read the shadowing
+relation — the grants below are then the boundary (see
+`docs/architecture.md` → "`search_path` is pinned only on request" for
+what each mode guarantees and when to turn the pin on). In both modes a
+SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
 TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
 the check reports it as "granted but not declared" (shown quoted,
 `"schema"."name"`) and `--apply` revokes it. The names come from whoever
