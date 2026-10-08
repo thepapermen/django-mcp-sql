@@ -312,9 +312,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     0.1.0b5, it resolves through the database's own `search_path`: a
     schema an operator puts ahead of `public` (a `"$user"` schema named
     after the profile role, a database-, login-role- or connection-level
-    setting) or a temporary table on the backend (searched first) shadows
-    a whitelisted table — read only where the profile role may SELECT the
-    shadowing relation, an error otherwise. None of these can be created
+    setting) or a temporary relation (table or view) on the backend
+    (searched first) shadows a whitelisted table — read only where the
+    profile role may SELECT the shadowing relation, an error otherwise. None of these can be created
     by an agent's query (a single SELECT in a read-only transaction); the
     profile role's grants, which the inventory below now covers in every
     schema, are the boundary. On, the read transaction pins `search_path`
@@ -688,9 +688,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `False`; `True` / `False` only, anything else refuses to boot). On, every
   read transaction sets `SET LOCAL search_path = 'public', 'pg_temp'` and
   `mcp_sql_smoke`'s session check expects it, so an unqualified table name
-  is always the whitelisted relation in `public`; a temporary table or a
-  schema ahead of `public` on the database's `search_path` can no longer
-  shadow it. Off, `search_path` is the database's own, as in 0.1.0b5 (the
+  is always the whitelisted relation in `public`; a temporary relation
+  (table or view) or a schema ahead of `public` on the database's
+  `search_path` can no longer shadow it. Off, `search_path` is the database's own, as in 0.1.0b5 (the
   profile role's grants are the boundary for a shadowing relation). The
   cost of turning it on: an extension installed outside `public` must be
   qualified (`ext.f(...)`, `OPERATOR(ext.op)`; a bare `=` on its `citext`
@@ -707,10 +707,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- An unknown top-level `MCP_SQL` key now refuses to boot
-  (`ImproperlyConfigured`, "Extra inputs are not permitted") instead of
-  being ignored, so a misspelt opt-in (`PIN_SEARCHPATH`) cannot leave its
-  feature silently off. Remove or correct any stray key.
+- An unknown `MCP_SQL` key at any level now refuses to boot
+  (`ImproperlyConfigured`, "Extra inputs are not permitted", naming the
+  key's path: `PIN_SEARCHPATH`, `LIMITS.EXTRA`, `PROFILES.default.EXTRA`,
+  `CLOUD_CLIENTS.0.EXTRA`) instead of being ignored, so a misspelt opt-in
+  (`PIN_SEARCHPATH`) cannot leave its feature silently off. Remove or
+  correct any stray key, top-level or nested.
 - `oauthlib` is now a declared dependency (`>=3.3.0,<5`): the package builds
   its OAuth server from oauthlib's classes and relies on two internals,
   pinned by a test. CI's minimum-versions job pins `oauthlib==3.3.0`.

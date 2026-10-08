@@ -70,9 +70,11 @@ class CloudClientEntry(TypedDict):
 
 
 class McpSqlSettings(TypedDict):
-    # No unknown top-level key: a typo'd one (`PIN_SEARCHPATH`) would
+    # No unknown key at any level: a typo'd one (`PIN_SEARCHPATH`) would
     # otherwise be ignored and the default used in its place, with nothing in
-    # the logs — for an opt-in guard, the guard silently off.
+    # the logs — for an opt-in guard, the guard silently off. Pydantic applies
+    # this config to the nested TypedDicts too (`LIMITS`, a `PROFILES` entry,
+    # a `CLOUD_CLIENTS` entry; pinned by `test_search_path_pin`).
     __pydantic_config__ = ConfigDict(extra="forbid")  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
 
     # Required: every consumer must declare these.
@@ -340,8 +342,9 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
     """Validate the `MCP_SQL` settings dict on startup.
 
     - Pydantic TypeAdapter enforces the TypedDict shape (required keys
-      present and typed, optional keys typed when present, no unknown
-      top-level key); `PIN_SEARCH_PATH` must be a real bool.
+      present and typed, optional keys typed when present, no unknown key
+      at any level — top level, `LIMITS`, a `PROFILES` entry, a
+      `CLOUD_CLIENTS` entry); `PIN_SEARCH_PATH` must be a real bool.
     - Numeric values must be positive; `DEFAULT_LIMIT` must not exceed
       `HARD_LIMIT`.
     - Each profile in `PROFILES` has non-empty unique ROLE /

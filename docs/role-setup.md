@@ -340,9 +340,9 @@ relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
 read path then pins `search_path` to `public, pg_temp`); with the default
 (`False`) Postgres resolves it through the database's own `search_path`,
 so a schema listed ahead of `public` (or a `"$user"` schema named after
-the profile role, or a temporary table on the backend) can shadow a
-whitelisted table wherever the profile role may read the shadowing
-relation — the grants below are then the boundary (see
+the profile role, or a temporary relation — table or view — on the
+backend) can shadow a whitelisted table wherever the profile role may
+read the shadowing relation — the grants below are then the boundary (see
 `docs/architecture.md` → "`search_path` is pinned only on request" for
 what each mode guarantees and when to turn the pin on). In both modes a
 SELECT grant on a relation in another schema (a `GRANT SELECT ON ALL
