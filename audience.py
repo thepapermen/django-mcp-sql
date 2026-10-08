@@ -61,8 +61,8 @@ def canonical_resource_url(request: HttpRequest) -> str:
     Slash-less because that is the form the MCP authorization spec asks
     implementations to use for the server URI, and because it is a prefix
     of both transport spellings: DOT's default audience validator matches it
-    on `/mcp/sql` and `/mcp/sql/` (it compares parsed paths up to the
-    trailing slash; so would the slashed form), and so does a validator
+    on `/mcp/sql` and `/mcp/sql/` (it compares `posixpath.normpath`ed
+    parsed paths; so would the slashed form), and so does a validator
     that compares raw strings by prefix (which the slashed form fails on
     `/mcp/sql`). Discovery still echoes the spelling the client asked for
     (RFC 9728 §3.3); both are accepted and stored as this one.
@@ -196,9 +196,13 @@ def _resource_identity(value: str) -> tuple[str, str, str] | None:
 
 def same_resource(first: str, second: str) -> bool:
     """True when `first` and `second` are two spellings of one resource by
-    the rule `foreign_resource` applies: scheme and host case-insensitive,
-    the default port explicit or omitted, the path equal up to one trailing
-    slash (nothing else normalised)."""
+    the normalisation `foreign_resource` applies: scheme and host
+    case-insensitive, the default port explicit or omitted, the path equal
+    up to one trailing slash (nothing else normalised). Without its
+    acceptance rule: two spellings of the bare origin match too, so a
+    caller passes at least one value `foreign_resource` already accepted
+    (`use_granted_spelling`: the token request's, which `MCPTokenView`
+    checked)."""
     identity = _resource_identity(first)
     return identity is not None and identity == _resource_identity(second)
 

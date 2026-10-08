@@ -366,9 +366,10 @@ they do **not** announce themselves.
     endpoint (GET, and the consent POST's form field and query string), a
     400 at the token endpoint (`MCPTokenView`, now mounted at `/o/token/`;
     the code is not consumed). The package's `invalid_target` names the
-    accepted value, never the client's (DOT's own errors may name it, such
-    as its token-step `invalid_target` for a code granted for another
-    resource). A NUL `resource` at the
+    accepted value, never the client's (DOT's own token-step
+    `invalid_target`, for a code granted for another resource, names the
+    requested value after the rewrite to the canonical spelling). A NUL
+    `resource` at the
     authorization GET, in the consent POST's query string or at the token
     endpoint gets the same answer instead of a 500; in the consent form's
     own `resource` field (DOT 3.4 and later) Django's form validation

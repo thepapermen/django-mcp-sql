@@ -728,6 +728,19 @@ class TestGrantsStoredBeforeTheRewrite:
         token = AccessToken.objects.get(token=response.json()["access_token"])
         assert token.resource == [SLASHED]
 
+    def test_repeated_values_are_each_matched(
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture
+    ):
+        """Every repeated body value is put in the stored spelling, not
+        only the one oauthlib keeps (DOT reads them all)."""
+        from oauth2_provider.models import AccessToken
+
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [SLASHED])
+        response = _exchange(client, code, verifier, [SLASHLESS, SLASHED])
+        assert response.status_code == HTTPStatus.OK, response.content
+        token = AccessToken.objects.get(token=response.json()["access_token"])
+        assert token.resource == [SLASHED, SLASHED]
+
     def test_a_foreign_value_is_still_refused(
         self, client, mcp_app, mcp_user, gate_posture
     ):
