@@ -349,6 +349,87 @@ class TestClientValidation:
         app = Application.objects.get(client_id=f"mcp-sql-cloud.{slug}")
         assert app.name == app.client_id
 
+    # The curated and DCR client_ids are bounded the same way: migration 0005
+    # writes `APPLICATION_NAME` to both columns, `/o/register` writes
+    # `<APPLICATION_NAME_PREFIX><22-char token>`. Each used to pass boot and
+    # fail the write with a DataError (`migrate`; a 500 from the anonymous
+    # `/o/register`).
+
+    @staticmethod
+    def _width():
+        from oauth2_provider import __version__ as dot_version
+        from oauth2_provider.models import get_application_model
+
+        meta = get_application_model()._meta
+        width = min(
+            meta.get_field("client_id").max_length, meta.get_field("name").max_length
+        )
+        # DOT 3.2 / 3.3 store client_id in 100 characters, 3.4 in 255.
+        major_minor = tuple(int(p) for p in dot_version.split(".")[:2])
+        assert width == (255 if major_minor >= (3, 4) else 100)
+        return width
+
+    def test_dcr_token_constants_agree(self):
+        from mcp_sql.clients import DCR_SUFFIX_LENGTH
+        from mcp_sql.clients import DCR_TOKEN_BYTES
+
+        for _ in range(50):
+            assert len(secrets.token_urlsafe(DCR_TOKEN_BYTES)) == DCR_SUFFIX_LENGTH
+
+    def test_application_name_at_the_column_limit_is_accepted_and_writes(self, db):
+        from oauth2_provider.models import Application
+
+        name = "a" * self._width()
+        validate_mcp_sql_settings({**_cfg({}), "APPLICATION_NAME": name})  # no raise
+        Application.objects.create(
+            name=name,
+            client_id=name,
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="http://127.0.0.1",
+        )
+
+    def test_application_name_overflowing_the_columns_is_refused_at_boot(self):
+        name = "a" * (self._width() + 1)
+        with pytest.raises(ImproperlyConfigured, match="APPLICATION_NAME is"):
+            validate_mcp_sql_settings({**_cfg({}), "APPLICATION_NAME": name})
+
+    @pytest.mark.usefixtures("_isolated_mcp_cache")
+    def test_dcr_prefix_at_the_column_limit_really_registers(
+        self, db, client, settings
+    ):
+        import json
+
+        from django.urls import reverse
+        from mcp_sql.clients import DCR_SUFFIX_LENGTH
+        from oauth2_provider.models import Application
+
+        prefix = "p" * (self._width() - DCR_SUFFIX_LENGTH - 1) + "-"
+        config = {**_cfg({}), "APPLICATION_NAME_PREFIX": prefix}
+        validate_mcp_sql_settings(config)  # no raise
+        settings.MCP_SQL = config
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps({"redirect_uris": ["http://127.0.0.1:3456/callback"]}),
+            content_type="application/json",
+        )
+        assert response.status_code == 201, response.content
+        client_id = response.json()["client_id"]
+        assert len(client_id) == self._width()
+        app = Application.objects.get(client_id=client_id)
+        assert app.name == client_id
+        assert classify_application(app) is ClientKind.DCR
+
+    @pytest.mark.parametrize("clients", [{}, {"claude": CLAUDE}], ids=["none", "one"])
+    def test_dcr_prefix_overflowing_the_columns_is_refused_at_boot(self, clients):
+        from mcp_sql.clients import DCR_SUFFIX_LENGTH
+
+        prefix = "p" * (self._width() - DCR_SUFFIX_LENGTH) + "-"
+        with pytest.raises(ImproperlyConfigured, match="APPLICATION_NAME_PREFIX is"):
+            validate_mcp_sql_settings(
+                {**_cfg(clients), "APPLICATION_NAME_PREFIX": prefix}
+            )
+
     def test_removed_cloud_clients_key_is_a_loud_error(self):
         # Silently ignoring the old key would empty CLIENTS, de-recognise the
         # consumer's declared clients, and start rejecting their live tokens at
@@ -895,10 +976,11 @@ class TestValidateRedirectUriOverride:
     )
     def test_userinfo_at_the_prefix_rules_own_path_is_refused(self, settings, uri):
         """A prefix rule is not an exact callback: only `_redirect_under_prefix`
-        sees its URI, and it refuses any userinfo. DOT's matcher must not be
-        handed it — on DOT 3.2/3.3 that matcher compares the parsed hostname
-        and ignores userinfo, so it would admit this URI sitting exactly at
-        the prefix's own path."""
+        sees its URI, and it refuses any userinfo. The supported DOT (3.4.1+)
+        refuses userinfo in its own matcher too, so here this pins that the
+        refusal does not depend on DOT: a matcher that compares only the
+        parsed hostname (DOT before 3.4) would admit this URI sitting exactly
+        at the prefix's own path if it were ever handed the prefix's URI."""
         settings.MCP_SQL = _cfg({"chatgpt": CHATGPT})
         assert (
             MCPOAuth2Validator().validate_redirect_uri(CHATGPT_ID, uri, request=None)
@@ -1165,7 +1247,34 @@ class TestDeclaredRedirectsFollowSettingsEndToEnd:
             reverse("authorize"),
             data={**self._query(OLD_CB), "allow": "Authorize"},
         )
-        assert not response.get("Location", "").startswith(OLD_CB)
+        # oauthlib's fatal redirect-mismatch: the error page, not a 500 and
+        # not a redirect anywhere.
+        assert response.status_code == 400
+        assert "Location" not in response
+        assert b'id="authorizationForm"' not in response.content
+        assert not Grant.objects.exists()
+
+    @pytest.mark.parametrize(
+        "clients",
+        [
+            pytest.param({"claude": _exact(OLD_CB, NEW_CB)}, id="two-exact"),
+            pytest.param({"claude": {**CHATGPT, "LABEL": "Claude.ai"}}, id="prefix"),
+        ],
+    )
+    def test_omitted_redirect_without_a_default_gets_the_error_page(
+        self, client, settings, mcp_user, gate_posture, clients
+    ):
+        """No default (two rules, or a lone prefix rule) → `None` from
+        `get_default_redirect_uri` → oauthlib's fatal
+        `MissingRedirectURIError`: the error page, never a redirect."""
+        from oauth2_provider.models import Grant
+
+        _provision(settings, clients)
+        client.force_login(mcp_user)
+        response = self._get(client)
+        assert response.status_code == 400
+        assert "Location" not in response
+        assert b'id="authorizationForm"' not in response.content
         assert not Grant.objects.exists()
 
 
@@ -1496,8 +1605,8 @@ class TestAuthRejectionAttribution:
     def test_row_named_like_an_mcp_client_under_another_client_id_is_refused(
         self, db, settings, mcp_user, name
     ):
-        """Recognition keys on the name; provisioning, redirects and the
-        consent label on the client_id. A row carrying a recognised NAME under
+        """Recognition and the consent label key on the name; provisioning
+        and redirects on the client_id. A row carrying a recognised NAME under
         a different client_id is not an MCP client: no authorization, and its
         tokens 401 as `bad_application` with a blank kind."""
         from mcp_sql.models import MCPAuthRejectionLog
@@ -1588,6 +1697,88 @@ class TestQueryAuditAttribution:
         row = MCPQueryLog.objects.get()
         assert row.application_name == CLAUDE_ID
         assert row.client_kind == ClientKind.CLOUD
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("_isolated_mcp_cache")
+class TestDeclaredClientTokenReachesTheEndpoint:
+    """The positive half of recognition at `/mcp/sql/`: a token issued to a
+    PROVISIONED declared row (client_id == name, entry in settings) passes
+    `MCPOAuth2Authentication` and reaches the tools with its identity —
+    elsewhere the positive control is always the curated row."""
+
+    @pytest.mark.usefixtures("mcp_active_session", "gate_posture")
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param(("claude", CLAUDE, CLAUDE_ID, ClientKind.CLOUD), id="cloud"),
+            pytest.param(
+                (
+                    "cursor-desktop",
+                    CURSOR_DESKTOP,
+                    CURSOR_DESKTOP_ID,
+                    ClientKind.LOCAL,
+                ),
+                id="local",
+            ),
+        ],
+    )
+    def test_provisioned_declared_token_is_authenticated(
+        self, client, settings, monkeypatch, mcp_user, case
+    ):
+        from unittest.mock import MagicMock
+
+        from django.http import HttpResponse
+        from django.urls import reverse
+        from mcp_sql.models import MCPAuthRejectionLog
+        from oauth2_provider.models import AccessToken
+        from oauth2_provider.models import Application
+
+        slug, entry, client_id, kind = case
+        settings.MCP_SQL = {**settings.MCP_SQL, "CLIENTS": {slug: entry}}
+        provision_mcp_clients(sender=django_apps.get_app_config("mcp_sql"))
+        app = Application.objects.get(client_id=client_id)
+        assert app.name == client_id
+        token = AccessToken.objects.create(
+            user=mcp_user,
+            token="test_" + secrets.token_urlsafe(24),
+            application=app,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+
+        # The direct call: credentials, not a rejection.
+        user, auth = MCPOAuth2Authentication().authenticate(
+            _bearer_request(token.token)
+        )
+        assert user == mcp_user
+        assert auth == token
+
+        # Through the view: the auth class fronts it, and the tools are built
+        # for this client (the bridge itself is stubbed out).
+        seen = {}
+
+        def capture(**kwargs):
+            seen.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._build_mcp_server", capture)
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._bridge", lambda server: None)
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app",
+            lambda app, request: HttpResponse(status=200),
+        )
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token.token}",
+        )
+        assert response.status_code == 200
+        assert seen["user"] == mcp_user
+        assert seen["client"].name == client_id
+        assert seen["client"].kind == kind
+        assert not MCPAuthRejectionLog.objects.exists()
 
 
 @pytest.mark.django_db

@@ -252,7 +252,9 @@ class MCPOAuth2Validator(OAuth2Validator):
         so it never reads the port of a stored `127.0.0.1` / `[::1]`
         candidate: a valid request on the same path matches, staying
         loopback.) The same holds for the settings path
-        (`_declared_redirect_allowed`).
+        (`_declared_redirect_allowed`). A REQUEST port no parser takes
+        (`http://localhost:99999/cb`) never reaches DOT for a curated or DCR
+        client: `_is_loopback_redirect` refuses it first.
 
         The default used when a request omits `redirect_uri` never reaches
         this method — `get_default_redirect_uri` below holds it to the same
@@ -277,9 +279,12 @@ class MCPOAuth2Validator(OAuth2Validator):
         """The default redirect: from settings for a declared client, and held
         to loopback for every client that is not a declared cloud client.
 
-        When a request omits `redirect_uri`, oauthlib resolves the default
-        WITHOUT calling `validate_redirect_uri`, and a later non-fatal error
-        (missing `response_type`, a bad scope, ...) is then 302'd to it.
+        When an authorization request omits `redirect_uri`, oauthlib resolves
+        the default WITHOUT calling `validate_redirect_uri`, and a later
+        non-fatal error (missing `response_type`, a bad scope, ...) is then
+        302'd to it. When a token request omits it, the default is the value
+        `confirm_redirect_uri` compares with the grant's (a mismatch refuses
+        the exchange).
 
         A declared client's default comes from settings, not the provisioned
         row (which would bring back a callback since changed or removed in
@@ -291,8 +296,8 @@ class MCPOAuth2Validator(OAuth2Validator):
         A default that fails the loopback predicate for a client that is not
         a declared cloud client (e.g. a canonical row hand-edited to an
         off-machine URI) is dropped too. A dropped default makes oauthlib
-        raise its fatal `MissingRedirectURIError` instead — error page, no
-        redirect.
+        raise its fatal `MissingRedirectURIError` instead — at `/o/authorize/`
+        the error page, no redirect.
         """
         declared = mcp_sql_settings.clients().get(client_id)
         if declared is None:
