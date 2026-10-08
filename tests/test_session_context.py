@@ -122,20 +122,76 @@ class TestSessionDrift:
 
 
 # A statement that starts with `SET` and is not `SET LOCAL` (a session-level
-# setting): the word `SET` at the start of the text (after any replacement
-# fields an f-string or a `+` chain starts with, `{…}`) or after a `;`,
-# followed by anything but `LOCAL` — the end of the text too. Comments are
-# blanked first (`_without_comments`), so one in front hides nothing.
+# setting): the word `SET` (or `SET"name"`) where a statement starts — the
+# start of the text (after any replacement fields an f-string or a `+` chain
+# starts with, `{…}`), after a `;`, inside a PL/pgSQL body (after `BEGIN`,
+# `THEN`, `ELSE`, `LOOP` or a dollar quote) or a string that dynamic SQL
+# runs (`EXECUTE 'SET …'`) — followed by anything but `LOCAL`, the end of
+# the text too (review rounds 18-20). Also any such `SET` in a function or
+# procedure definition (its `SET` clause, its body). Comments are blanked
+# first (`_without_comments`), so one in front hides nothing.
+#
+# A lexical heuristic, not a SQL parser: it reads the text as written
+# (`"SE" "T"` and `+` chains are joined by `_string_literals`), but SQL
+# built by `.format()` / `%`, a `SET` in an English sentence after "then",
+# or an E-string with `\'` inside are beyond it.
 _BARE_SET = re.compile(
-    r"(?:\A(?:\s*\{…\})*|;)\s*SET(?=\s|;|\Z)(?!\s+LOCAL\b)", re.IGNORECASE
+    r"(?:\A(?:\s*\{…\})*|;|\$(?:[^\W\d]\w*)?\$|'|\b(?:BEGIN|THEN|ELSE|LOOP)\b)"
+    r"\s*SET(?=[\s;\"]|\Z)(?!\s+LOCAL\b)"
+    r"|\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b.*?"
+    r"\bSET(?=[\s;\"]|\Z)(?!\s+LOCAL\b)",
+    re.IGNORECASE | re.DOTALL,
 )
-_SQL_COMMENT = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
 
 
 def _without_comments(text: str) -> str:
-    """`text` with each SQL comment (`/* … */`, `-- …`) replaced by a
-    space."""
-    return _SQL_COMMENT.sub(" ", text)
+    """`text` with each SQL comment replaced by a space: `-- …` to the end
+    of the line, `/* … */` nested as Postgres nests them. A `'…'` or `"…"`
+    is read whole (`''` / `""` inside), so `'--'` starts no comment."""
+    out, i = [], 0
+    while i < len(text):
+        if text.startswith(("--", "/*"), i):
+            out.append(" ")
+            i = _comment_end(text, i)
+        elif text[i] in "'\"":
+            end = _quoted_end(text, i)
+            out.append(text[i:end])
+            i = end
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _comment_end(text: str, start: int) -> int:
+    """Where the comment at `start` ends (`--` or a nested `/*`)."""
+    if text.startswith("--", start):
+        end = text.find("\n", start)
+        return len(text) if end == -1 else end
+    depth, i = 0, start
+    while i < len(text):
+        if text.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return i
+
+
+def _quoted_end(text: str, start: int) -> int:
+    """Where the `'…'` / `"…"` at `start` ends (a doubled quote inside)."""
+    quote, i = text[start], start + 1
+    while i < len(text):
+        if text.startswith(quote * 2, i):
+            i += 2
+        elif text[i] == quote:
+            return i + 1
+        else:
+            i += 1
+    return i
 
 
 def _bare_set(text: str) -> bool:
@@ -242,6 +298,21 @@ def test_no_production_code_issues_a_bare_set():
         "{…}SET lock_timeout = '5s'",
         "SELECT {…}; SET x = 1",
         "{…} {…}SET x = 1",
+        # Review round 20: inside PL/pgSQL and dynamic SQL, a function's
+        # own `SET`, a quoted name, nested comments, `--` in a string.
+        "DO $$ BEGIN SET ROLE x; END $$",
+        "BEGIN\nSET ROLE x",
+        "DO $body$ BEGIN IF a THEN SET ROLE x; END IF; END $body$",
+        "LOOP set x = 1; END LOOP",
+        "EXECUTE 'SET ROLE ' || quote_ident(r)",
+        "CREATE FUNCTION f() RETURNS int AS $$ SET ROLE x $$ LANGUAGE sql",
+        "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql\n"
+        "SET search_path = public AS $$ SELECT 1 $$",
+        "CREATE PROCEDURE p() SET work_mem = '1MB' AS $$ SELECT 1 $$",
+        'SET"lock_timeout" = 1',
+        "/* a /* b */ c */ SET lock_timeout = 1",
+        "SELECT '--'; SET lock_timeout = 1",
+        "SELECT 'it''s'; SET x = 1",
     ],
 )
 def test_the_bare_set_scan_finds(text):
@@ -265,6 +336,12 @@ def test_the_bare_set_scan_finds(text):
         "Set-returning functions are refused; SET-like words are not",
         "ALTER ROLE {…} SET {…} = {…};",
         "SELECT set_config('a', 'b', true)",
+        "DO $$ BEGIN SET LOCAL ROLE x; END $$",
+        "EXECUTE 'SET LOCAL ROLE x'",
+        "IF a THEN RAISE NOTICE 'the SET ROLE will fail'; END IF",
+        "SELECT '$$' AS a, 'SETTINGS' AS b",
+        "/* nested /* SET x */ SET y */ SELECT 1",
+        "SELECT 'a -- b' AS c; SET LOCAL x = 1",
     ],
 )
 def test_the_bare_set_scan_ignores(text):

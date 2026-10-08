@@ -459,13 +459,21 @@ The load-bearing invariants and footguns, grouped by layer:
   popped at commit, and would persist on the reused backend as pgbouncer
   hands it to the next client. The only SQL `SET`s in the library are:
   `session.py` (`SET LOCAL ROLE` + one `SET LOCAL <guc>` per entry of
-  `EXPECTED_SESSION_GUCS` and `TRANSACTION_GUCS` — the runtime read path), and `sql/role_setup.sql` (`SET LOCAL
+  `EXPECTED_SESSION_GUCS` and `TRANSACTION_GUCS` — the runtime read
+  path), `signals.py` (`SET LOCAL lock_timeout` on the revocation's own
+  connection, `_transaction`, PostgreSQL only — the multi-database
+  revocation path), and `sql/role_setup.sql` (`SET LOCAL
   mcp_sql.app_role` inside an explicit `BEGIN ... COMMIT` — the
   bootstrap path). The `ALTER ROLE mcp_readonly_role SET …` lines
-  in `role_setup.sql` are *not* session SETs — they write to
+  in `role_setup.sql` (and those `mcp_sql_role_setup --emit-sql`
+  prints) are *not* session SETs — they write to
   `pg_db_role_setting` and apply only at LOGIN, so the pgbouncer
-  contamination model doesn't reach them. When grepping for compliance:
-  `grep -nE '\bSET\b'` over the package tree should match nothing
+  contamination model doesn't reach them. Pinned by
+  `test_session_context.test_no_production_code_issues_a_bare_set`, a
+  lexical scan of every string literal of the package's Python and of its
+  `.sql` files (a `SET` not followed by `LOCAL` where a statement starts,
+  inside PL/pgSQL and dynamic SQL too, or in a function definition); by
+  hand: `grep -nE '\bSET\b'` over the package tree should match nothing
   outside `SET LOCAL` (or `ALTER ROLE ... SET`).
 - **The membership grant** lives in `role_setup.sql` and is parametrised
   via the psql variable `app_role`. Callers pass `-v app_role=<role>`:
