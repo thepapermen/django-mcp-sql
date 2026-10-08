@@ -28,6 +28,34 @@ visible and reviewable.
 # The tables the corpus reads: see `SETUP_SQL`.
 SETUP_SQL = "CREATE TABLE t (id int PRIMARY KEY, x numeric, y int, g text, d date, ts timestamptz, j jsonb, arr int[], b boolean, f float8, iv interval, tags text[]);\nINSERT INTO t SELECT i, i*1.37, i%7, chr(97 + i%4), DATE '2024-01-01' + i*3, TIMESTAMPTZ '2024-01-01 00:00+00' + i * INTERVAL '5 hours', jsonb_build_object('k', i, 'n', jsonb_build_object('m', i%3), 'a', jsonb_build_array(i, i+1)), ARRAY[i, i%3], i%2=0, i/3.0, i * INTERVAL '1 minute', ARRAY['x'||i%3, 'y'] FROM generate_series(1,40) i;\nCREATE TABLE u (id int PRIMARY KEY, t_id int, amount numeric, status text, created date);\nINSERT INTO u SELECT i, 1 + i%40, (i*7)%100 + 0.25, (ARRAY['open','closed','void'])[1+i%3], DATE '2024-01-01' + i FROM generate_series(1,120) i;\nINSERT INTO t (id, x, y, g, d, ts, j, arr, b, f, iv, tags) VALUES (41, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (42, 2.5, NULL, 'B', DATE '2024-03-01', NULL, '{\"k\": null, \"Key\": 1, \"\": 7, \"a''b\": 2, \"a\": [null, 1], \"n\": {\"\": 3, \"m\": null}}', ARRAY[NULL, 1]::int[], NULL, NULL, NULL, ARRAY['X', NULL]), (43, NULL, 3, 'Ab', NULL, TIMESTAMPTZ '2024-02-29 23:00+00', '{}', '{}', true, 0.5, NULL, '{}');\nINSERT INTO u (id, t_id, amount, status, created) VALUES (121, NULL, NULL, NULL, NULL), (122, 41, 5.5, 'Open', NULL), (123, 42, NULL, 'CLOSED', DATE '2024-02-29');\n"
 
+# Operators reached as `OPERATOR(schema.op)` (review round 20): one name in
+# schemas whose names fold differently, with different functions, so a
+# rendering that loses the quotes picks another operator; and a prefix `!~`
+# in `public` (bare `!~ x` is that operator to Postgres; sqlglot read `! ~x`).
+OPERATOR_SCHEMAS = '"McpOps", mcpops, "mcp ops", "mcp""ops"'
+SETUP_SQL += (
+    f"DROP SCHEMA IF EXISTS {OPERATOR_SCHEMAS} CASCADE;\n"
+    "DROP OPERATOR IF EXISTS public.!~ (NONE, text);\n"
+    'CREATE SCHEMA "McpOps";\n'
+    "CREATE SCHEMA mcpops;\n"
+    'CREATE SCHEMA "mcp ops";\n'
+    'CREATE SCHEMA "mcp""ops";\n'
+    'CREATE OPERATOR "McpOps".= (LEFTARG = text, RIGHTARG = text, FUNCTION = pg_catalog.texteq);\n'
+    "CREATE OPERATOR mcpops.= (LEFTARG = text, RIGHTARG = text, FUNCTION = pg_catalog.textne);\n"
+    'CREATE OPERATOR "mcp ops".= (LEFTARG = text, RIGHTARG = text, FUNCTION = pg_catalog.text_lt);\n'
+    'CREATE OPERATOR "mcp""ops".+ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = pg_catalog.int4mi);\n'
+    'CREATE OPERATOR "McpOps".- (RIGHTARG = integer, FUNCTION = pg_catalog.int4abs);\n'
+    "CREATE OPERATOR mcpops.- (RIGHTARG = integer, FUNCTION = pg_catalog.int4um);\n"
+    "CREATE OPERATOR public.!~ (RIGHTARG = text, FUNCTION = pg_catalog.upper);\n"
+    f"GRANT USAGE ON SCHEMA {OPERATOR_SCHEMAS} TO PUBLIC;\n"
+)
+# Drops what `SETUP_SQL` creates.
+TEARDOWN_SQL = (
+    "DROP TABLE IF EXISTS t, u;\n"
+    f"DROP SCHEMA IF EXISTS {OPERATOR_SCHEMAS} CASCADE;\n"
+    "DROP OPERATOR IF EXISTS public.!~ (NONE, text);\n"
+)
+
 FUNCTIONAL: list[tuple[str, str]] = [
     (
         "aggregates",
@@ -3121,6 +3149,72 @@ FUNCTIONAL: list[tuple[str, str]] = [
         "intervals",
         "SELECT '90'::\"interval\" days, '90'::pg_catalog.interval h, '{9}'::\"interval\" array[2] AS c",
     ),
+    # Review round 20: `OPERATOR(schema.op)` keeps its name as written (a
+    # quoted qualifier came back unquoted: another operator; see
+    # `SETUP_SQL`), the prefix form runs, operators sqlglot cannot read bare
+    # run in this form, `x operator` keeps its alias (sqlglot 30.7 dropped
+    # it) and `!~ x` is the prefix operator `!~` (sqlglot: `! ~x`).
+    (
+        "operators",
+        "SELECT id, g OPERATOR(\"McpOps\".=) 'a' AS q, g OPERATOR(mcpops.=) 'a' AS f, g OPERATOR(McpOps.=) 'a' AS u FROM t WHERE id <= 6 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id FROM t WHERE g OPERATOR(\"mcp ops\".=) 'b' ORDER BY id",
+    ),
+    (
+        "operators",
+        'SELECT id, y OPERATOR("mcp""ops".+) 1 AS v, y OPERATOR(pg_catalog.+) 1 AS w FROM t WHERE id <= 3 ORDER BY id',
+    ),
+    (
+        "operators",
+        'SELECT id, OPERATOR("McpOps".-) (y - 3) AS a, OPERATOR(mcpops.-) (y - 3) AS b, OPERATOR(pg_catalog.-) y + 1 AS c FROM t WHERE id <= 4 ORDER BY id',
+    ),
+    (
+        "operators",
+        "SELECT id FROM t WHERE g OPERATOR( \"McpOps\" . = ) 'a' AND g OPERATOR(pg_catalog./* c */=) 'a' ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id, g OPERATOR(pg_catalog.~<~) 'b' AS lt, g OPERATOR(pg_catalog.~>=~) 'b' AS ge FROM t WHERE id <= 6 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT OPERATOR(pg_catalog.|/) y AS r, OPERATOR(pg_catalog.||/) y, OPERATOR(pg_catalog.@) (y - 3) AS a FROM t WHERE id <= 5 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id, y OPERATOR(pg_catalog.+) 1 OPERATOR(pg_catalog.*) 2 AS v, 2 OPERATOR(pg_catalog.*) y + 1 AS w, 1 OPERATOR(pg_catalog.+) y || 'x' AS s FROM t WHERE id <= 4 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id, y operator FROM t WHERE id <= 3 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id FROM t WHERE y OPERATOR(pg_catalog.=) ANY (ARRAY[1, 2]) ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT id, !~ g AS v, g OPERATOR(pg_catalog.~) !~ 'b' AS w FROM t WHERE id <= 4 ORDER BY id",
+    ),
+    (
+        "operators",
+        "SELECT g OPERATOR(pg_catalog.||) id::text AS s FROM t WHERE id OPERATOR(pg_catalog.<) 3 ORDER BY id OPERATOR(pg_catalog.-) 0",
+    ),
+    (
+        "operators",
+        "SELECT g, count(*) FILTER (WHERE y OPERATOR(pg_catalog.>) 2) AS n FROM t GROUP BY g HAVING sum(y) OPERATOR(pg_catalog.>) 0 ORDER BY g",
+    ),
+    # `nchar varying` is `varchar` (refused in round 19; Opus final 11).
+    (
+        "types",
+        "SELECT id, g::nchar varying AS a, 'abc'::nchar varying(2) AS b, CAST(g AS NCHAR VARYING(1)) AS c, '{abc}'::nchar varying(1)[] AS e, nchar varying 'xy' FROM t WHERE id <= 3 ORDER BY id",
+    ),
+    (
+        "types",
+        "SELECT id, '1'::\"int4\" AS a, '{1}'::\"int4\"[2] AS b, '1.234'::\"numeric\"(10, 2) AS c, '{9}'::\"interval\"[] AS e FROM t WHERE id = 1",
+    ),
 ]
 
 REFUSED: list[tuple[str, str]] = [
@@ -3435,6 +3529,12 @@ REFUSED: list[tuple[str, str]] = [
     # parse either (`interval day '…'` is Postgres's syntax error).
     ("unsafe_literal", "SELECT interval day E'a\\b' AS v"),
     ("unsafe_literal", "SELECT interval U&'1' AS v"),
+    # Review round 20: two operators inside `OPERATOR()` (sqlglot joined
+    # them into one: `< =` ran as `<=`), or no operator name at all.
+    ("parse_error", "SELECT id, y OPERATOR(pg_catalog.< =) 1 AS v FROM t"),
+    ("parse_error", "SELECT id, g OPERATOR(pg_catalog.~ ~) 'a' AS v FROM t"),
+    ("parse_error", "SELECT id, y OPERATOR(pg_catalog.+-) 1 AS v FROM t"),
+    ("parse_error", "SELECT id, y OPERATOR('x') 1 AS v FROM t"),
 ]
 
 # Need a newer Postgres than the oldest CI runs (see the module docstring).
@@ -3521,4 +3621,18 @@ POSTGRES_REJECTS: list[str] = [
     # A subscript with a stride (Postgres has none), as written.
     "SELECT x[1:2:3] AS v FROM (SELECT ARRAY[5] AS x) s",
     "SELECT interval[1:2:3] AS v FROM (SELECT ARRAY[5] AS interval) s",
+    # `OPERATOR()` as written: a quoted qualifier stays quoted (no schema
+    # "PG_CATALOG"; it ran as `pg_catalog.+`), no such operator / schema.
+    'SELECT id, y OPERATOR("PG_CATALOG".+) 1 AS v FROM t',
+    "SELECT id, x OPERATOR(pg_catalog.==) 2 AS v FROM t",
+    "SELECT id, x OPERATOR(nosuchschema.+) 1 AS v FROM t",
+    "SELECT id, y OPERATOR(McpOps.=) 'a' AS v FROM t",
+    "SELECT id, !~ x AS v FROM t",
+    # A quoted type name is the name as written (no such types): sqlglot
+    # ran `"bit varying"` as `varbit` and `"int array"` as `"int array"[]`.
+    "SELECT '101'::\"bit varying\" AS v",
+    'SELECT id, CAST(g AS "bit varying") AS v FROM t',
+    "SELECT '{101}'::\"bit varying\"[] AS v",
+    "SELECT '{1}'::\"int array\" AS v",
+    "SELECT '{1}'::\"int[]\" AS v",
 ]

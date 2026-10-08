@@ -2412,6 +2412,215 @@ class TestReviewRound19:
         assert source.count("_match(TokenType.ARRAY)") == 1
 
 
+class TestReviewRound20:
+    """`OPERATOR(schema.op)`, the documented way to an operator outside
+    the pinned `search_path`, keeps its name as written. sqlglot joined the
+    texts of the tokens inside: `OPERATOR("MySchema".=)` ran as
+    `OPERATOR(MySchema.=)` (Postgres: the operator in `myschema`, another
+    one), `OPERATOR("my schema".=)` as `myschema.=`, `OPERATOR(pg_catalog.<
+    =)` (a Postgres syntax error) as `<=`. The prefix form was a parse
+    error, `x operator` lost its alias on sqlglot 30.7, and `!~ x` ran as
+    `! ~x`. Values against Postgres: the functional corpus."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # Quoted qualifiers stay quoted, unquoted ones as written.
+            ('1 OPERATOR("MySchema".=) 2', '1 OPERATOR("MySchema".=) 2'),
+            ('1 OPERATOR("my schema".=) 2', '1 OPERATOR("my schema".=) 2'),
+            ('1 OPERATOR("a""b".+) 2', '1 OPERATOR("a""b".+) 2'),
+            ("1 OPERATOR(MySchema.=) 2", "1 OPERATOR(MySchema.=) 2"),
+            ('1 OPERATOR("PG_CATALOG".+) 2', '1 OPERATOR("PG_CATALOG".+) 2'),
+            ("1 OPERATOR(db.pg_catalog.+) 2", "1 OPERATOR(db.pg_catalog.+) 2"),
+            ("1 OPERATOR(+) 2", "1 OPERATOR(+) 2"),
+            # What separates the tokens is dropped (Postgres: the same).
+            ("1 OPERATOR ( pg_catalog . + ) 2", "1 OPERATOR(pg_catalog.+) 2"),
+            ("1 OPERATOR(pg_catalog./* c */+) 2", "1 OPERATOR(pg_catalog.+) 2"),
+            # Chains, and an operand starting with a sign.
+            (
+                "1 OPERATOR(pg_catalog.+) 2 OPERATOR(pg_catalog.*) 3",
+                "1 OPERATOR(pg_catalog.+) 2 OPERATOR(pg_catalog.*) 3",
+            ),
+            ("1 OPERATOR(pg_catalog.+)-1", "1 OPERATOR(pg_catalog.+) -1"),
+            ("1 OPERATOR(pg_catalog.=) ANY ('{1}')", "OPERATOR(pg_catalog.=) ANY("),
+            # Prefix operators.
+            ("OPERATOR(pg_catalog.-) 2 + 3", "OPERATOR(pg_catalog.-) 2 + 3"),
+            ('OPERATOR("MySchema".-) 2', 'OPERATOR("MySchema".-) 2'),
+            (
+                "OPERATOR(pg_catalog.-) OPERATOR(pg_catalog.-) 5",
+                "OPERATOR(pg_catalog.-) OPERATOR(pg_catalog.-) 5",
+            ),
+            (
+                "1 OPERATOR(pg_catalog.+) OPERATOR(pg_catalog.-) 5",
+                "1 OPERATOR(pg_catalog.+) OPERATOR(pg_catalog.-) 5",
+            ),
+            ("- OPERATOR(pg_catalog.-) 5", "-OPERATOR(pg_catalog.-) 5"),
+            # Operators sqlglot cannot read bare (refused there).
+            ("'a' OPERATOR(pg_catalog.~<~) 'b'", "'a' OPERATOR(pg_catalog.~<~) 'b'"),
+            ("1 OPERATOR(pg_catalog.%-) 2", "1 OPERATOR(pg_catalog.%-) 2"),
+            ("OPERATOR(pg_catalog.|/) 16", "OPERATOR(pg_catalog.|/) 16"),
+            ("OPERATOR(pg_catalog.@-@) 1", "OPERATOR(pg_catalog.@-@) 1"),
+            # `operator` with no `(` after it is a name.
+            ("1 operator", "1 AS operator"),
+            ("1 operator, 2 AS k", "1 AS operator, 2 AS k"),
+            ("operator FROM (SELECT 1 AS operator) s", "SELECT operator FROM"),
+            # `!~ x` is one prefix operator to Postgres.
+            ("!~ 'a'", "!~ 'a'"),
+            ("'a' OPERATOR(pg_catalog.~) !~ 'b'", "OPERATOR(pg_catalog.~) !~ 'b'"),
+            ("! ~1", "! ~1"),
+            ("!!'a'::tsquery", "!! CAST('a' AS tsquery)"),
+        ],
+    )
+    def test_operator_form_kept_as_written(self, written, rendered):
+        assert rendered in self._rendered(f"SELECT {written}")
+
+    @pytest.mark.parametrize(
+        "operator",
+        [
+            # Postgres reads two operators, a syntax error in OPERATOR().
+            "pg_catalog.< =",
+            "pg_catalog.~ ~",
+            "pg_catalog.</**/=",
+            "pg_catalog.+-",
+            # Not an operator name.
+            "'x'",
+            "pg_catalog.pg_sleep",
+            "a b.+",
+            "pg_catalog.",
+            ".+",
+            "",
+            "e'x'.+",
+            "$$x$$.+",
+            '"x"(.+',
+        ],
+    )
+    def test_not_an_operator_name_is_a_parse_error(self, operator):
+        _expect_reject(f"SELECT 1 OPERATOR({operator}) 2", OutcomeReason.PARSE_ERROR)
+        _expect_reject(f"SELECT OPERATOR({operator}) 2", OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 OPERATOR(pg_catalog.+ AS v",
+            "SELECT OPERATOR(pg_catalog.-) AS v",
+            "SELECT operator(1) AS v",
+        ],
+    )
+    def test_incomplete_operator_form_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            (
+                "SELECT id FROM auth_permission WHERE id OPERATOR(pg_catalog.=) "
+                "pg_sleep(1)",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT pg_read_file('x') OPERATOR(pg_catalog.||) 'a' AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT OPERATOR(pg_catalog.-) pg_backend_pid() AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT OPERATOR(\"MySchema\".-) set_config('a', 'b', true)::int",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT 1 OPERATOR(pg_catalog.=) (SELECT max(id) FROM secret) AS v",
+                OutcomeReason.DISALLOWED_TABLE,
+            ),
+            (
+                "SELECT OPERATOR(pg_catalog.-) (SELECT max(oid) FROM pg_class) AS v",
+                OutcomeReason.SYSTEM_SCHEMA,
+            ),
+            (
+                "SELECT id, t OPERATOR(pg_catalog.=) t AS v FROM auth_permission t",
+                OutcomeReason.SELECT_STAR,
+            ),
+            # Outside the parentheses sqlglot's reading still counts.
+            (
+                "SELECT 1 OPERATOR(pg_catalog.+) 2 %-3 AS v",
+                OutcomeReason.UNSAFE_LITERAL,
+            ),
+            (
+                "SELECT 1 OPERATOR(pg_catalog.+) 2 == 3 AS v",
+                OutcomeReason.UNSAFE_LITERAL,
+            ),
+            ('SELECT 1 OPERATOR(U&"x".+) 2 AS v', OutcomeReason.UNSAFE_LITERAL),
+        ],
+    )
+    def test_the_operands_are_checked(self, sql, reason):
+        _expect_reject(sql, reason, table_columns=COLUMNS)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # A quoted type name is one name to Postgres (none of these is
+            # a type); sqlglot read its text again as SQL (Opus final 11).
+            ("'101'::\"bit varying\"", "CAST('101' AS \"bit varying\")"),
+            ("CAST('101' AS \"bit varying\")", "CAST('101' AS \"bit varying\")"),
+            ("'{101}'::\"bit varying\"[]", "CAST('{101}' AS \"bit varying\"[])"),
+            ("'{1}'::\"int array\"", "CAST('{1}' AS \"int array\")"),
+            ("'{1}'::\"int[]\"", "CAST('{1}' AS \"int[]\")"),
+            ("'{1}'::\"int array\"[]", "CAST('{1}' AS \"int array\"[])"),
+            ("'{1}'::\"int array\"[3]", "CAST('{1}' AS \"int array\"[3])"),
+            ("'1'::\"double precision\"", "CAST('1' AS \"double precision\")"),
+            # Real types, quoted: kept as written, modifiers and brackets too.
+            ("'{1}'::\"int4\"[2]", "CAST('{1}' AS \"int4\"[2])"),
+            ("'{1}'::\"int4\" array", "CAST('{1}' AS \"int4\"[])"),
+            ("'1'::\"numeric\"(10, 2)", "CAST('1' AS \"numeric\"(10, 2))"),
+            ("'90'::\"interval\" days", "CAST('90' AS \"interval\") AS days"),
+            ("'{9}'::\"interval\"[]", "CAST('{9}' AS \"interval\"[])"),
+            ("'1'::\"pg_catalog\".int4", "CAST('1' AS \"pg_catalog\".int4)"),
+            # `nchar varying` is `varchar` (refused before; Opus final 11).
+            ("'ab'::nchar varying", "CAST('ab' AS VARCHAR)"),
+            ("'ab'::NCHAR VARYING(1)", "CAST('ab' AS VARCHAR(1))"),
+            ("CAST('ab' AS nchar /* c */ varying (1))", "CAST('ab' AS VARCHAR(1))"),
+            ("'{ab}'::nchar varying(1)[]", "CAST('{ab}' AS VARCHAR(1)[])"),
+            ("nchar varying 'ab'", "CAST('ab' AS VARCHAR)"),
+            ("'ab'::nchar \"varying\"", "CAST('ab' AS CHAR) AS \"varying\""),
+        ],
+    )
+    def test_type_name_as_written(self, written, rendered):
+        assert f"SELECT {rendered} LIMIT 11" == self._rendered(f"SELECT {written}")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'ab'::nchar(1) varying",
+            "SELECT 'ab'::nchar varying(1.5)",
+            "SELECT 'ab'::nchar varying varying",
+        ],
+    )
+    def test_nchar_varying_syntax_errors(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql", ["SELECT '1'::\"json\"(3)", "SELECT '1'::\"interval day\"(3)"]
+    )
+    def test_a_modifier_sqlglot_drops_from_a_quoted_type_is_refused(self, sql):
+        # sqlglot rendered the type without it (`"json"`), where Postgres
+        # errors: "type modifier is not allowed", "type does not exist".
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    def test_sqlglot_reads_operator_only_after_an_operand(self):
+        """sqlglot calls `_parse_operator` from its range parser only;
+        `FaithfulPostgres` adds the prefix form. A sqlglot reading
+        `OPERATOR(` somewhere else too would need a look."""
+        import inspect
+
+        import sqlglot.parser
+
+        source = inspect.getsource(sqlglot.parser)
+        assert source.count("self._parse_operator(") == 1
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual

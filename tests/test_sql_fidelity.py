@@ -423,3 +423,61 @@ def test_every_catalog_function_call_is_rendered_as_written():
     assert changed == []
     assert refused == []
     assert len(seen) > 2000  # the sweep really ran over the catalog
+
+
+@pytest.mark.django_db
+def test_every_catalog_operator_in_operator_form_is_rendered_as_written():
+    """Review round 20: `OPERATOR(schema.op)` is the way to an operator
+    outside the pinned `search_path`, and the spelling of any operator
+    sqlglot cannot read bare (`~<~`, `|/`, `*=`, ...). sqlglot rebuilt the
+    name from its tokens' texts (a quoted qualifier came back unquoted, the
+    prefix form did not parse, the operator characters of 26 binary
+    operators were refused). Every operator in this server's `pg_catalog`,
+    infix or prefix, with the qualifier plain, quoted or upper-case, must
+    render exactly as written. Values: the functional corpus."""
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT oprname, oprkind FROM pg_operator "
+            "WHERE oprnamespace = 'pg_catalog'::regnamespace"
+        )
+        operators = cur.fetchall()
+    changed = []
+    for name, kind in operators:
+        for qualifier in ("pg_catalog", '"pg_catalog"', "PG_CATALOG"):
+            form = f"OPERATOR({qualifier}.{name})"
+            sql = (
+                f"SELECT 'm0' {form} 'm1' AS r"
+                if kind == "b"
+                else f"SELECT {form} 'm1' AS r"
+            )
+            rendered = _rendered(sql)
+            if rendered != f"{sql} LIMIT 11":
+                changed.append((sql, rendered))
+    assert changed == []
+    assert len(operators) > 70  # the sweep really ran over the catalog
+
+
+@pytest.mark.django_db
+def test_no_catalog_operator_runs_a_function_the_deny_list_refuses():
+    """An operator calls its function without naming it — bare (`a = b`) or
+    as `OPERATOR(schema.op)` — so the deny list, which matches function
+    names, never sees that call. On this server the only operators whose
+    function it would refuse by name are the `pg_lsn` comparisons and
+    arithmetic (`pg_lsn_eq`, `pg_lsn_mi`, ...): immutable, not
+    set-returning, not SECURITY DEFINER. A new one fails here (review round
+    20); operators of an extension the role can reach (`public`, or a
+    schema it has USAGE on) are the DBA's to vet, like its functions."""
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT o.oprname, p.proname, p.provolatile, p.proretset, p.prosecdef "
+            "FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode"
+        )
+        operators = cur.fetchall()
+    denied = [row for row in operators if _denial(row[1]) is not None]
+    assert denied  # the pg_lsn ones: the check really matched something
+    unexpected = [
+        row
+        for row in denied
+        if not row[1].startswith("pg_lsn_") or row[2:] != ("i", False, False)
+    ]
+    assert unexpected == []

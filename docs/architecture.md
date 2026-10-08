@@ -435,9 +435,17 @@ The load-bearing invariants and footguns, grouped by layer:
   `session.guc_value_sql`). The cost: functions, operators and types of
   an extension installed in another schema are not found unqualified —
   call the function qualified (`ext.similarity(…)`) and the operator as
-  `OPERATOR(ext.=)` (sqlglot 30.7 and 30.21 read and render it as
-  written); a bare `=` on a `citext` column in schema `ext` compares as
-  `text`. Pinned by `tests/test_schema_scoping.py`.
+  `OPERATOR(ext.=)` / prefix `OPERATOR(ext.@) x` (`FaithfulPostgres`
+  keeps the name exactly as written, a quoted schema quoted, review
+  round 20); a bare `=` on a `citext` column in schema `ext` compares as
+  `text`. An operator calls its function without naming it, so the
+  function deny list does not apply to operators, bare or in
+  `OPERATOR()`: in a stock catalog the only operators whose function it
+  would refuse by name are the immutable `pg_lsn` comparisons and
+  arithmetic (pinned by
+  `test_sql_fidelity.test_no_catalog_operator_runs_a_function_the_deny_list_refuses`);
+  an extension's operators in a schema the role can use are the DBA's to
+  vet, like its functions. Pinned by `tests/test_schema_scoping.py`.
 - **Only `SET LOCAL`, never bare `SET`.** Library-wide invariant: every SQL
   `SET` issued by `mcp_sql` code (runtime read path AND bootstrap script)
   uses `SET LOCAL` inside an explicit transaction. Deployments commonly
@@ -663,7 +671,8 @@ The load-bearing invariants and footguns, grouped by layer:
   `SELECT interval day`, which Postgres requires `AS` for); and a few
   valid forms sqlglot cannot parse are refused (`ORDER BY … USING`,
   `national character varying(n)` / `national char(n)`, `j @? path` on
-  30.7). The infix operator `a @ b` (no
+  30.7; operators sqlglot cannot read bare, `x ~<~ y`, `|/ x` → `SQRT`,
+  run when written `OPERATOR(pg_catalog.~<~)`). The infix operator `a @ b` (no
   built-in one since PostgreSQL 14; an extension may define it) is a
   parse error beside an alias or in a condition, and as a projection
   without an alias sqlglot reads `a` with the alias `@ b` and renders `a AS
@@ -701,13 +710,19 @@ The load-bearing invariants and footguns, grouped by layer:
   as `text`, `'{1}'::interval day array` as one day — made it the alias
   `array` before a comma and refused it before an operator), and bounds
   (`'{1,2}'::int[3]`, `int[][1]`, `'{1.234}'::interval(1)[1]`, which
-  sqlglot rendered as a subscript of the cast, a Postgres syntax error)
+  sqlglot rendered as a subscript of the cast, a Postgres syntax error;
+  `'{1.234}'::interval(1)[1]` returns `{00:00:01.2}`, as in Postgres)
   run as written; `int[] array`, `int array[]`, a bound that is not an
   unsigned integer constant, an array type in a typed literal (`int[]
   '{1}'`) and a bare `array` alias are parse errors, as in Postgres. `bit
   varying` / `bit varying(n)` is `varbit` (sqlglot read `bit` with the
   alias `varying`: `'10101'::bit varying` ran as `bit(1)`, the value
-  `1`). `INTERVAL(3) '…'` (the precision form, with any form of
+  `1`), `nchar varying` / `nchar varying(n)` `varchar` (review round 20;
+  refused before). A double-quoted type name is the name as written,
+  whole (`"int4"`, `"numeric"(10, 2)`, `"int4"[3]`; `"bit varying"`,
+  `"int array"` are names no type has — sqlglot read the text again as
+  SQL and ran `varbit`, review round 20); a type modifier sqlglot does
+  not keep on it (`"json"(3)`) is a parse error. `INTERVAL(3) '…'` (the precision form, with any form of
   string constant) is kept as written,
   and any other `INTERVAL(…)` (`INTERVAL(1 + 2) '…'`, `INTERVAL(3.0) '…'`,
   `INTERVAL(3)` alone, `interval(1)` with a column `interval` in scope;
@@ -721,7 +736,7 @@ The load-bearing invariants and footguns, grouped by layer:
   `BAN_SELECT_STAR` (any `t.*` is `select_star`), `t.f` when a column `t`
   is also in scope. Pre-existing and tracked separately:
   psycopg2's type-cast errors escaping the audit, `reg*` casts as an
-  existence oracle. `tests/test_sql_functional_corpus.py` runs 918
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 933
   ordinary analytical queries (over data with NULLs and mixed case) end to
   end and checks each returns exactly what Postgres returns for the
   original text (`repr`-exact), plus queries Postgres rejects that must

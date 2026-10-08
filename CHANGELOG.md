@@ -193,11 +193,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     as the bigint it is to Postgres. An array constructor subscripted without
     parentheses (`ARRAY[1, 2][1]`, a syntax error to Postgres, which
     sqlglot parenthesised; `ARRAY(SELECT …)[1]`, which it turned into
-    `ARRAY[1]`) and `INTERVAL(p) '<string>' <field>` are `parse_error`. The guarantee is about what sqlglot reads in the
+    `ARRAY[1]`) and `INTERVAL(p) '<string>' <field>` are `parse_error`.
+    `OPERATOR(schema.op)` keeps its name as written: sqlglot rebuilt it
+    from the texts of the tokens inside, so a quoted qualifier came back
+    unquoted (`OPERATOR("MySchema".=)` ran as `OPERATOR(MySchema.=)`, the
+    operator of schema `myschema` — another operator, or none) and tokens
+    written apart came back together (`OPERATOR(pg_catalog.< =)`, a
+    Postgres syntax error, ran as `<=`); what is not `[schema.]operator`
+    there is a parse error, as in Postgres. The prefix form
+    `OPERATOR(schema.op) x` (refused) runs; every operator, also one
+    sqlglot cannot read bare (`~<~`, `|/`, `*=`, `?-|`, ...), can be
+    written `OPERATOR(pg_catalog.op)`; `x operator` keeps its alias on
+    sqlglot 30.7 (dropped); `!~ x` is the prefix operator `!~` (it ran as
+    `! ~x`). A quoted type name is the name as written: sqlglot read its
+    text again as SQL, so `'101'::"bit varying"` ran as `varbit` (Postgres:
+    no such type) and `'{1}'::"int array"` came back as `"int
+    array"[]`; `nchar varying` / `nchar varying(n)` (refused) is
+    `varchar`. The guarantee is about what sqlglot reads in the
     executed text — it passed every check and re-renders to itself — not a
     proof about Postgres's lexer; forms whose reading by Postgres is known
     to differ are refused by the parser (above). A new acceptance test runs
-    918 ordinary analytical queries (over data with NULLs and mixed case)
+    933 ordinary analytical queries (over data with NULLs and mixed case)
     end to end and checks each returns exactly what Postgres returns for
     the original text, on both sqlglot versions, and another renders a
     call (with plain string arguments) to every `pg_catalog` function the
@@ -325,7 +341,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `search_path`, normally `public`) loses its unqualified names: call
     its functions qualified (`extensions.similarity(...)`) and its
     operators with `OPERATOR(schema.op)` (`name OPERATOR(extensions.=)
-    'alice'`, `s OPERATOR(extensions.%) 'cafe'`). Written bare, its
+    'alice'`, `s OPERATOR(extensions.%) 'cafe'`, prefix `OPERATOR(ext.@)
+    x`; a quoted schema stays quoted). Written bare, its
     operators either fail or resolve to a `pg_catalog` one through a cast
     (a `citext` column compared with `=` compares as `text`,
     case-sensitively). Install such extensions in `public` if the agent

@@ -312,9 +312,48 @@ def _keyword(text: str) -> str:
 
 class _PrefixOperator(exp.Expression):
     """A Postgres prefix operator sqlglot has no node for (`@ x`, `@-@ x`,
-    `!! q`, `! x`), rendered as written."""
+    `!! q`, `! x`, `!~ x`, `OPERATOR(s.op) x`), rendered as written."""
 
     arg_types = {"this": True, "op": True}
+
+
+# `meta` key of an `OPERATOR(...)` node: the source offsets of its
+# parentheses. The name between them is rendered as written, so the
+# operator-run checks of `_check_lexical_fidelity` (which judge how sqlglot
+# reads operator characters) do not apply to it.
+_WRITTEN_OPERATOR = "mcp_sql_written_operator"
+
+
+def _operator_name_as_written(sql: str, tokens: list[Token]) -> str | None:
+    """The name inside `OPERATOR(...)` (`tokens`, without the parentheses)
+    as Postgres reads it — `[qualifier.]...operator`, each qualifier a
+    plain or double-quoted identifier, the operator one run of operator
+    characters written together that Postgres lexes as one operator — or
+    `None` when it is not that (Postgres: a syntax error). The text is
+    kept as written (a quoted qualifier stays quoted); what separated the
+    tokens (spaces, comments) is dropped, which Postgres reads the same."""
+    texts = [sql[token.start : token.end + 1] for token in tokens]
+    split = len(texts)
+    while split and _is_operator_token(sql, tokens[split - 1]):
+        split -= 1
+    run = tokens[split:]
+    operator = "".join(texts[split:])
+    if (
+        not run
+        or any(b.start != a.end + 1 for a, b in itertools.pairwise(run))
+        or _postgres_operator(operator) != operator
+    ):
+        return None
+    qualifiers = texts[:split]
+    if len(qualifiers) % 2:
+        return None
+    for token, text, dot in zip(
+        tokens[:split:2], qualifiers[::2], qualifiers[1::2], strict=True
+    ):
+        quoted = token.token_type == TokenType.IDENTIFIER and text.startswith('"')
+        if dot != "." or not (quoted or _UNQUOTED_IDENTIFIER_RE.fullmatch(text)):
+            return None
+    return "".join(texts)
 
 
 class _InfixOperator(exp.Expression):
@@ -421,9 +460,11 @@ class FaithfulPostgres(Postgres):
     - `j -> k` / `j ->> k` keep their right operand as written: sqlglot
       turned it into a JSON path, dropping an empty key (`j -> ''`) and, on
       30.7, a quote inside the key.
-    - A quoted type name stays quoted (`x::"char"`, `x::"Numeric"(10, 2)`):
-      sqlglot folded it onto its builtin (`CHAR`, `DECIMAL`), a different
-      type or one Postgres does not have under that spelling.
+    - A quoted type name stays quoted, whole (`x::"char"`,
+      `x::"Numeric"(10, 2)`, `x::"bit varying"`): sqlglot folded it onto
+      its builtin (`CHAR`, `DECIMAL`) or read its text again as SQL
+      (`varbit`), a different type or one Postgres does not have under
+      that spelling. `nchar varying(n)` is `varchar(n)`.
     - `bit '011'` / `char 'abc'` (no length) keep their full value: sqlglot
       rendered `CAST('011' AS BIT)`, which Postgres reads as `bit(1)`.
     - Numeric constants keep their spelling, including the PG16 forms
@@ -436,6 +477,10 @@ class FaithfulPostgres(Postgres):
       written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` and `!` as
       `NOT`. A parameter `$1` stays a parameter.
     - `current_timestamp` / `current_time` keep the precision written.
+    - `OPERATOR(schema.op)` keeps its name as written (sqlglot rebuilt it
+      from its tokens' texts: a quoted schema came back unquoted, `< =`
+      as `<=`), infix and prefix; `operator` with no `(` after it is a
+      name.
 
     Used for every parse, tokenization and rendering in this module. The
     tokenizers are the postgres dialect's own classes, assigned rather than
@@ -497,6 +542,7 @@ class FaithfulPostgres(Postgres):
         UNARY_PARSERS = {
             **Postgres.Parser.UNARY_PARSERS,
             TokenType.NOT: lambda self: self._parse_not_or_bang(),
+            TokenType.OPERATOR: lambda self: self._parse_prefix_qualified_operator(),
         }
         PLACEHOLDER_PARSERS = {
             **Postgres.Parser.PLACEHOLDER_PARSERS,
@@ -687,9 +733,10 @@ class FaithfulPostgres(Postgres):
                 # type. `_array_suffix` reads them all again.
                 parsed = _element_type(parsed)
             parsed = self._bit_varying(parsed, index)
+            parsed = self._nchar_varying(parsed, index)
             parsed = self._interval_alias(parsed, index)
             if token is not None and token.token_type == TokenType.IDENTIFIER:
-                _keep_quoted_type(parsed, token)
+                parsed = self._quoted_type(parsed, token, index)
             parsed = self._second_precision(parsed)
             if check_func:
                 self._no_array_typed_literal(parsed)
@@ -810,6 +857,81 @@ class FaithfulPostgres(Postgres):
                 kind=exp.to_identifier("varbit"),
                 expressions=typmod,
             )
+
+        def _nchar_varying(self, parsed: exp.DataType, index: int) -> exp.DataType:
+            """`nchar varying` / `nchar varying(n)`: Postgres's `varchar`,
+            which sqlglot read as `nchar` and then the word `varying`
+            (refused since review round 19, an alias before it: `'ab'::nchar
+            varying(1)` ran as `bpchar`, the value `ab` where Postgres
+            returns `a`). The word must follow the unquoted `nchar` directly
+            (`nchar(3) varying` is Postgres's syntax error). Rendered
+            `VARCHAR(n)`: the same type, the same column name (review round
+            20)."""
+            tokens = self._tokens
+            if (
+                parsed.this != exp.DType.NCHAR
+                or tokens[index].token_type != TokenType.NCHAR
+                or self._index != index + 1
+                or not self._is_unquoted(self._index, "VARYING")
+            ):
+                return parsed
+            self._advance()
+            typmod = []
+            if self._at(TokenType.L_PAREN):
+                size = tokens[self._index : self._index + 3]
+                if not (
+                    [token.token_type for token in size]
+                    == [TokenType.L_PAREN, TokenType.NUMBER, TokenType.R_PAREN]
+                    and size[1].text.isdigit()
+                ):
+                    self.raise_error("nchar varying(n) takes an integer")
+                self._advance(3)
+                typmod = [exp.DataTypeParam(this=exp.Literal.number(size[1].text))]
+            return exp.DataType(this=exp.DType.VARCHAR, expressions=typmod)
+
+        def _quoted_type(
+            self, parsed: exp.DataType, token: Token, index: int
+        ) -> exp.DataType:
+            """The type named by the double-quoted `token`, as written:
+            Postgres resolves a quoted name whole and case-sensitively
+            (`"int4"` is a type, `"bit varying"`, `"int array"`, `"Text"` are
+            names no type has). sqlglot read the quoted text again as SQL
+            (with this dialect): `"bit varying"` ran as `varbit`, `"int
+            array"` came back as `"int array"[]` (review round 20). The
+            brackets and the type modifier written after the name are kept;
+            a qualified name (`"s"."t"`, `"pg_catalog".int4`) stays as
+            sqlglot read it, as written."""
+            tokens = self._tokens
+            if (
+                index + 1 < len(tokens)
+                and tokens[index + 1].token_type == TokenType.DOT
+            ):
+                return parsed
+            consumed = tokens[index + 1 : self._index]
+            levels = []
+            node = parsed
+            for _ in range(sum(t.token_type == TokenType.L_BRACKET for t in consumed)):
+                inner = node.expressions[0] if node.expressions else None
+                if node.this != exp.DType.ARRAY or not isinstance(inner, exp.DataType):
+                    break
+                levels.append(node)
+                node = inner
+            typmods = []
+            if any(t.token_type == TokenType.L_PAREN for t in consumed):
+                typmods = list(node.expressions)
+                if not typmods or not all(
+                    isinstance(param, exp.DataTypeParam) for param in typmods
+                ):
+                    self.raise_error("A quoted type name takes (n) or (p, s)")
+            name = exp.to_identifier(token.text, quoted=True)
+            name.update_positions(token)
+            node = exp.DataType(
+                this=exp.DType.USERDEFINED, kind=name, expressions=typmods
+            )
+            for level in reversed(levels):
+                level.set("expressions", [node])
+                node = level
+            return node
 
         def _interval_alias(self, parsed: exp.DataType, index: int) -> exp.DataType:
             """`'90'::interval days`, `'1.5'::interval(1) secs`: Postgres's
@@ -942,15 +1064,13 @@ class FaithfulPostgres(Postgres):
 
         def _parse_not_or_bang(self) -> exp.Expression | None:
             """`NOT x`, or Postgres's prefix operators `!! q` (tsquery
-            negation) and `! x` (none: Postgres's error), as written; sqlglot
-            read `!` as `NOT`."""
+            negation), `! x` and `!~ x` (none: Postgres's error), as
+            written; sqlglot read `!` as `NOT` and `!~ x` as `! ~x`, another
+            operator."""
             if self._prev is None or self._prev.text != "!":
                 negated: exp.Expression | None = _STOCK_NOT_PARSER(self)
                 return negated
-            symbol = "!"
-            if self._adjacent(self._prev, TokenType.NOT, "!"):
-                self._advance()
-                symbol = "!!"
+            symbol = self._prefix_run(self._prev)
             operand = self._parse_unary()
             if operand is None:
                 return None
@@ -958,6 +1078,103 @@ class FaithfulPostgres(Postgres):
                 _PrefixOperator(this=operand, op=symbol)
             )
             return prefixed
+
+        def _prefix_run(self, first: Token) -> str:
+            """The prefix operator Postgres lexes at `first` (a `!`) with
+            the operator characters written right after it (`!!`, `!~`,
+            `!~*`), its tokens consumed; `!` alone when that operator ends
+            inside a token (`_check_operator_runs` refuses those)."""
+            sql, tokens = self.sql, self._tokens
+            index, end = self._index, first.end
+            while (
+                index < len(tokens)
+                and tokens[index].start == end + 1
+                and _is_operator_token(sql, tokens[index])
+            ):
+                end = tokens[index].end
+                index += 1
+            symbol = _postgres_operator(sql[first.start : end + 1])
+            stop = first.start + len(symbol) - 1
+            count, last = 0, first.end
+            while last < stop:
+                last = tokens[self._index + count].end
+                count += 1
+            if last != stop:
+                return "!"
+            self._advance(count)
+            return symbol
+
+        def _parse_operator(self, this: exp.Expression | None) -> exp.Expression | None:
+            """`a OPERATOR(schema.op) b`, the name as written
+            (`_operator_name`). sqlglot joined the texts of the tokens:
+            a quoted qualifier came back unquoted (`OPERATOR("MySchema".=)`
+            ran as `OPERATOR(MySchema.=)`, another operator), tokens
+            written apart came back together (`OPERATOR(pg_catalog.< =)`,
+            a Postgres syntax error, ran as `<=`). `operator` without a
+            `(` after it is a name, an alias (sqlglot 30.7 dropped it)."""
+            first = True
+            while True:
+                if self._curr is None or self._curr.token_type != TokenType.L_PAREN:
+                    self._retreat(self._index - 1)  # back to the OPERATOR word
+                    return None if first else this
+                opening = self._curr
+                name = self._operator_name()
+                span = (opening.start, self._prev.start)
+                comments = self._prev_comments
+                node: exp.Expression = self.expression(
+                    exp.Operator(
+                        this=this, operator=name, expression=self._parse_bitwise()
+                    ),
+                    comments=comments,
+                )
+                node.meta[_WRITTEN_OPERATOR] = span
+                this, first = node, False
+                if not self._match(TokenType.OPERATOR):
+                    return this
+
+        def _parse_prefix_qualified_operator(self) -> exp.Expression | None:
+            """`OPERATOR(schema.op) x`, a prefix operator (sqlglot: a parse
+            error), the name as written; `operator` without a `(` after it
+            is a name. The operand is the next unary expression, as for
+            `@ x`: the text is kept, so Postgres groups it as written."""
+            if self._curr is None or self._curr.token_type != TokenType.L_PAREN:
+                self._retreat(self._index - 1)
+                name_or_column: exp.Expression | None = self._parse_type()
+                return name_or_column
+            opening = self._curr
+            name = self._operator_name()
+            span = (opening.start, self._prev.start)
+            operand = self._parse_unary()
+            if operand is None:
+                self.raise_error("Expected an operand after OPERATOR(...)")
+            prefixed: exp.Expression = self.expression(
+                _PrefixOperator(this=operand, op=f"OPERATOR({name})")
+            )
+            prefixed.meta[_WRITTEN_OPERATOR] = span
+            return prefixed
+
+        def _operator_name(self) -> str:
+            """At the `(` after `OPERATOR`: the name up to the `)`, as
+            written (`_operator_name_as_written`); a parse error when it is
+            not `[qualifier.]...operator`, as in Postgres."""
+            start = self._index + 1
+            closing = next(
+                (
+                    index
+                    for index in range(start, len(self._tokens))
+                    if self._tokens[index].token_type == TokenType.R_PAREN
+                ),
+                None,
+            )
+            if closing is None:
+                self.raise_error("Expecting ) after OPERATOR(")
+                return ""  # not reached: raise_error raises
+            name = _operator_name_as_written(self.sql, self._tokens[start:closing])
+            if name is None:
+                self.raise_error("OPERATOR() takes [schema.]operator")
+                return ""  # not reached
+            self._advance(closing + 1 - self._index)
+            return name
 
         def _adjacent(self, before: Token, kind: TokenType, text: str) -> bool:
             """The current token is `text` of `kind`, written right after
@@ -1392,23 +1609,6 @@ def _element_type(parsed: exp.DataType) -> exp.DataType:
     return parsed
 
 
-def _keep_quoted_type(parsed: exp.DataType, token: Token) -> None:
-    """Make the type `parsed` from the double-quoted name `token` render as
-    that quoted name (Postgres resolves it case-sensitively, as written)."""
-    base = parsed
-    while base.this == exp.DType.ARRAY and base.expressions:
-        inner = base.expressions[0]
-        if not isinstance(inner, exp.DataType):
-            return
-        base = inner
-    if base.this == exp.DType.USERDEFINED:
-        return  # already the name as written
-    name = exp.to_identifier(token.text, quoted=True)
-    name.update_positions(token)
-    base.set("this", exp.DType.USERDEFINED)
-    base.set("kind", name)
-
-
 class QueryRejectedError(Exception):
     """Raised by `parse_and_validate` on any AST-layer reject.
 
@@ -1685,8 +1885,20 @@ def _check_lexical_fidelity(raw_sql: str, ast: exp.Query) -> list[Token]:
         problem = _token_problem(raw_sql, tokens, i, kept_names)
         if problem is not None:
             raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, problem)
-    _check_operator_runs(raw_sql, tokens)
-    _check_sqlglot_only_operators(raw_sql, tokens)
+    # The name inside `OPERATOR(...)` is rendered as written: how sqlglot
+    # reads its operator characters does not matter there.
+    verbatim = [
+        node.meta[_WRITTEN_OPERATOR]
+        for node in ast.find_all(exp.Operator, _PrefixOperator)
+        if _WRITTEN_OPERATOR in node.meta
+    ]
+    read_by_sqlglot = [
+        token
+        for token in tokens
+        if not any(opening < token.start < closing for opening, closing in verbatim)
+    ]
+    _check_operator_runs(raw_sql, read_by_sqlglot)
+    _check_sqlglot_only_operators(raw_sql, read_by_sqlglot)
     for ident in ast.find_all(exp.Identifier):
         start, end = ident.meta.get("start"), ident.meta.get("end")
         written = (

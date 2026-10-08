@@ -44,6 +44,7 @@ from mcp_sql.tests.sql_functional_corpus import MIN_SERVER_VERSION
 from mcp_sql.tests.sql_functional_corpus import POSTGRES_REJECTS
 from mcp_sql.tests.sql_functional_corpus import REFUSED
 from mcp_sql.tests.sql_functional_corpus import SETUP_SQL
+from mcp_sql.tests.sql_functional_corpus import TEARDOWN_SQL
 from mcp_sql.tests.test_executor import _DEFAULT_PROFILE
 
 _TABLES = {"t": "t", "u": "u"}
@@ -52,15 +53,16 @@ _ROW_LIMIT = 1000
 
 @pytest.fixture(scope="module")
 def corpus_tables(django_db_setup, django_db_blocker):
-    """The corpus tables, readable by the read role, for this module."""
+    """The corpus tables (and operator schemas), readable by the read role,
+    for this module."""
     with django_db_blocker.unblock(), connection.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS t, u")
-        for statement in filter(str.strip, SETUP_SQL.split(";\n")):
+        for statement in filter(str.strip, (TEARDOWN_SQL + SETUP_SQL).split(";\n")):
             cur.execute(statement)
         cur.execute(f"GRANT SELECT ON t, u TO {_DEFAULT_PROFILE.role}")
     yield
     with django_db_blocker.unblock(), connection.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS t, u")
+        for statement in filter(str.strip, TEARDOWN_SQL.split(";\n")):
+            cur.execute(statement)
 
 
 @pytest.fixture
