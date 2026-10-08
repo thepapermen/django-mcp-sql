@@ -1,7 +1,14 @@
 """Tests for the OAuth validator and the issuance-gate AuthorizationView."""
 
+import base64
+import hashlib
+import json
+import secrets
 from http import HTTPStatus
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs
+from urllib.parse import urlencode
+from urllib.parse import urlparse
 
 import pytest
 from django.conf import settings
@@ -11,6 +18,65 @@ from django.urls import reverse
 from mcp_sql.oauth import MCPOAuth2Validator
 from mcp_sql.tests.conftest import SECOND_PROFILE_GROUP
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
+from oauth2_provider.models import AccessToken
+from oauth2_provider.models import Grant
+from oauth2_provider.models import RefreshToken
+from oauth2_provider.oauth2_validators import OAuth2Validator
+
+# A dynamically-registered client's loopback callback for the end-to-end flows.
+_LOOPBACK = "http://127.0.0.1:8765/cb"
+
+
+def _s256_pair() -> tuple[str, str]:
+    """A fresh PKCE (code_verifier, S256 code_challenge) pair."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return verifier, challenge
+
+
+def _register_dcr_client(client) -> str:
+    """Register via `/o/register` the way Anthropic's MCP SDK does (it asks for
+    `refresh_token` too) and return the minted client_id."""
+    response = client.post(
+        reverse("oauth_dynamic_client_registration"),
+        data=json.dumps(
+            {
+                "redirect_uris": [_LOOPBACK],
+                "grant_types": ["authorization_code", "refresh_token"],
+            }
+        ),
+        content_type="application/json",
+    )
+    assert response.status_code == HTTPStatus.CREATED, response.content
+    return response.json()["client_id"]
+
+
+def _authorize_params(client_id: str, challenge, method) -> dict:
+    """An `/o/authorize/` request; `None` leaves that PKCE parameter out."""
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": _LOOPBACK,
+        "scope": "mcp:sql",
+        "state": "st4te",
+    }
+    if challenge is not None:
+        params["code_challenge"] = challenge
+    if method is not None:
+        params["code_challenge_method"] = method
+    return params
+
+
+def _redirect_query(response) -> dict:
+    """The query of a 302 back to the loopback callback, parsed."""
+    assert response.status_code == HTTPStatus.FOUND, response.content
+    location = urlparse(response["Location"])
+    assert f"{location.scheme}://{location.netloc}{location.path}" == _LOOPBACK
+    return parse_qs(location.query)
 
 
 @pytest.mark.django_db
@@ -85,26 +151,75 @@ class TestMCPOAuth2ValidatorScopes:
         assert v.validate_scopes("c", [], None, MagicMock()) is False
 
 
-class TestMCPOAuth2ValidatorCodeChallengeMethod:
-    """`validate_code_challenge_method` is pinned to `S256` only.
-
-    oauthlib's default also accepts `plain`, but plain PKCE collapses to no
-    PKCE under verifier leak. The Authorization Server Metadata advertises
-    `S256` only; the validator enforces what the metadata promises.
+class TestMCPOAuth2ValidatorPKCE:
+    """The validator's PKCE backstops: `is_pkce_required` forces PKCE on and
+    `get_code_challenge_method` (token) refuses a stored non-S256 grant. The
+    S256-only method check at /o/authorize/ is `MCPServer`'s grant.
+    End-to-end behaviour: `TestPKCEEnforcedEndToEnd`.
     """
 
-    def test_accepts_s256(self):
-        v = MCPOAuth2Validator()
-        assert v.validate_code_challenge_method(MagicMock(), "S256") is True
+    def test_pkce_is_required(self):
+        assert MCPOAuth2Validator().is_pkce_required("c", MagicMock()) is True
 
-    def test_rejects_plain(self):
-        v = MCPOAuth2Validator()
-        assert v.validate_code_challenge_method(MagicMock(), "plain") is False
+    def test_pkce_stays_required_when_the_consumer_disables_it(self, settings):
+        settings.OAUTH2_PROVIDER = {**settings.OAUTH2_PROVIDER, "PKCE_REQUIRED": False}
+        assert MCPOAuth2Validator().is_pkce_required("c", MagicMock()) is True
 
-    def test_rejects_unknown_method(self):
-        v = MCPOAuth2Validator()
-        assert v.validate_code_challenge_method(MagicMock(), "S512") is False
-        assert v.validate_code_challenge_method(MagicMock(), "") is False
+    @pytest.mark.parametrize(
+        ("stored", "returned"), [("S256", "S256"), ("plain", None), (None, None)]
+    )
+    def test_token_time_backstop_hides_non_s256_methods(
+        self, monkeypatch, stored, returned
+    ):
+        monkeypatch.setattr(
+            OAuth2Validator, "get_code_challenge_method", lambda *_a, **_k: stored
+        )
+        assert (
+            MCPOAuth2Validator().get_code_challenge_method("code", MagicMock())
+            == returned
+        )
+
+
+class TestMCPOAuth2ValidatorGrantBackstops:
+    """No refresh grant and no password grant, even on DOT's stock server.
+    End-to-end: `TestRefreshRefused` and
+    `test_oauth_server.py::TestValidatorBackstopsOnStockViews`."""
+
+    def test_refuses_a_refresh_token_dot_would_accept(self, monkeypatch):
+        monkeypatch.setattr(
+            OAuth2Validator, "validate_refresh_token", lambda *_a, **_k: True
+        )
+        assert (
+            MCPOAuth2Validator().validate_refresh_token("rt", MagicMock(), MagicMock())
+            is False
+        )
+
+    def test_refresh_token_is_dropped_before_dot_stores_the_token(self, monkeypatch):
+        stored: dict = {}
+        monkeypatch.setattr(
+            OAuth2Validator,
+            "save_bearer_token",
+            lambda _self, token, _request, *_a, **_k: stored.update(token),
+        )
+        token = {"access_token": "at", "refresh_token": "rt", "scope": "mcp:sql"}
+        MCPOAuth2Validator().save_bearer_token(token, MagicMock())
+        # Mutated in place: oauthlib serialises this same dict as the response.
+        assert "refresh_token" not in token
+        assert "refresh_token" not in stored
+        assert stored["access_token"] == "at"
+
+    def test_refuses_a_password_without_checking_it(self, monkeypatch):
+        checked: list = []
+        # DOT's own `validate_user` calls the `authenticate` it imported.
+        monkeypatch.setattr(
+            "oauth2_provider.oauth2_validators.authenticate",
+            lambda *_a, **k: checked.append(k),
+        )
+        assert (
+            MCPOAuth2Validator().validate_user("u", "p", MagicMock(), MagicMock())
+            is False
+        )
+        assert checked == []
 
 
 @pytest.mark.django_db
@@ -167,6 +282,47 @@ class TestMCPAuthorizationViewRouting:
         # Wherever the consumer's LOGIN_URL points (an allauth
         # /accounts/login/, the admin login, ...) — not a hardcoded path.
         assert resolve_url(settings.LOGIN_URL) in response["Location"]
+
+    def test_anonymous_prompt_none_never_redirects_off_machine(self, client, mcp_app):
+        """DOT before 3.4.0 answered an anonymous `prompt=none` request with a
+        302 to whatever `redirect_uri` it named — before validating the client
+        or the URI (DOT #1719), so before any check of this package. The
+        `django-oauth-toolkit>=3.4.1` floor keeps this out: the request is now
+        validated first, and an off-machine URI gets an error page.
+        """
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "prompt": "none",
+            "redirect_uri": "https://evil.example/x",
+            "state": "st4te",
+        }
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert "Location" not in response
+
+    def test_anonymous_prompt_none_errors_back_to_a_valid_loopback(
+        self, client, mcp_app
+    ):
+        # Positive control: for a VALID request, `prompt=none` still answers
+        # an anonymous user with `login_required` at the client's redirect URI
+        # (OIDC Core §3.1.2.6) instead of a login page.
+        _verifier, challenge = _s256_pair()
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "prompt": "none",
+            "redirect_uri": "http://127.0.0.1:9999",
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        location = urlparse(response["Location"])
+        assert f"{location.scheme}://{location.netloc}" == "http://127.0.0.1:9999"
+        assert parse_qs(location.query)["error"] == ["login_required"]
 
 
 @pytest.mark.django_db
@@ -237,12 +393,12 @@ class TestOAuthTokenEndpointHappyPath:
         assert body["token_type"] == "Bearer"
         assert body["scope"] == "mcp:sql"
         assert "access_token" in body
-        # `REFRESH_TOKEN_EXPIRE_SECONDS=0` does NOT prevent DOT from issuing
-        # a refresh_token field — it just sets its lifetime to 0 seconds.
-        # The refresh token is structurally present but immediately expired
-        # and so cannot be used to refresh. Effectively-no-refresh-tokens,
-        # not literally-no-refresh-tokens.
-        assert "refresh_token" in body  # DOT 3.2.0 still mints them; expiry is 0s.
+        # No refresh token: `MCPServer`'s grant never generates one, so
+        # neither the response field nor a `RefreshToken` row exists
+        # (`REFRESH_TOKEN_EXPIRE_SECONDS=0` alone would NOT have stopped one
+        # from working — see TestRefreshRefused).
+        assert "refresh_token" not in body
+        assert not RefreshToken.objects.exists()
 
         # Verify the DB row matches what the response describes — defends
         # against a DOT regression that mis-binds the token's user/app/scope.
@@ -254,44 +410,39 @@ class TestOAuthTokenEndpointHappyPath:
         assert token_row.scope == "mcp:sql"
         assert token_row.expires > timezone.now()
 
-    def test_plain_pkce_is_rejected_at_authorize(self, client, mcp_user, mcp_mfa_on):
-        """`code_challenge_method=plain` at /o/authorize/ must be refused.
+    @pytest.mark.parametrize("method", ["plain", None], ids=["plain", "omitted"])
+    def test_non_s256_pkce_is_rejected_at_authorize(
+        self, client, mcp_user, mcp_app, mcp_mfa_on, method
+    ):
+        """A `plain` (or omitted, which oauthlib defaults to `plain`)
+        `code_challenge_method` at /o/authorize/ must be refused.
 
-        Integration counterpart to the unit test in
-        `TestMCPOAuth2ValidatorCodeChallengeMethod`: proves the override is
-        actually consulted by oauthlib during the live authorize flow.
-        oauthlib only calls `validate_code_challenge_method` here (the
-        method comes in as a query-string parameter); the /o/token/
-        exchange verifies the verifier against the stored method without
-        re-validating the method itself. So /o/authorize/ is where the
-        defense fires, and where a regression would surface.
+        Against the canonical row (the fixture creates it, so the client is
+        known and the check is not vacuous): oauthlib checks the method on the
+        GET, before the consent page. The refusal is oauthlib's normal error
+        redirect to the (already validated) loopback URI — `invalid_request`,
+        no code, no Grant.
         """
         client.force_login(mcp_user)
-        # Same shape as the happy-path AUTHORIZE_QS in
-        # TestMCPAuthorizationViewLiveGate, but `code_challenge_method=plain`.
-        url = reverse("authorize") + (
-            "?client_id=mcp-sql"
-            "&response_type=code"
-            "&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999"
-            "&code_challenge=any-value-since-the-method-is-rejected-first"
-            "&code_challenge_method=plain"
-        )
-        response = client.get(url)
-        # oauthlib's standard rejection on a PKCE-method validator returning
-        # False is a 302 redirect back to the client with
-        # `?error=invalid_request` (the OAuth error-response shape). A 200
-        # / 400 would still prove the validator didn't approve — but the 302
-        # is the path oauthlib actually takes. We accept anything other than
-        # the happy 302-to-loopback-with-?code= and 5xx.
-        assert response.status_code != HTTPStatus.OK, response.content
-        if response.status_code == HTTPStatus.FOUND:
-            # The error must surface as a redirect with an error param —
-            # NOT as a redirect with a code (which would mean the validator
-            # approved plain).
-            location = response["Location"]
-            assert "code=" not in location, (
-                f"Plain PKCE was approved — Grant minted: {location}"
-            )
+        params = {
+            "client_id": "mcp-sql",
+            "response_type": "code",
+            "redirect_uri": "http://127.0.0.1:9999",
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": secrets.token_urlsafe(48),
+        }
+        if method is not None:
+            params["code_challenge_method"] = method
+        response = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert response.status_code == HTTPStatus.FOUND, response.content
+        location = urlparse(response["Location"])
+        assert f"{location.scheme}://{location.netloc}" == "http://127.0.0.1:9999"
+        query = parse_qs(location.query)
+        assert query["error"] == ["invalid_request"]
+        assert query["state"] == ["st4te"]
+        assert "code" not in query
+        assert not Grant.objects.filter(application=mcp_app).exists()
 
     def test_token_minted_via_oauth_pipeline_authenticates_against_mcp_view(
         self, client, mcp_user, mcp_app, mcp_mfa_on, mcp_active_session
@@ -436,6 +587,189 @@ class TestMCPAuthorizationViewLiveGate:
             f"Gate may have rejected a fully-qualified user, or stack broke: "
             f"status={response.status_code}, body={response.content[:200]!r}"
         )
+
+
+@pytest.mark.django_db
+class TestPKCEEnforcedEndToEnd:
+    """S256-only, mandatory PKCE through real HTTP: `/o/authorize/` GET, the
+    consent POST, and `/o/token/`, for a dynamically-registered client (which
+    always shows the consent screen)."""
+
+    @pytest.mark.parametrize("method", ["plain", None], ids=["plain", "omitted"])
+    def test_non_s256_is_refused_on_the_consent_get_and_post(
+        self, client, mcp_user, mcp_mfa_on, method
+    ):
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        params = _authorize_params(client_id, secrets.token_urlsafe(48), method)
+
+        # GET: refused before the consent page renders.
+        get = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert _redirect_query(get)["error"] == ["invalid_request"]
+
+        # POST: the consent form re-runs oauthlib's request validation, so a
+        # crafted POST approving a `plain` challenge is refused the same way.
+        post = client.post(reverse("authorize"), data={**params, "allow": "Authorize"})
+        query = _redirect_query(post)
+        assert query["error"] == ["invalid_request"]
+        assert "code" not in query
+        assert not Grant.objects.exists()
+
+    def test_pkce_is_required_even_if_the_consumer_disables_it(
+        self, client, mcp_user, mcp_mfa_on, settings
+    ):
+        settings.OAUTH2_PROVIDER = {**settings.OAUTH2_PROVIDER, "PKCE_REQUIRED": False}
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        params = _authorize_params(client_id, None, None)
+        post = client.post(reverse("authorize"), data={**params, "allow": "Authorize"})
+        query = _redirect_query(post)
+        assert query["error"] == ["invalid_request"]
+        assert "code" not in query
+        assert not Grant.objects.exists()
+
+    def test_s256_flow_completes_without_a_refresh_token(
+        self, client, mcp_user, mcp_mfa_on
+    ):
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        verifier, challenge = _s256_pair()
+        params = _authorize_params(client_id, challenge, "S256")
+
+        get = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert get.status_code == HTTPStatus.OK, get.content  # consent page
+        post = client.post(reverse("authorize"), data={**params, "allow": "Authorize"})
+        code = _redirect_query(post)["code"][0]
+        token = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _LOOPBACK,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        assert token.status_code == HTTPStatus.OK, token.content
+        body = token.json()
+        assert body["scope"] == "mcp:sql"
+        assert "refresh_token" not in body
+        assert AccessToken.objects.filter(token=body["access_token"]).exists()
+        assert not RefreshToken.objects.exists()
+
+    def test_a_pre_fix_plain_grant_cannot_be_exchanged(self, client, mcp_user, mcp_app):
+        # What <= 0.1.0b5 stored for a `plain` authorization — explicit, or an
+        # omitted method that oauthlib defaulted to `plain`: the challenge IS
+        # the verifier. The token-time backstop refuses it.
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        verifier = secrets.token_urlsafe(48)
+        code = secrets.token_urlsafe(32)
+        Grant.objects.create(
+            user=mcp_user,
+            code=code,
+            application=mcp_app,
+            expires=timezone.now() + timedelta(minutes=1),
+            redirect_uri="http://127.0.0.1:9999",
+            scope="mcp:sql",
+            code_challenge=verifier,
+            code_challenge_method="plain",
+        )
+        response = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://127.0.0.1:9999",
+                "client_id": "mcp-sql",
+                "code_verifier": verifier,
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_grant"
+        assert not AccessToken.objects.exists()
+
+
+@pytest.mark.django_db
+class TestRefreshRefused:
+    """`ACCESS_TOKEN_EXPIRE_SECONDS` is the re-consent interval: no refresh
+    token is minted, and a refresh token minted by an earlier release (DOT
+    honoured those indefinitely under `REFRESH_TOKEN_EXPIRE_SECONDS=0`) is
+    refused: `/o/token/` answers every refresh grant with a constant
+    `invalid_grant`, the error that makes an MCP client re-authorize.
+    (`MCPOAuth2Validator.validate_refresh_token` is the backstop for DOT's
+    stock server.)"""
+
+    def _exchange_code(self, client, client_id) -> dict:
+        verifier, challenge = _s256_pair()
+        params = _authorize_params(client_id, challenge, "S256")
+        post = client.post(reverse("authorize"), data={**params, "allow": "Authorize"})
+        code = _redirect_query(post)["code"][0]
+        token = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _LOOPBACK,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        assert token.status_code == HTTPStatus.OK, token.content
+        return token.json()
+
+    def test_a_pre_fix_refresh_token_is_refused(self, client, mcp_user, mcp_mfa_on):
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        body = self._exchange_code(client, client_id)
+        assert "refresh_token" not in body
+        # What <= 0.1.0b5 also stored with every access token: a live
+        # RefreshToken row bound to it, as DOT's `save_bearer_token` writes it.
+        access = AccessToken.objects.get(token=body["access_token"])
+        legacy = RefreshToken.objects.create(
+            user=mcp_user,
+            token=secrets.token_urlsafe(32),
+            application=access.application,
+            access_token=access,
+        )
+
+        response = client.post(
+            reverse("token"),
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": legacy.token,
+                "client_id": client_id,
+            },
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
+        assert response.json()["error"] == "invalid_grant"
+        # No new access token; the original one is untouched.
+        assert list(AccessToken.objects.values_list("token", flat=True)) == [
+            body["access_token"]
+        ]
+
+    def test_dcr_still_accepts_a_client_asking_for_refresh(self, client):
+        # Anthropic's MCP SDK registers with `refresh_token` in grant_types;
+        # registration must still succeed and echo only what is supported.
+        response = client.post(
+            reverse("oauth_dynamic_client_registration"),
+            data=json.dumps(
+                {
+                    "redirect_uris": [_LOOPBACK],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                }
+            ),
+            content_type="application/json",
+        )
+        assert response.status_code == HTTPStatus.CREATED, response.content
+        assert response.json()["grant_types"] == ["authorization_code"]
+
+    def test_metadata_advertises_no_refresh_grant(self, client):
+        metadata = client.get(reverse("oauth_authorization_server_metadata")).json()
+        assert metadata["grant_types_supported"] == ["authorization_code"]
+        assert metadata["code_challenge_methods_supported"] == ["S256"]
 
 
 class TestMCPAuthorizationViewConsentTemplate:
@@ -770,7 +1104,7 @@ def test_provisioning_never_re_enables_skip_on_the_curated_row(mcp_app):
 
 
 class TestCuratedConsentMigration:
-    """Migration 0015 flips the curated row (and only it); 0005 creates new
+    """Migration 0016 flips the curated row (and only it); 0005 creates new
     installs' row with consent required. The suite runs `--nomigrations`, so
     the RunPython functions are called directly against the app registry."""
 
@@ -785,7 +1119,7 @@ class TestCuratedConsentMigration:
         from django.apps import apps
         from oauth2_provider.models import Application
 
-        migration = self._module("0015_curated_application_requires_consent")
+        migration = self._module("0016_curated_application_requires_consent")
         curated = Application.objects.create(
             name="mcp-sql",
             client_id="mcp-sql",
@@ -900,33 +1234,33 @@ class TestLogoutKillsPendingCode:
         client,
         mcp_user,
         mcp_mfa_on,
-        mcp_session_factory,
+        settings,
         django_capture_on_commit_callbacks,
     ):
-        """Logout leaves refresh-token rows in place; pin what each DOT line
-        then does with one (under the suite's `REFRESH_TOKEN_EXPIRE_SECONDS=0`).
+        """A refresh token from before logout cannot mint a token afterwards.
 
-        Branches on the INSTALLED DOT version, not on the response, so a DOT
-        that changed behaviour fails here instead of slipping into the other
-        branch. CI runs DOT 3.2 (floor job) and the newest 3.x (3.4.x today).
-        The refusal arrived in 3.4.1 (an orphaned refresh token is invalid);
-        3.4.0 behaves like 3.2.
+        By default the package's server issues no refresh token at all
+        (`oauth_server.MCPAuthorizationCodeGrant`); with the opt-in refresh
+        grant on (`REFRESH_TOKEN_MAX_AGE_SECONDS`), logout deletes the user's
+        MCP refresh tokens with the access tokens and pending codes
+        (`signals._revoke_and_audit`), and the refresh grant then answers
+        `invalid_grant`. (Before the merge with the refresh-token round this
+        test pinned DOT's own behaviour for a refresh token left behind;
+        with DOT >= 3.4.1 as the floor and the rows deleted that branch is
+        gone.)
         """
-        from importlib.metadata import version
-
-        from mcp_sql.auth import MCPOAuth2Authentication
         from oauth2_provider.models import AccessToken
         from oauth2_provider.models import RefreshToken
-        from packaging.version import Version
-        from rest_framework.exceptions import AuthenticationFailed
-        from rest_framework.test import APIRequestFactory
 
+        settings.MCP_SQL = {**settings.MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": 3600}
         code, verifier = self._consent_code(client, mcp_user)
         refresh_token = self._exchange(client, code, verifier).json()["refresh_token"]
+        assert RefreshToken.objects.filter(user=mcp_user).exists()
         with django_capture_on_commit_callbacks(execute=True):
             client.logout()
-        # Logout deletes access tokens and pending codes, not refresh tokens.
-        assert RefreshToken.objects.filter(user=mcp_user).exists()
+        # Logout deletes access tokens, refresh tokens and pending codes.
+        assert not RefreshToken.objects.filter(user=mcp_user).exists()
+        tokens_before = AccessToken.objects.count()
 
         refreshed = client.post(
             reverse("token"),
@@ -936,24 +1270,9 @@ class TestLogoutKillsPendingCode:
                 "client_id": self.CLIENT_ID,
             },
         )
-        if Version(version("django-oauth-toolkit")) >= Version("3.4.1"):
-            # Refuses a refresh token whose access token is gone.
-            assert refreshed.status_code == HTTPStatus.BAD_REQUEST, refreshed.content
-            assert refreshed.json()["error"] == "invalid_grant"
-            return
-        # DOT < 3.4.1 (3.2 is the tested floor): a token IS minted, but its scope
-        # is read from the deleted access token, so it carries none...
-        assert refreshed.status_code == HTTPStatus.OK, refreshed.content
-        new = AccessToken.objects.get(token=refreshed.json()["access_token"])
-        assert new.scope == ""
-        # ...and the `mcp:sql` check refuses it. A live web session elsewhere
-        # rules out the session gate as the reason.
-        mcp_session_factory(user=mcp_user)
-        bearer = APIRequestFactory().post(
-            "/mcp/sql/", HTTP_AUTHORIZATION=f"Bearer {new.token}"
-        )
-        with pytest.raises(AuthenticationFailed, match="mcp:sql"):
-            MCPOAuth2Authentication().authenticate(bearer)
+        assert refreshed.status_code == HTTPStatus.BAD_REQUEST, refreshed.content
+        assert refreshed.json()["error"] == "invalid_grant"
+        assert AccessToken.objects.count() == tokens_before
 
 
 @pytest.mark.django_db
@@ -1150,6 +1469,24 @@ class TestConsentPostErrorsNeverRedirectOffClient:
         with pytest.raises(application_model.DoesNotExist):
             self._post(client, mcp_user, allow="Authorize")
         assert application_model.objects.filter(client_id=self.CLIENT_ID).exists()
+
+
+@pytest.mark.django_db
+class TestConsentFormInvalidRender:
+    """DOT's `form_invalid` re-renders the consent template without
+    `application`; `{{ resource_name|default:application.name }}` resolved
+    the filter argument anyway and raised `VariableDoesNotExist` (500)."""
+
+    def test_incomplete_consent_post_renders(self, client, mcp_user, mcp_mfa_on):
+        client_id = _register_dcr_client(client)
+        client.force_login(mcp_user)
+        _verifier, challenge = _s256_pair()
+        params = _authorize_params(client_id, challenge, "S256")
+        del params["scope"]  # a required AllowForm field
+        response = client.post(reverse("authorize"), data={**params, "allow": "1"})
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert b"MCP SQL" in response.content
+        assert not Grant.objects.exists()
 
 
 class TestOauthAdminUnregistered:

@@ -26,7 +26,10 @@ Approving this form is an explicit, CSRF-protected POST, and
 the Application), so a phished authorization link cannot complete silently;
 the check the user can actually make is the "Only continue if you started
 this from there" instruction. Keep both it and the destination visible in
-any re-theme.
+any re-theme. Do not reference `application` through a filter argument
+(`default:application.name`): a filter argument is resolved eagerly, and
+DOT's `form_invalid` re-render carries no `application`, which made it
+raise a 500.
 {% endcomment %}
 {% block content %}
   <div class="block-center">

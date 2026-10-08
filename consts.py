@@ -11,12 +11,10 @@ on the settings accessor (`mcp_sql_settings.APPLICATION_NAME` /
 
 Also `absolute_url`, the one place an absolute URL on the OAuth surface is
 composed (discovery documents, the 401 challenge, `/o/register`'s response),
-with `canonical_authority`, the host spelling it and the RFC 8707 check share,
-and `client_ip` / `normalize_client_ip`, the one place an audit row's
-`client_ip` is derived.
+with `canonical_authority`, the host spelling it and the RFC 8707 check share.
+(An audit row's `client_ip` is derived by `models.audit_client_ip`.)
 """
 
-import ipaddress
 import re
 from typing import Any
 
@@ -93,49 +91,6 @@ def canonical_authority(scheme: str, authority: str) -> str:
         return authority
     port = port.lstrip("0") or "0"
     return host if port == DEFAULT_PORTS.get(scheme) else f"{host}:{port}"
-
-
-def normalize_client_ip(value: object) -> str | None:
-    """`value` as a canonical IP address string, or `None` if it is not one.
-
-    Every audit writer (`executor._audit_safely`, `auth._audit_rejection`,
-    the logout receiver) stores `client_ip` through this, and the view hands
-    the tools only its result. The column is a `GenericIPAddressField`, and
-    `REMOTE_ADDR` is whatever the front end put there: uvicorn with
-    `--proxy-headers --forwarded-allow-ips='*'`, or a hand-rolled
-    `X-Forwarded-For` middleware, copies the client's left-most entry
-    unvalidated. A non-IP value made psycopg 3 raise `ValueError` at the
-    insert, past every audit wrapper's `DatabaseError` catch (a gate denial
-    became a 500, an executed query left no row), and psycopg2 raise a
-    `DataError` that the wrappers swallow (the row silently lost). An
-    unusable address is recorded as unknown instead; the row itself always
-    lands.
-
-    Strict on purpose: no whitespace trimming and no picking an address out
-    of a list, since guessing which part of a malformed value is the client
-    is exactly what the front end failed to do. An IPv6 zone index
-    (`fe80::1%eth0`) is dropped: `ipaddress` accepts it, Postgres `inet`
-    does not.
-    """
-    if not isinstance(value, str):
-        return None
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return None
-    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
-        address = ipaddress.IPv6Address(int(address))
-    return str(address)
-
-
-def client_ip(request: HttpRequest) -> str | None:
-    """The request's `REMOTE_ADDR`, normalised by `normalize_client_ip`.
-
-    `REMOTE_ADDR` is the client IP only as far as the deployment's proxy and
-    real-IP middleware make it so (`docs/architecture.md` "Watch out: the
-    per-IP throttle trusts YOUR deployment's IP handling").
-    """
-    return normalize_client_ip(request.META.get("REMOTE_ADDR"))
 
 
 # DCR mints Application names as

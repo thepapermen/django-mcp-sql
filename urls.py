@@ -4,7 +4,9 @@ Mounted from the project's root urlconf via `include("mcp_sql.urls")`.
 Carries the seven routes the subsystem owns:
 
 - 3 curated DOT URLs at `/o/` (authorize gated by `MCPAuthorizationView`,
-  token via `MCPTokenView`, revoke). `/o/applications/`, `/o/authorized_tokens/`,
+  token via `MCPTokenView`, revoke), each a DOT view subclass running on the
+  package's narrow `oauth_server.MCPServer` rather than the consumer's
+  `OAUTH2_SERVER_CLASS`. `/o/applications/`, `/o/authorized_tokens/`,
   `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin /
   introspection / userinfo surface is exposed.
 - 1 RFC 7591 dynamic client registration endpoint at `/o/register`.
@@ -24,9 +26,9 @@ from mcp_sql.views.discovery import authorization_server_metadata
 from mcp_sql.views.discovery import protected_resource_metadata
 from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
+from mcp_sql.views.oauth_token import MCPRevokeTokenView
 from mcp_sql.views.oauth_token import MCPTokenView
 from mcp_sql.views.registration import register_client
-from oauth2_provider import views as oauth2_views
 
 urlpatterns = [
     # Curated subset of django-oauth-toolkit URLs. Each OAuth endpoint is
@@ -43,7 +45,7 @@ urlpatterns = [
     path("o/token/", cap_request_body()(MCPTokenView.as_view()), name="token"),
     path(
         "o/revoke_token/",
-        cap_request_body()(oauth2_views.RevokeTokenView.as_view()),
+        cap_request_body()(MCPRevokeTokenView.as_view()),
         name="revoke-token",
     ),
     # RFC 7591 dynamic client registration. Required by Claude Code's MCP

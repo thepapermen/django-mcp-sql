@@ -309,6 +309,47 @@ DEFAULTS: dict[str, Any] = {
     # just under the limit.
     "BAD_TOKEN_IP_THRESHOLD": 100,
     "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
+    # === Refresh tokens (opt-in) ===
+    #
+    # Hard cap, in seconds, on a refresh-token chain, measured from the
+    # consent that started it (the authorization-code exchange) across every
+    # rotation — NOT django-oauth-toolkit's sliding idle window
+    # (`REFRESH_TOKEN_EXPIRE_SECONDS`). `0` (the default) disables refresh
+    # tokens: none are issued and `grant_type=refresh_token` gets
+    # `invalid_grant`, so `ACCESS_TOKEN_EXPIRE_SECONDS` is the re-consent
+    # interval. A positive value issues a rotating refresh token with every
+    # access token; once the cap passes, the client must re-authorize.
+    # Logout and a password change revoke refresh tokens with the access
+    # tokens. See docs/oauth.md "Refresh tokens (opt-in)".
+    "REFRESH_TOKEN_MAX_AGE_SECONDS": 0,
+    # === search_path pin (opt-in; turning it on is recommended) ===
+    #
+    # `True` adds `SET LOCAL search_path = 'public', 'pg_temp'` to the guards
+    # every read transaction sets (`session.session_gucs`), and
+    # `session_drift` (the `mcp_sql_smoke` check) expects it. An unqualified
+    # name in an agent query is then the relation in `public` — the one the
+    # parser's whitelist check matched — whatever the login's `search_path`
+    # (if no relation of that name exists in `public`, a temporary relation
+    # of that name on the backend is found instead: `pg_temp` is last).
+    # `False` (the default) leaves `search_path` alone: an unqualified name
+    # resolves through the database's own `search_path`, so a schema ahead
+    # of `public` (a `"$user"` schema named after the profile role, a
+    # database- / role-level setting, a connection option) or a temporary
+    # relation on the backend shadows a whitelisted `public` table wherever
+    # the profile role may read it — a grant to `PUBLIC` is enough. A party
+    # with no right on the whitelisted tables can plant one: any role with
+    # CREATE on the database (the `"$user"` schema), or another session on
+    # the same backend, e.g. under transaction-mode pooling (a temporary
+    # relation); the agent then reads its rows under the whitelisted name,
+    # and the grants drift check does not see it (it lists direct grants to
+    # the profile role only: not `PUBLIC`, membership, materialized views or
+    # temporary relations). Leave it off only if an extension the agent
+    # needs lives outside `public` (or `pg_catalog`): with it on, such an
+    # extension loses its unqualified functions and operators (`ext.f(...)`,
+    # `OPERATOR(ext.op)`). The schema-qualified whitelist check and the
+    # every-schema grants inventory apply either way. See
+    # docs/architecture.md "`search_path`".
+    "PIN_SEARCH_PATH": False,
 }
 
 
@@ -452,6 +493,12 @@ class MCPSQLSettings:
 
 
 mcp_sql_settings = MCPSQLSettings()
+
+
+def refresh_tokens_enabled() -> bool:
+    """`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` is positive: the opt-in
+    refresh grant is on (see `oauth.MCPOAuth2Validator.validate_refresh_token`)."""
+    return bool(mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS > 0)
 
 
 def merge_config(cfg: Mapping[str, Any]) -> dict[str, Any]:

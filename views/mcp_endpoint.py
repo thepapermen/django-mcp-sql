@@ -37,8 +37,8 @@ from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.clients import NO_CLIENT
 from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import mcp_sql_settings
-from mcp_sql.consts import client_ip as request_client_ip
 from mcp_sql.consts import identify_application
+from mcp_sql.models import audit_client_ip
 from mcp_sql.schemas import ToolName
 from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes
@@ -573,9 +573,10 @@ def _mcp_transport(request):
     # see docs/architecture.md "the per-IP throttle trusts YOUR deployment's
     # IP handling") has already rewritten `REMOTE_ADDR` to the derived
     # client IP. Use `REMOTE_ADDR` directly — re-deriving here would
-    # duplicate (or fight) that middleware's work — but normalised: a non-IP
-    # value is recorded as unknown rather than failing the audit insert.
-    client_ip = request_client_ip(request)
+    # duplicate (or fight) that middleware's work. A value that is not one
+    # IP address is recorded as None (`audit_client_ip`): it would make the
+    # audit row's insert fail.
+    client_ip = audit_client_ip(request.META.get("REMOTE_ADDR"))
 
     # Bound by the auth class on success (auth.py sets it on the underlying
     # HttpRequest). Reflects exactly one access tier; the tool closures expose

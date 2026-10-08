@@ -1,8 +1,9 @@
-"""DOT `AuthorizationView` + the Option D session-trust issuance gate
-(is_active + MFA + an unambiguous single-profile assignment via
-`resolve_profile`). See `docs/architecture.md` "OAuth surface" for the
-full design rationale."""
+"""DOT `AuthorizationView` on the narrow `MCPServer` + the Option D
+session-trust issuance gate (is_active + MFA + an unambiguous single-profile
+assignment via `resolve_profile`). See `docs/architecture.md` "OAuth surface"
+for the full design rationale."""
 
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from urllib.parse import urlparse
@@ -12,6 +13,8 @@ from mcp_sql.audience import foreign_resource
 from mcp_sql.audience import invalid_target_error
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.oauth import has_control_character
+from mcp_sql.oauth_server import MCPServerViewMixin
 from oauth2_provider.exceptions import FatalClientError
 from oauth2_provider.exceptions import OAuthToolkitError
 from oauth2_provider.models import get_application_model
@@ -22,10 +25,33 @@ from oauthlib.uri_validate import is_absolute_uri
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
+    from django.http import HttpRequest
+
+# RFC 7636 §4.2: a code_challenge is 43-128 characters of the unreserved set
+# (an S256 challenge is exactly 43). It is stored in DOT's
+# `Grant.code_challenge` (varchar(128)); anything longer raised a 500.
+_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9\-._~]{43,128}")
+# DOT stores `nonce` in `Grant.nonce` (varchar(255)).
+_NONCE_MAX_LENGTH = 255
 
 
-class MCPAuthorizationView(AuthorizationView):
-    """`AuthorizationView` + the MCP issuance gate."""
+def _authorize_parameter_problem(request: "HttpRequest") -> str | None:
+    """Why this authorize request's parameters cannot reach DOT's `Grant`
+    insert, or `None` if they can."""
+    if has_control_character(request.GET, request.POST):
+        return "Control character in a request parameter."
+    for params in (request.GET, request.POST):
+        challenges = params.getlist("code_challenge")
+        if any(not _CODE_CHALLENGE_RE.fullmatch(c) for c in challenges):
+            return "code_challenge must be 43-128 characters of [A-Za-z0-9-._~]."
+        if any(len(n) > _NONCE_MAX_LENGTH for n in params.getlist("nonce")):
+            return f"nonce must be at most {_NONCE_MAX_LENGTH} characters."
+    return None
+
+
+class MCPAuthorizationView(MCPServerViewMixin, AuthorizationView):
+    """`AuthorizationView` + the MCP issuance gate, on `MCPServer` (the
+    `code` response type only, `S256` PKCE only)."""
 
     # Package-owned consent template (overrides DOT's
     # `oauth2_provider/authorize.html`). Named under `mcp_sql/` so a
@@ -34,14 +60,16 @@ class MCPAuthorizationView(AuthorizationView):
     template_name = "mcp_sql/authorize.html"
 
     def render_to_response(self, context, **response_kwargs):
-        # `render_to_response` is the single chokepoint for the only two
-        # template renders this view performs: the consent page (`get`)
-        # and the fatal-client-error page (`error_response` when oauthlib
-        # refuses to redirect — unknown `client_id` / untrusted
-        # `redirect_uri` — or when this view's own re-validation in
-        # `error_response` / `form_valid` does). Every other outcome is a
-        # redirect (recoverable OAuth errors bounce back to the client,
-        # success carries the auth
+        # `render_to_response` is the single chokepoint for every template
+        # render this view performs: the consent page (`get`), its
+        # re-render when the consent POST's form is invalid (DOT's
+        # `form_invalid`, whose context has no `application`), and the
+        # fatal-client-error page (`error_response` when oauthlib refuses
+        # to redirect — unknown `client_id` / untrusted `redirect_uri` —
+        # when `dispatch` screens out a parameter, or when this view's own
+        # re-validation in `error_response` / `form_valid` does). Every
+        # other outcome is a redirect (recoverable OAuth errors bounce back
+        # to the client, success carries the auth
         # code, login / `prompt=none` 302), and a failed issuance gate
         # raises `PermissionDenied` rendered by the consumer's 403 page —
         # none of those render here. So injecting here reaches every page
@@ -146,8 +174,7 @@ class MCPAuthorizationView(AuthorizationView):
         # query string (one plain string, not a list) reached the grant
         # instead, and DOT's model refused it with a 500 (ledger F55). A
         # browser posts the page's own query back, so a real consent POST
-        # always matches. (Below 3.4 the form has no such field and DOT
-        # ignores both.)
+        # always matches.
         query_resources = self.request.GET.getlist("resource")
         resources = query_resources + [
             value
@@ -209,8 +236,7 @@ class MCPAuthorizationView(AuthorizationView):
         From DOT 3.4 a `resource` is stored on the grant and the token, and
         DOT audience-checks the token against `/mcp/sql/`: any other value
         minted a token that endpoint always refuses with a bare 401. Refused
-        here instead, on every DOT version (below 3.4 DOT ignores
-        `resource`; the answer is the same). Raised after oauthlib has
+        here instead. Raised after oauthlib has
         validated `client_id` and `redirect_uri`, through DOT's own handling
         of a failed validation (`error_response`, which re-validates the
         redirect anyway), so the error goes back to the client's registered
@@ -299,7 +325,7 @@ class MCPAuthorizationView(AuthorizationView):
         # does with it next is outside this server). `skip_authorization=False` is
         # supposed to make consent an explicit POST every time; this keeps it
         # so, for every client kind (the curated `mcp-sql` row included,
-        # since migration 0015). The parameter is DOT-specific and no MCP
+        # since migration 0016). The parameter is DOT-specific and no MCP
         # client is known to send it; what the pin does take away, on
         # purpose, is a consumer-wide `REQUEST_APPROVAL_PROMPT = "auto"` for
         # this view — same-client re-authorization before the token expires
@@ -307,20 +333,25 @@ class MCPAuthorizationView(AuthorizationView):
         query = request.GET.copy()
         query["approval_prompt"] = "force"  # replaces every value, if repeated
         request.GET = query
-        # A NUL never names a client. On the GET, DOT hands it to Postgres in
-        # its client lookup (`validate_authorization_request`), which raises
-        # `DataError`: a 500 on every retry. Refuse it here with the
-        # fatal-client error page, before any lookup (and before the gate,
-        # which queries the DB too). On the consent POST Django's form
-        # validation already rejects a NUL (the page is re-rendered, a 200);
-        # checking the POST too is defence in depth, and gives both methods
-        # the same answer.
-        client_ids = request.GET.getlist("client_id")
-        if request.method == "POST":
-            client_ids += request.POST.getlist("client_id")
-        if any("\x00" in value for value in client_ids):
-            return super().error_response(
-                FatalClientError(error=oauth2_errors.InvalidClientIdError()),
+        # Parameters DOT would store raw on the `Grant` row (code_challenge,
+        # nonce, resource, ...) are screened first, on the query string and
+        # the consent POST alike: a NUL or an over-long value otherwise
+        # reached the INSERT and raised an uncaught 500 (DataError). The
+        # redirect_uri is not validated yet, so this is the fatal error page
+        # (400), never a redirect. The control-character screen covers
+        # `client_id` too, before any lookup (and before the gate, which
+        # queries the DB too): a NUL there reached DOT's client lookup on the
+        # GET (`validate_authorization_request`), a `DataError` 500 on every
+        # retry; on the consent POST Django's form validation would have
+        # re-rendered the page. It also runs before the RFC 8707 `resource`
+        # checks, so a control character in `resource` gets this answer.
+        problem = _authorize_parameter_problem(request)
+        if problem is not None:
+            self.oauth2_data = {}
+            return self.error_response(
+                FatalClientError(
+                    error=oauth2_errors.InvalidRequestError(description=problem)
+                ),
                 application=None,
             )
         if request.user.is_authenticated:

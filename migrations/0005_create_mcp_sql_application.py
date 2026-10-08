@@ -14,8 +14,8 @@
 #   other client kind. Up to 0.1.x this was True ("friction without
 #   security"), but DOT accepts any port on the registered loopback IP, so a
 #   phished authorize link delivered a code silently to any local port; see
-#   migration 0015, which flips existing rows. Changed here too (it only
-#   affects fresh installs, which also run 0015) so this file no longer
+#   migration 0016, which flips existing rows. Changed here too (it only
+#   affects fresh installs, which also run 0016) so this file no longer
 #   creates the unsafe posture.
 # - `redirect_uris="http://127.0.0.1"`: per RFC 8252 §7.3, native-app OAuth
 #   uses loopback redirects, and DOT 3.x's `redirect_to_uri_allowed` accepts

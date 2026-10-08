@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('mcp_sql', '0012_mcpauthrejectionlog_client_redirect_and_more'),
+        ('mcp_sql', '0013_refresh_token_family'),
     ]
 
     operations = [

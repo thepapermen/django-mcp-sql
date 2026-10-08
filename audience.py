@@ -16,8 +16,7 @@ advertises (`views/discovery.py`), built here by `mcp_resource_url`:
   omitted, the path exactly the endpoint's with or without its trailing
   slash (the two spellings discovery serves) — and answer anything else
   `invalid_target` (`foreign_resource`, `invalid_target_error`). Enforced by
-  the package's views on every DOT version, so DOT below 3.4 (which ignores
-  `resource`) answers the same.
+  the package's views before DOT sees the value.
 - verification: `/mcp/sql/` hands DOT's audience check the request URL built
   the same way (`CanonicalUriOAuthLibCore`), not Django's
   `build_absolute_uri`, so a token bound to the advertised identifier always

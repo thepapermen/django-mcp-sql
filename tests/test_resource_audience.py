@@ -13,9 +13,8 @@ counted toward the bad-token IP throttle).
 The suite's test client speaks `http` with `DEBUG` off, so discovery
 advertises `https://testserver/mcp/sql/` while every request arrives as
 `http`: exactly the proxy-without-`SECURE_PROXY_SSL_HEADER` deployment. The
-end-to-end tests therefore fail on DOT 3.4 without the bearer half of the
-fix, and the refusal tests fail on every DOT version without the issuance
-half.
+end-to-end tests therefore fail without the bearer half of the fix, and the
+refusal tests fail without the issuance half.
 
 "The advertised identifier" is compared by RFC 3986 equivalence of scheme
 and authority (case, default port), with the path exact; and the host in it
@@ -23,9 +22,10 @@ is spelled canonically whatever the Host header says (`<name>:443`, an
 uppercase name), so a client that parses discovery's value and sends back
 the normalised form is accepted end to end on that host.
 
-DOT below 3.4 ignores `resource` (no field on the grant or token); the
-package's checks run on every version, so the answers are the same there and
-a token is simply unrestricted.
+DOT 3.4.1 is the floor, so every DOT the package supports stores `resource`
+and audience-checks bound tokens. A control character in `resource` is
+refused by the OAuth views' control-character screen (`invalid_request`)
+before the `resource` check runs.
 """
 
 import base64
@@ -36,7 +36,6 @@ from collections.abc import Sequence
 from datetime import timedelta
 from html.parser import HTMLParser
 from http import HTTPStatus
-from importlib.metadata import version
 from urllib.parse import parse_qs
 from urllib.parse import unquote
 from urllib.parse import urlencode
@@ -78,7 +77,6 @@ FOREIGN = [
     "https:testserver/mcp/sql/",
     "//testserver/mcp/sql/",
     "testserver/mcp/sql/",
-    "https://testserver/mcp/\tsql/",  # urlsplit would drop the tab
     "https://testsérver/mcp/sql/",
     "",
     "not a uri",
@@ -123,13 +121,6 @@ def exact_audience_validator(request_uri: str, audiences: list[str]) -> bool:
     """A `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` comparing strings (bar
     the trailing slash), stricter than DOT's default."""
     return request_uri.rstrip("/") in {audience.rstrip("/") for audience in audiences}
-
-
-def _dot_stores_resource() -> bool:
-    """DOT 3.4 added RFC 8707: `resource` on Grant / AccessToken and the
-    audience check. Below it the parameter is ignored."""
-    dot = tuple(int(p) for p in version("django-oauth-toolkit").split(".")[:2])
-    return dot >= (3, 4)
 
 
 def _pkce() -> tuple[str, str]:
@@ -245,6 +236,22 @@ def _assert_invalid_target_redirect(response, accepted: str = SLASHED) -> None:
     assert accepted in query["error_description"][0]
 
 
+# A tab is a control character: refused by the OAuth views' control-character
+# screen (`invalid_request`) before the `resource` check, so it is not in
+# `FOREIGN` (`urlsplit` would have dropped it).
+TAB_IN_PATH = "https://testserver/mcp/\tsql/"
+
+
+def _assert_control_character_page(response) -> None:
+    """`/o/authorize/`'s control-character screen: the fatal error page
+    (`invalid_request`), no redirect, nothing stored."""
+    assert response.status_code == HTTPStatus.BAD_REQUEST, response.content[:300]
+    assert "Location" not in response
+    assert b"invalid_request" in response.content
+    assert b"Control character" in response.content
+    assert _grant_count() == 0
+
+
 def _grant_count() -> int:
     from oauth2_provider.models import Grant
 
@@ -291,10 +298,7 @@ class TestMatchingResourceWorksEndToEnd:
         from oauth2_provider.models import AccessToken
 
         row = AccessToken.objects.get(token=access_token)
-        if _dot_stores_resource():
-            assert row.resource == [resource]
-        else:
-            assert not hasattr(row, "resource")
+        assert row.resource == [resource]
 
         response = _ping(client, access_token, transport)
         assert response.status_code == HTTPStatus.OK, response.content
@@ -307,9 +311,9 @@ class TestMatchingResourceWorksEndToEnd:
         query = urlencode(_authorize_params(challenge, []))
         client.force_login(mcp_user)
         assert client.get(reverse("authorize") + "?" + query).status_code == 200
-        # DOT 3.4's form carries a blank `resource` field when the GET had
+        # DOT's form (3.4+) carries a blank `resource` field when the GET had
         # none; a blank field is no resource.
-        form_resource = "" if _dot_stores_resource() else None
+        form_resource = ""
         code = _code_from(_consent(client, query, form_resource))
         token = _exchange(client, code, verifier)
         assert token.status_code == HTTPStatus.OK, token.content
@@ -318,8 +322,7 @@ class TestMatchingResourceWorksEndToEnd:
         from oauth2_provider.models import AccessToken
 
         row = AccessToken.objects.get(token=access_token)
-        if _dot_stores_resource():
-            assert row.resource == []
+        assert row.resource == []
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
     def test_debug_on_advertises_and_accepts_http(  # noqa: PLR0913 — fixtures, all load-bearing
@@ -379,8 +382,7 @@ class TestEquivalentSpellingsAreAccepted:
 
         from oauth2_provider.models import AccessToken
 
-        if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == [resource]
+        assert AccessToken.objects.get(token=access_token).resource == [resource]
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
     def test_mixed_spellings_in_one_request(
@@ -430,14 +432,12 @@ class TestConsentPageRoundTrip:
         page = client.get(page_url)
         assert page.status_code == HTTPStatus.OK
         code = _code_from(_submit_consent_page(client, page_url, page))
-        if _dot_stores_resource():
-            assert Grant.objects.get(code=code).resource == resources
+        assert Grant.objects.get(code=code).resource == resources
         # No `resource` at the token endpoint: the token inherits the grant's.
         token = _exchange(client, code, verifier)
         assert token.status_code == HTTPStatus.OK, token.content
         access_token = token.json()["access_token"]
-        if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == resources
+        assert AccessToken.objects.get(token=access_token).resource == resources
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
 
@@ -475,10 +475,6 @@ class TestSpellingsAcrossSteps:
         assert client.get(reverse("authorize") + "?" + query).status_code == 200
         code = _code_from(_consent(client, query, at_authorize))
         response = _exchange(client, code, verifier, [at_token])
-        if not _dot_stores_resource():
-            # Below 3.4 DOT ignores `resource`.
-            assert response.status_code == HTTPStatus.OK, response.content
-            return
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
         # DOT's answer, not the package's (whose check the value passed);
         # DOT labels its JSON body `text/html`.
@@ -534,9 +530,6 @@ class TestNonCanonicalHostHeader:
         response = _ping(client, access_token, HTTP_HOST=host)
         assert response.status_code == HTTPStatus.OK, response.content
 
-    @pytest.mark.skipif(
-        not _dot_stores_resource(), reason="DOT audience-checks tokens from 3.4"
-    )
     @pytest.mark.parametrize("resource", [SLASHED, SLASHLESS])
     @pytest.mark.parametrize("host", NON_CANONICAL_HOSTS)
     def test_bearer_sees_the_canonical_url(  # noqa: PLR0913 — fixtures + two parametrize axes
@@ -629,53 +622,45 @@ class TestForeignResourceIsRefusedAtAuthorize:
         _assert_invalid_target_redirect(client.get(reverse("authorize") + "?" + query))
         assert _grant_count() == 0
 
-    def test_get_with_a_nul_is_invalid_target_not_500(
-        self, client, mcp_app, mcp_user, gate_posture
+    @pytest.mark.parametrize("resource", [SLASHED + "\x00", TAB_IN_PATH])
+    def test_get_with_a_control_character_is_invalid_request_not_500(
+        self, client, mcp_app, mcp_user, gate_posture, resource
     ):
-        """A NUL `resource` never reaches DOT (which, from 3.4, stores it on
-        the grant: a Postgres `DataError` where consent is skipped)."""
+        """A NUL `resource` never reaches DOT (which stores it on the grant:
+        a Postgres `DataError` where consent is skipped). The control-
+        character screen (`oauth_authorize._authorize_parameter_problem`)
+        runs before the `resource` check: the fatal error page."""
         _, challenge = _pkce()
-        query = urlencode(_authorize_params(challenge, [SLASHED + "\x00"]))
+        query = urlencode(_authorize_params(challenge, [resource]))
         client.force_login(mcp_user)
-        _assert_invalid_target_redirect(client.get(reverse("authorize") + "?" + query))
+        _assert_control_character_page(client.get(reverse("authorize") + "?" + query))
 
-    def test_consent_form_field_with_a_nul_is_refused_not_500(
-        self, client, mcp_app, mcp_user, gate_posture
+    @pytest.mark.parametrize("resource", [SLASHED + "\x00", TAB_IN_PATH])
+    def test_consent_form_field_with_a_control_character_is_refused_not_500(
+        self, client, mcp_app, mcp_user, gate_posture, resource
     ):
-        """From DOT 3.4 the consent form has a `resource` field, and Django's
-        form validation refuses a NUL in it before `form_valid` runs: the
-        consent page is re-rendered with the form error (no redirect,
-        nothing stored). Below 3.4 the form has no such field, and the
-        package's check answers `invalid_target`."""
+        """A NUL in the consent form's `resource` field is screened with the
+        rest of the POST before Django's form validation or `form_valid`
+        run: the fatal error page (no redirect, nothing stored)."""
         _, challenge = _pkce()
         query = urlencode(_authorize_params(challenge, []))
         client.force_login(mcp_user)
-        response = _consent(client, query, SLASHED + "\x00")
-        assert _grant_count() == 0
-        if _dot_stores_resource():
-            assert response.status_code == HTTPStatus.OK
-            assert "Location" not in response
-            assert b'id="authorizationForm"' in response.content
-        else:
-            _assert_invalid_target_redirect(response)
+        response = _consent(client, query, resource)
+        _assert_control_character_page(response)
 
     @pytest.mark.parametrize("form_resource", [None, SLASHED])
-    def test_consent_query_string_with_a_nul_is_invalid_target_not_500(
+    def test_consent_query_string_with_a_nul_is_refused_not_500(
         self, client, mcp_app, mcp_user, gate_posture, form_resource
     ):
         """A NUL `resource` in the query string the consent form posts back
-        to (oauthlib reads it as well as the form field) is the package's
-        `invalid_target`, whatever the form field holds: no 500, nothing
-        stored, on every DOT version. (From DOT 3.4 the form field then
-        disagrees with the query, unless it carries the NUL too, which
-        Django's form validation refuses first; below 3.4 the form has no
-        such field and `foreign_resource` refuses the NUL itself.)"""
+        to (oauthlib reads it as well as the form field) is screened first,
+        whatever the form field holds: the fatal error page, no 500, nothing
+        stored."""
         _, challenge = _pkce()
         query = urlencode(_authorize_params(challenge, [SLASHED + "\x00"]))
         client.force_login(mcp_user)
         response = _consent(client, query, form_resource)
-        _assert_invalid_target_redirect(response)
-        assert _grant_count() == 0
+        _assert_control_character_page(response)
 
     def test_get_with_one_foreign_among_repeated_values(
         self, client, mcp_app, mcp_user, gate_posture
@@ -729,17 +714,13 @@ class TestForeignResourceIsRefusedAtAuthorize:
         """From DOT 3.4, a blank form field beside a query-string `resource`
         let oauthlib's string reading reach the grant: a 500 (ledger F55)
         even for the advertised value. A browser posts the page's own query
-        back, so the two always agree; when they do not, `invalid_target`.
-        Below 3.4 the form has no field and DOT ignores both."""
+        back, so the two always agree; when they do not, `invalid_target`."""
         _, challenge = _pkce()
         query = urlencode(_authorize_params(challenge, [SLASHED]))
         client.force_login(mcp_user)
         response = _consent(client, query, form_resource)
-        if _dot_stores_resource():
-            _assert_invalid_target_redirect(response)
-            assert _grant_count() == 0
-        else:
-            assert _code_from(response)
+        _assert_invalid_target_redirect(response)
+        assert _grant_count() == 0
 
     def test_cancel_with_a_foreign_resource_is_invalid_target(
         self, client, mcp_app, mcp_user, gate_posture
@@ -806,13 +787,20 @@ class TestForeignResourceIsRefusedAtToken:
         # The same code still works without the resource.
         assert _exchange(client, code, verifier).status_code == HTTPStatus.OK
 
-    def test_nul_is_invalid_target_not_500(
-        self, client, mcp_app, mcp_user, gate_posture
+    @pytest.mark.parametrize("resource", [SLASHED + "\x00", TAB_IN_PATH])
+    def test_control_character_is_invalid_request_not_500(
+        self, client, mcp_app, mcp_user, gate_posture, resource
     ):
+        """`MCPTokenView`'s control-character screen runs before the
+        `resource` check: `invalid_request`, and the code is not consumed."""
+        from oauth2_provider.models import Grant
+
         code, verifier = self._grant(mcp_app, mcp_user)
-        response = _exchange(client, code, verifier, [SLASHED + "\x00"])
+        response = _exchange(client, code, verifier, [resource])
         assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert response.json()["error"] == "invalid_target"
+        assert response["Cache-Control"] == "no-store"
+        assert response.json()["error"] == "invalid_request"
+        assert Grant.objects.filter(code=code).exists()
 
     def test_query_string(self, client, mcp_app, mcp_user, gate_posture):
         from oauth2_provider.models import AccessToken
@@ -842,15 +830,11 @@ class TestForeignResourceIsRefusedAtToken:
         response = _exchange(client, code, verifier, [resource])
         assert response.status_code == HTTPStatus.OK, response.content
         access_token = response.json()["access_token"]
-        if _dot_stores_resource():
-            assert AccessToken.objects.get(token=access_token).resource == [resource]
+        assert AccessToken.objects.get(token=access_token).resource == [resource]
         assert _ping(client, access_token).status_code == HTTPStatus.OK
 
 
 @pytest.mark.django_db
-@pytest.mark.skipif(
-    not _dot_stores_resource(), reason="DOT audience-checks tokens from 3.4"
-)
 class TestBearerAudienceCheck:
     """`/mcp/sql/` compares a bound token with the URL built as discovery
     builds `resource`, not with Django's `build_absolute_uri`; DOT's check
@@ -1177,7 +1161,11 @@ def test_the_token_view_stays_csrf_exempt():
     from django.test import Client
 
     response = Client(enforce_csrf_checks=True).post(
-        reverse("token"), data={"resource": "https://somewhere.example/api"}
+        reverse("token"),
+        data={
+            "grant_type": "authorization_code",
+            "resource": "https://somewhere.example/api",
+        },
     )
     assert response.status_code == HTTPStatus.BAD_REQUEST
     assert response.json()["error"] == "invalid_target"
