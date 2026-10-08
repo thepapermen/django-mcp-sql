@@ -19,6 +19,7 @@ from io import StringIO
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import DatabaseError
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from mcp_sql import grants
@@ -319,6 +320,61 @@ class TestCatalogNamesAreQuoted:
         assert "Grants in sync" in out.getvalue()
 
 
+class TestQuotedNamesAsPostgresReadsThem:
+    """Review round 20: `quote_ident`'s two forms (`"…"`, and `U&"…"` with
+    `\\+XXXXXX` escapes for a name that does not print) were pinned by
+    string equality only. Each name below, written by `quote_ident`, must
+    name exactly itself to PostgreSQL, with `standard_conforming_strings`
+    on and off (the grants pipeline runs on the default alias, which does
+    not pin it): as a column alias, and as a relation `relation_sql`
+    creates, read back from the catalog."""
+
+    NAMES = [
+        "plain",
+        "Mixed Case",
+        'a"b',
+        '"',
+        'x" FROM r; --',
+        "back\\slash",
+        "\\+000041",
+        "a\nb",
+        "tab\there",
+        "zero\u200bwidth",
+        "bell\x07",
+        "astral\U0001d173",
+        'q"\n"',
+        "\n\\+000041",
+        "\\\n\\",
+        "e\u0301\u2028",
+    ]
+
+    @pytest.mark.parametrize("scs", ["on", "off"])
+    def test_an_alias_names_itself(self, scs):
+        assert any(not name.isprintable() for name in self.NAMES)  # U& form
+        with connection.cursor() as cur:
+            cur.execute(f"SET LOCAL standard_conforming_strings = {scs}")
+            for name in self.NAMES:
+                cur.execute(f"SELECT 1 AS {grants.quote_ident(name)}")
+                assert cur.description[0].name == name
+
+    @pytest.mark.parametrize("scs", ["on", "off"])
+    def test_a_relation_names_itself(self, scs):
+        schema = "mcp_sql a20\n\\+00005C"
+        with connection.cursor() as cur:
+            cur.execute(f"SET LOCAL standard_conforming_strings = {scs}")
+            cur.execute(f"CREATE SCHEMA {grants.quote_ident(schema)}")
+            for name in self.NAMES:
+                cur.execute(
+                    f"CREATE TABLE {grants.relation_sql((schema, name))} (id int)"
+                )
+            cur.execute(
+                "SELECT c.relname FROM pg_class c JOIN pg_namespace n "
+                "ON n.oid = c.relnamespace WHERE n.nspname = %s",
+                [schema],
+            )
+            assert sorted(row[0] for row in cur.fetchall()) == sorted(self.NAMES)
+
+
 class TestOverlongDbTable:
     """Review round 18: PostgreSQL truncates a name longer than 63 bytes
     (on a character boundary), so the catalog lists the truncated name.
@@ -446,3 +502,41 @@ class TestARefusedProfileChangesNoGrant:
             cur.execute("CREATE ROLE mcp_sql_a19_b NOLOGIN")
         call_command("mcp_sql_grants", "--apply", stdout=StringIO())
         assert ("public", self._TABLE) in grants.granted_tables(_ROLE)
+
+    _STALE = "mcp_sql_a20_stale"
+
+    def _with_a_stale_grant(self):
+        """`a` also has a grant nothing declares: its REVOKE is drift too."""
+        with connection.cursor() as cur:
+            cur.execute(f"CREATE TABLE public.{self._STALE} (id int)")
+            cur.execute(f"GRANT SELECT ON public.{self._STALE} TO {_ROLE}")
+
+    def _nothing_applied(self):
+        granted = grants.granted_tables(_ROLE)
+        return ("public", self._TABLE) not in granted and (
+            "public",
+            self._STALE,
+        ) in granted
+
+    def test_grant_failure_in_last_profile_rolls_back_everything(self, two_profiles):
+        """Review round 20: `b`'s GRANT fails at the database (its table
+        does not exist); `a`'s GRANT and REVOKE, applied before it in the
+        same transaction, are rolled back with it."""
+        two_profiles(
+            ["mcp_sql_testapp.Widget"],
+            {"mcp_sql_testapp.Widget": "mcp_sql_a20_no_such_table"},
+        )
+        self._with_a_stale_grant()
+        with connection.cursor() as cur:
+            cur.execute("CREATE ROLE mcp_sql_a19_b NOLOGIN")
+        with pytest.raises(DatabaseError, match="mcp_sql_a20_no_such_table"):
+            call_command("mcp_sql_grants", "--apply", stdout=StringIO())
+        assert self._nothing_applied()
+
+    def test_missing_role_in_last_profile_changes_nothing(self, two_profiles):
+        """Strict mode: `b`'s role does not exist; `a` is not applied."""
+        two_profiles(["mcp_sql_testapp.Widget"], {})
+        self._with_a_stale_grant()
+        with pytest.raises(CommandError, match="mcp_sql_a19_b"):
+            call_command("mcp_sql_grants", "--apply", stdout=StringIO())
+        assert self._nothing_applied()
