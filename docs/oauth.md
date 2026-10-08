@@ -124,15 +124,26 @@ spelled out (`https://<HOST>:443/mcp/sql/` is the same resource, as RFC 3986
 endpoint's exactly, with or without the trailing slash. Repeating it is
 fine; omitting it is fine (the token is then not resource-bound, as before).
 
+Equivalent spellings are equivalent at each step, not across steps. From
+DOT 3.4, `/o/token/` also requires each `resource` to be one of the
+grant's, compared as strings: exchange the code with the same `resource`
+string the authorization request carried, or with none (the token then
+carries the grant's). Another spelling, even an equivalent one, passes the
+package's check and then gets DOT's own `invalid_target`, whose
+`error_description` names the value sent; the code is not consumed, so the
+client can retry. The MCP SDKs send the same value at both steps.
+
 Anything else — the bare origin `https://<host>`, another path, host, port
-or scheme, a query, a fragment, userinfo, an empty value — is refused with
-**`invalid_target`** (RFC 8707 §2), naming the accepted value in
-`error_description` (never the value the client sent):
+or scheme, a port no URL parser takes (two ports, more than five digits,
+above 65535), a query, a fragment, userinfo, an empty value — is refused
+with **`invalid_target`** (RFC 8707 §2), naming the accepted value in
+`error_description` (the package's answer never names the value the client
+sent):
 
 | Where | Answer |
 |---|---|
 | `/o/authorize/` GET | 302 to the client's registered `redirect_uri` with `error=invalid_target` and its `state`; no consent page, no authorization code |
-| consent POST | the same, for the form's `resource` field or one in the URL's query string (from DOT 3.4 the two must agree); a tampered `redirect_uri` still gets the error page, never a redirect |
+| consent POST | the same, for the form's `resource` field or one in the URL's query string (from DOT 3.4 the two must agree); a tampered `redirect_uri` still gets the error page, never a redirect. A NUL in the form's own field (DOT 3.4+) is refused by Django's form validation first: the consent page is re-rendered with a form error, nothing stored |
 | `/o/token/` | 400 JSON `{"error": "invalid_target", ...}` with `Cache-Control: no-store`; the code is not consumed, so the client can retry |
 
 Typical causes: a client configured with a URL other than the one discovery
@@ -168,10 +179,13 @@ accepted spelling (uppercase, `:443`) passes DOT's default audience
 validator, which compares parsed URLs; a custom
 `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings would
 accept only the canonical one. DOT's check is not switched off: a token
-bound to anything else (one issued before this release) still gets a 401
-until it expires. Below DOT 3.4, which ignores `resource`, the package's
-checks answer the same way and tokens are never resource-bound. Pinned by
-`tests/test_resource_audience.py`.
+bound to a URL that is not a prefix of the endpoint's (one issued before
+this release) still gets a 401 until it expires. DOT's default validator
+is a URL-prefix match, so a token bound to a prefix of the endpoint URL —
+the origin, `https://<host>/mcp` — passes; the package no longer issues
+one (those values are `invalid_target`). Below DOT 3.4, which ignores
+`resource`, the package's checks answer the same way and tokens are never
+resource-bound. Pinned by `tests/test_resource_audience.py`.
 
 Both discovery endpoints return `Access-Control-Allow-Origin: *` so a
 future browser-based MCP client can `fetch()` them without CORS preflight

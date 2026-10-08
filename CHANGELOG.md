@@ -274,13 +274,27 @@ separately below precisely because they do **not** announce themselves.
     host in any case, the scheme's default port spelled out or omitted, the
     path exactly the endpoint's, with or without the trailing slash. Anything
     else (including an empty value, the bare origin `https://<host>`, another
-    path, port, host or scheme, a query, a fragment, userinfo) is
+    path, port, host or scheme, a port no URL parser takes — two ports, more
+    than five digits, above 65535 — a query, a fragment, userinfo) is
     **`invalid_target`** — a redirect to the client's validated
     `redirect_uri` with its `state` and no grant at the authorization
     endpoint (GET, and the consent POST's form field and query string), a
     400 at the token endpoint (`MCPTokenView`, now mounted at `/o/token/`;
-    the code is not consumed). This error names the accepted value, never the
-    client's. A NUL `resource` gets the same answer instead of a 500.
+    the code is not consumed). The package's `invalid_target` names the
+    accepted value, never the client's (DOT's own errors, such as the
+    token-step one below, may name it). A NUL `resource` at the
+    authorization GET, in the consent POST's query string or at the token
+    endpoint gets the same answer instead of a 500; in the consent form's
+    own `resource` field (DOT 3.4 and later) Django's form validation
+    refuses it first, and the consent page is re-rendered with a form error
+    (no redirect, nothing stored).
+  - Equivalent spellings are equivalent at each step, not across steps:
+    from DOT 3.4, `/o/token/` also requires each `resource` to be one of the
+    grant's, compared as strings. Exchange the code with the same `resource`
+    string the authorization request carried, or with none (the token then
+    carries the grant's); another spelling gets DOT's own `invalid_target`,
+    which names the value sent, and the code is not consumed. The MCP SDKs
+    send the same value at both steps.
   - Discovery, and every other absolute URL the package builds, spells the
     host canonically: lowercased, without the scheme's default port. A proxy
     forwarding `Host: <name>:443` (nginx `proxy_set_header Host
@@ -292,8 +306,10 @@ separately below precisely because they do **not** announce themselves.
     discovery builds `resource`, so a token bound to the advertised value
     always passes, with or without `SECURE_PROXY_SSL_HEADER`, whatever the
     spelling of the forwarded host. The check is not disabled: a token bound
-    to anything else still gets a 401 (tokens issued before upgrading expire
-    within their 6 h).
+    to a URL that is not a prefix of the endpoint's still gets a 401 (tokens
+    issued before upgrading expire within their 6 h). DOT's default
+    validator is a URL-prefix match, so one bound to a prefix — the origin,
+    `https://<host>/mcp` — passes; the package no longer issues those.
   - On the consent POST (DOT 3.4 and later) the form's `resource` and a
     `resource` in the URL's query string must agree; a blank form field
     beside a query `resource` reached the grant as a plain string and 500'd.

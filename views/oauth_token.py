@@ -55,6 +55,11 @@ class MCPTokenView(TokenView):
         unless it names that endpoint. The check runs before DOT, on every
         DOT version (below 3.4 `resource` is otherwise ignored), so the
         authorization code is not consumed and the client can retry.
+
+        The check accepts any equivalent spelling (`foreign_resource`); when
+        the grant carries a `resource` (DOT 3.4+), DOT then also requires each
+        value to be one of the grant's, as a string, and answers its own
+        `invalid_target` (naming the value) otherwise.
         """
         resources = request.GET.getlist("resource") + request.POST.getlist("resource")
         if foreign_resource(request, resources) is not None:
