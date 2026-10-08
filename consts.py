@@ -1,8 +1,9 @@
 """Cross-module logic helpers for the MCP read-only SQL surface.
 
 The settings-bound half of the client taxonomy: `classify_application_name`
-maps a DOT `Application.name` to its `ClientKind`, `is_mcp_application_name`
-is that classifier read as a yes/no recognition predicate, and
+maps a DOT `Application.name` to its `ClientKind`, `classify_application`
+applies it to a row (only while the row's `client_id` equals its `name`),
+`is_mcp_application` is that read as a yes/no recognition predicate, and
 `identify_application` packages the result for the audit trail. The
 taxonomy's pure half — the kinds themselves, the declared-client dataclasses,
 the namespace derivation — lives in `clients.py`; the identifier strings live
@@ -187,14 +188,33 @@ def classify_application_name(name: str) -> ClientKind | None:
     return None
 
 
-def is_mcp_application_name(name: str) -> bool:
+def classify_application(application: Any) -> ClientKind | None:
+    """`classify_application_name` for a DOT `Application` row, or None.
+
+    Recognition keys on the name, but provisioning, the redirect checks and
+    the consent label key on the `client_id` — and every row this package
+    writes carries one string in both (migration 0005, `/o/register`,
+    `signals.provision_mcp_clients`). Nothing in DOT enforces that, so a row
+    whose `client_id` differs from its `name` is recognised as nothing,
+    whatever the name: otherwise a row NAMED `mcp-sql-cloud.claude` under
+    another client_id (an admin-UI or shell edit) would be accepted as the
+    declared client while every client_id-keyed check looked at something
+    else. Applies to every branch (curated, declared and DCR rows alike).
+    A `None` application is not recognised either.
+    """
+    if application is None or application.client_id != application.name:
+        return None
+    return classify_application_name(application.name)
+
+
+def is_mcp_application(application: Any) -> bool:
     """Is this DOT Application part of the MCP surface?
 
-    The yes/no reading of `classify_application_name` — one predicate so
+    The yes/no reading of `classify_application` — one predicate so
     `MCPOAuth2Validator` and `MCPOAuth2Authentication` can never drift from
     each other, or from what the audit trail records.
     """
-    return classify_application_name(name) is not None
+    return classify_application(application) is not None
 
 
 def identify_application(application: Any) -> ClientIdentity:
@@ -205,15 +225,15 @@ def identify_application(application: Any) -> ClientIdentity:
     `None` application (no token in hand, e.g. logout-driven revocation)
     yields the blank identity, matching the models' blank defaults.
 
-    `kind` is empty for an Application that classifies as nothing: DOT
-    resolved the token, but the client is not (or is no longer) part of the
-    MCP surface. That is a rejection path, and recording it blank is the
-    honest answer — "we don't recognise this client" — rather than inventing
-    a kind for it.
+    `kind` is empty for an Application that classifies as nothing
+    (`classify_application`): DOT resolved the token, but the client is not
+    (or is no longer) part of the MCP surface. That is a rejection path, and
+    recording it blank is the honest answer — "we don't recognise this
+    client" — rather than inventing a kind for it.
     """
     if application is None:
         return ClientIdentity()
-    kind = classify_application_name(application.name)
+    kind = classify_application(application)
     return ClientIdentity.build(
         name=application.name,
         kind=kind.value if kind is not None else "",

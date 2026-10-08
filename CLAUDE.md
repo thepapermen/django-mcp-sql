@@ -61,6 +61,13 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   `client_kind` be declared — that is what keeps one client_id from spanning a
   provider-hosted and a machine-local surface, and what makes the audit
   trail's `client_kind` trustworthy.
+- **A declared client is settings-gated end to end**: recognition AND its
+  redirects (`oauth.MCPOAuth2Validator.validate_redirect_uri` /
+  `get_default_redirect_uri`) are decided from `MCP_SQL["CLIENTS"]` at every
+  request — never from the provisioned row's `redirect_uris` (refreshed only
+  by `post_migrate`), so no fall-through to DOT's row-backed `super()`.
+  Recognition (`consts.classify_application`) also requires the row's
+  `client_id == name`, on every branch; never recognise from the name alone.
 - **Every `MCP_SQL` key has a default and a declared key replaces its default
   WHOLESALE** — no per-member merge, `extra="forbid"` at every level. Adding a
   key means adding it to `conf.DEFAULTS` *and* `validation.McpSqlSettings`;

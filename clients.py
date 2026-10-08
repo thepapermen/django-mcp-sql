@@ -44,10 +44,11 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
-# Redirect-matching strategies for one rule. "exact" rides DOT's stock
-# exact-match against the Application's stored `redirect_uris`; "prefix"
-# is admitted by `oauth._redirect_under_prefix` for providers whose callback
-# is per-instance (ChatGPT's `/connector/oauth/{id}`).
+# Redirect-matching strategies for one rule. "exact" is DOT's stock matcher
+# (`oauth2_provider.models.redirect_to_uri_allowed`) run against the declared
+# exact URIs; "prefix" is admitted by `oauth._redirect_under_prefix` for
+# providers whose callback is per-instance (ChatGPT's `/connector/oauth/{id}`).
+# Both read SETTINGS, never the provisioned row (`oauth.MCPOAuth2Validator`).
 MATCH_EXACT = "exact"
 MATCH_PREFIX = "prefix"
 VALID_MATCHES = frozenset({MATCH_EXACT, MATCH_PREFIX})
@@ -104,9 +105,10 @@ class RedirectRule:
 class DeclaredClient:
     """One `MCP_SQL["CLIENTS"]` entry, normalised.
 
-    `client_id` doubles as the DOT `Application.name` — recognition
-    (`consts.is_mcp_application_name`) matches on the name, and provisioning
-    (`signals.provision_mcp_clients`) writes the same string to both columns.
+    `client_id` doubles as the DOT `Application.name` — provisioning
+    (`signals.provision_mcp_clients`) writes the same string to both columns,
+    and recognition (`consts.classify_application`) accepts a row only while
+    the two agree.
     `label` is the operator-authored display name shown on the consent screen;
     it defaults to the slug and is never sourced from the client itself.
     """
@@ -120,14 +122,22 @@ class DeclaredClient:
     @property
     def redirect_uris(self) -> tuple[str, ...]:
         """Every rule's URI — space-joined onto the `Application` by
-        provisioning, and what DOT exact-matches against."""
+        provisioning, for the admin and the audit trail. Redirect decisions
+        never read that copy (it is refreshed only on `migrate`)."""
         return tuple(r.uri for r in self.redirects)
 
     @property
+    def exact_uris(self) -> tuple[str, ...]:
+        """Just the `MATCH_EXACT` rules' URIs — what
+        `oauth.MCPOAuth2Validator.validate_redirect_uri` hands DOT's stock
+        exact matcher."""
+        return tuple(r.uri for r in self.redirects if r.match == MATCH_EXACT)
+
+    @property
     def prefixes(self) -> tuple[str, ...]:
-        """Just the `MATCH_PREFIX` rules' URIs — the only ones
-        `oauth.MCPOAuth2Validator.validate_redirect_uri` may admit beyond
-        DOT's stock exact matching."""
+        """Just the `MATCH_PREFIX` rules' URIs — what
+        `oauth.MCPOAuth2Validator.validate_redirect_uri` admits through
+        `oauth._redirect_under_prefix`."""
         return tuple(r.uri for r in self.redirects if r.match == MATCH_PREFIX)
 
 

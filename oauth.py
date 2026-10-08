@@ -6,9 +6,11 @@
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
+from mcp_sql.clients import DeclaredClient
 from mcp_sql.conf import mcp_sql_settings
-from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.consts import is_mcp_application
 from oauth2_provider.models import Application
+from oauth2_provider.models import redirect_to_uri_allowed
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
 
@@ -79,6 +81,30 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     )
 
 
+def _declared_redirect_allowed(declared: DeclaredClient, redirect_uri: str) -> bool:
+    """A declared client's redirect, decided from SETTINGS alone.
+
+    Prefix rules through `_redirect_under_prefix`; exact rules through DOT's
+    own matcher (`redirect_to_uri_allowed`, the function behind
+    `Application.redirect_uri_allowed`) run on the declared exact URIs, so an
+    exact rule means exactly what DOT's matching of a stored `redirect_uris`
+    means on the installed DOT version — only the list comes from
+    `MCP_SQL["CLIENTS"]` instead of the provisioned row. That row is
+    refreshed only by `post_migrate` (`signals.provision_mcp_clients`), so
+    reading it let a callback changed or removed in settings keep working,
+    and refused the new one, until the next `migrate`.
+
+    A `ValueError` from DOT's parsing (a request port no parser takes, e.g.
+    `:99999`, on a declared host) is a refusal, not a 500.
+    """
+    if any(_redirect_under_prefix(redirect_uri, p) for p in declared.prefixes):
+        return True
+    try:
+        return bool(redirect_to_uri_allowed(redirect_uri, list(declared.exact_uris)))
+    except ValueError:
+        return False
+
+
 class MCPOAuth2Validator(OAuth2Validator):
     """Validator pinned to the mcp-sql Application surface + the single scope."""
 
@@ -87,11 +113,13 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         DOT's default looks up by `client_id` and binds the Application onto
         `request.client`. We let it do that, then verify the resulting
-        Application is a recognised mcp-sql shape via `is_mcp_application_name`:
+        Application is a recognised mcp-sql client via `is_mcp_application`:
         the curated `mcp-sql` row, a dynamically-registered `mcp-sql-<token>`
-        row, OR a settings-declared `mcp-sql-{cloud,local}.<slug>` client. An
-        Application whose name matches none of these (e.g. some unrelated OAuth
-        client added later) is rejected here.
+        row, OR a settings-declared `mcp-sql-{cloud,local}.<slug>` client,
+        each only while its `client_id` equals its `name`. An Application that
+        matches none of these (e.g. some unrelated OAuth client added later,
+        or a row named like an MCP client under another client_id) is
+        rejected here.
         """
         if not super().validate_client_id(client_id, request, *args, **kwargs):
             return False
@@ -99,36 +127,54 @@ class MCPOAuth2Validator(OAuth2Validator):
             getattr(request, "client", None)
             or Application.objects.filter(client_id=client_id).first()
         )
-        return app is not None and is_mcp_application_name(app.name)
+        return is_mcp_application(app)
 
     def validate_redirect_uri(self, client_id, redirect_uri, request, *args, **kwargs):
-        """Admit a declared client's per-instance ("prefix") callback.
+        """A declared client's redirect is decided by settings; every other
+        client's by DOT against its row.
 
-        For a settings-declared client carrying `MATCH: "prefix"` rules
-        (ChatGPT / Codex-cloud, whose callback is per-instance), accept a
-        redirect sitting under one of the allowlisted host+path prefixes via
-        `_redirect_under_prefix`.
+        For a settings-declared client (`mcp_sql_settings.clients()`), only
+        `_declared_redirect_allowed` decides: its prefix rules
+        (`_redirect_under_prefix`, for ChatGPT / Codex-cloud's per-instance
+        callbacks) and its exact rules (DOT's matcher on the declared exact
+        URIs). There is no fall-through to `super()`: the provisioned row's
+        `redirect_uris` is a copy refreshed only on `migrate`, and recognition
+        is already settings-gated per request — so are redirects. A callback
+        changed in settings takes effect at the next request (old refused, new
+        accepted), and a removed rule stops being admissible at once.
 
-        The `or super()` fallthrough is load-bearing, not defensive: a client
-        may carry BOTH prefix and exact rules, and its exact callbacks are
-        matched by DOT against the Application's stored `redirect_uris`, not
-        here. Returning the prefix result on its own would reject them.
-
-        EVERY other client — declared clients with only exact rules, the
-        canonical `mcp-sql` row, and every loopback DCR client — reaches only
-        the `super()` call, so this override neither widens nor weakens the
-        loopback/exact paths.
+        EVERY other client — the canonical `mcp-sql` row and every loopback
+        DCR client — gets DOT's stock matching against its own row, untouched.
 
         Why declared clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Clients".
         """
         declared = mcp_sql_settings.clients().get(client_id)
-        prefixes = declared.prefixes if declared is not None else ()
-        return any(
-            _redirect_under_prefix(redirect_uri, prefix) for prefix in prefixes
-        ) or super().validate_redirect_uri(
+        if declared is not None:
+            return _declared_redirect_allowed(declared, redirect_uri)
+        return super().validate_redirect_uri(
             client_id, redirect_uri, request, *args, **kwargs
         )
+
+    def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
+        """A declared client's default redirect comes from settings too.
+
+        oauthlib asks for it only when an authorization request omits
+        `redirect_uri`, and uses it WITHOUT calling `validate_redirect_uri`
+        (a later non-fatal error is 302'd to it too). DOT's default reads the
+        provisioned row, which would bring back a callback since changed or
+        removed in settings. A declared client has a default only when it
+        declares exactly one rule and that rule is exact — as DOT gives one
+        only for a single stored URI; a prefix is not a callback. Otherwise
+        `None`, and oauthlib raises its fatal `MissingRedirectURIError` (error
+        page, no redirect). Every other client keeps DOT's default.
+        """
+        declared = mcp_sql_settings.clients().get(client_id)
+        if declared is None:
+            return super().get_default_redirect_uri(client_id, request, *args, **kwargs)
+        if len(declared.redirects) == 1 and declared.exact_uris:
+            return declared.exact_uris[0]
+        return None
 
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
         """Reject any token request that asks for scopes other than `mcp:sql`."""

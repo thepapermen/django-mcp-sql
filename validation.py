@@ -21,6 +21,7 @@ does not require them.
 import re
 import socket
 import sys
+from collections.abc import Iterable
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import ParseResult
@@ -287,7 +288,8 @@ def _validate_profiles(profiles: Mapping[str, Mapping[str, Any]]) -> None:
 # `<APPLICATION_NAME_PREFIX><kind>.<slug>` (see `clients.build_clients`). The
 # `.` after the kind keeps that id provably disjoint from the DCR
 # `<prefix><22-urlsafe>` shape, so no slug-length guard against the DCR shape
-# is needed here.
+# is needed here. Its length IS bounded, by the installed DOT `Application`
+# columns the id is written to (`_validate_client_id_lengths`).
 _CLIENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
@@ -620,8 +622,53 @@ def _validate_localhost_loopback(kinds: set[ClientKind]) -> None:
         raise ImproperlyConfigured(msg)
 
 
+def _validate_client_id_lengths(names: Iterable[str], prefix: str) -> None:
+    """Every derived client_id must fit the `Application` columns it is
+    written to.
+
+    Provisioning writes the derived `<prefix><kind>.<slug>` to both
+    `Application.client_id` (DOT 3.2: `max_length=100`; 3.4: 255) and
+    `Application.name` (255), and recognition reads the name back — so a
+    longer id passed boot and then failed `migrate` with a `DataError` inside
+    `signals.provision_mcp_clients`. The limit is read off the installed
+    (possibly swapped) model, the smaller of the two columns, minus the
+    longest derived prefix — so a slug that fits as `local` also fits as
+    `cloud` and the bound does not depend on the redirect scheme. A column
+    without a `max_length` (a swapped model's `TextField`) imposes none.
+    """
+    from oauth2_provider.models import get_application_model
+
+    meta = get_application_model()._meta
+    widths = [
+        width
+        for width in (
+            meta.get_field("client_id").max_length,
+            meta.get_field("name").max_length,
+        )
+        if width is not None
+    ]
+    if not widths:
+        return
+    longest_prefix = max(
+        len(f"{prefix}{kind.value}.") for kind in (ClientKind.CLOUD, ClientKind.LOCAL)
+    )
+    max_slug = min(widths) - longest_prefix
+    for name in names:
+        if len(name) > max_slug:
+            msg = (
+                f"MCP_SQL.CLIENTS key {name!r} is {len(name)} characters; its "
+                f"derived client_id ({prefix}<kind>.{name}) must fit the "
+                f"installed OAuth Application's client_id and name columns "
+                f"({min(widths)} characters), so a slug may be at most "
+                f"{max(max_slug, 0)} characters with APPLICATION_NAME_PREFIX "
+                f"{prefix!r}"
+            )
+            raise ImproperlyConfigured(msg)
+
+
 def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> None:
-    """Each CLIENTS entry: a slug key, MATCH in {"exact", "prefix"}, a
+    """Each CLIENTS entry: a slug key (short enough for its derived client_id
+    to fit the `Application` columns), MATCH in {"exact", "prefix"}, a
     hardened redirect URI per rule, and a single consistent redirect scheme
     across the entry (enforced by `clients.build_clients`, which derives the
     kind). Then the two DOT-settings guards above. `{}` is a no-op — DCR and
@@ -653,6 +700,8 @@ def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> 
     except ValueError as exc:
         msg = f"Invalid MCP_SQL.CLIENTS: {exc}"
         raise ImproperlyConfigured(msg) from exc
+
+    _validate_client_id_lengths(clients, prefix)
 
     kinds = {client.kind for client in built.values()}
     _validate_redirect_schemes(kinds)

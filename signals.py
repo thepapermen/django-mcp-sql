@@ -225,9 +225,12 @@ def provision_mcp_clients(sender: AppConfig | None, **kwargs: object) -> None:
     the silent-GET phishing chain the loopback rule otherwise prevents.
 
     `update_or_create` keeps the row's stored `redirect_uris` in sync with
-    settings on every migrate; it never touches issued `AccessToken` rows, and
-    DOT re-checks the redirect only at the next authorization, so a changed
-    callback does not disconnect anyone mid-session.
+    settings on every migrate — for the admin and the audit trail only:
+    `oauth.MCPOAuth2Validator` decides a declared client's redirects from
+    settings at every request, so a changed or removed callback applies
+    without a `migrate`. It never touches issued `AccessToken` rows, and the
+    redirect is checked only at the next authorization, so a changed callback
+    does not disconnect anyone mid-session.
 
     Rows for entries later REMOVED from settings are deliberately NOT deleted
     — deletion cascades to live tokens in the middle of a `migrate`, and it

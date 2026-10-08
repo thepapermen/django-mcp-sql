@@ -48,7 +48,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import absolute_url
 from mcp_sql.consts import client_ip
 from mcp_sql.consts import identify_application
-from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.consts import is_mcp_application
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
@@ -401,10 +401,12 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # `AccessToken.objects.create()` in a shell, a second OAuth use case
         # ever being added) would bypass that gate. Re-verify on every
         # request — `mcp:sql` scope is necessary but not sufficient; the
-        # token MUST also be tied to an MCP-purpose Application. DOT's FK to
-        # `Application` is nullable, so a token with none is refused here too.
+        # token MUST also be tied to an MCP-purpose Application (recognised
+        # by name, and only while its `client_id` equals that name —
+        # `consts.classify_application`). DOT's FK to `Application` is
+        # nullable, so a token with none is refused here too.
         application = token.application
-        if application is None or not is_mcp_application_name(application.name):
+        if not is_mcp_application(application):
             return _Denial(
                 AuthRejectionReason.BAD_APPLICATION,
                 "Token was not issued by an mcp-sql Application.",
