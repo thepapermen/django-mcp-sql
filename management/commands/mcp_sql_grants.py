@@ -25,9 +25,11 @@ class Command(BaseCommand):
             "--apply",
             action="store_true",
             help=(
-                "Execute GRANT / REVOKE for any drift. Without this flag the "
-                "command is read-only and exits 1 on drift (intended as a "
-                "CI / pre-deploy gate)."
+                "Execute GRANT / REVOKE for any drift, then re-check the "
+                "grants: if PostgreSQL left any unchanged (the login does not "
+                "own the relation), roll back and exit 1. Without this flag "
+                "the command is read-only and exits 1 on drift (intended as "
+                "a CI / pre-deploy gate)."
             ),
         )
 

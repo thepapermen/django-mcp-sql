@@ -295,24 +295,36 @@ profile's `ALLOWED_MODELS`. It is the only code path that issues
 `GRANT SELECT` / `REVOKE SELECT` statements; the `post_migrate` signal
 in `mcp_sql.signals` only DETECTS drift and logs a WARNING.
 
+**Run it as a login that may change those grants**: the owner of the
+whitelisted relations (or a member of the owning role) or a role holding
+SELECT `WITH GRANT OPTION` on them — a REVOKE also removes only grants the
+running role made itself. PostgreSQL does not fail a GRANT / REVOKE the
+role may not make when the role holds some other privilege on the relation
+(an app login with read/write grants on tables a separate migration role
+owns): it warns "no privileges were granted" / "no privileges could be
+revoked" and changes nothing. So `--apply` re-reads the grants in the same
+transaction before committing; if any drift is left it rolls everything
+back and fails, naming each relation still not granted / still granted,
+its owner, and the login that ran the statements.
+
 Sample output:
 
 ```
-Grants already in sync; no action.
+Grants in sync; no action.
 ```
 
 Or, after adding `auth.Permission` to the whitelist:
 
 ```
 GRANT SELECT ON "public"."auth_permission" TO mcp_readonly_role;
-Applied: +1 grant(s), -0 revoke(s).
+Applied: +1 grant(s), -0 revoke(s) across 1 profile(s).
 ```
 
 ### Drift detection on every `migrate` (advisory)
 
 Every `python manage.py migrate` invocation fires the `post_migrate`
 receiver `audit_grants_drift_after_migrate` in `mcp_sql.signals`.
-The receiver runs `compute_drift(strict=False)` — pure read against PG.
+The receiver runs `reconcile_grants(strict=False, apply=False)` — pure read against PG.
 On drift it logs a single WARNING line that names the +N/-M to-grant /
 to-revoke counts and points at the apply command. It does **not** issue
 GRANT / REVOKE statements; reconciliation happens only via the deploy
@@ -331,7 +343,8 @@ python manage.py mcp_sql_grants
 Read-only — never issues `GRANT` / `REVOKE`. Exits non-zero if there's
 any drift between declared whitelist and actual grants. Useful as a
 verification step in the deploy pipeline AFTER `mcp_sql_grants --apply`
-runs (to confirm the apply succeeded), and as a manual sanity check on
+runs (`--apply` already re-checks its own result before committing; this
+confirms nothing changed since), and as a manual sanity check on
 stage/prod. Not useful in CI test runs — the test settings have an
 empty whitelist, so `grants_check` would trivially pass and prove
 nothing.
@@ -347,7 +360,7 @@ answer if you ever suspect a routing bug.
 
 ```sh
 python manage.py mcp_sql_grants --apply
-# Expected: "Grants already in sync; no action."
+# Expected: "Grants in sync; no action."
 ```
 
 If the second run emits another GRANT / REVOKE, something is mutating the

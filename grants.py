@@ -14,8 +14,10 @@ that profile's whitelist independently (per-role drift — never global).
   `post_migrate` signal so a fresh environment without `role_setup.sql`
   does not crash `migrate`.
 - `apply=True`: also execute the GRANT / REVOKE statements implied by the
-  diff. `apply=False` is read-only; the returned `DriftDiff` describes
-  what WOULD have been done.
+  diff, then re-read the grants in the same transaction and roll back with
+  `GrantsReconcileError` if any drift is left (PostgreSQL only warns on a
+  GRANT / REVOKE the app login may not make). `apply=False` is read-only;
+  the returned `DriftDiff` describes what WOULD have been done.
 
 The signal observes (`apply=False`); the deploy command applies
 (`apply=True`). Keeping detection and execution behind one flag means
@@ -48,9 +50,10 @@ MAX_IDENTIFIER_BYTES = 63
 
 
 class GrantsReconcileError(Exception):
-    """Strict-mode preflight failure (role missing, no membership) or
+    """Strict-mode preflight failure (role missing, no membership),
     code-level misconfiguration (self-referential whitelist, a `db_table`
-    longer than PostgreSQL keeps)."""
+    longer than PostgreSQL keeps), or an `--apply` whose statements left
+    drift (rolled back)."""
 
 
 def _verify_default_alias() -> None:
@@ -361,6 +364,9 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
     applied, and all profiles' GRANT / REVOKE statements run in one
     transaction: a refusal of any profile changes no grant (review round
     19: the profiles before the refused one had been applied already).
+    The grants are re-read in that transaction before it commits, and any
+    drift left — a statement PostgreSQL only warned about — rolls it back
+    with `GrantsReconcileError` (`_apply_and_verify`).
     Roles are unique per profile (boot-validated), so one profile's
     changes never alter another's drift.
     """
@@ -370,19 +376,18 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
     for profile in profiles:
         result.per_profile[profile.name] = _profile_drift(profile, strict=strict)
     if apply and result.changed:
-        with transaction.atomic():
-            for profile in profiles:
-                _apply_drift(profile.role, result.per_profile[profile.name])
+        _apply_and_verify(
+            [(profile, result.per_profile[profile.name]) for profile in profiles]
+        )
     return result
 
 
 def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> ProfileDrift:
     """Reconcile one profile's role against its declared whitelist (the
-    checks and the drift of `_profile_drift`, then `_apply_drift`)."""
+    checks and the drift of `_profile_drift`, then `_apply_and_verify`)."""
     drift = _profile_drift(profile, strict=strict)
     if apply and drift.changed:
-        with transaction.atomic():
-            _apply_drift(profile.role, drift)
+        _apply_and_verify([(profile, drift)])
     return drift
 
 
@@ -442,6 +447,12 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
     # statements against an out-of-sync view.
     _verify_view_parity(profile)
 
+    return _role_drift(profile)
+
+
+def _role_drift(profile: Profile) -> ProfileDrift:
+    """The profile role's drift from its whitelist as the catalog stands
+    now: declared minus granted, granted minus declared."""
     # Relations, `(schema, name)`, on both sides (`"t"` and `t` are the same
     # table; `s"."t` is not `t`).
     declared = {relation_of(table) for table in declared_tables(profile).values()}
@@ -450,6 +461,84 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
         granted=sorted(declared - current),
         revoked=sorted(current - declared),
     )
+
+
+def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
+    """Run every profile's GRANT / REVOKE statements in one transaction,
+    then re-read each role's grants in it; if any drift is left, roll the
+    transaction back and raise `GrantsReconcileError` naming it.
+
+    PostgreSQL does not fail a GRANT or REVOKE the executing role may not
+    make: on a relation the app login neither owns (nor is a member of the
+    owning role of) nor holds `WITH GRANT OPTION` on, GRANT warns "no
+    privileges were granted" and REVOKE "no privileges could be revoked",
+    and nothing changes; a REVOKE also removes only grants its role made
+    itself. Before, `--apply` reported such statements as applied and
+    exited 0 while check mode kept reporting the same drift."""
+    with transaction.atomic():
+        for profile, drift in drifts:
+            _apply_drift(profile.role, drift)
+        left = {
+            profile.name: remaining
+            for profile, drift in drifts
+            if drift.changed and (remaining := _role_drift(profile)).changed
+        }
+        if left:
+            raise GrantsReconcileError(_unapplied_message(left))
+
+
+def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
+    """Name each profile's drift `--apply` left, with each relation's owner
+    and the login that ran the statements."""
+    owners = _owners({r for d in left.values() for r in d.granted + d.revoked})
+
+    def shown(relations: list[Relation]) -> str:
+        return ", ".join(
+            f"{relation_display(r)} (owner {quote_ident(owners[r])})"
+            if r in owners
+            else relation_display(r)
+            for r in relations
+        )
+
+    lines = []
+    for name, drift in left.items():
+        if drift.granted:
+            lines.append(f"  [{name}] still not granted: {shown(drift.granted)}")
+        if drift.revoked:
+            lines.append(f"  [{name}] still granted: {shown(drift.revoked)}")
+    with connection.cursor() as cur:
+        cur.execute("SELECT current_user")
+        login = cur.fetchone()[0]
+    return (
+        "GRANT / REVOKE ran but PostgreSQL left these privileges unchanged "
+        "(it only warns when a role may not change a privilege), so nothing "
+        "was applied:\n"
+        + "\n".join(lines)
+        + f"\nThe login running mcp_sql_grants ({login!r}) can grant or "
+        "revoke a privilege only on a relation it owns (or whose owning role "
+        "it is a member of) or holds WITH GRANT OPTION on, and REVOKE "
+        "removes only the grants it made itself. Run `mcp_sql_grants "
+        "--apply` as the relations' owner, or have the owner run the "
+        "statements `mcp_sql_grants` prints without --apply."
+    )
+
+
+def _owners(relations: set[Relation]) -> dict[Relation, str]:
+    """The owning role of each of `relations` that exists, by relation."""
+    if not relations:
+        return {}
+    schemas, names = zip(*sorted(relations), strict=True)
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner)
+            FROM unnest(%s::text[], %s::text[]) AS r(nspname, relname)
+            JOIN pg_namespace n ON n.nspname = r.nspname
+            JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = r.relname
+            """,
+            [list(schemas), list(names)],
+        )
+        return {(str(s), str(n)): str(owner) for s, n, owner in cur.fetchall()}
 
 
 def _apply_drift(role: str, drift: ProfileDrift) -> None:
