@@ -112,6 +112,10 @@ class McpSqlSettings(TypedDict):
     carries all of them.
     """
 
+    # No unknown key at any level (`_FORBID_EXTRA` on every TypedDict here):
+    # a typo'd one (`PIN_SEARCHPATH`) would otherwise be ignored and the
+    # default used in its place, with nothing in the logs — for an opt-in
+    # guard, the guard silently off (pinned by `test_search_path_pin`).
     __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
 
     # One entry per access tier; keys are profile names (e.g. "default").
@@ -135,6 +139,12 @@ class McpSqlSettings(TypedDict):
     # Declared (non-DCR) clients, keyed by slug. `{}` turns them all off.
     CLIENTS: NotRequired[dict[str, ClientEntry]]
 
+    # Opt-in refresh tokens: chain cap in seconds; 0 = off (the default).
+    REFRESH_TOKEN_MAX_AGE_SECONDS: NotRequired[int]
+    # Opt-in `search_path = public, pg_temp` per read transaction; False (the
+    # default) = off. Bool only (checked on the raw value below).
+    PIN_SEARCH_PATH: NotRequired[bool]
+
 
 # Keys that existed in an earlier release and are gone. Checked by name so the
 # upgrade error says what to do, instead of pydantic's generic "extra inputs
@@ -151,6 +161,9 @@ _REMOVED_KEYS = {
     ),
 }
 
+
+# Upper bound for MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]: ten years.
+_REFRESH_TOKEN_MAX_AGE_LIMIT = 10 * 365 * 24 * 3600
 
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
 
@@ -625,11 +638,11 @@ def _validate_localhost_loopback(kinds: set[ClientKind]) -> None:
 
 def _application_id_width() -> int | None:
     """The longest client_id this package may write: the smaller of the
-    installed (possibly swapped) `Application` model's `client_id` (DOT 3.2 /
-    3.3: `max_length=100`; 3.4: 255) and `name` (255) columns, because every
-    row the package writes carries one string in both (migration 0005,
-    `/o/register`, `signals.provision_mcp_clients`) and recognition reads the
-    name back. A column without a `max_length` (a swapped model's
+    installed (possibly swapped) `Application` model's `client_id` (255 on
+    the supported DOT >= 3.4.1; 100 before 3.4) and `name` (255) columns,
+    because every row the package writes carries one string in both
+    (migration 0005, `/o/register`, `signals.provision_mcp_clients`) and
+    recognition reads the name back. A column without a `max_length` (a swapped model's
     `TextField`) imposes none; `None` when neither does.
     """
     from oauth2_provider.models import get_application_model
@@ -753,6 +766,30 @@ def _validate_clients(clients: Mapping[str, Mapping[str, Any]], prefix: str) -> 
     _validate_localhost_loopback(kinds)
 
 
+def _validate_raw_types(cfg: Mapping[str, Any]) -> None:
+    """The keys pydantic's lax mode would coerce, checked on the raw value."""
+    # Checked on the RAW value: pydantic's lax mode lets "3600" (a str from
+    # an env var) and 3600.0 past the TypedDict, and a huge value overflows
+    # `timedelta` at every token exchange.
+    refresh_cap = cfg.get("REFRESH_TOKEN_MAX_AGE_SECONDS", 0)
+    if type(refresh_cap) is not int or not (
+        0 <= refresh_cap <= _REFRESH_TOKEN_MAX_AGE_LIMIT
+    ):
+        msg = (
+            "MCP_SQL.REFRESH_TOKEN_MAX_AGE_SECONDS must be an int from 0 "
+            f"(refresh tokens off) to {_REFRESH_TOKEN_MAX_AGE_LIMIT} (10 years); "
+            f"got {refresh_cap!r}"
+        )
+        raise ImproperlyConfigured(msg)
+
+    # On the raw value, like the refresh cap: pydantic's lax mode would take
+    # `"yes"`, `"off"`, `1` (an env-var string, a number) as a bool.
+    pin = cfg.get("PIN_SEARCH_PATH", False)
+    if type(pin) is not bool:
+        msg = f"MCP_SQL.PIN_SEARCH_PATH must be True or False; got {pin!r}"
+        raise ImproperlyConfigured(msg)
+
+
 def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
     """Validate the consumer's `MCP_SQL` dict on startup.
 
@@ -762,7 +799,9 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
     themselves checked on every boot.
 
     - Removed keys are named explicitly, then the Pydantic TypeAdapter
-      enforces the TypedDict shape (types, and no unknown keys anywhere).
+      enforces the TypedDict shape (types, and no unknown key at any level —
+      top level, `LIMITS`, a `PROFILES` entry, a `CLIENTS` entry or one of
+      its `REDIRECTS` rules); `PIN_SEARCH_PATH` must be a real bool.
     - Numeric values must be positive; `DEFAULT_LIMIT` must not exceed
       `HARD_LIMIT`.
     - Each profile in `PROFILES` has non-empty unique ROLE /
@@ -817,8 +856,39 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
         )
         raise ImproperlyConfigured(msg)
 
+    _validate_raw_types(cfg)
     _validate_profiles(cfg["PROFILES"])
     _validate_application_name_lengths(
         cfg["APPLICATION_NAME"], cfg["APPLICATION_NAME_PREFIX"]
     )
     _validate_clients(cfg["CLIENTS"], cfg["APPLICATION_NAME_PREFIX"])
+
+
+def validate_oauth2_validator_class() -> None:
+    """`OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]` must be `MCPOAuth2Validator`
+    or a subclass.
+
+    The package's OAuth server (`oauth_server.MCPServer`) is built with the
+    install's validator, and the client pinning (only mcp-sql Applications),
+    the `mcp:sql`-only scope, mandatory PKCE, the loopback / cloud redirect
+    rules and every install-wide backstop live in that class. With DOT's
+    stock validator and `PKCE_REQUIRED=False`, for example, a code was issued
+    and exchanged without PKCE. Checked at `ready()` so such an install
+    refuses to boot instead.
+    """
+    # Lazy: `mcp_sql.oauth` imports DOT models, so only once apps are ready.
+    from mcp_sql.oauth import MCPOAuth2Validator
+    from oauth2_provider.settings import oauth2_settings
+
+    validator_class = oauth2_settings.OAUTH2_VALIDATOR_CLASS
+    if not (
+        isinstance(validator_class, type)
+        and issubclass(validator_class, MCPOAuth2Validator)
+    ):
+        msg = (
+            "OAUTH2_PROVIDER['OAUTH2_VALIDATOR_CLASS'] must be "
+            "'mcp_sql.oauth.MCPOAuth2Validator' or a subclass of it "
+            f"(got {validator_class!r}): the MCP OAuth surface relies on it "
+            "for client, scope, PKCE and redirect enforcement."
+        )
+        raise ImproperlyConfigured(msg)

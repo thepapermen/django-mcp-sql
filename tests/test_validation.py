@@ -9,7 +9,9 @@ import copy
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
+from mcp_sql.oauth import MCPOAuth2Validator
 from mcp_sql.validation import validate_mcp_sql_settings
+from mcp_sql.validation import validate_oauth2_validator_class
 
 VALID = {
     "PROFILES": {
@@ -233,3 +235,42 @@ class TestSessionContextImportCheck:
     def test_absent_and_none_accepted(self):
         validate_mcp_sql_settings(copy.deepcopy(VALID))
         validate_mcp_sql_settings(_cfg(SESSION_CONTEXT=None))
+
+
+class TestOAuth2ValidatorClassBootCheck:
+    """`apps.ready()` refuses an install whose DOT validator is not
+    `MCPOAuth2Validator` (or a subclass): the package's OAuth server is
+    built with that validator, which carries the client, scope, PKCE and
+    redirect enforcement."""
+
+    def _with_validator(self, settings, path):
+        provider = {**settings.OAUTH2_PROVIDER}
+        if path is None:
+            provider.pop("OAUTH2_VALIDATOR_CLASS", None)
+        else:
+            provider["OAUTH2_VALIDATOR_CLASS"] = path
+        settings.OAUTH2_PROVIDER = provider
+
+    def test_package_validator_passes(self, settings):
+        self._with_validator(settings, "mcp_sql.oauth.MCPOAuth2Validator")
+        validate_oauth2_validator_class()
+
+    def test_subclass_passes(self, settings):
+        self._with_validator(
+            settings, "mcp_sql.tests.test_validation._ConsumerValidator"
+        )
+        validate_oauth2_validator_class()
+
+    @pytest.mark.parametrize(
+        "path",
+        [None, "oauth2_provider.oauth2_validators.OAuth2Validator"],
+        ids=["dot-default", "dot-validator-explicit"],
+    )
+    def test_other_validators_refuse_to_boot(self, settings, path):
+        self._with_validator(settings, path)
+        with pytest.raises(ImproperlyConfigured, match="OAUTH2_VALIDATOR_CLASS"):
+            validate_oauth2_validator_class()
+
+
+class _ConsumerValidator(MCPOAuth2Validator):
+    """A consumer's subclass of the package validator."""

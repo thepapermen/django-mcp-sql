@@ -9,8 +9,14 @@ responding to an incident.
 ## Architecture in five lines
 
 - Single OAuth Application `mcp-sql`; single scope `mcp:sql`; PKCE
-  required; `authorization_code` grant only.
-- Token lifetime: 6 h access, no refresh tokens, 60 s authorization code.
+  required, `S256` only (whatever `PKCE_REQUIRED` says);
+  `authorization_code` grant only, bearer token in the `Authorization`
+  header only — enforced by the package's own OAuth server (see "The OAuth
+  server" below), not by the consumer's `OAUTH2_SERVER_CLASS`.
+- Token lifetime: 6 h access, 60 s authorization code; no refresh tokens
+  unless `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` opts in to rotating
+  refresh tokens hard-capped from the consent (see "Refresh tokens
+  (opt-in)").
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
 - Issuance gate at `/o/authorize/`: `is_active AND
@@ -32,8 +38,8 @@ discovery surface comprises two anonymous-GET endpoints plus the
 
 | URL | RFC | What it says |
 |---|---|---|
-| `/.well-known/oauth-protected-resource/mcp/sql` (and `…/mcp/sql/`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. Served under **both** spellings of the resource path — see below. |
-| `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
+| `/.well-known/oauth-protected-resource/mcp/sql` (and `…/mcp/sql/`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]` (enforced: an `access_token` query or form parameter is not a credential, so a request carrying its token only there gets the ordinary 401). Served under **both** spellings of the resource path — see below. |
+| `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]` (plus `refresh_token` when the opt-in refresh grant is on), `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE), `token_endpoint_auth_methods_supported=["none"]` (public client). The response type, grant type and PKCE method lists are enforced, see "The OAuth server". |
 
 The `/mcp/sql/` 401 response advertises the RFC 9728 URL (a request to the
 slash-less `/mcp/sql` gets the slash-less `…/oauth-protected-resource/mcp/sql`
@@ -112,7 +118,7 @@ Pinned by `test_discovery.TestResourceIdentifierMatchesMetadataPath`.
 ### The `resource` parameter (RFC 8707)
 
 MCP clients send the protected resource they want a token for as `resource`
-on `/o/authorize/` and `/o/token/` (RFC 8707). From DOT 3.4, DOT stores it on
+on `/o/authorize/` and `/o/token/` (RFC 8707). DOT (3.4.1 is the floor) stores it on
 the grant and the access token and audience-checks every bearer that carries
 one against the URL of the request it arrives on. So the package accepts
 exactly one resource: the `resource` the protected-resource document above
@@ -130,17 +136,18 @@ slash (the MCP authorization spec's preferred form of a server URI). Both
 OAuth endpoints rewrite each accepted `resource` to it before DOT reads the
 value: `/o/authorize/` on the query string and in the consent page's form
 field (so the grant stores it), `/o/token/` in the form body. That matters
-because from DOT 3.4, when the grant carries a `resource`, `/o/token/`
-requires each `resource` sent there to be one of the grant's, compared as
-strings — and clients do not always repeat the authorization request's
+because when the grant carries a `resource`, `/o/token/` requires each
+`resource` sent there to be one of the grant's, compared as strings (DOT's
+rule) — and clients do not always repeat the authorization request's
 spelling: Cursor sends `…/mcp/sql/` to `/o/authorize/` and `…/mcp/sql` to
 `/o/token/`, which DOT refused ("Token request cannot escalate resource
 permissions…"). Now any accepted spelling may be sent at either step, or
-none at the token step (the token then carries the grant's). With a
-resource-less grant the token is bound to the same canonical string. The
-token passes DOT's audience check on `/mcp/sql` and on `/mcp/sql/`.
-Discovery still echoes the spelling the client asked for (RFC 9728 §3.3
-requires it); either one is accepted.
+none at the token step (the token then carries the grant's); a refresh
+request's `resource` is rewritten the same way. With a resource-less grant
+the token is bound to the same canonical string. The token passes DOT's
+audience check on `/mcp/sql` and on `/mcp/sql/`. Discovery still echoes the
+spelling the client asked for (RFC 9728 §3.3 requires it); either one is
+accepted.
 
 A code granted (or a refresh token issued) before this release may carry
 another accepted spelling. At the token step `MCPOAuth2Validator` puts the
@@ -163,8 +170,13 @@ sent):
 | Where | Answer |
 |---|---|
 | `/o/authorize/` GET | 302 to the client's registered `redirect_uri` with `error=invalid_target` and its `state`; no consent page, no authorization code |
-| consent POST | the same, for the form's `resource` field or one in the URL's query string (from DOT 3.4 the two must agree); a tampered `redirect_uri` still gets the error page, never a redirect. A NUL in the form's own field (DOT 3.4+) is refused by Django's form validation first: the consent page is re-rendered with a form error, nothing stored |
+| consent POST | the same, for the form's `resource` field or one in the URL's query string (the two must agree); a tampered `redirect_uri` still gets the error page, never a redirect |
 | `/o/token/` | 400 JSON `{"error": "invalid_target", ...}` with `Cache-Control: no-store`; the code is not consumed, so the client can retry |
+
+A NUL or any other control character in `resource` never reaches this check:
+the OAuth views' control-character screen answers `invalid_request` first
+(the error page at `/o/authorize/`, GET and consent POST alike; a 400 JSON
+at `/o/token/`).
 
 Typical causes: a client configured with a URL other than the one discovery
 returns (another host or alias, `http` for `https`, a different path), or a
@@ -185,7 +197,7 @@ non-default port stays (`https://<name>:8443/mcp/sql/`).
 `JSONOAuthLibCore` a JSON body's `resource` would bypass the check, so a JSON
 token request is refused.
 
-Before this check, DOT 3.4+ issued a token for any `resource` and then
+Before this check, DOT issued a token for any `resource` and then
 refused it at `/mcp/sql/` on every call with a bare 401 — no audit row, and
 each call counted toward the bad-token IP throttle
 (`MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]`), so a shared egress IP could end up
@@ -206,9 +218,8 @@ bound to a URL that is not a prefix of the endpoint's (one issued before
 this release) still gets a 401 until it expires. DOT's default validator
 is a URL-prefix match, so a token bound to a prefix of the endpoint URL —
 the origin, `https://<host>/mcp` — passes; the package no longer issues
-one (those values are `invalid_target`). Below DOT 3.4, which ignores
-`resource`, the package's checks answer the same way and tokens are never
-resource-bound. Pinned by `tests/test_resource_audience.py`.
+one (those values are `invalid_target`). Pinned by
+`tests/test_resource_audience.py`.
 
 Both discovery endpoints return `Access-Control-Allow-Origin: *` so a
 future browser-based MCP client can `fetch()` them without CORS preflight
@@ -218,15 +229,135 @@ companion `Access-Control-Allow-Methods: GET, HEAD` matches the actual
 `@require_safe` posture; OPTIONS is deliberately absent so the
 advertisement does not lie about a method the view rejects.
 
+## The OAuth server
+
+DOT runs its views on `OAUTH2_PROVIDER["OAUTH2_SERVER_CLASS"]`, by default
+oauthlib's all-grants `Server` (password, client credentials, refresh token,
+device code and implicit, besides the authorization code). The package's own
+OAuth views — `/o/authorize/`, `/o/token/`, `/o/revoke_token/` — and
+`MCPOAuth2Authentication` on `/mcp/sql/` instead run on
+`oauth_server.MCPServer`, whatever `OAUTH2_SERVER_CLASS` is set to, and
+always parse the request with DOT's form-body `OAuthLibCore`, whatever
+`OAUTH2_BACKEND_CLASS` is set to:
+
+- `/o/authorize/` serves the `code` response type only. A request is first
+  screened, query string and consent POST alike: a control character in any
+  parameter, a `code_challenge` outside RFC 7636 §4.2's shape (43–128
+  characters of `[A-Za-z0-9-._~]`) or an over-long `nonce` gets the error
+  page (400 `invalid_request`, no redirect, nothing stored). Then a
+  `response_type` without `code` in it (`token`, `id_token`, ...) is
+  redirected back as `unsupported_response_type`; `none` and values that
+  contain `code` but are not exactly `code` (`code token`, `code id_token`,
+  `codex`, ...) are redirected back as `unauthorized_client`. Either way no
+  code and no token are issued. PKCE is mandatory and `S256` only: a
+  missing challenge, `plain`, or an omitted `code_challenge_method` (which
+  oauthlib would default to `plain`) is redirected back as
+  `invalid_request`, on the authorize GET and on the consent POST.
+- `/o/token/` accepts exactly one `grant_type=authorization_code` (and
+  `refresh_token` when refresh tokens are enabled). With refresh off, a
+  `grant_type=refresh_token` request gets a constant 400 `invalid_grant`
+  with no token lookup — the error that makes an MCP client drop its
+  refresh token and re-authorize. Anything else — `password`,
+  `client_credentials`, the device-code grant, `openid`, an unknown,
+  missing or repeated value — is a 400 `unsupported_grant_type`. Both run
+  before DOT's own token handling or the server, so a password grant cannot
+  test a password and DOT's device-code branch is unreachable. Only then is
+  a control character in any other parameter (query or body) a 400
+  `invalid_request` (one inside `grant_type` is already refused by the
+  checks above). With refresh off the response never carries a
+  `refresh_token`.
+- `/mcp/sql/` takes the bearer token from the `Authorization` header only.
+  An `access_token` query or form-body parameter is not a credential: a
+  request carrying its token only there gets the ordinary 401 (never looked
+  up, not counted by the bad-token throttle), and beside a header the
+  parameter is ignored. **Recommended:**
+  `OAUTH2_PROVIDER["COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT"] = True`
+  (DOT 3.4.1+; scheduled to become DOT 4.0's default). It makes DOT refuse
+  any request with an `access_token` query parameter itself, before the
+  server runs — also a 401, and then even beside a valid header — and stops
+  DOT logging an RFC 9700 deprecation warning for every such request, an
+  unthrottled log line anyone can trigger.
+- `/o/revoke_token/` is DOT's RFC 7009 token revocation.
+
+`OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"]` must be
+`mcp_sql.oauth.MCPOAuth2Validator` or a subclass: the app refuses to boot
+otherwise (`ImproperlyConfigured`), because the client pinning, the
+`mcp:sql`-only scope, mandatory PKCE and the redirect rules live there.
+Being the install's validator, it also serves any stock DOT view a consumer
+mounts for another purpose (e.g. `include("oauth2_provider.urls")`) on the
+stock server. There it keeps backstops, not the narrowing above: PKCE stays
+required and a non-`S256` code cannot be exchanged (`invalid_grant`, though
+such a view still accepts `plain` at authorize); password grants are refused
+with `invalid_grant` (the password is never checked, so a correct and a
+wrong one get the same answer); with refresh off no refresh token is stored
+or returned and refresh grants are refused with `invalid_grant` (with
+refresh on, the same hard cap applies as on the package's endpoints); and a
+`client_id` carrying a control character is never looked up. Pinned by
+`tests/test_oauth_server.py` and `tests/test_refresh_tokens.py`.
+
+## Refresh tokens (opt-in)
+
+Off by default: `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the documented
+settings) is then the re-consent interval. Set
+`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` to a positive number of seconds
+to turn them on:
+
+- The authorization-code exchange returns a `refresh_token`; every refresh
+  rotates it (the presented token is spent, a new one is issued in the same
+  chain), whatever DOT's `ROTATE_REFRESH_TOKEN` says.
+- **Hard cap from the consent.** The package records when each chain
+  started (the authorization-code exchange; `MCPRefreshTokenFamily`) and
+  refuses a refresh once `REFRESH_TOKEN_MAX_AGE_SECONDS` has passed since
+  then, however often the token was rotated. This is not DOT's
+  `REFRESH_TOKEN_EXPIRE_SECONDS`, a window that slides with every new access
+  token (`0` there means no limit). The last access token minted before the
+  cap still lives its `ACCESS_TOKEN_EXPIRE_SECONDS`, so access ends at most
+  that long after the cap.
+- A refresh token with no recorded consent — minted by 0.1.0b5 or earlier,
+  or written by any path that bypassed `MCPOAuth2Validator.save_bearer_token`
+  — is refused.
+- `MCPRefreshTokenFamily` rows past the cap are pruned at each new exchange.
+  Rows whose refresh tokens are gone (revoked, removed by `cleartokens`, or
+  refresh switched off again) are inert and safe to delete, e.g. next to
+  `cleartokens`:
+  `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.objects.filter(token_family__isnull=False).values("token_family")).delete()`
+  (keep the `isnull` filter: `NOT IN` over a list holding a NULL matches
+  nothing, so without it the snippet deletes no rows).
+- The discovery document and the DCR response (when the client asked for
+  it) list `refresh_token`.
+- Logout and a password change delete the user's MCP refresh tokens with
+  the access tokens (see "Revoking access").
+
+Consider DOT's `REFRESH_TOKEN_REUSE_PROTECTION = True` as well: replaying a
+rotated-out refresh token then revokes the whole chain.
+
+## Security posture: what each optional layer adds
+
+The OAuth and SQL boundaries hold on their own; three layers are optional and
+each adds one bound. CI runs the whole suite a second time with an allow-all
+`MFA_CHECKER` and no `SESSION_MODEL` (`MCP_SQL_TEST_POSTURE=minimal`, `make
+test-minimal`) to prove the first column.
+
+| Control | Without the optional layers | MFA (`MFA_CHECKER`) adds | Session gate (`SESSION_MODEL`) adds | Refresh cap (`REFRESH_TOKEN_MAX_AGE_SECONDS`) |
+|---|---|---|---|---|
+| Who can get a token | Active user holding exactly one MCP profile, through `/o/authorize/` (consent screen for every client) | A verified second factor, at issuance and on every request | — | — |
+| How long a token works | 6 h access token; no refresh | — | Only while the user has a live web session (`SESSION_COOKIE_AGE`) | Opt-in: refresh for at most the cap after consent (access then ends ≤ 6 h later) |
+| What ends access early | Losing active / the profile (checked every request); logout; password change; deleting the tokens | Removing the MFA device | Expiry or deletion of every web session | — |
+| What the token can do | Read-only `SELECT` on the profile's whitelisted tables, in a read-only, rolled-back transaction, through the checked SQL only | — | — | — |
+
 ## Dynamic Client Registration (RFC 7591)
 
 Claude Code's MCP SDK requires the AS to advertise a `registration_endpoint`
 and refuses to authenticate against an AS that doesn't. The AS metadata
 exposes `/o/register` at this slot; the view at
 `views/registration.py` accepts anonymous JSON POST,
-validates that every `redirect_uris` entry is an RFC 8252 §7.3 loopback URI
-(`127.0.0.1` or `[::1]`, http only), and creates a public-client
-Application named `mcp-sql-<urlsafe-token>`.
+registers the `redirect_uris` entries that are RFC 8252 §7.3 loopback URIs
+(`127.0.0.1`, `[::1]` or `localhost`, http only, no userinfo, printable
+ASCII) and echoes that subset back (RFC 7591 §3.2.1; nothing left is a 400,
+and whitespace or an invisible character in any entry refuses the whole
+request), and creates a public-client Application named
+`mcp-sql-<urlsafe-token>` that shows the consent screen
+(`skip_authorization=False`).
 
 **What Claude Code does on first `claude mcp add` + tool use**:
 
@@ -255,6 +386,31 @@ for a in Application.objects.filter(name__startswith='mcp-sql').order_by('-creat
 "
 ```
 
+Releases up to and including 0.1.0b5 could store a DCR row whose
+`redirect_uris` holds an off-machine entry smuggled in through whitespace
+(see `CHANGELOG.md`). Since the fix such an entry is refused at
+`/o/authorize/`, but the rows are not deleted automatically. List the
+canonical and DCR rows holding any entry the current registration check
+would refuse (print-only; review before deleting). Cloud-client rows
+(`mcp-sql-cloud.<name>`, including ones whose entry was since removed from
+settings) are skipped — an `https` callback is expected there:
+
+```sh
+python manage.py shell -c "
+from django.db.models import Q
+from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.views.registration import _is_loopback_redirect
+from oauth2_provider.models import Application
+prefix = mcp_sql_settings.APPLICATION_NAME_PREFIX
+qs = Application.objects.filter(
+    Q(name=mcp_sql_settings.APPLICATION_NAME) | Q(name__startswith=prefix)
+).exclude(name__startswith=prefix + 'cloud.')
+for a in qs:
+    if not all(_is_loopback_redirect(u) for u in a.redirect_uris.split()):
+        print(a.created, a.client_id, '->', repr(a.redirect_uris))
+"
+```
+
 Manual registration probe (no auth, no client tooling):
 
 ```sh
@@ -266,7 +422,13 @@ curl -s -X POST https://<host>/o/register \
 
 **Security**: the structural mitigations are the loopback-only
 `redirect_uris` restriction (a rogue registered client can only redirect to
-its own machine — useless for cross-machine token theft) and the
+its own machine — useless for cross-machine token theft; enforced at
+registration and re-checked on the requested redirect at `/o/authorize/`,
+see the "DOT stores redirect URIs whitespace-joined" entry in
+`docs/architecture.md`; the `django-oauth-toolkit>=3.4.1` floor also keeps
+out DOT releases that redirected an unauthenticated `prompt=none` request to
+the supplied `redirect_uri` before any of this ran, DOT #1719, and ones whose
+redirect matching was not exact) and the
 `/o/authorize/` issuance gate (real, active user with MFA + an MCP profile
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same
@@ -354,8 +516,8 @@ full threat-model analysis.
    point.
 
    **The consent click recurs every 6 h** for the same user. Token TTL
-   is 6 h and refresh tokens are disabled (see "Token lifetime / freshness
-   FAQ"), so Claude Code re-OAuths whenever the token expires; DOT's
+   is 6 h and there are no refresh tokens by default (see "Token lifetime /
+   freshness FAQ" and "Refresh tokens (opt-in)"), so Claude Code re-OAuths whenever the token expires; DOT's
    default consent template has no "remember my choice" mechanism, so
    the user sees the page each time. This is deliberate: see
    "Every client requires consent" below.
@@ -396,7 +558,7 @@ why the two mitigations above matter.
 
 Every Application this package creates has `skip_authorization=False`: each
 one created via `/o/register` (every Claude Code install), each declared
-client, and, since migration 0015, the curated `mcp-sql` row. This forces the
+client, and, since migration 0016, the curated `mcp-sql` row. This forces the
 OAuth consent screen on every `/o/authorize/` call — including repeat visits
 by a user who already holds a live token for the client, because
 `MCPAuthorizationView` pins DOT's `approval_prompt` to `force` (on `auto`, DOT
@@ -408,7 +570,7 @@ hold: its registered redirect is `http://127.0.0.1`, and DOT accepts any port
 on a loopback IP at request time, so the attacker does not need a rogue
 client at all. A phished `/o/authorize/?client_id=mcp-sql&redirect_uri=
 http://127.0.0.1:31337&...` link gets the same silent code delivery as step 5
-below. Migration 0015 flips existing rows (its reverse restores the old
+below. Migration 0016 flips existing rows (its reverse restores the old
 posture); 0005 creates new ones requiring consent.
 
 The consent page exists because of the attack chain it breaks (shown with a
@@ -452,7 +614,7 @@ which one did:
 
 | Kind | `client_id` | How it gets registered | Consent |
 |---|---|---|---|
-| `curated` | `mcp-sql` | migration 0005, by the operator | forced (since migration 0015) |
+| `curated` | `mcp-sql` | migration 0005, by the operator | forced (since migration 0016) |
 | `dcr` | `mcp-sql-<22 chars>` | anonymous RFC 7591 self-registration at `/o/register`, loopback callbacks only | forced |
 | `cloud` | `mcp-sql-cloud.<slug>` | `MCP_SQL["CLIENTS"]`, https callback | forced |
 | `local` | `mcp-sql-local.<slug>` | `MCP_SQL["CLIENTS"]`, `http://localhost:<port>` callback | forced |
@@ -555,27 +717,29 @@ stops working until the two match again.
   matcher (`redirect_to_uri_allowed`, the function behind
   `Application.redirect_uri_allowed`) run on the entry's exact URIs from
   settings — so "exact" means what it means for any DOT application on the
-  installed DOT version, only the list comes from `CLIENTS`. That is not
-  strict string equality everywhere: DOT 3.2 / 3.3 only require the
-  registered callback's query parameters to be present in the request's, so
-  a requested callback carrying extra query parameters beyond the registered
-  one's is admitted there (DOT 3.4.1 requires the query string to match
-  exactly).
+  installed DOT version, only the list comes from `CLIENTS`.
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
   (`MCPOAuth2Validator.validate_redirect_uri` → `_redirect_under_prefix`)
-  accepts a redirect **iff** it is `https`, carries no userinfo, its host
-  **exactly equals** the prefix host (never `endswith`, so
-  `chatgpt.com.evil.com` is rejected), its port matches, it has no `..`
-  segment and no backslash (which a browser reads as `/`, so `..\` is
-  traversal too), and its path starts with the allowlisted prefix path — anchored at
-  a `/` boundary, so `.../oauthEVIL` cannot pass as `.../oauth`. A client may
-  carry both kinds of rule; each is matched by its own check, both from
-  settings. A redirect that matches neither is refused — a declared client
-  never falls back to the row-backed matching. The canonical row and every
-  loopback DCR client keep DOT's stock matching against their own rows,
-  untouched.
+  accepts a redirect **iff** it is `https`, has no `@` anywhere in its
+  authority (no userinfo, not even an empty one), carries no query, fragment
+  or `;params` (not even a bare `?` / `#`), its host **exactly equals** the
+  prefix host (never `endswith`, so `chatgpt.com.evil.com` is rejected), its
+  port matches, it has no `..` segment and no backslash (which a browser
+  reads as `/`, so `..\` is traversal too), and its path starts with the
+  allowlisted prefix path — anchored at a `/` boundary, so `.../oauthEVIL`
+  cannot pass as `.../oauth`. A client may carry both kinds of rule; each is
+  matched by its own check, both from settings. A redirect that matches
+  neither is refused — a declared client never falls back to the row-backed
+  matching. The canonical row and every loopback DCR client keep DOT's stock
+  matching against their own rows. Every client that is not a declared cloud
+  client (the canonical row, every DCR client, every declared local client)
+  is checked only after the requested redirect passes the `/o/register`
+  loopback predicate (`_is_loopback_redirect`), and its default (used when a
+  request omits `redirect_uri`) is held to the same predicate. So for such a
+  client, the validator refuses a non-loopback redirect whether it was
+  requested or stored.
 
 ### Cursor: three surfaces, two paths
 
@@ -686,10 +850,10 @@ The token's RFC 8707 audience does not depend on them: the accepted
    removed callback on an existing entry does not — it applies at the next
    request, and `migrate` only refreshes the row's unread copy. A slug
    must be short enough for `<prefix><kind>.<slug>` to fit DOT's
-   `Application.client_id` column (100 characters on DOT 3.2/3.3, 255 on
-   3.4); a longer one refuses to boot. So does an `APPLICATION_NAME` longer
-   than that column, or an `APPLICATION_NAME_PREFIX` longer than it minus
-   the 22-character DCR token.
+   `Application.client_id` and `name` columns (255 characters); a longer one
+   refuses to boot. So does an `APPLICATION_NAME` longer than those columns,
+   or an `APPLICATION_NAME_PREFIX` longer than them minus the 22-character
+   DCR token.
 2. Ensure `"https"` is in `OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"]` —
    with any https client declared the app **refuses to boot** without it. DOT's
    default already includes `https`; you only hit this if you narrowed the list
@@ -700,8 +864,9 @@ The token's RFC 8707 audience does not depend on them: the accepted
    are public/PKCE clients).
 4. The user connects: login + MFA + the one-click consent screen, then tool
    calls work. As with loopback clients, **consent recurs every 6 h** — token
-   TTL is 6 h and refresh tokens are disabled, so the user re-consents each
-   time the token expires. There is no "remember me"; this is deliberate (same
+   TTL is 6 h and there are no refresh tokens by default, so the user
+   re-consents each time the token expires (unless the install opts in to
+   capped refresh tokens). There is no "remember me"; this is deliberate (same
    rationale as [DCR-minted clients require
    consent](#every-client-requires-consent)).
 
@@ -732,7 +897,7 @@ that provider. Claude.ai's callback is one URL shared by every Claude.ai
 account, and every ChatGPT connector's `/connector/oauth/<id>` callback renders
 as `https://chatgpt.com`. So an attacker who adds their own connector against
 your server, starts the flow and sends the resulting authorization link to a
-staff user produces a page that looks exactly like a legitimate one; if the
+user with an MCP profile produces a page that looks exactly like a legitimate one; if the
 user approves, their browser is sent to the shared callback with a code bound
 to the attacker's PKCE challenge and carrying the attacker's `state` (the
 shared-callback phishing surface noted under "What each entry does"). Whether
@@ -756,15 +921,13 @@ when the Application no longer classifies); a *successful* handshake
 (`initialize`, `tools/list`) writes no row and does not count toward the
 volume tripwire; a token lives only as
 long as `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the recommended config); and
-logging out deletes both the user's MCP access tokens and their pending MCP
-authorization codes, so a code approved a moment ago — say, on a link the user
-now realises they did not start — cannot be exchanged afterwards. Not reached:
-a code or refresh exchange already in progress at that instant. Refresh-token
-rows are not deleted; tested with `REFRESH_TOKEN_EXPIRE_SECONDS=0`, a refresh
-token obtained before logout yields no usable MCP token after it — DOT 3.4.1
-answers `invalid_grant` (its access token is gone), and DOT 3.2.0 still mints
-a token but with an empty scope (read from the deleted access token), which
-the `mcp:sql` check refuses (pinned by
+logging out (or a password change) deletes the user's MCP access tokens,
+refresh tokens and pending MCP authorization codes, so a code approved a
+moment ago — say, on a link the user now realises they did not start —
+cannot be exchanged afterwards. Not reached: a code or refresh exchange
+already in progress at that instant. Refresh tokens exist only when
+`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` opts in (see "Refresh tokens
+(opt-in)"); one obtained before logout then gets `invalid_grant` (pinned by
 `test_oauth.py::TestLogoutKillsPendingCode`). If you re-theme
 `mcp_sql/authorize.html`, keep both the destination and that instruction.
 
@@ -834,12 +997,13 @@ docstrings point back to):
 
 ## Revoking access
 
-Three paths by urgency:
+Paths by urgency:
 
 | Urgency | Action | Effect |
 |---|---|---|
-| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's pending authorization codes and then their access tokens for every MCP-purpose Application — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-{cloud,local}.<slug>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
-| Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import get_access_token_model, get_grant_model; u='alice@example.com'; get_grant_model().objects.filter(user__email=u).delete(); get_access_token_model().objects.filter(user__email=u).delete()"` | Pending codes and outstanding tokens dropped in < 1 s (codes first, so a just-approved code cannot be exchanged afterwards; this snippet covers every OAuth Application the user holds, not only MCP's); user can re-OAuth |
+| User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose access **and refresh** tokens and pending authorization codes — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-{cloud,local}.<slug>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
+| User- or admin-driven | The password changes (the user's own change, an admin reset, `set_unusable_password`; proxies of the user model included) | Same deletion, from a `pre_save`/`post_save` pair on the user model (after the change commits, on the database the user was saved to); an `MCPAuthRejectionLog` row with reason `password_change` when it deleted anything (as for logout: a user with no MCP token or pending code gets no row, so the table records only changes that ended MCP access). Needs no session table. The stored hash is compared through the model's base manager on that database, so a default manager that filters rows (active users only, soft delete) cannot hide the user — reactivating a user with a new password revokes like any other change. Django's login-time hash upgrade is not a change: the package wraps `AbstractBaseUser.check_password` / `acheck_password` (in `ready()`) to mark the save they make while they run, and only that save is exempt — when the hash checked is the one stored (a legacy hash for a new password assigned in memory and then checked is a change). Any other new hash revokes, even one saved the same way (`set_password(...)` + `save(update_fields=["password"])`, as an SSO / LDAP sync does). A user model that overrides `check_password` without calling `super()` loses the exemption (its hash upgrades revoke too). **Multi-database installs:** the deletes and the audit row commit together in a transaction of their own on the database DOT keeps its tokens on; a transaction the request has open there (`ATOMIC_REQUESTS`) does not undo them when it rolls back — they run on a separate connection, which does not see tokens that transaction has written and not committed, and gives up after 5 s waiting for a row lock it holds (logged, no audit row; delete those tokens by hand). A failure to write the audit row is logged and never undoes the deletes (a connection lost while writing it ends the deletes' transaction too: logged as a failed revocation, not as "Revoked"), and nothing the revocation raises reaches the logout or the save. Logout's revocation waits for the default database's commit. **Not seen:** bulk `User.objects.filter(...).update(password=...)` and `User.objects.bulk_update(users, ["password"])` send no model signals — delete the tokens explicitly (row below) when changing passwords that way. |
+| Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import get_access_token_model, get_grant_model, get_refresh_token_model; u='alice@example.com'; get_grant_model().objects.filter(user__email=u).delete(); get_refresh_token_model().objects.filter(user__email=u).delete(); get_access_token_model().objects.filter(user__email=u).delete()"` | Pending codes, refresh tokens (they exist only with the opt-in refresh grant) and outstanding tokens dropped in < 1 s (codes first, so a just-approved code cannot be exchanged afterwards; this snippet covers every OAuth Application the user holds, not only MCP's); user can re-OAuth |
 | Operator, kick out | Remove from `mcp_sql_users` group (admin) | Outstanding tokens still exist in DB but `MCPOAuth2Authentication` re-checks the perm on every request and rejects. Combine with the token-delete shell snippet for a clean state. |
 
 The 6 h hard cap on `access_token` lifetime is the worst-case fallback:
@@ -858,8 +1022,8 @@ rows above, or, with `SESSION_MODEL` set, the per-request session gate, which
 refuses them once the user holds no live session. A user who wants their MCP
 access gone should log in and log out again (a logout from a live session
 revokes every MCP token and pending code they hold, not only that session's),
-or ask an operator. A password change does not revoke MCP tokens in this
-release.
+or ask an operator. A password change revokes them too (row above), whatever
+the session state.
 
 ## Incident playbooks
 
@@ -999,14 +1163,23 @@ volume.
 
 - **Why 6 h?** Bounded blast radius on a leaked token; comfortably spans
   a typical workday so users don't re-OAuth mid-session.
-- **Why no refresh tokens?** Adds lifecycle complexity not worth it for
-  internal use. Users re-OAuth silently (the session-trust gate at
-  `/o/authorize/` runs without re-prompting MFA so long as the Django
-  session is still valid) every 6 h, mediated by Claude Code. Technical
-  note: DOT 3.2.0 still emits a `refresh_token` field in the `/o/token/`
-  response, but `REFRESH_TOKEN_EXPIRE_SECONDS=0` sets its lifetime to
-  zero — it cannot actually be used to refresh. Effective behavior is
-  no-refresh; the field is cosmetic.
+- **Why no refresh tokens by default?** They would make the 6 h
+  access-token TTL meaningless as a re-consent interval: a refresh token
+  keeps renewing access without the user. Users instead re-OAuth every 6 h
+  (the session-trust gate at `/o/authorize/` runs without re-prompting MFA
+  so long as the Django session is still valid; DCR and cloud clients show
+  the consent screen each time), mediated by the client. Enforcement is the
+  package's OAuth server (see "The OAuth server"): its authorization-code
+  grant generates no refresh token (so `/o/token/` returns none and no
+  `RefreshToken` row is created), `MCPOAuth2Validator.save_bearer_token`
+  drops one a stock DOT token view would mint, and `/o/token/` answers every
+  `grant_type=refresh_token` request with a constant `invalid_grant` —
+  including refresh tokens minted by releases up to and including 0.1.0b5,
+  which did emit them. `REFRESH_TOKEN_EXPIRE_SECONDS` is not what disables
+  refresh: DOT reads `0` as *no age limit*, and on those releases such a
+  token renewed access indefinitely. An install that wants fewer consent
+  prompts can opt in to refresh tokens with a hard cap measured from the
+  consent (see "Refresh tokens (opt-in)").
 - **Why no idle timeout?** Out of scope. The 6 h hard cap + logout
   revocation + the daily-volume Sentry alerts bound exposure for **every**
   consumer. A consumer that enables the **opt-in** session-existence gate
@@ -1140,7 +1313,7 @@ client, every one with `skip_authorization=false`.
 If the curated row is missing, the `0005_create_mcp_sql_application`
 migration did not run — re-apply with `python manage.py migrate mcp_sql`. If
 it still has `skip_authorization=true`, migration
-`0015_curated_application_requires_consent` has not run. If a DCR-minted row
+`0016_curated_application_requires_consent` has not run. If a DCR-minted row
 has `skip_authorization=true`, it predates the security fix; delete it and
 have the developer re-register via `claude mcp add`.
 

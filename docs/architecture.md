@@ -25,16 +25,19 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
   per RFC 8252 §7.3 (DOT 3.x port-wildcards any port on the loopback IP
   `127.0.0.1`; bare `localhost` can't be port-wildcarded so the curated app
   omits it — but the DCR endpoint DOES accept `localhost` via exact-match,
-  see "OAuth surface"). 6h hard cap on tokens, refresh tokens
-  disabled (cosmetic field still emitted by DOT, zero lifetime). Audience
-  binding is the single `mcp:sql` scope plus the auth class being mounted
-  only on `/mcp/sql/`. RFC 8707 adds to it only partly: a `resource` is
-  accepted only when it is the MCP endpoint's identifier as discovery
-  advertises it (else `invalid_target`, `audience.py`), and from DOT 3.4 a
-  token issued with one is audience-checked by DOT itself when it validates
-  the bearer; a token issued without one (DOT below 3.4 ignores the
-  parameter; clients may omit it) is unrestricted, so the package does not
-  rely on it. See "Audience binding" under "OAuth surface" and
+  see "OAuth surface"). The package's OAuth views and auth class run on
+  its own narrow oauthlib server (`oauth_server.MCPServer`), not the
+  consumer's `OAUTH2_SERVER_CLASS`. 6h hard cap on access tokens; no
+  refresh tokens unless `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` opts in
+  to rotating ones capped from the consent. Audience binding is the single
+  `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`.
+  RFC 8707 adds to it only partly: a `resource` is accepted only when it is
+  the MCP endpoint's identifier as discovery advertises it (else
+  `invalid_target`, `audience.py`), and a token issued with one is
+  audience-checked by DOT itself (3.4.1 is the floor) when it validates the
+  bearer; a token issued without one (clients may omit it) is unrestricted,
+  so the package does not rely on it. See "Audience binding" under "OAuth
+  surface" and
   `docs/oauth.md` for the operational profile.
 - **Authorization**: layered — issuance gate at `/o/authorize/` (Option D
   session-trust: `is_active AND is_mfa_enabled AND an
@@ -58,34 +61,35 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 |---|---|
 | `sql/role_setup.sql` | Idempotent SQL to create `mcp_readonly_role` + role-level GUC defaults + the membership GRANT. The app role name is supplied via the psql variable `app_role` (`-v app_role=<role>`); the GRANT lives inside a `DO $$ ... $$` block (so psql variable substitution does not reach it directly), so the script wraps the GRANT in an explicit `BEGIN ... COMMIT` and uses `SET LOCAL mcp_sql.app_role = :'app_role'` (psql substitutes the variable at the call site, and the DO block reads the value via `current_setting(...)` + `EXECUTE format('GRANT mcp_readonly_role TO %I', target_role)`). `SET LOCAL` (not bare `SET`) keeps the library-wide invariant — no session-scope SET in mcp_sql code, even on bootstrap paths that don't traverse pgbouncer today. Portable across environments whose `POSTGRES_USER` differs (the caller passes the matching value via `-v app_role=<role>`). |
 | `sql/10_mcp_role.sh` | Init-dir wrapper for fresh dev clusters. Mounted at `/docker-entrypoint-initdb.d/10_mcp_role.sh`; the Postgres image entrypoint runs it once after `POSTGRES_USER` is created. It `exec`s psql with `-v app_role="$POSTGRES_USER"` against `role_setup.sql` (mounted at `/mcp_sql/role_setup.sql`, deliberately OUTSIDE the init dir so the entrypoint does not also auto-run the SQL without the variable substitution). For long-lived deployments the DBA applies the SQL manually with the matching `-v app_role=<role>` value (see `docs/role-setup.md`). |
-| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. |
+| `session.py` | Single source of truth for the `SET LOCAL ROLE` + `SET LOCAL` GUC sequence every read transaction must issue. The executor and the smoke command both call `enter_readonly_session(cursor, role=..., session_context=...)` from here. `session_gucs()` — `EXPECTED_SESSION_GUCS` (timeouts, `default_transaction_read_only`, `standard_conforming_strings`; also the role defaults in `role_setup.sql`), plus `PINNED_SEARCH_PATH` (`search_path = public, pg_temp`) only with `MCP_SQL["PIN_SEARCH_PATH"]` on — plus `TRANSACTION_GUCS` (`transaction_read_only`, per transaction only); `session_drift` checks both, the live read-only flag included. |
 | `db_router.py` | One universal invariant, nothing else: `allow_migrate` returns `False` for `MCP_SQL["DB_ALIAS"]` so **no** app ever builds or tracks schema through the read-only execution alias — it is a lens onto a database `default` owns (or a read replica), which Django can't infer and would otherwise migrate per-alias (a `migrate --database=<alias>`, or the test runner's per-alias setup). Abstains (`None`) on every other decision: audit writes/reads land on `default` via Django's fallback (no explicit pin needed), and the executor reaches the read alias via an explicit `connections[DB_ALIAS]` that routers don't intercept. Deliberately bakes in **no** consumer-topology assumption (no literal `"default"` home for `mcp_sql`'s own tables — a multi-DB consumer manages that with their own routers). Keyed on the `DB_ALIAS` setting, so it holds whether the alias is the same DB via a read-only role or a separate replica. |
-| `models.py` | Two audit tables, both carrying the same client attribution (`application_name`, derived `client_kind`, truncated `client_redirect`). `MCPQueryLog` — every `executor.run_query` call (parser-reject / executor-misconfig / timeout / execution-error / `limit=0` short-circuit / success). `MCPAuthRejectionLog` — every `MCPOAuth2Authentication.authenticate` rejection of a token that resolved to a user (bad-application / bad-scope / inactive (`inactive_or_non_staff` on rows written by 0.1.x) / no-MFA / no-perm / ambiguous-profile / no-session), plus the logout-revocation rows written by `signals.py`. An unknown or expired bearer never resolves to a user and is NOT recorded here — it increments the per-IP `bad_token` cache counter (`throttle`); a request with no `Authorization` header at all is neither recorded nor counted. Separate tables by design: auth rejections happen before query evaluation, conflating them in `MCPQueryLog` would pollute the daily-volume "queries per user" aggregation with bot-probe rejection counts. The planned revoked-credential probing alert reads `MCPAuthRejectionLog`. Both tables append-only by convention; admin has no write paths; both have `REVOKE SELECT ... FROM mcp_readonly_role` (migrations 0002 + 0008). |
-| `management/commands/mcp_sql_grants.py` | The single grants-pipeline command. Default mode is read-only: prints the drift diff and exits non-zero if any profile role's grants don't match its `MCP_SQL["PROFILES"][...]["ALLOWED_MODELS"]` whitelist (pre-deploy gate). With `--apply`, executes GRANT / REVOKE — intended as the deploy-pipeline step right after `migrate`, and also runnable against an ephemeral CI test cluster to fail PRs that add a model to a profile's `ALLOWED_MODELS` without the migration that creates its table. Strict in both modes: raises if the role is missing, the app role lacks membership, OR any curated MCPxxx view's column list drifts from its unmanaged-model declaration (verified inside `reconcile_grants` via `_verify_view_parity` so the same gate runs on the deploy command + the post_migrate signal). The `post_migrate` signal (see `signals.py`) only DETECTS drift and logs a WARNING; this command is the only code path that mutates. |
+| `models.py` | Two audit tables, both carrying the same client attribution (`application_name`, derived `client_kind`, truncated `client_redirect`); their `client_ip` comes through `audit_client_ip` (`REMOTE_ADDR` when it is one IP address, else NULL). `MCPQueryLog` — every `executor.run_query` call (parser-reject / executor-misconfig / timeout / execution-error / `limit=0` short-circuit / success). `MCPAuthRejectionLog` — every `MCPOAuth2Authentication.authenticate` rejection of a token that resolved to a user (bad-application / bad-scope / inactive (`inactive_or_non_staff` on rows written by 0.1.x) / no-MFA / no-perm / ambiguous-profile / no-session), plus the logout and password-change revocation rows (`session_logout`, `password_change`) written by `signals.py` — when one deleted a token or pending code; a user who held none gets no row. An unknown or expired bearer never resolves to a user and is NOT recorded here — it increments the per-IP `bad_token` cache counter (`throttle`); a request with no `Authorization` header at all is neither recorded nor counted. Separate tables by design: auth rejections happen before query evaluation, conflating them in `MCPQueryLog` would pollute the daily-volume "queries per user" aggregation with bot-probe rejection counts. The planned revoked-credential probing alert reads `MCPAuthRejectionLog`. Both tables append-only by convention; admin has no write paths; both have `REVOKE SELECT ... FROM mcp_readonly_role` (migrations 0002 + 0008). `MCPRefreshTokenFamily` (migration 0013) records the consent time of each refresh-token chain, used only when `REFRESH_TOKEN_MAX_AGE_SECONDS` enables refresh tokens. |
+| `management/commands/mcp_sql_grants.py` | The single grants-pipeline command. Default mode is read-only: prints the drift diff and exits non-zero if any profile role's grants don't match its `MCP_SQL["PROFILES"][...]["ALLOWED_MODELS"]` whitelist (pre-deploy gate) — SELECT grants in every schema but the system ones, so a grant on a relation outside `public` is drift too; GRANT / REVOKE name the relation schema-qualified, each identifier quoted (see "Watch out: catalog names are untrusted SQL"). With `--apply`, executes GRANT / REVOKE — intended as the deploy-pipeline step right after `migrate`, and also runnable against an ephemeral CI test cluster to fail PRs that add a model to a profile's `ALLOWED_MODELS` without the migration that creates its table. Strict in both modes: raises if the role is missing, the app role lacks membership, OR any curated MCPxxx view's column list drifts from its unmanaged-model declaration (verified inside `reconcile_grants` via `_verify_view_parity` so the same gate runs on the deploy command + the post_migrate signal). The `post_migrate` signal (see `signals.py`) only DETECTS drift and logs a WARNING; this command is the only code path that mutates. |
 | `management/commands/mcp_sql_lint.py` | Walks `git diff <base>...HEAD`, fails on column-add migrations targeting whitelisted models without `# MCP-OK: <reason>` annotation. |
 | `management/commands/mcp_sql_smoke.py` | Smoke check, two modes. Default: role/grants contract — opens `mcp_readonly`, enters the read-only session, verifies guard GUCs, asserts the audit table is unreadable, asserts a write is rejected. `--run-query "<sql>"`: drives the executor end-to-end (parser → LIMIT N+1 → readonly tx → row caps → audit). |
 | `clients.py` | The client taxonomy, Django-free: `ClientKind` (`curated` / `dcr` / `cloud` / `local`), `RedirectRule` / `DeclaredClient`, `build_clients(raw, prefix)` — the single normaliser both the settings accessor and boot validation call — and `ClientIdentity`, the name+kind+redirect triple threaded onto every audit row. **A declared client's kind and client_id namespace are DERIVED from its redirect scheme** (all-https → `cloud`, all-loopback → `local`, mixed → `ImproperlyConfigured`), so `client_kind` can't drift from what the client is and one client_id can't span a provider-hosted and a machine-local surface. Takes the prefix as an argument rather than reading settings, so `conf.py` / `validation.py` / `consts.py` all import it without a cycle; the redirect SAFETY rules live in `validation.py`, which owns the operator-facing messages. |
 | `schemas.py` | `QueryResult` dataclass + `OutcomeReason` short-code vocabulary + `HINTS` map (agent-facing text per reason + truncation hint). Reused by the MCP transport layer. |
 | `fencing.py` | `fence_query_result(payload)` — wraps `run_query`'s untrusted, DB-sourced fields (`rows`, and `error` when set) in a per-response random-UUID `<untrusted-data-…>` XML fence plus a `data_handling` instruction, so injected DB content (email subjects, contact names, comments, …) can't forge the boundary and be read as agent instructions. Pure-Python / Django-free (travels with the package); called from the `run_query` tool closure in `views/mcp_endpoint.py`. |
-| `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery` and `inject_limit(ast, n) -> Expression`. sqlglot-backed AST validators: single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *`, no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte`; a flat global CTE-name set let an inner CTE shadow an outer-scope real table), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`). Raises `QueryRejectedError(reason, detail)`. |
-| `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → inject `LIMIT N+1` → open `mcp_readonly` tx → `enter_readonly_session` → execute → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, `rejection_reason`, and the `ClientIdentity` attribution (`application_name` / `client_kind` / `client_redirect`, expanded once in `_audit_safely` — also the single place the redirect is truncated to the column width, since an overflow would raise `DataError` and lose the row) — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
+| `parser.py` | `parse_and_validate(raw_sql, *, allowed_tables, ban_select_star=True) -> ParsedQuery`, `inject_limit(ast, n) -> Expression` and `render_for_execution(ast, n, *, allowed_tables, ...) -> str` (the LIMIT-wrapped SQL the executor sends, itself validated and stable under re-rendering — see "Watch out: the executed SQL is the text that was validated"). Parse failures of every kind (sqlglot's `TokenError`, its `re.error` on `UESCAPE`, any plain Python exception from inside sqlglot) become `PARSE_ERROR`, and `run_query` audits anything unexpected from parsing or rendering. Parsing and rendering use `FaithfulPostgres`, sqlglot's postgres dialect reading and rendering SQL as written (function calls, interval strings, JSON keys, quoted types, numeric constants, ...; see "Watch out: the executed SQL is the text that was validated"). sqlglot-backed AST validators: lexical fidelity first (no `E'…'` escape string with a backslash, no `U&` escape, no identifier written as a string constant, no double-quoted function name sqlglot would fold onto a builtin, no adjacent string constants, no dollar-quote tag Postgres rejects — `UNSAFE_LITERAL`), single statement (trailing `;` and comments are stripped), SELECT-shaped root, no `SELECT *` (a `t.*` anywhere but `count(*)`; a bare row alias — `t`, `to_jsonb(t)`, `CAST(t AS text)` — **in a projection list only**: in `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING`, `ORDER BY` it is accepted, see "Watch out: the whole-row ban covers projections"), no writeable CTE, no SELECT INTO/RETURNING, no OFFSET / FETCH / FOR UPDATE / FOR SHARE, no set-returning / table functions in the projection (`generate_series` / `unnest` via the `exp.GenerateSeries` / `exp.UDTF` base classes, the json/regexp expanders via the `DENIED_SRF_FUNCTIONS` name set — both escape the empty-name FROM-Table guard; not exhaustive of every PG SRF, the `statement_timeout` + LIMIT backstop covers anything unlisted), scope-aware table whitelist (a CTE name only masks a table reference when that CTE is **in scope** for it — `_resolves_to_cte` / `_cte_named`: an enclosing query's CTE, inside a CTE's own body only the CTEs before it, never for a schema-qualified name; a flat global CTE-name set let an inner CTE shadow an outer-scope real table; names compare as Postgres compares them — quoted exactly, unquoted folded — against CTE names and against the whitelist, whose entries are exact `db_table` spellings, each a relation in a schema: `public`, or the one a `db_table` written `schema"."name` names; a qualified reference matches only in its own schema, an unqualified one is checked as the relation in `public` (opened there only with `PIN_SEARCH_PATH` on) — see "Watch out: the whitelist names a relation in a schema"), system-schema reject (`pg_*` / `information_schema`), function deny-list (exact: `copy`, `current_setting`, `set_config`; prefix: `dblink_*`, `lo_*`, `pg_*`, `has_*`) — also matched on Postgres's attribute notation (`x.f` / `(expr).f` is the call `f(x)` exempt only where Postgres provably reads a column — `t.f` / `(t.*).f` (with `BAN_SELECT_STAR` off; under the default ban every `t.*` is `SELECT_STAR`) / `(t).f` (`t` a derived table, VALUES list or aliased subquery; for a base-table or CTE alias the bare-row check refuses it as `SELECT_STAR`) where the FROM item `t` has a column `f` (derived-table / CTE / VALUES output columns with the names Postgres derives, alias column lists, whitelisted tables' columns from their models via `table_columns` — the model's own table's columns, `concrete_model._meta.local_concrete_fields`, never an MTI parent's — plus every table's system columns `tableoid` / `ctid` / `xmin` / `xmax` / `cmin` / `cmax`) and `t` is not also a column name in scope; for `(t).f` (where a column `t` would win over the row) every FROM item in scope must have fully known column names, else it is a call; for `t.f` Postgres reads the FROM item even when a column `t` exists, so refusing that is a deliberate, owner-accepted over-refusal; quoted names compare case-sensitively; `t.to_jsonb`, `t.concat`, `t.record_out` and friends as `SELECT_STAR`; names of denied functions that take no argument or two or more, `t.version` / `t.has_access`, never calls), on schema-qualified names, and on any denied name written before `(` that the tree does not show as a call (`_check_no_denied_calls`). Raises `QueryRejectedError(reason, detail)`. |
+| `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → `render_for_execution` (inject `LIMIT N+1`, render without comments, validate the rendered text and require a stable re-render, else `ROUNDTRIP_MISMATCH`) → open `mcp_readonly` tx → `enter_readonly_session` → execute → fetch → mark the tx for rollback (it is never committed) → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, `rejection_reason`, and the `ClientIdentity` attribution (`application_name` / `client_kind` / `client_redirect`, expanded once in `_audit_safely` — also the single place the redirect is truncated to the column width, since an overflow would raise `DataError` and lose the row) — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
 | `observability.py` | `record_query_volume(*, user_id, decision, user_label="", client_name="", client_kind="")` — per-(user, decision, window) fixed-window cache counters (mirrors `throttle`'s `cache.add`+`incr` primitive), called from `executor._audit_safely` on every audited row. Emits ONE `logger.error` (Sentry event) at each crossing of `MCP_SQL["VOLUME_ALERT_THRESHOLDS"][decision][window]` (hour + day, allowed + rejected). ALERTS, never blocks; fail-open on cache trouble. The alert names the user (pk + `get_username()`) AND the client whose query crossed the threshold; counting is per user across clients, so a burst spread over several clients still alerts (one alert, naming the crossing client — the per-row audit attribution has the breakdown). It never logs SQL. |
-| `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't a recognised MCP Application (`consts.is_mcp_application`: a recognised name, and `client_id == name`) and any scope set that isn't `{"mcp:sql"}`. For a declared client, `validate_redirect_uri` and `get_default_redirect_uri` decide from `MCP_SQL["CLIENTS"]` alone (`_declared_redirect_allowed`: `"prefix"` rules via `_redirect_under_prefix`, `"exact"` rules via DOT's `redirect_to_uri_allowed` on the declared exact URIs; no fall-through to `super()`, so the provisioned row's `redirect_uris` never decides); the curated row and DCR clients keep DOT's stock row-backed matching. `save_bearer_token` first puts a token request's RFC 8707 `resource` in the grant's or refresh token's stored spelling when it is another spelling of it (`audience.use_granted_spelling`, for rows stored before the one-spelling rewrite). |
-| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. The bearer itself is verified by `_verify_bearer` — DOT's `OAuth2Authentication.authenticate` on the configured server and validator, but through `audience.CanonicalUriOAuthLibCore`, so DOT's RFC 8707 audience check (DOT 3.4+) compares a resource-bound token with the URL discovery advertises rather than with `build_absolute_uri` (see "Audience binding"). |
-| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` and runs the issuance gate (`is_active + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects three values: `resource_name = RESOURCE_NAME` (what is being accessed — the same identity in the RFC 9728 metadata, instead of DOT's opaque per-client `application.name`), `client_label` (WHO is asking — a declared client's operator-authored `LABEL`, or the curated name; deliberately EMPTY for a DCR client, whose self-declared `client_name` is attacker-chosen free text), and `client_destination` (WHERE the code will be delivered — `scheme://host[:port]` rebuilt from the validated `redirect_uri`'s parsed parts so a userinfo component can never render). The destination identifies the provider or machine the code goes to, not whose account there — a shared provider callback (Claude.ai, every ChatGPT connector) renders identically for an attacker's own connector — so the page's real check is its "Only continue if you started this from there" instruction (consent is a CSRF-protected POST, so a phished link cannot complete silently — `dispatch` pins DOT's `approval_prompt` to `force`, since on `auto` DOT skips consent for a user who already holds a live token for that Application), backed by re-gating every `/mcp/sql/` request whose token resolves to a user, the token lifetime (6 h in the recommended config) and logout revocation — which deletes the user's MCP access tokens AND pending MCP authorization codes, so a just-approved code cannot be exchanged after logout (short of an exchange already in progress at that instant). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`). `error_response` re-validates the redirect target against the client (through the configured validator, as oauthlib's own check does) before ANY error redirect and renders that error page when it fails: DOT raises the consent POST's Cancel (`access_denied`) and, from DOT 3.4, invalid-`resource` (`invalid_target`) errors before oauthlib has validated the form's hidden `redirect_uri`, and would otherwise redirect to whatever a tampered form put there. `form_valid` likewise renders it for a POST naming a `client_id` that does not exist, or no longer does when the client is loaded after that check — on its `invalid_target` path, or as DOT's own `form_valid`'s first line on every other path, Authorize or Cancel (DOT's `form_valid` 500'd on `DoesNotExist`; an Application `DoesNotExist` while the client still exists is re-raised, never reported as an unknown client), and `dispatch` for a `client_id` containing a NUL byte, before DOT's client lookup hands it to Postgres (on the GET that was `DataError`, a 500; on the consent POST Django's form validation already rejected it with a 200 re-render, so the POST check is defence in depth); `validate_authorization_request` (after oauthlib has validated the client and redirect) and `form_valid` (the form field and the query string, which from DOT 3.4 must agree) refuse an RFC 8707 `resource` that is not the MCP endpoint's advertised identifier with `invalid_target` to the registered redirect, on every DOT version (see "Audience binding"); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
+| `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't a recognised MCP Application (`consts.is_mcp_application`: a recognised name, and `client_id == name`) and any scope set that isn't `{"mcp:sql"}`. For a declared client, `validate_redirect_uri` and `get_default_redirect_uri` decide from `MCP_SQL["CLIENTS"]` alone (`_declared_redirect_allowed`: `"prefix"` rules via `_redirect_under_prefix`, `"exact"` rules via DOT's `redirect_to_uri_allowed` on the declared exact URIs; no fall-through to `super()`, so the provisioned row's `redirect_uris` never decides); the curated row and DCR clients keep DOT's stock row-backed matching. Its `validate_redirect_uri` / `get_default_redirect_uri` also re-apply the `/o/register` predicate (`views/registration.py::_is_loopback_redirect`) to the requested redirect and to the stored default of every client that is not a declared cloud client (see "Watch out: DOT stores redirect URIs whitespace-joined"). It must be the install's `OAUTH2_VALIDATOR_CLASS` (or a subclass; `validation.validate_oauth2_validator_class` refuses to boot otherwise), so it also keeps backstops for any stock DOT view on DOT's stock server: `is_pkce_required` always `True`, `get_code_challenge_method` refuses to redeem a stored non-S256 grant (`invalid_grant`, on any server), `validate_user` refuses every password grant, `_load_application` never looks up a `client_id` carrying a control character. It also owns the refresh policy on every server: with refresh off `save_bearer_token` drops any refresh token and `validate_refresh_token` refuses; with `REFRESH_TOKEN_MAX_AGE_SECONDS` on, `save_bearer_token` records each chain's consent (`MCPRefreshTokenFamily`), `validate_refresh_token` enforces the hard cap from it and `rotate_refresh_token` is always on (see "Watch out: the OAuth server is narrowed on the package's views"). `save_bearer_token` also first puts a token request's RFC 8707 `resource` in the grant's or refresh token's stored spelling when it is another spelling of it (`audience.use_granted_spelling`, for rows stored before the one-spelling rewrite). |
+| `oauth_server.py` | The narrow oauthlib server the package's OAuth views and `MCPOAuth2Authentication` run on, whatever the consumer's `OAUTH2_SERVER_CLASS`. `MCPAuthorizationCodeGrant` (`S256`-only PKCE table; a refresh token only when refresh is enabled), `HeaderOnlyBearer` (bearer token from the `Authorization` header only), `MCPServer` (authorization endpoint with the `code` response type only, token endpoint with the `authorization_code` grant — plus oauthlib's `RefreshTokenGrant` when `REFRESH_TOKEN_MAX_AGE_SECONDS` enables it — resource endpoint, revocation endpoint; takes DOT's `server_kwargs`), `MCPServerViewMixin` (`server_class = MCPServer`, `oauthlib_backend_class = OAuthLibCore`, the core built per call — see "Watch out") and `get_mcp_oauthlib_core(core_class=OAuthLibCore)` (DOT's `get_oauthlib_core()` on `MCPServer` with `OAuthLibCore` or a subclass of it; the auth class passes `audience.CanonicalUriOAuthLibCore`). |
+| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. The bearer itself is verified by `_verify_bearer` — DOT's `OAuth2Authentication.authenticate` logic on `MCPServer` (`get_mcp_oauthlib_core(audience.CanonicalUriOAuthLibCore)`), so a bearer token is taken from the `Authorization` header only (an `access_token` query or form parameter is not a credential; see "Watch out: bearer tokens travel in the header only") and DOT's RFC 8707 audience check compares a resource-bound token with the URL discovery advertises rather than with `build_absolute_uri` (see "Audience binding"). |
+| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` (on `MCPServer`, via `MCPServerViewMixin`: `code` response type and `S256` PKCE only). `dispatch` pins `approval_prompt` (below), then screens the query string and consent POST — a control character anywhere (a NUL `client_id` included, before DOT's client lookup hands it to Postgres), a `code_challenge` outside RFC 7636 §4.2's shape or an over-long `nonce` gets the fatal error page (`invalid_request`) before DOT could store them on a `Grant` — then runs the issuance gate (`is_active + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects three values: `resource_name = RESOURCE_NAME` (what is being accessed — the same identity in the RFC 9728 metadata, instead of DOT's opaque per-client `application.name`), `client_label` (WHO is asking — a declared client's operator-authored `LABEL`, or the curated name; deliberately EMPTY for a DCR client, whose self-declared `client_name` is attacker-chosen free text), and `client_destination` (WHERE the code will be delivered — `scheme://host[:port]` rebuilt from the validated `redirect_uri`'s parsed parts so a userinfo component can never render). The destination identifies the provider or machine the code goes to, not whose account there — a shared provider callback (Claude.ai, every ChatGPT connector) renders identically for an attacker's own connector — so the page's real check is its "Only continue if you started this from there" instruction (consent is a CSRF-protected POST, so a phished link cannot complete silently — `dispatch` pins DOT's `approval_prompt` to `force`, since on `auto` DOT skips consent for a user who already holds a live token for that Application), backed by re-gating every `/mcp/sql/` request whose token resolves to a user, the token lifetime (6 h in the recommended config) and logout revocation — which deletes the user's MCP access tokens AND pending MCP authorization codes, so a just-approved code cannot be exchanged after logout (short of an exchange already in progress at that instant). `render_to_response` is the single chokepoint for the view's template renders — the consent page (`get`), its re-render by DOT's `form_invalid` (no `application` in the context, so the template never reads it through a filter argument) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`, or `dispatch` screens out a parameter). `error_response` re-validates the redirect target against the client (through the configured validator, as oauthlib's own check does) before ANY error redirect and renders that error page when it fails: DOT raises the consent POST's Cancel (`access_denied`) and invalid-`resource` (`invalid_target`) errors before oauthlib has validated the form's hidden `redirect_uri`, and would otherwise redirect to whatever a tampered form put there. `form_valid` likewise renders it for a POST naming a `client_id` that does not exist, or no longer does when the client is loaded after that check — on its `invalid_target` path, or as DOT's own `form_valid`'s first line on every other path, Authorize or Cancel (DOT's `form_valid` 500'd on `DoesNotExist`; an Application `DoesNotExist` while the client still exists is re-raised, never reported as an unknown client); `validate_authorization_request` (after oauthlib has validated the client and redirect) and `form_valid` (the form field and the query string, which must agree) refuse an RFC 8707 `resource` that is not the MCP endpoint's advertised identifier with `invalid_target` to the registered redirect (see "Audience binding"; a control character in it gets `dispatch`'s `invalid_request` first); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
 | `views/mcp_endpoint.py` | `/mcp/sql/` view. Per-request `FastMCP` instantiation with three tool callables (`list_tables`, `describe_table`, `run_query`) closed over the authenticated `user`/`token_id`/`client_ip`. Mounted via `a2wsgi.ASGIMiddleware`. **POST only**: `mcp_endpoint` answers every other method `405` (`Allow: POST`) before DRF runs, then hands POST to the DRF view `_mcp_transport`, whose auth class runs first, so anonymous / wrong-scope requests are rejected before the bridge runs. CSRF exempt (bearer auth, not cookies). The `FastMCP` carries `instructions=_SERVER_INSTRUCTIONS` (the standing untrusted-data + human-in-the-loop security posture, delivered once in the `initialize` response — see "Watch out") and each tool carries honest `readOnlyHint=True` / `openWorldHint=False` `ToolAnnotations`. **Routed (`urls.py`) at BOTH `/mcp/sql/` (canonical — named, what `reverse()` builds from) and the slash-less alias `/mcp/sql`**: Claude.ai's web connector normalises the trailing slash off and POSTs to `/mcp/sql`, and `APPEND_SLASH` can't 301-redirect a POST without dropping the body, so a slash-only route 500s the instant the transport opens (`docs/oauth.md` → "Clients" → Troubleshooting; pinned by `test_mcp_endpoint.py::TestEndpointRouting`). |
 | `views/discovery.py` | OAuth 2.0 discovery surface. `protected_resource_metadata` (RFC 9728) at `/.well-known/oauth-protected-resource/mcp/sql` **and the trailing-slash spelling `…/mcp/sql/`** advertises the MCP endpoint's `resource` — echoed to match whichever spelling the client requested, because RFC 9728 §3.3 makes the returned `resource` MUST-equal the identifier the client built the metadata URL from and clients disagree on trailing-slash normalisation (Cursor Desktop requests the slash-less spelling and enforces §3.3; Claude Code requests it too and does not) — plus the env's `resource_name` (sourced from `MCP_SQL["RESOURCE_NAME"]`; consuming projects typically override this to an env-distinct value), and the AS URL. `authorization_server_metadata` (RFC 8414) at `/.well-known/oauth-authorization-server/o` (path-suffix per RFC 8414 §3.1, matching the `https://<host>/o` issuer) advertises `issuer`, the three OAuth endpoints, the `registration_endpoint`, scopes, grant types, `code_challenge_methods_supported=["S256"]`, and `token_endpoint_auth_methods_supported=["none"]` (public client). Both anonymous-GET, CSRF-exempt. Referenced by `MCPOAuth2Authentication.authenticate_header()` via the `resource_metadata` parameter in `WWW-Authenticate` so MCP clients can bootstrap the OAuth dance off a 401 — pointing at the spelling that matches the request path (`/mcp/sql/` → `…/mcp/sql/`, `/mcp/sql` → `…/mcp/sql`), because §3.3's second clause requires a document reached through that pointer to name the URL the client requested. The `resource` value is built by `audience.mcp_resource_url`, the same function the issuance-side RFC 8707 check and the bearer audience check use. |
 | `audience.py` | RFC 8707 resource indicators, pinned to the one resource this server issues tokens for. `mcp_resource_url(request)` — the MCP endpoint's RFC 9728 identifier (`consts.absolute_url` + `reverse("mcp_sql_endpoint")`), what discovery advertises; `foreign_resource(request, values)` — the first value that does not name that URL: scheme and host compared case-insensitively and the default port explicit or omitted (`consts.canonical_authority`, the rule `absolute_url` spells the host with), the path exactly the endpoint's with or without its trailing slash; the bare origin, any other path, a query, fragment, userinfo, a port the package does not take (two ports or above 65535, which URL parsers refuse too; over five digits, the package's own cap), an empty or non-ASCII value is foreign; `canonical_resource_url(request)` — the one spelling every accepted value is stored as, the advertised URL without its trailing slash; `canonical_resources(request, values)` — each accepted value replaced by it, every foreign value left as it is (run by both OAuth views before DOT reads `resource`); `same_resource` / `use_granted_spelling` — at token issuance (`oauth.MCPOAuth2Validator.save_bearer_token`), the token request's values put in the grant's or refresh token's own spelling when that is another spelling of them (rows stored before the rewrite); `invalid_target_error` — the RFC 8707 error naming the accepted value; `CanonicalUriOAuthLibCore` — DOT's `OAuthLibCore` handing oauthlib the request URL built by `absolute_url`, used only by `MCPOAuth2Authentication._verify_bearer`. See "Audience binding". |
-| `views/oauth_token.py` | `MCPTokenView` — DOT's `TokenView` (`/o/token/`), answering `invalid_target` (400, `no-store`) when any `resource` in the query or form body is foreign (`audience.foreign_resource`), before DOT runs, so the authorization code is not consumed; otherwise rewriting the form body's `resource` values to `audience.canonical_resource_url`, the spelling the grant stores (a query string never reaches DOT's resource handling: oauthlib refuses a token POST that has one). Pins DOT's form-body `OAuthLibCore` and builds the core per call (DOT's class-level `_oauthlib_core` cache would otherwise hand down a core cached on the stock `TokenView`), so a consumer's `OAUTH2_BACKEND_CLASS` (e.g. `JSONOAuthLibCore`) cannot parse a body the check never read. Keeps DOT's `csrf_exempt`. |
+| `views/oauth_token.py` | `MCPTokenView` / `MCPRevokeTokenView` — DOT's `TokenView` / `RevokeTokenView` on `MCPServer` (`MCPServerViewMixin`, which pins DOT's form-body `OAuthLibCore` and builds the core per call — DOT's class-level `_oauthlib_core` cache would otherwise hand down a core cached on the stock view — so a consumer's `OAUTH2_BACKEND_CLASS`, e.g. `JSONOAuthLibCore`, cannot parse a body the checks never read). `MCPTokenView.post` answers `grant_type=refresh_token` with a constant 400 `invalid_grant` while refresh is off, anything else but exactly one `grant_type=authorization_code` (or `refresh_token` when on) with 400 `unsupported_grant_type` (before DOT's own device-code branch, which no server setting reaches), then a control character in any other parameter with 400 `invalid_request`, then `invalid_target` (400, `no-store`) when any `resource` in the query or form body is foreign (`audience.foreign_resource`) — all before DOT runs, so the authorization code is not consumed — and otherwise rewrites the form body's `resource` values to `audience.canonical_resource_url`, the spelling the grant stores. Keeps DOT's `csrf_exempt`. |
 | `throttle.py` | Shared per-IP fixed-window block backed by the Django cache (use a SHARED backend — Redis, Memcached — in production: with a per-process backend like LocMem the counters, and therefore the block, are per-worker). One primitive, two surfaces: `auth` (`bad_token` scope, silent 401) and `views/registration` (`register` scope, silent inert 201). Both share `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]` / `["BAD_TOKEN_IP_WINDOW_SECONDS"]`; keys are scope-namespaced so one surface never depletes the other's budget. Keys on `REMOTE_ADDR` — sound only behind a hardened edge proxy (see "Watch out: the per-IP throttle trusts the proxy's IP handling"). |
 | `decorators.py` | `cap_request_body(max_bytes)` — the body-size cap on the OAuth endpoints, applied in `urls.py` (64 KiB; `OAUTH_REQUEST_BODY_MAX_BYTES`). Header-only `CONTENT_LENGTH` check (Django's `LimitedStream` truncates an under-declared body to the lie, so the header is the only gate needed), returning a plain 413 before the view reads the body; `functools.wraps` preserves each view's `csrf_exempt` flag. `/mcp/sql/` is capped separately and higher (1 MiB) in `auth.py`, since its body carries the SQL query. |
 | `views/registration.py` | RFC 7591 OAuth 2.0 Dynamic Client Registration endpoint at `/o/register`. Anonymous JSON POST that creates a new `Application` row with the curated public-client / PKCE-required posture and a `mcp-sql-<token>` name (so the prefix-based validator/auth/signal recognise it). Enforces RFC 8252 §7.3 loopback-only `redirect_uris` server-side by registering the loopback SUBSET of the request and echoing back what it registered (RFC 7591 §3.2.1) — a client presenting extra non-loopback callbacks (Cursor sends up to three) still registers, an empty subset is still a refusal, and nothing non-loopback is ever stored (and `_is_loopback_redirect` refuses embedded whitespace, so one stored string can never `.split()` into a URI that was never validated); a character outside the rule documented at the top of the character section of `views/registration.py` (a URI must be printable and visible; a name must be assigned, visible text, with invisible characters only inside well-formed sequences: joiners in words and emoji ZWJ sequences, Unicode's emoji variation sequences, Mongolian variation selectors, the combining grapheme joiner before a mark, subdivision flags) refuses the whole request with a 400 before the subset filter (as does a non-string member; a URI `urllib` cannot parse, which used to raise `ValueError` in the loopback filter, instead drops out of the subset like any other URI that is not a valid loopback callback), so a NUL or lone surrogate never reaches the INSERT (Postgres or the driver's encoder would raise, a 500) and no invisible or reordering character is stored, echoed or logged; an unparseable body (not JSON, not UTF-8, nested too deep) and a `grant_types` / `response_types` that is not an array of strings are `invalid_client_metadata` 400s too, so no input answers a 500; duplicates collapse and the list is capped at 10. Applies a **silent** per-IP block via `throttle` — once an IP crosses the threshold it gets an inert 201 (no `Application` row persisted) indistinguishable from success. Request-body size is capped at 64 KiB by `decorators.cap_request_body`, applied to all four OAuth endpoints in `urls.py`; periodic cleanup of stale dynamically-registered Applications is deferred until a concrete abuse pattern names the threat. |
-| `signals.py` | Five receivers. (1) `user_logged_out` → deletes the user's pending `Grant` rows (authorization codes not yet exchanged) and `AccessToken` rows scoped to BOTH the canonical `mcp-sql` Application AND every dynamically-registered `mcp-sql-*` Application (`Q \| Q`, one shared `_mcp_application_q()` for both deletes) — the `mcp-sql-` prefix also covers settings-declared `mcp-sql-{cloud,local}.<slug>` clients. (2) `post_migrate` `provision_mcp_profiles` → idempotently `get_or_create`s one Permission (content_type `mcpquerylog`) + one Group per `MCP_SQL["PROFILES"]` entry (config-derived, replaces static `Meta.permissions` + migration 0004). (2b) `post_migrate` `provision_mcp_clients` → idempotently `update_or_create`s one curated `Application` (`mcp-sql-<kind>.<slug>`, public/PKCE, no secret, `skip_authorization=False`, every rule's URI space-joined into `redirect_uris`) per `MCP_SQL["CLIENTS"]` entry; create/update only (never deletes — deletion would cascade live tokens mid-`migrate`, and settings-gated recognition is already the off-switch — but rows no longer backed by settings are named in a WARNING). (3) `post_migrate` `audit_grants_drift_after_migrate` → calls `reconcile_grants(strict=False, apply=False)` and logs a WARNING when any profile's grants drift from its whitelist. **Read-only on the signal path.** Apply happens explicitly via `python manage.py mcp_sql_grants --apply` (`reconcile_grants(strict=True, apply=True)`) as a deploy step. Lenient mode: a fresh env whose DBA has not yet created the roles logs a WARNING and skips. (4) `m2m_changed` on `User.groups.through` → `logger.error` (Sentry event) when a user is ADDED to ANY MCP profile group; layered on top, a second ERROR when the addition leaves the user in >1 MCP profile group (ambiguous → denied until fixed). Gain-only, group-only by design (no defense without a named threat): losing a group, direct `user_permissions` grants, and group-permission-set changes are deliberately out of scope. Names the affected user(s) + profile(s); None-safe before provisioning (fresh DB). |
+| `signals.py` | Receivers. (1) `user_logged_out` → deletes the user's `AccessToken`, `RefreshToken` and pending `Grant` (authorization-code) rows scoped to BOTH the canonical `mcp-sql` Application AND every dynamically-registered `mcp-sql-*` Application (`Q \| Q`, one shared `_mcp_application_q()` for every delete) — the `mcp-sql-` prefix also covers settings-declared `mcp-sql-{cloud,local}.<slug>` clients. (1b) `pre_save` / `post_save` (connected without a sender, filtered with `isinstance`, so proxies of the user model count) → the same deletion after a password change commits on the saving alias (`password_change` audit row when anything was deleted; no session table needed; the stored hash is read with `User._base_manager.db_manager(using)`, so neither a row-filtering default manager nor a non-default alias hides it). Both revocations (`_revoke_and_audit`) delete on `db_for_write(AccessToken)` (DOT's token database) and write the audit row inside that transaction (a savepoint); on a database other than the one whose commit triggered them (logout: `default`) where this thread has a transaction open, they run on a separate connection in a transaction of their own (`_outside_open_transaction`; lock wait bounded to 5 s on PostgreSQL), so a rollback of that transaction cannot undo them — see "Watch out: revocation on a multi-database install"; only Django's login-time hash upgrade is exempt — the save `check_password` / `acheck_password` makes while it runs, which `install_password_check_marker` (called from `ready()`) marks by wrapping those two `AbstractBaseUser` methods with a context variable; any other new hash revokes, however it is saved — and bulk `QuerySet.update(password=...)` / `bulk_update` are not seen. (2) `post_migrate` `provision_mcp_profiles` → idempotently `get_or_create`s one Permission (content_type `mcpquerylog`) + one Group per `MCP_SQL["PROFILES"]` entry (config-derived, replaces static `Meta.permissions` + migration 0004). (2b) `post_migrate` `provision_mcp_clients` → idempotently `update_or_create`s one curated `Application` (`mcp-sql-<kind>.<slug>`, public/PKCE, no secret, `skip_authorization=False`, every rule's URI space-joined into `redirect_uris`) per `MCP_SQL["CLIENTS"]` entry; create/update only (never deletes — deletion would cascade live tokens mid-`migrate`, and settings-gated recognition is already the off-switch — but rows no longer backed by settings are named in a WARNING). (3) `post_migrate` `audit_grants_drift_after_migrate` → calls `reconcile_grants(strict=False, apply=False)` and logs a WARNING when any profile's grants drift from its whitelist. **Read-only on the signal path.** Apply happens explicitly via `python manage.py mcp_sql_grants --apply` (`reconcile_grants(strict=True, apply=True)`) as a deploy step. Lenient mode: a fresh env whose DBA has not yet created the roles logs a WARNING and skips. (4) `m2m_changed` on `User.groups.through` → `logger.error` (Sentry event) when a user is ADDED to ANY MCP profile group; layered on top, a second ERROR when the addition leaves the user in >1 MCP profile group (ambiguous → denied until fixed). Gain-only, group-only by design (no defense without a named threat): losing a group, direct `user_permissions` grants, and group-permission-set changes are deliberately out of scope. Names the affected user(s) + profile(s), read on the `m2m_changed` `using` alias (the database the membership was written to); None-safe before provisioning (fresh DB). |
 | `admin.py` | Unregisters django-oauth-toolkit's ModelAdmins (single-Application invariant), AND registers READ-ONLY admins for `MCPQueryLog` / `MCPAuthRejectionLog` (browse-only — `has_add/change/delete_permission` all False, via a LOCAL mixin, deliberately not a consumer-provided read-only mixin) plus a per-user **usage-summary** view at `/admin/mcp_sql/mcpquerylog/usage-summary/` aggregating allowed/rejected query + auth-rejection counts per rolling window (1h/24h/7d) — the `VOLUME_ALERT_THRESHOLDS` tuning instrument. `search_fields`/`ordering`/summary labels traverse the consumer user model's `USERNAME_FIELD`; the `user_email` display stays `get_username()`-generic — no email-keyed assumption. |
 | `migrations/0004_create_mcp_sql_users_group.py` | Retained **no-op**. Originally created the `mcp_sql_users` group + `mcp_sql.use_mcp_session` permission; provisioning moved to the config-derived `provision_mcp_profiles` `post_migrate` receiver (signals.py) because the package can't enumerate consumer profile names in a migration. Kept so the graph stays intact for environments that already applied it. |
 | `management/commands/mcp_sql_role_setup.py` | `--emit-sql`: generates the N-role bootstrap SQL (one `CREATE ROLE … NOLOGIN` + GUC defaults + membership `GRANT … TO <app_role>` per distinct profile role) from `MCP_SQL["PROFILES"]`, mirroring `sql/role_setup.sql`. Read-only — prints to stdout for a DBA to review/run (`… --emit-sql \| psql … -v app_role=<role>`); never connects or applies. |
 | `migrations/0005_create_mcp_sql_application.py` | Hand-written data migration creating the curated `mcp-sql` OAuth Application: public client, PKCE, `skip_authorization=False` (consent required like every client — see "Consent screen" in the "OAuth surface" section; up to 0.1.x this created `True`), RFC 8252 loopback redirect URI `http://127.0.0.1` (only — DOT 3.x doesn't treat `localhost` as loopback). |
-| `migrations/0015_curated_application_requires_consent.py` | Hand-written data migration setting `skip_authorization=False` on the existing curated row (looked up by `MCP_SQL["APPLICATION_NAME"]`, as 0005 does); reverse restores `True`. |
+| `migrations/0016_curated_application_requires_consent.py` | Hand-written data migration setting `skip_authorization=False` on the existing curated row (looked up by `MCP_SQL["APPLICATION_NAME"]`, as 0005 does); reverse restores `True`. |
 
 ## Settings shape
 
@@ -100,7 +104,10 @@ rule, applied identically by the `mcp_sql_settings` accessor and by
 never member-by-member (declaring `LIMITS` means declaring all three of its
 members). Validation runs on the MERGED mapping, so the shipped defaults are
 re-checked on every boot, and `extra="forbid"` is set at every level — a
-typo'd key is a boot error rather than a setting that silently does nothing.
+typo'd key anywhere (top level, inside `LIMITS`, a `PROFILES` entry, a
+`CLIENTS` entry or one of its `REDIRECTS` rules) is a boot error naming its
+path (`PROFILES.default.EXTRA`) rather than a setting that silently does
+nothing.
 Keys removed in a past release (`CLOUD_CLIENTS`) are named explicitly with
 their replacement.
 
@@ -138,8 +145,24 @@ MCP_SQL = {
         },
         # {} turns them all off (a declared key replaces its default wholesale)
     },
+    "PIN_SEARCH_PATH": True,  # recommended; default False (see below)
 }
 ```
+
+`PIN_SEARCH_PATH` (bool, default `False`; anything but `True` / `False`
+refuses to boot): whether every read transaction pins `search_path` to
+`public, pg_temp`. **Set it to `True`** unless an extension the agents use
+lives outside `public` (and even then, with the pin on, they can call it
+as `ext.f(…)` / `OPERATOR(ext.op)`). Off, unqualified names resolve
+through the database's own `search_path`, and a party with no right on
+any whitelisted table — any role with `CREATE` on the database, or
+another session on the same backend (e.g. under transaction-mode
+pooling) — can plant a same-named relation, readable through a grant to
+`PUBLIC`, whose rows the agent then reads under the whitelisted name;
+`mcp_sql_grants` does not detect it. A DBA's database- or login-level
+`search_path` listing another schema first does the same without any
+attacker. What each mode guarantees: "Watch out" → "`search_path` is
+pinned only on request".
 
 ## Profiles (access tiers)
 
@@ -177,7 +200,8 @@ and a single-tier consumer is a behaviour-preserving config.
   static `WHERE`). A universal table shared across tiers can be exposed to a
   narrower tier as a `WHERE <discriminator> = '<value>'` view; the role gets
   SELECT on the view only. RLS is deferred (role-keyed RLS only enforces *through* a
-  view on PG15+ `security_invoker`; the CI/test image is PG14).
+  view on PG15+ `security_invoker`; the supported floor is still PG14 on Django ≤ 6.0,
+  PG15 only on Django 6.1).
 - **Per-user scoping = the dormant `SESSION_CONTEXT` hook, NOT a feature.** A
   profile may set `SESSION_CONTEXT` to a dotted path
   `callable(user, profile) -> Mapping[str, str] | None` (default `None`;
@@ -233,7 +257,12 @@ security review of the override diff matters more than the review of
 the base diff** — env-specific entries are the highest-risk place to
 widen the surface.
 
-Each entry resolves at apply / check time to its `Model._meta.db_table`.
+Each entry resolves at apply / check time to its `Model._meta.db_table`,
+which names a relation in `public` — or, spelled `schema"."name` (Django's
+own spelling of a schema-qualified `db_table`), in that schema; the DBA
+grants the profile role `USAGE` on such a schema. The parser matches a
+reference only in that schema, and the drift check treats a SELECT grant
+on any other relation, in any non-system schema, as drift.
 `mcp_sql_grants --apply` emits **table-level** SELECT grants (no
 column-level grants). For sensitive subsets where exposing the full
 table would leak passwords, encrypted credentials, or other PII, use
@@ -304,7 +333,7 @@ underlying table — e.g. `"users.MCPUserSummary"` (view) rather than
 `"users.User"` (full table with `password`).
 
 To add a new curated view (e.g. for a table whose body text or other
-columns should stay hidden), follow the **two invariants** every
+columns should stay hidden), follow the **invariants** every
 view migration must uphold:
 
 - **Forward SQL uses `CREATE OR REPLACE VIEW`** (not bare `CREATE VIEW`)
@@ -331,11 +360,24 @@ view migration must uphold:
   records "model in state, no DB schema managed". See the consumer's
   existing curated-view migrations for a working example.
 
+- **A view that filters ROWS must be created `WITH (security_barrier)`.**
+  A view that only drops columns needs nothing more. But Postgres may push
+  the caller's `WHERE` conditions below the view's own filter, so a cast or
+  function in the agent's query is evaluated on rows the view hides — and
+  its error text quotes the hidden value (`invalid input syntax for type
+  integer: "<hidden value>"`), which `run_query` returns. With
+  `CREATE OR REPLACE VIEW mcp_<view> WITH (security_barrier) AS ...` the
+  view's own conditions are applied first and nothing leaks (verified;
+  ledger F71). This applies to every row-scoping view, including the
+  per-tenant `SESSION_CONTEXT` pattern. It is a documentation rule today:
+  nothing checks `pg_class.reloptions` yet.
+
 Steps:
 
 1. **Migration** in the owning app (e.g. `<owning_app>/migrations/000X_mcp_<view>_view.py`):
    ```python
    migrations.RunSQL(
+       # Add `WITH (security_barrier)` after the view name if it filters rows.
        sql="CREATE OR REPLACE VIEW mcp_<view> AS SELECT col_a, col_b, ... FROM <table>;",
        reverse_sql="DROP VIEW IF EXISTS mcp_<view>;",
        state_operations=[
@@ -363,17 +405,18 @@ column-level grants scattered in tooling state.
 ## OAuth surface
 
 - **Application identity**: four recognised kinds (`clients.ClientKind`), and every audit row records which one — the exact name `mcp-sql` (`curated`, the canonical row from migration 0005), the prefix `mcp-sql-` (`dcr`, every RFC 7591 dynamically-registered client, named `mcp-sql-<22 url-safe chars>`), and one settings-declared `mcp-sql-cloud.<slug>` (`cloud`) or `mcp-sql-local.<slug>` (`local`) per `MCP_SQL["CLIENTS"]` entry. The first two come from `mcp_sql_settings.APPLICATION_NAME` / `APPLICATION_NAME_PREFIX` (defaults `"mcp-sql"` / `"mcp-sql-"` — note the trailing dash, see "Watch out" for why); the declared two are a **settings-gated** branch in `consts.classify_application_name(name)` that matches against `mcp_sql_settings.clients()` (drop the entry from settings → denied at the next request, tokens included). Every branch is applied to a row only through `consts.classify_application(application)`, which recognises nothing unless the row's `client_id` equals its `name` (every row the package writes has one string in both; provisioning and the redirect checks key on `client_id`, recognition and the consent label on `name`). **A declared client's kind is DERIVED from its redirect scheme** (all-https → `cloud`, all-loopback → `local`, mixed → boot error), so `client_kind` on an audit row cannot drift from what the client is, and one client_id can never span a provider-hosted and a machine-local surface. The `.` after the kind keeps both ids disjoint from the DCR `<22 url-safe chars>` shape. `MCPOAuth2Validator` / `MCPOAuth2Authentication` use the helper; the logout signal uses `Q(name=APPLICATION_NAME) | Q(name__startswith=APPLICATION_NAME_PREFIX)` (the prefix covers the cloud shape too). All MCP-purpose Applications carry `client_type=public` (no `client_secret`), `authorization_grant_type=authorization_code`, PKCE-required.
-- **Consent screen**: every Application this package creates has `skip_authorization=False` — each DCR-minted `mcp-sql-<token>` row, each settings-declared `mcp-sql-{cloud,local}.<slug>` row, and (since migration 0015) the curated `mcp-sql` row. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The curated row used to skip consent ("operator-provisioned, fixed redirect, no rogue-client surface"), but its registered redirect is `http://127.0.0.1` and DOT accepts any port on a loopback IP, so the same phished link needs no rogue client at all (ledger F08). Declared clients' redirects are provider-hosted, shared callbacks, so the same surface applies. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template. Nothing in the package re-enables the skip: provisioning touches only declared rows (always `False`), `/o/register` always writes `False`, and DOT's admin is unregistered.
+- **Consent screen**: every Application this package creates has `skip_authorization=False` — each DCR-minted `mcp-sql-<token>` row, each settings-declared `mcp-sql-{cloud,local}.<slug>` row, and (since migration 0016) the curated `mcp-sql` row. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The curated row used to skip consent ("operator-provisioned, fixed redirect, no rogue-client surface"), but its registered redirect is `http://127.0.0.1` and DOT accepts any port on a loopback IP, so the same phished link needs no rogue client at all (ledger F08). Declared clients' redirects are provider-hosted, shared callbacks, so the same surface applies. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template. Nothing in the package re-enables the skip: provisioning touches only declared rows (always `False`), `/o/register` always writes `False`, and DOT's admin is unregistered.
 - **Single scope**: `mcp:sql`. `MCPOAuth2Validator` refuses to mint anything else, and `MCPOAuth2Authentication` re-checks the scope on every request.
-- **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb`). **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins. **Non-loopback (`https`) redirects are admitted only for operator-declared clients** (`MCP_SQL["CLIENTS"]`, see the "OAuth surface" clients note below): a declared client's redirect is decided from its `CLIENTS` entry alone (`MCPOAuth2Validator.validate_redirect_uri` → `oauth._declared_redirect_allowed`): `"exact"` rules through DOT's own matcher (`redirect_to_uri_allowed`) on the declared exact URIs, `"prefix"` rules through `_redirect_under_prefix`, which admits a per-instance callback under an allowlisted `https` host+path prefix (host-exact never `endswith`, no userinfo, no `..`, no backslash, port-exact). There is no fall-through to `super()`, so the provisioned row's `redirect_uris` (refreshed only by `post_migrate`) never decides; a client carrying both kinds of rule gets each kind matched by its own helper. `/o/register` itself is **still loopback-only**: it now registers the loopback SUBSET of a request's `redirect_uris` and echoes back what it registered (RFC 7591 §3.2.1) rather than refusing the whole request, which is what lets a client presenting extra non-loopback callbacks — Cursor sends up to three — register at all. Nothing non-loopback is ever stored, and an empty subset is still a refusal.
-- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`); refresh tokens "disabled" via `REFRESH_TOKEN_EXPIRE_SECONDS=0` — DOT still mints a `refresh_token` field in the token response (cosmetic), but its lifetime is 0 seconds so it cannot actually be used to refresh. Effective behavior: no usable refresh tokens. Authorization code expires in 60 s.
-- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
+- **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb` — any `@` in the authority, even an empty userinfo), any whitespace inside a URI (see "Watch out: DOT stores redirect URIs whitespace-joined"), any non-printable or non-ASCII character, and an unparseable authority or port — such a URI is never registered (whitespace or an invisible character refuses the whole request; anything else drops out of the loopback subset), and never a 500. `MCPOAuth2Validator` re-applies the same predicate at `/o/authorize/` to the requested redirect and to the stored default of every client that is not a declared cloud client, so a row that already stores an off-machine redirect cannot be redirected to it. **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins. **Non-loopback (`https`) redirects are admitted only for operator-declared clients** (`MCP_SQL["CLIENTS"]`, see the "OAuth surface" clients note below): a declared client's redirect is decided from its `CLIENTS` entry alone (`MCPOAuth2Validator.validate_redirect_uri` → `oauth._declared_redirect_allowed`): `"exact"` rules through DOT's own matcher (`redirect_to_uri_allowed`) on the declared exact URIs, `"prefix"` rules through `_redirect_under_prefix`, which admits a per-instance callback under an allowlisted `https` host+path prefix (host-exact never `endswith`, no `@` in the authority, no query / fragment / `;params`, no `..`, no backslash, port-exact). There is no fall-through to `super()`, so the provisioned row's `redirect_uris` (refreshed only by `post_migrate`) never decides; a client carrying both kinds of rule gets each kind matched by its own helper. `/o/register` itself is **still loopback-only**: it now registers the loopback SUBSET of a request's `redirect_uris` and echoes back what it registered (RFC 7591 §3.2.1) rather than refusing the whole request, which is what lets a client presenting extra non-loopback callbacks — Cursor sends up to three — register at all. Nothing non-loopback is ever stored, and an empty subset is still a refusal.
+- **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`), which is also the re-consent interval by default: no refresh tokens. `MCPServer`'s authorization-code grant then generates none (no `RefreshToken` row, no response field), `MCPOAuth2Validator.save_bearer_token` drops one a stock DOT token view would mint, and `/o/token/` answers every refresh grant with a constant `invalid_grant` (what makes an MCP client re-authorize), so refresh tokens minted by releases up to and including 0.1.0b5 are refused too. `REFRESH_TOKEN_EXPIRE_SECONDS` plays no part — on its own, `0` means *no age limit* to DOT, and such tokens did renew access. Authorization code expires in 60 s.
+- **Refresh tokens (opt-in)**: `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] > 0` adds oauthlib's refresh grant to `MCPServer`; every refresh rotates (`rotate_refresh_token` → `True`), and `validate_refresh_token` refuses a chain once the cap has passed since its consent — recorded per DOT `token_family` in `MCPRefreshTokenFamily` by `save_bearer_token` at the authorization-code exchange, because `cleartokens` deletes the chain's rotated-out rows. A family with no record (0.1.0b5 or earlier, or any token written outside `save_bearer_token`) is refused; rows whose refresh tokens are gone are inert and safe to prune (see `docs/oauth.md`). Logout and password change delete refresh tokens with the access tokens. Runbook: `docs/oauth.md` → "Refresh tokens (opt-in)".
+- **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs, as `MCPServer`-backed subclasses, plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
 - **Issuance gate** at `/o/authorize/`: `is_active AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
 - **Runtime gate** in `MCPOAuth2Authentication.authenticate` (every MCP request): the same issuance checks PLUS an **opt-in** session-existence check. The checks live in `_evaluate_gates`, which only decides; `authenticate` audits and raises. A gate that raises (a consumer `MFA_CHECKER` failing, a DB blip in `resolve_profile`, a bad `SESSION_MODEL`) is a denial too: one `gate_error` row and a **503** without `WWW-Authenticate` (`auth.GateUnavailable`), never an unaudited 500. Not a 401: MCP clients answer a 401 challenge with a full OAuth re-authorization, which during an MFA-backend or session-store outage fails the same way and can leave a hosted connector needing a manual reconnect. A token with no user (DOT allows one, e.g. `client_credentials` for another OAuth use case on the same install) is refused before the gates with a WARNING, since the rejection table needs a user; a token with no Application is a `bad_application` denial. When `MCP_SQL["SESSION_MODEL"]` is set to a session-with-user model, the gate runs `<model>.objects.filter(user=user, expire_date__gt=now()).exists()` and rejects on miss. When `SESSION_MODEL` is unset (`None`, the in-package default), the gate is skipped — stock `django.contrib.sessions.Session` has no `user` FK, so defaulting to it would crash with `FieldError`; making the gate opt-in is the honest contract. Consumers who DO enable the gate get the runtime half of Option D — without it, a Django session can die (cookie cleared, admin deletes the row, `clearsessions` sweeps an expired row, a restart wipes a cache-only session store) while the OAuth bearer outlives it for up to the token's 6h TTL. With the gate enabled, the consumer's `SESSION_COOKIE_AGE` becomes the *real* upper bound on token usefulness rather than just an issuance-time freshness proxy. Explicit logout still has its own fast path via the `user_logged_out` signal regardless of gate setting (deletes the user's MCP access tokens, so a request with one of them 401s on missing-token, not on missing-session, and their pending MCP authorization codes, so a code issued just before logout cannot be exchanged after it — short of an exchange already in progress at that instant).
 - **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
-- **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` rows AND their pending `Grant` rows (authorization codes not yet exchanged), both through the one predicate `signals._mcp_application_q()` (`Q(application__name=APPLICATION_NAME) | Q(application__name__startswith=APPLICATION_NAME_PREFIX)`, covering the curated Application, every dynamically-registered client, and every settings-declared `mcp-sql-{cloud,local}.<slug>` client); rows of Applications outside that predicate are untouched, while one whose name merely starts with the prefix is revoked even if recognition (`consts.is_mcp_application`) would reject it — deliberately looser, erring toward revocation (see "Trailing dash" below). Codes are deleted first, so an exchange that has not yet loaded its code fails. What logout cannot reach is an exchange already in progress — a code (or refresh token) redeemed in the same instant the revocation runs can still mint its token — or a user it cannot identify: a logout from an already-expired or cookie-less session sends `user=None` (allauth sends no signal at all), so it revokes nothing and writes no row (`docs/oauth.md` → "What logout cannot revoke"; the per-request session gate covers it only when `SESSION_MODEL` is set). Refresh-token rows are not deleted; tested with `REFRESH_TOKEN_EXPIRE_SECONDS=0`, a refresh token obtained before logout yields no usable MCP token after it — DOT 3.4.1 answers `invalid_grant` (its access token is gone), DOT 3.2.0 mints a token with an empty scope (read from the deleted access token) that the `mcp:sql` check refuses.
-- **Declared clients**: `MCP_SQL["CLIENTS"]` ships ON with `claude`, `chatgpt`, and `cursor` (the hosted-agent surface) — cloud-brokered clients that vault the token in the provider's cloud behind an `https` callback. Each entry provisions one curated `Application` (`mcp-sql-<kind>.<slug>`, public/PKCE, no secret, `skip_authorization=False`) via the `post_migrate` receiver `provision_mcp_clients` (mirrors `provision_mcp_profiles`; create/update only). A declared key replaces its default wholesale, so `"CLIENTS": {}` runs loopback-only. Redirect matching is per-rule `"exact"` (DOT's stock matcher) or `"prefix"` (`_redirect_under_prefix`), both run on the SETTINGS entry at every request — never on the provisioned row, which `post_migrate` refreshes only on `migrate` (a callback changed or removed in settings takes effect at the next request); a `local` entry (loopback callback, for a client that pins a fixed port and cannot DCR) is held to narrower rules — `localhost` only, explicit port, non-root path, exact match — and while one is declared, boot refuses DOT ≥ 3.4's `ALLOW_LOCALHOST_LOOPBACK=True` (it would port-wildcard `localhost` and widen the exact rule to any port). `manage.py mcp_sql_clients` prints each client_id + callbacks for pasting into a provider connector. No refresh tokens: cloud users re-consent every 6 h like everyone else. CIMD (Client ID Metadata Documents) is deferred — see `docs/oauth.md` → "Roadmap". Full onboarding, the Cursor surfaces, and the `SESSION_MODEL` recommendation: `docs/oauth.md` → "Clients".
-- **Audience binding**: the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. RFC 8707 Resource Indicators add to it only partly: DOT below 3.4 (the declared floor is 3.2) ignores `resource`; from 3.4 DOT stores it on the grant and token and, in `validate_bearer_token`, audience-checks a token that carries one against the request URL (by default a URL-prefix match, `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR`), but a token issued without one is unrestricted. The package therefore does not rely on RFC 8707 for binding — but it makes sure the check can never strand a token (ledger F135). Before, any `resource` was accepted, so another URL, or the endpoint with a different scheme, host or path, minted a token that `/mcp/sql/` refused on every call with a bare 401: no audit row (a failed bearer check never resolves a user) and each call counted toward the `bad_token` IP throttle, until a shared egress IP was silently blocked. Now both halves use the one identifier discovery advertises (`audience.mcp_resource_url`: `consts.absolute_url` + the endpoint path, i.e. `https://<host>/mcp/sql/` with `DEBUG` off): **issuance** — `/o/authorize/` (GET, and the consent POST's form field and query string) and `/o/token/` (`MCPTokenView`, query and body) accept a `resource` only if it names that URL — scheme and host in any case, the default port explicit or omitted (RFC 3986 §6.2; the MCP spec asks servers to accept uppercase scheme and host), the path exactly the endpoint's with or without the trailing slash (both spellings discovery serves), and a port only if the package takes it (not two ports and at most 65535, which URL parsers require too, so every accepted value is one DOT parses; at most five digits, the package's own cap — `urlsplit` and DOT also take a longer zero-padded spelling such as `:000443`) — and answer anything else `invalid_target` — a redirect to the already-validated `redirect_uri` with `state` at the authorization endpoint (no grant), a 400 at the token endpoint (code not consumed); that answer names the accepted value, never the client's. The checks are the package's own, so DOT below 3.4 answers the same. **One spelling**: when the grant carries a `resource`, DOT (3.4+) requires each `resource` at `/o/token/` to be one of the grant's as a string (`_check_and_set_request_resource`; with a resource-less grant it compares nothing and stores the token request's value), and Cursor sends the slashed spelling to `/o/authorize/` and the slash-less one to `/o/token/` — DOT answered `invalid_target` ("cannot escalate"). So both views rewrite every accepted value to `audience.canonical_resource_url` before DOT reads it (`canonical_resources`): `MCPAuthorizationView.dispatch` on `request.GET` (the GET's hidden field and skip-authorization credentials) and on the consent POST's `resource` field (item by item; the form's value replaces what oauthlib parsed from the raw query string, and `form_valid`'s query-vs-field agreement check compares the rewritten values), `MCPTokenView.post` on the form body. Grant, token request and token carry the same string. The canonical spelling is the advertised URL without its trailing slash: the MCP authorization spec's guidance for the server URI, and a raw-string prefix of both transport spellings (DOT's default validator accepts either spelling on either path). A foreign value is never rewritten (it stays foreign, and the check that follows refuses it). Rows stored before the rewrite: `MCPOAuth2Validator.save_bearer_token` first puts the token request's values in the grant's (looked up as DOT does, by code and client) or refresh token's own spelling when `audience.same_resource` says they are two spellings of it (`use_granted_spelling`), so such a code or refresh token still exchanges and the token is bound to the stored string; this half needs the package's validator, as the rest of the package does. **Verification** — `MCPOAuth2Authentication._verify_bearer` hands DOT the request URL built by `absolute_url` too (`audience.CanonicalUriOAuthLibCore`), not Django's `build_absolute_uri`: behind a TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`, `request.scheme` is `http` while discovery (and so the token's `resource`) says `https`, and DOT's check failed every legitimately issued token. With one rule on both sides, `SECURE_PROXY_SSL_HEADER` is not needed for this (it still matters for Django's own `is_secure()`), and the host is `request.get_host()` on both (`USE_X_FORWARDED_HOST` applies to both alike), spelled canonically by `consts.canonical_authority` (lowercased, default port dropped): a proxy forwarding `Host: <name>:443` would otherwise make discovery advertise `https://<name>:443/mcp/sql/`, which clients that parse it send back as `https://<name>/mcp/sql/`. New tokens carry the canonical spelling; one bound to another accepted spelling (issued before the rewrite) passes DOT's default validator, which compares parsed URLs; a custom `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings sees the canonical (slash-less) value against the request URL `CanonicalUriOAuthLibCore` builds (`https://<host>/mcp/sql/` on the slashed transport), so it has to allow for the trailing slash or compare by prefix. DOT's check stays in force: a token bound to a URL that is not a prefix of the endpoint's (rows from before the fix, or written by hand) still fails it; one bound to a prefix (the origin, `https://<host>/mcp`) passes DOT's default prefix validator, though the package no longer issues one. Residuals: the bare origin `https://<host>` and other prefixes of the endpoint URL (which DOT's prefix validator would accept as an audience) are `invalid_target` — no MCP client is known to send them (the MCP SDKs send the discovery document's `resource`), and accepting one would be a deliberate widening; a `resource` names the host the client authorized on, so a token from one `ALLOWED_HOSTS` name presented at another fails DOT's check (discovery points every client at the AS on its own host); and pre-fix tokens bound to a non-prefix URL keep 401ing until they expire. Pinned by `tests/test_resource_audience.py`.
+- **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` and `RefreshToken` rows AND their pending `Grant` rows (authorization codes not yet exchanged), all through the one predicate `signals._mcp_application_q()` (`Q(application__name=APPLICATION_NAME) | Q(application__name__startswith=APPLICATION_NAME_PREFIX)`, covering the curated Application, every dynamically-registered client, and every settings-declared `mcp-sql-{cloud,local}.<slug>` client); rows of Applications outside that predicate are untouched, while one whose name merely starts with the prefix is revoked even if recognition (`consts.is_mcp_application`) would reject it — deliberately looser, erring toward revocation (see "Trailing dash" below). The deletes commit together, so an exchange that has not yet loaded its code fails. What logout cannot reach is an exchange already in progress — a code (or refresh token) redeemed in the same instant the revocation runs can still mint its token — or a user it cannot identify: a logout from an already-expired or cookie-less session sends `user=None` (allauth sends no signal at all), so it revokes nothing and writes no row (`docs/oauth.md` → "What logout cannot revoke"; the per-request session gate covers it only when `SESSION_MODEL` is set). Refresh tokens exist only with the opt-in refresh grant; the three deletes are one transaction, and a password change triggers the same deletion (see the `signals.py` row and "Watch out: revocation on a multi-database install").
+- **Declared clients**: `MCP_SQL["CLIENTS"]` ships ON with `claude`, `chatgpt`, and `cursor` (the hosted-agent surface) — cloud-brokered clients that vault the token in the provider's cloud behind an `https` callback. Each entry provisions one curated `Application` (`mcp-sql-<kind>.<slug>`, public/PKCE, no secret, `skip_authorization=False`) via the `post_migrate` receiver `provision_mcp_clients` (mirrors `provision_mcp_profiles`; create/update only). A declared key replaces its default wholesale, so `"CLIENTS": {}` runs loopback-only. Redirect matching is per-rule `"exact"` (DOT's stock matcher) or `"prefix"` (`_redirect_under_prefix`), both run on the SETTINGS entry at every request — never on the provisioned row, which `post_migrate` refreshes only on `migrate` (a callback changed or removed in settings takes effect at the next request); a `local` entry (loopback callback, for a client that pins a fixed port and cannot DCR) is held to narrower rules — `localhost` only, explicit port, non-root path, exact match — and while one is declared, boot refuses DOT ≥ 3.4's `ALLOW_LOCALHOST_LOOPBACK=True` (it would port-wildcard `localhost` and widen the exact rule to any port). `manage.py mcp_sql_clients` prints each client_id + callbacks for pasting into a provider connector. No refresh tokens by default: cloud users re-consent every 6 h like everyone else (the opt-in refresh cap applies to them too). CIMD (Client ID Metadata Documents) is deferred — see `docs/oauth.md` → "Roadmap". Full onboarding, the Cursor surfaces, and the `SESSION_MODEL` recommendation: `docs/oauth.md` → "Clients".
+- **Audience binding**: the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. RFC 8707 Resource Indicators add to it only partly: DOT (3.4.1 is the floor; DOT #1626) requires a `resource` to be an absolute URI, stores it on the grant and token and, in `validate_bearer_token`, audience-checks a token that carries one against the request URL (by default a URL-prefix match, `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR`), but a token issued without one is unrestricted. The package therefore does not rely on RFC 8707 for binding — but it makes sure the check can never strand a token (ledger F135). Before, any `resource` was accepted, so another URL, or the endpoint with a different scheme, host or path, minted a token that `/mcp/sql/` refused on every call with a bare 401: no audit row (a failed bearer check never resolves a user) and each call counted toward the `bad_token` IP throttle, until a shared egress IP was silently blocked. Now both halves use the one identifier discovery advertises (`audience.mcp_resource_url`: `consts.absolute_url` + the endpoint path, i.e. `https://<host>/mcp/sql/` with `DEBUG` off): **issuance** — `/o/authorize/` (GET, and the consent POST's form field and query string) and `/o/token/` (`MCPTokenView`, query and body) accept a `resource` only if it names that URL — scheme and host in any case, the default port explicit or omitted (RFC 3986 §6.2; the MCP spec asks servers to accept uppercase scheme and host), the path exactly the endpoint's with or without the trailing slash (both spellings discovery serves), and a port only if the package takes it (not two ports and at most 65535, which URL parsers require too, so every accepted value is one DOT parses; at most five digits, the package's own cap — `urlsplit` and DOT also take a longer zero-padded spelling such as `:000443`) — and answer anything else `invalid_target` — a redirect to the already-validated `redirect_uri` with `state` at the authorization endpoint (no grant), a 400 at the token endpoint (code not consumed); that answer names the accepted value, never the client's. **One spelling**: when the grant carries a `resource`, DOT requires each `resource` at `/o/token/` to be one of the grant's as a string (`_check_and_set_request_resource`; with a resource-less grant it compares nothing and stores the token request's value; a refresh request is held to the refresh token's the same way), and Cursor sends the slashed spelling to `/o/authorize/` and the slash-less one to `/o/token/` — DOT answered `invalid_target` ("cannot escalate"). So both views rewrite every accepted value to `audience.canonical_resource_url` before DOT reads it (`canonical_resources`): `MCPAuthorizationView.dispatch`, after the parameter screen, on `request.GET` (the GET's hidden field and skip-authorization credentials) and on the consent POST's `resource` field (item by item; the form's value replaces what oauthlib parsed from the raw query string, and `form_valid`'s query-vs-field agreement check compares the rewritten values), `MCPTokenView.post`, after its foreign check, on the form body (a token POST with a query string is refused by oauthlib before it reads one). Grant, token request and token carry the same string. The canonical spelling is the advertised URL without its trailing slash: the MCP authorization spec's guidance for the server URI, and a raw-string prefix of both transport spellings (DOT's default validator accepts either spelling on either path). A foreign value is never rewritten (it stays foreign, and the check that follows refuses it). Rows stored before the rewrite: `MCPOAuth2Validator.save_bearer_token` first puts the token request's values in the grant's (looked up as DOT does, by code and client) or refresh token's own spelling when `audience.same_resource` says they are two spellings of it (`use_granted_spelling`), so such a code or refresh token still exchanges and the token is bound to the stored string; this half needs the package's validator, as the rest of the package does. **Verification** — `MCPOAuth2Authentication._verify_bearer` hands DOT the request URL built by `absolute_url` too (`audience.CanonicalUriOAuthLibCore`), not Django's `build_absolute_uri`: behind a TLS-terminating proxy without `SECURE_PROXY_SSL_HEADER`, `request.scheme` is `http` while discovery (and so the token's `resource`) says `https`, and DOT's check failed every legitimately issued token. With one rule on both sides, `SECURE_PROXY_SSL_HEADER` is not needed for this (it still matters for Django's own `is_secure()`), and the host is `request.get_host()` on both (`USE_X_FORWARDED_HOST` applies to both alike), spelled canonically by `consts.canonical_authority` (lowercased, default port dropped): a proxy forwarding `Host: <name>:443` would otherwise make discovery advertise `https://<name>:443/mcp/sql/`, which clients that parse it send back as `https://<name>/mcp/sql/`. New tokens carry the canonical spelling; one bound to another accepted spelling (issued before the rewrite) passes DOT's default validator, which compares parsed URLs; a custom `RESOURCE_SERVER_TOKEN_RESOURCE_VALIDATOR` that compares strings sees the canonical (slash-less) value against the request URL `CanonicalUriOAuthLibCore` builds (`https://<host>/mcp/sql/` on the slashed transport), so it has to allow for the trailing slash or compare by prefix. DOT's check stays in force: a token bound to a URL that is not a prefix of the endpoint's (rows from before the fix, or written by hand) still fails it; one bound to a prefix (the origin, `https://<host>/mcp`) passes DOT's default prefix validator, though the package no longer issues one. Residuals: the bare origin `https://<host>` and other prefixes of the endpoint URL (which DOT's prefix validator would accept as an audience) are `invalid_target` — no MCP client is known to send them (the MCP SDKs send the discovery document's `resource`), and accepting one would be a deliberate widening; a `resource` names the host the client authorized on, so a token from one `ALLOWED_HOSTS` name presented at another fails DOT's check (discovery points every client at the AS on its own host); and pre-fix tokens bound to a non-prefix URL keep 401ing until they expire. Pinned by `tests/test_resource_audience.py`.
 
 ## Naming map
 
@@ -417,6 +460,130 @@ The load-bearing invariants and footguns, grouped by layer:
   single helper that does this; do not inline a partial copy. The role-level
   defaults are kept in `role_setup.sql` as defense-in-depth in case the role
   is ever switched to `LOGIN`, not as active enforcement today.
+- **`default_transaction_read_only` does not make the RUNNING transaction
+  read-only.** It is read when a transaction starts, and the executor's has
+  already started (Django's `atomic` BEGIN) when the guard is set, so on
+  its own the read transaction stayed read-WRITE: a SECURITY DEFINER
+  function owned by a privileged role could write, and the write committed
+  (ledger F01). `enter_readonly_session` therefore also sets
+  `SET LOCAL transaction_read_only = on` (`session.TRANSACTION_GUCS`, per
+  transaction only, never a role default) — any write then fails with
+  SQLSTATE 25006 — and the executor marks its read transaction for rollback
+  after fetching, so it is never committed. `session_drift` (the smoke
+  check) reads the live flag, not only the default. Pinned by
+  `tests/test_readonly_transaction.py`.
+- **`standard_conforming_strings` is pinned on.** The parser (sqlglot) reads
+  `'a\b'` the way Postgres does only with it on; a database- or login-role
+  level `off` would make the executed SQL mean something else (quotes
+  shift). It is one of the per-transaction guards.
+- **`search_path` is pinned only on request (`MCP_SQL["PIN_SEARCH_PATH"]`,
+  default `False`) — set it to `True` unless an extension the agents use
+  lives outside `public`.** The parser checks an unqualified `FROM t` as
+  the whitelisted relation in `public` (`parser.DEFAULT_SCHEMA`); which
+  relation Postgres opens depends on the mode.
+  - **Off (default):** the read transaction does not touch `search_path`
+    (and `session_drift` does not check it), so Postgres opens the first
+    `t` on the login session's `search_path` — the database's default
+    (`"$user", public` unless configured), an `ALTER DATABASE` /
+    `ALTER ROLE <app login>` setting, a connection option. What can come
+    before `public` (each verified on PostgreSQL 15): a schema named after
+    the profile role (`"$user"` is `current_user`, the profile role under
+    `SET ROLE`; skipped unless the role has `USAGE` on it), a schema an
+    operator lists ahead of `public`, and a temporary relation (table or
+    view), which is searched first when `pg_temp` is not listed. The agent
+    cannot create one — its SQL is a single SELECT, its transaction is
+    read-only (`CREATE TEMP TABLE`, `CREATE TEMP VIEW` and `SELECT … INTO`
+    fail with "cannot execute … in a read-only transaction"),
+    `CREATE SCHEMA` needs a privilege the profile role is not given, and
+    `set_config` is on the deny list. `ALTER ROLE <profile role> SET
+    search_path` has no effect either way (role defaults are inert under
+    `SET ROLE`). Name resolution ignores privileges: when such a relation
+    shadows a whitelisted one, the query reads it if the profile role may
+    SELECT it, a grant to `PUBLIC` included, and otherwise fails
+    ("permission denied"; it does not fall through to `public`).
+    **What this exposes:** a party with no right on any whitelisted table
+    can make the agent read *its* rows under the whitelisted name
+    (verified on PostgreSQL 15; pinned by
+    `test_schema_scoping.TestUnpinnedShadowPlantedWithoutRights`):
+    - any role with `CREATE` on the database (by default its owner — often
+      the app's own login — plus any role granted it, e.g. a co-tenant app)
+      creates a schema named after the profile role, a same-named table in
+      it, and grants `USAGE` on the schema and `SELECT` on the table to
+      `PUBLIC`;
+    - another session on the same backend, e.g. under transaction-mode
+      pooling, creates a temporary relation (a view, or a table
+      `ON COMMIT PRESERVE ROWS`; `TEMP` on a database is granted to
+      `PUBLIC` by default) and grants `SELECT` on it to `PUBLIC`. The
+      alias's own connections are not reused with the documented
+      `CONN_MAX_AGE = 0`, but transaction-mode pgbouncer shares a backend
+      among every client of a pool (one database and server login), and
+      the relation lives as long as the backend. Confirmed on a single
+      backend; not reproduced through pgbouncer;
+    - without any attacker, a DBA or operator lists another schema ahead
+      of `public` (database- or login-level `search_path`, a connection
+      option) that holds a same-named relation the profile role can read.
+
+    The agent's `SELECT name FROM t` then returns the shadowing relation's
+    rows: an integrity / result-spoofing problem, and planted text can
+    carry prompt-injection content (the rows are still fenced as untrusted
+    data). `SELECT *` and whole-row references in a projection are
+    refused, so the agent reads only columns it names, but column names
+    are not checked against the model: a column only the shadow has is
+    read when a query names it. **`mcp_sql_grants` does not detect it:**
+    its inventory (`information_schema.role_table_grants WHERE grantee =
+    <profile role>`) does not see a grant to `PUBLIC`, one held through
+    role membership, a materialized view, or a temporary relation
+    (temporary schemas are skipped), nor the schema-level `USAGE` grant —
+    so the check stays clean while the shadow is served. It reports (and
+    `--apply` revokes) only a direct SELECT grant to the profile role on
+    a relation in a non-system schema, a relation the role owns included:
+    an operator's same-named copy readable through such a grant is the
+    one case above it catches. The profile role's own grants are
+    therefore not the boundary in this mode — what `PUBLIC` and the
+    role's memberships can read counts too, and nothing in the package
+    checks those. The qualified spelling of the shadowing relation
+    (`s.t`) stays refused.
+    Functions and operators still resolve in `pg_catalog` first, unless
+    the configured `search_path` lists `pg_catalog` explicitly after
+    another schema, which lets that schema's `lower(…)` replace the
+    built-in one for every query (verified; the deny list matches names,
+    so it would not see the swap).
+  - **On:** `SET LOCAL search_path = 'public', 'pg_temp'` is one of the
+    per-transaction guards (a list, written element by element:
+    `session.guc_value_sql`) and `session_drift` checks it, so an
+    unqualified name is the relation in `public` whenever one of that
+    name exists there, and no `"$user"` or operator-listed schema is
+    searched. `pg_temp` is listed last, not left out: when the whitelisted
+    relation is missing from `public` (dropped, not yet migrated, a
+    lagging replica), a temporary relation of that name on the backend is
+    opened instead (verified) — the same-backend case above, narrowed to a
+    whitelisted relation that does not exist. The cost: functions,
+    operators and types of
+    an extension installed in another schema are not found unqualified —
+    call the function qualified (`ext.similarity(…)`) and the operator as
+    `OPERATOR(ext.=)` / prefix `OPERATOR(ext.@) x` (`FaithfulPostgres`
+    keeps the name exactly as written, a quoted schema quoted, review
+    round 20); a bare `=` on a `citext` column in schema `ext` compares as
+    `text`, silently.
+  - **When to turn it on:** recommended for every install, and it costs
+    nothing whenever every extension the agents use lives in `public` or
+    `pg_catalog` (`SELECT extname, extnamespace::regnamespace FROM
+    pg_extension`; Django's `CreateExtension` installs into the first
+    schema on the app's `search_path`, normally `public`). A database
+    whose only schema is `public` loses nothing by it. An install whose
+    agents use an extension elsewhere can still turn it on and have them
+    write `ext.f(…)` / `OPERATOR(ext.op)`; left off, the exposure above
+    stays, and only the database's own privileges (who holds `CREATE` on
+    it, who shares a pooled backend, what `PUBLIC` may read) limit it.
+  - In both modes: an operator calls its function without naming it, so the
+    function deny list does not apply to operators, bare or in
+    `OPERATOR()`: in a stock catalog the only operators whose function it
+    would refuse by name are the immutable `pg_lsn` comparisons and
+    arithmetic (pinned by
+    `test_sql_fidelity.test_no_catalog_operator_runs_a_function_the_deny_list_refuses`);
+    an extension's operators in a schema the role can use are the DBA's to
+    vet, like its functions. Pinned by `tests/test_schema_scoping.py` and
+    `tests/test_search_path_pin.py`.
 - **Only `SET LOCAL`, never bare `SET`.** Library-wide invariant: every SQL
   `SET` issued by `mcp_sql` code (runtime read path AND bootstrap script)
   uses `SET LOCAL` inside an explicit transaction. Deployments commonly
@@ -429,14 +596,22 @@ The load-bearing invariants and footguns, grouped by layer:
   sends after the revert). A bare `SET` modifies session scope, is NOT
   popped at commit, and would persist on the reused backend as pgbouncer
   hands it to the next client. The only SQL `SET`s in the library are:
-  `session.py` (`SET LOCAL ROLE` + four `SET LOCAL <guc>` lines — the
-  runtime read path), and `sql/role_setup.sql` (`SET LOCAL
+  `session.py` (`SET LOCAL ROLE` + one `SET LOCAL <guc>` per entry of
+  `session_gucs()` — `EXPECTED_SESSION_GUCS`, plus `PINNED_SEARCH_PATH`
+  with the pin on — and `TRANSACTION_GUCS`: the runtime read path), `signals.py` (`SET LOCAL lock_timeout` on the revocation's own
+  connection, `_transaction`, PostgreSQL only — the multi-database
+  revocation path), and `sql/role_setup.sql` (`SET LOCAL
   mcp_sql.app_role` inside an explicit `BEGIN ... COMMIT` — the
-  bootstrap path). The four `ALTER ROLE mcp_readonly_role SET …` lines
-  in `role_setup.sql` are *not* session SETs — they write to
+  bootstrap path). The `ALTER ROLE mcp_readonly_role SET …` lines
+  in `role_setup.sql` (and those `mcp_sql_role_setup --emit-sql`
+  prints) are *not* session SETs — they write to
   `pg_db_role_setting` and apply only at LOGIN, so the pgbouncer
-  contamination model doesn't reach them. When grepping for compliance:
-  `grep -nE '\bSET\b'` over the package tree should match nothing
+  contamination model doesn't reach them. Pinned by
+  `test_session_context.test_no_production_code_issues_a_bare_set`, a
+  lexical scan of every string literal of the package's Python and of its
+  `.sql` files (a `SET` not followed by `LOCAL` where a statement starts,
+  inside PL/pgSQL and dynamic SQL too, or in a function definition); by
+  hand: `grep -nE '\bSET\b'` over the package tree should match nothing
   outside `SET LOCAL` (or `ALTER ROLE ... SET`).
 - **The membership grant** lives in `role_setup.sql` and is parametrised
   via the psql variable `app_role`. Callers pass `-v app_role=<role>`:
@@ -482,13 +657,268 @@ The load-bearing invariants and footguns, grouped by layer:
   `exp.Returning` only appears under write nodes, which NON_SELECT_ROOT
   rejects at the top level); SYSTEM_SCHEMA before SELECT_STAR so
   `SELECT * FROM pg_class` attributes to the catalog. Reorder with care —
-  `test_parser.TestCheckOrdering` pins the contract.
+  `test_parser.TestCheckOrdering` pins the contract. The lexical-fidelity
+  check (`UNSAFE_LITERAL`) runs before every AST check: when it fires, the
+  tree the other checks would inspect is not what Postgres would run.
+- **The whitelist names a relation in a schema.** A `db_table` is the
+  relation in `public`, or in the schema a `db_table` written
+  `schema"."name` names (`parser.relation_of`; Django's own spelling of a
+  schema-qualified table). `_check_tables` resolves each reference as
+  Postgres does — schema and name quoted exactly, unquoted folded, an
+  unqualified name as the one in `public` (what Postgres opens with
+  `PIN_SEARCH_PATH` on; off, see "`search_path` is pinned only on
+  request" above) — and accepts it only when that relation is on the
+  whitelist:
+  `analytics.t` beside a whitelisted `t` is `DISALLOWED_TABLE`, whatever
+  grants the role holds on it. Before round 16 the bare name matched in any
+  schema (ledger F04 / F132). A database qualifier (`db.public.t`) is left
+  to Postgres, which accepts only the current database; a system schema is
+  refused in any position. The column map the attribute-notation check
+  reads (`table_columns`) is keyed the same way, so `analytics.t` never
+  borrows `public.t`'s columns (keyed by the relation, `(schema, name)`).
+  On the grants side `granted_tables` lists SELECT grants in every
+  non-system schema (not `pg_catalog`, `information_schema`, `pg_*` —
+  temporary schemas included), so the drift check reports, and `--apply`
+  revokes, a grant on a relation nothing declares wherever it is. Limits:
+  it reads `information_schema.role_table_grants`, which lists neither
+  materialized views, nor grants to `PUBLIC`, nor grants the profile role
+  holds only through membership in another role (ledger F42 / F64). A
+  whitelisted `db_table` whose schema or table name is longer than 63
+  bytes (UTF-8; `grants.MAX_IDENTIFIER_BYTES`, PostgreSQL's `NAMEDATALEN -
+  1`) is refused by the reconciler in every mode (`overlong_entries`, like
+  a self-referential entry): PostgreSQL truncates such a name, so the
+  catalog lists a name the declared side never matches and each `--apply`
+  granted and revoked it in turn. Queries are unaffected (PostgreSQL
+  truncates the name in the agent's SQL the same way). The byte count is
+  UTF-8's: exact on a UTF-8 server, stricter than needed on a
+  single-byte one; a server built with another `NAMEDATALEN`, or a
+  multi-byte encoding that spends more bytes on a character than UTF-8
+  does (`EUC_TW`'s four-byte planes), is not read. `reconcile_grants`
+  checks every profile and computes every drift before it applies any,
+  then runs all GRANT / REVOKE statements in one transaction, so a
+  refused profile changes no grant (review round 19).
+- **Catalog names are untrusted SQL.** Whoever owns a relation names it,
+  and a name may hold `"`, `"."`, `;`, newlines. The grants pipeline
+  carries relations as `(schema, name)` tuples (inventory rows as read;
+  the declared side through `relation_of(db_table)`), compares tuples,
+  and renders SQL only through `grants.relation_sql` / `quote_ident`
+  (every `"` doubled; a name with a non-printing character written as a
+  `U&"…"` escape identifier, so a printed statement stays one line);
+  messages use `relation_display`. Before round 17 the inventory joined
+  `schema"."name` strings and interpolated them: a table named
+  `x" FROM r; CREATE TABLE …; --` granted to a profile role made
+  `--apply` run that SQL as the operator's role, and a name containing
+  `"."` broke the statement and rolled back every revoke. The role in
+  GRANT / REVOKE / `SET LOCAL ROLE` stays unquoted: it is boot-validated
+  as a plain identifier (`validation._PG_IDENTIFIER_RE`); the session
+  GUCs are import-validated constants. `mcp_sql_smoke` names its table
+  the same way (`relation_sql(relation_of(table))`).
+- **The executed SQL is the text that was validated — as sqlglot reads
+  it.** The executor never sends the agent's text; it sends sqlglot's
+  rendering of the validated tree, and that is not always faithful (ledger
+  F32 and its variants, on every supported sqlglot): stock sqlglot re-emits
+  `E'\\'` as `e'\'`, which swallows its closing quote, and `E'a\\nb'` as a
+  real newline, and an alias written as a dollar-quoted string (`AS $$x,
+  version() AS v$$`, which Postgres itself refuses) is re-emitted unquoted
+  as SQL — extra projections, or `; RESET ROLE; DELETE ...` as further
+  statements. Three layers close it:
+  1. The parser refuses source forms that sqlglot and Postgres read
+     differently (`UNSAFE_LITERAL`, checked first): escape strings with a
+     backslash (`FaithfulPostgres` renders an E-string as the plain string
+     it was read as, but sqlglot's tokenizer decodes only some escapes —
+     `\n`, `\t`, `\b`, `\r`, `\f`, `\\`, `\'`, and `\v` / `\a`, which
+     Postgres reads as the letters — and keeps the rest as written (`\x…`,
+     octal, `\u…`, `\0`), so `E'\x41'`, `A`
+     to Postgres, would run as `'\x41'`), `U&'…'` / `U&"…"` (sqlglot 30.7
+     reads `U & '…'`),
+     identifiers written as string constants, a double-quoted name called
+     as a function where the parsed tree does not keep the quoted name
+     (`"Count"(x)`, `"Extract"(...)` fold onto the builtin; `"Lower"(x)`,
+     quoted aliases / CTEs with a column list and `::"type"(n)` are kept
+     as written), adjacent string constants (sqlglot: `CONCAT`; Postgres:
+     an error on one line, a differently named column across a newline),
+     dollar-quote tags Postgres rejects, a sign written against an operator
+     that Postgres lexes into it, operator characters written together that
+     Postgres reads as another operator (`2 %-3` is `%-`, `y=~1` is `=~`).
+  2. `parser.render_for_execution` renders the LIMIT-wrapped tree WITHOUT
+     comments (their text is not in the tree), with function-name case
+     kept and `unsupported_level=RAISE` (a construct sqlglot cannot express
+     in Postgres — `IGNORE NULLS` / `RESPECT NULLS` — is refused, not
+     silently dropped), runs the FULL `parse_and_validate` on that text with
+     the same whitelist, and requires it to re-render to the identical
+     string and still end in exactly the injected LIMIT (or
+     `LIMIT LEAST(<as written>, n)` for a LIMIT that is not a plain
+     integer). If the first re-render only respells, that text is
+     validated and re-rendered in turn, up to three rounds. Otherwise
+     `ROUNDTRIP_MISMATCH`: audited, nothing executed. Respellings that keep
+     the meaning (`SOME` → `ANY`, `x::int` → `CAST(x AS INT)`, an expanded
+     window frame) validate and run; a rendering that smuggles in a
+     statement, a table or a denied function fails the checks (a harmless
+     extra projection would run — as checked).
+  3. `FaithfulPostgres` reads and renders Postgres SQL as written. Stock
+     sqlglot maps function calls onto its own nodes and renders them in its
+     own spelling, and much of that is not the same to Postgres (`like(a,
+     b)` → `b LIKE a`; `log10` / `date_part` → numeric instead of double
+     precision; `to_char` formats "translated"; zones dropped; `strpos` →
+     `POSITION`, `now()` → `CURRENT_TIMESTAMP`, other column names). So
+     every plain call `name(args)` is kept as written (`exp.Anonymous`),
+     except the three the checks match structurally (`count`,
+     `generate_series`, `unnest`) and Postgres's keyword-syntax functions
+     (`EXTRACT`, `SUBSTRING`, `TRIM`, `POSITION`, `OVERLAY`, `CAST`, the
+     SQL/JSON constructors), which render in sqlglot's spelling — not as
+     written, but read the same by Postgres: the `json_object` constructor
+     renders `'k' VALUE v` as `'k': v`, which Postgres 16 reads identically
+     (pinned in the corpus with `ABSENT ON NULL`, `RETURNING`, `FORMAT
+     JSON`); constructor clauses sqlglot cannot read (`json_array(… NULL ON
+     NULL)`, `json_objectagg(k VALUE v)`) are refused. It also keeps as
+     written: interval strings (multi-part, and with their quotes escaped;
+     the string ends the interval — Postgres has no sum of intervals, so a
+     `+` after it is the operator — and an interval field word is compared
+     as Postgres compares keywords, ASCII letters only), every form of
+     string constant as the string it is (`E'…'` without a backslash,
+     `$$…$$`, `$tag$…$tag$` — in an interval, a typed literal, an `ESCAPE`
+     clause or a LIMIT exactly like `'…'`), `INTERVAL` as a typed literal
+     only before a string constant (a `U&'…'` one is refused,
+     `UNSAFE_LITERAL`, where Postgres reads the literal) or `(` and
+     otherwise an ordinary name (a
+     column `interval`, sliced too, `interval[:1]`: sqlglot ran `interval +
+     1` as `INTERVAL '1'`; and `INTERVAL 5`, `INTERVAL 5 DAY`, `interval
+     day '1'` are parse errors, as in Postgres — but a bare field word
+     after the column is an alias, `SELECT interval day` runs as `interval
+     AS day`, which Postgres rejects, as for any column below), the right operand of `->` / `->>`, quoted type names, `bit` /
+     `char` typed literals, numeric constants (incl. the PG16 forms `0x1F`,
+     `0o17`, `0b101`, `1_000`), `IS NOT NULL` (on 30.7), the operators
+     `a ^@ b` (sqlglot read `a ^ (@ b)`), `!! q` and `! x` (read as `NOT`),
+     `DISTINCT` over several aggregate arguments, `current_*` precision.
+     `test_sql_fidelity.test_every_catalog_function_call_is_rendered_as_written`
+     renders a call (plain string arguments) to every `pg_catalog`
+     function the parser accepts and requires it unchanged, so a newer
+     sqlglot cannot bring a rewrite back unnoticed; the ones refused must be
+     denied functions or forms Postgres rejects too (a new refusal fails
+     it). Shaped arguments (`json_object(ARRAY[...])`, `INTERVAL '…' DAY`)
+     are pinned in the functional corpus.
+     When subclassing a sqlglot dialect, assign the parent's tokenizer
+     classes: a derived one reads `E'\''` differently.
+  The guarantee is about what **sqlglot** reads in the executed text: it
+  passed every check and re-parses (by sqlglot) to itself. It is not a proof
+  about Postgres's lexer, and values are only as faithful as sqlglot's
+  generator. Where the two are known to disagree, the form is refused in
+  layer 1 or rendered as written in layer 3; a disagreement nobody has
+  found yet is the residual risk. Known, accepted: `|/ x` / `||/ x` render as
+  `SQRT(x)` / `CBRT(x)` (another column name), a generic typed literal of a
+  type sqlglot does not know (`lseg '…'`) is refused; syntax Postgres rejects that sqlglot still understands (`REGEXP`,
+  `(+)`, `position(a, b)`, `extract('year', d)`, `SELECT 1abc` on PG15+, a
+  typed literal of a number, `text 5` / `date 20240101::text`, which runs
+  as a cast) is translated rather than failing as in Postgres (so is a keyword spelled
+  with a non-ASCII letter that Python's `str.upper` folds onto ASCII:
+  sqlglot's tokenizer reads `ſelect`, `aſ`, `ınner`, `unıon`, `lımıt` as
+  the keywords, where Postgres reads names and raises — or, when a name is
+  spelled that way, reads it: `SELECT falſe FROM (SELECT 1 AS falſe) s`
+  is `false` here, 1 in Postgres, and `SELECT 1 ınner` is refused; and an
+  interval field used as a bare alias, `INTERVAL '1 day' + '1' DAY`,
+  `SELECT interval day`, which Postgres requires `AS` for); and a few
+  valid forms sqlglot cannot parse are refused (`ORDER BY … USING`,
+  `national character varying(n)` / `national char(n)`, `j @? path` on
+  30.7; operators sqlglot cannot read bare, `x ~<~ y`, `|/ x` → `SQRT`,
+  run when written `OPERATOR(pg_catalog.~<~)`). The infix operator `a @ b` (no
+  built-in one since PostgreSQL 14; an extension may define it) is a
+  parse error beside an alias or in a condition, and as a projection
+  without an alias sqlglot reads `a` with the alias `@ b` and renders `a AS
+  @ b`, which Postgres refuses as a syntax error (fail-closed, never run
+  as something else); the prefix `@ x` is kept as written. Also accepted: `SELECT 123abc` / `1e3x` /
+  `1_000abc` keep sqlglot's reading `123 AS abc` (Postgres 14's; 15+
+  reject "trailing junk"), unary `+x` loses its `+` (column name `x` instead of
+  `?column?`), `x IS [NOT] UNKNOWN` renders as `x IS [NOT] NULL` (the same
+  for a boolean `x`; for any other type Postgres raises "argument of IS
+  UNKNOWN must be type boolean" and the rendering runs), and a quoted call of a
+  set-returning builtin (`"unnest"(...)`) is refused as `UNSAFE_LITERAL`,
+  the lexical check running first (also when the text does not parse:
+  `interval day E'a\b'` is `UNSAFE_LITERAL`, review round 17). Interval
+  types with a precision in a cast are kept as written (`'1.5'::interval(3)`,
+  `interval second(2)`, `interval day to second(3)`, as arrays too; sqlglot
+  rendered `INTERVAL 3` and read `second(2)` as an alias list — refused
+  before round 17); a precision before a field (`interval(1) day`) or on a
+  field other than `SECOND` is a parse error, as in Postgres. A word after
+  an interval type that is not one of Postgres's six fields is an alias
+  (`'90'::interval days`, `'90'::interval h`, `'1.5'::interval(1) secs`;
+  `_interval_alias`, review round 18 — sqlglot read a unit of its own
+  list there: the one-letter units ran as a field, a wrong value, `h` as
+  90 hours, `y` / `m` / `d` likewise; `days`, `mins`, `week` came back as
+  `INTERVAL DAYS`, ..., a Postgres syntax error), and what follows parses
+  as in Postgres (`CAST(x AS interval h)`, `interval min to sec`,
+  `interval h[]` are parse errors). The quoted `"interval"` is a plain
+  type name to Postgres and takes no field: a word after it is an alias
+  (review round 19; sqlglot dropped it). A field word or `varying` after
+  a complete type (`'1'::int day`, `'{1}'::interval[] day`,
+  `'90'::"interval" day`, `'1'::bit(3) varying`) is a parse error, as in
+  Postgres (an alias only after `AS`). The array
+  part of a type name is read as Postgres reads it (`_array_suffix`,
+  review round 19): `ARRAY` / `ARRAY[n]` after a type, in any position
+  (sqlglot dropped it at the end of the input — `'{a,b}'::text array` ran
+  as `text`, `'{1}'::interval day array` as one day — made it the alias
+  `array` before a comma and refused it before an operator), and bounds
+  (`'{1,2}'::int[3]`, `int[][1]`, `'{1.234}'::interval(1)[1]`, which
+  sqlglot rendered as a subscript of the cast, a Postgres syntax error;
+  `'{1.234}'::interval(1)[1]` returns `{00:00:01.2}`, as in Postgres)
+  run as written; `int[] array`, `int array[]`, a bound that is not an
+  unsigned integer constant, an array type in a typed literal (`int[]
+  '{1}'`) and a bare `array` alias are parse errors, as in Postgres. `bit
+  varying` / `bit varying(n)` is `varbit` (sqlglot read `bit` with the
+  alias `varying`: `'10101'::bit varying` ran as `bit(1)`, the value
+  `1`), `nchar varying` / `nchar varying(n)` `varchar` (review round 20;
+  refused before). A double-quoted type name is the name as written,
+  whole (`"int4"`, `"numeric"(10, 2)`, `"int4"[3]`; `"bit varying"`,
+  `"int array"` are names no type has — sqlglot read the text again as
+  SQL and ran `varbit`, review round 20); a type modifier sqlglot does
+  not keep on it (`"json"(3)`) is a parse error. `INTERVAL(3) '…'` (the precision form, with any form of
+  string constant) is kept as written,
+  and any other `INTERVAL(…)` (`INTERVAL(1 + 2) '…'`, `INTERVAL(3.0) '…'`,
+  `INTERVAL(3)` alone, `interval(1)` with a column `interval` in scope;
+  Postgres rejects them all) is a parse error. A LIMIT whose type is not evident from how it is
+  written (a column, a function call) is capped with `LEAST` uncast, so a
+  NaN / infinite float there yields the cap where Postgres raises. Valid
+  attribute-notation reads still refused (fail-closed): `(t).f` beside a
+  FROM item whose column names are not all known (`SELECT *`, a function,
+  `'x'::text`, a table without model columns), `(t).f` for a base-table or
+  CTE alias `t` (the bare-row check), `(t.*).f` under the default
+  `BAN_SELECT_STAR` (any `t.*` is `select_star`), `t.f` when a column `t`
+  is also in scope. Pre-existing and tracked separately:
+  psycopg2's type-cast errors escaping the audit, `reg*` casts as an
+  existence oracle. `tests/test_sql_functional_corpus.py` runs 933
+  ordinary analytical queries (over data with NULLs and mixed case) end to
+  end and checks each returns exactly what Postgres returns for the
+  original text (`repr`-exact), plus queries Postgres rejects that must
+  fail in Postgres through `run_query` too.
+  Never send `ast.sql()` to the database directly. Pinned by
+  `tests/test_sql_fidelity.py` (values and column names checked against
+  Postgres itself on a corpus of analytic shapes, on the sqlglot floor and
+  the newest 30.x).
+- **The whole-row ban covers projections.** With `BAN_SELECT_STAR` on
+  (the default), `_check_no_select_star` refuses a `*` / `t.*` anywhere
+  but inside `count(*)`, and the attribute forms `t.to_jsonb`,
+  `t.row_to_json`, … anywhere; `_check_no_whole_row_refs` refuses a bare
+  row alias (`t`, `to_jsonb(t)`, `row_to_json(t)`, `json_agg(t)`,
+  `CAST(t AS text)`) only in a `Select`'s **projection list** (a subquery's
+  included). In `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING` and `ORDER BY`
+  it is accepted: `SELECT max(id) FROM t WHERE to_jsonb(t)::text LIKE
+  '%"g": "a"%'` runs (whole-row contents as a filter or sort key, never
+  returned). The ban is a "name the columns" convention, not an access
+  boundary — every column it could reach is one `SELECT <col>` reads
+  under the same grants. Extending it beyond the projection would refuse
+  valid PostgreSQL, so it is an owner decision, not a fidelity fix.
 - **Row cap is most-restrictive-wins across three sources.** `run_query`'s
   effective row cap is `min(tool_kwarg, sql_LIMIT_N, HARD_LIMIT)`, falling
   back to `DEFAULT_LIMIT` when neither tool kwarg nor SQL LIMIT is set.
-  `parser.extract_limit` reads what the user wrote in SQL so the executor
-  can honor a small `LIMIT N`; `parser.inject_limit` then clobbers with
-  `clamped+1` for the N+1 truncation-detection trick. Without
+  `parser.extract_limit` reads a plain integer `LIMIT N` the user wrote so
+  the executor can honor it; `parser.inject_limit` then clobbers it with
+  `clamped+1` for the N+1 truncation-detection trick. Any other LIMIT
+  (`3.5`, `2 + 3`, a subquery, `-1`, `0x10`, an integer beyond bigint) is
+  kept for Postgres to evaluate and capped: `LIMIT LEAST(<as written>,
+  clamped+1)`. A value numeric as written is cast to bigint first — for
+  those an explicit cast is exactly Postgres's LIMIT coercion, and `LEAST`
+  over a float would turn `'NaN'` into the cap — while any other
+  expression is left to Postgres's type resolution (an explicit cast would
+  widen `LIMIT '3'::text`, an error, into a working LIMIT). Without
   most-restrictive, the executor would silently *raise* a user's `LIMIT 3`
   to `LIMIT 10+1` and return 10 rows + `truncated=True` — confusing the
   caller about both the row count and the truncation reason.
@@ -560,6 +990,24 @@ The load-bearing invariants and footguns, grouped by layer:
   MCP clients (Claude Code) would never receive the challenge they
   need to bootstrap OAuth. The regression is pinned by
   `tests/test_mcp_endpoint.py::TestStockDRFDefaultsDoNotPiercePackage`.
+- **Bearer tokens travel in the header only — and that is OUR server, not
+  DOT's default.** oauthlib's stock `BearerToken` falls back to an
+  `access_token` request parameter (query string, or a form body on any
+  method, since DOT reads it through DRF's `Request.POST`) when there is no
+  `Authorization` header, so DOT on its own authenticates
+  `/mcp/sql/?access_token=<token>`; every release up to and including
+  0.1.0b5 did. `MCPOAuth2Authentication` therefore verifies on `MCPServer`
+  (`_verify_bearer` → `get_mcp_oauthlib_core(CanonicalUriOAuthLibCore)`),
+  whose `HeaderOnlyBearer`
+  reads the header only: a token carried only as a parameter is never looked
+  up and the request is an ordinary 401 (same for a valid and a bogus token;
+  no `MCPAuthRejectionLog` row; no throttle count, as there is no header),
+  and beside a header the parameter is ignored. Never verify through DOT's
+  `get_oauthlib_core()` / `super().authenticate()` here — that is the
+  consumer's server. This is what keeps the RFC 9728
+  `bearer_methods_supported: ["header"]` honest; pinned by
+  `tests/test_auth_class.py::TestBearerTokenOnlyInHeader` and
+  `tests/test_oauth_server.py::TestConsumerServerClassDoesNotWiden`.
 ### MCP transport & tool dispatch
 
 - **`run_query` results are fenced; `rows` is a string, not a list.** The
@@ -794,16 +1242,20 @@ The load-bearing invariants and footguns, grouped by layer:
   discovery-views bullet above (`ALLOWED_HOSTS` +
   `SECURE_PROXY_SSL_HEADER`).
 - **Audit `client_ip` is normalised, never trusted as-is.** Every audit
-  writer (`executor._audit_safely`, `auth._audit_rejection`, the logout
-  receiver) stores `client_ip` through `consts.normalize_client_ip`, and the
-  view derives it with `consts.client_ip(request)`: a canonical IP string or
-  `None`. A front end that copies an unvalidated `X-Forwarded-For` entry into
-  `REMOTE_ADDR` (uvicorn `--proxy-headers --forwarded-allow-ips='*'`, a
-  hand-rolled `split(",")[0]` middleware) used to break the
-  `GenericIPAddressField` insert: psycopg 3 raised `ValueError` past every
-  audit wrapper (an executed query left no row, a gate denial became a 500),
-  psycopg2 a swallowed `DataError`. A new writer must go through the same
-  helper. The throttle keys are not audit rows and still use the raw value.
+  writer (`executor._audit_safely` for `MCPQueryLog`, whoever calls
+  `run_query` / `audit_tool_call`; `auth._audit_rejection`; the logout
+  receiver; the `/mcp/sql/` view) stores `client_ip` through
+  `models.audit_client_ip`: `REMOTE_ADDR` only when it is one IP address
+  without a zone, else NULL. A front end that copies an unvalidated
+  `X-Forwarded-For` entry into `REMOTE_ADDR` (uvicorn `--proxy-headers
+  --forwarded-allow-ips='*'`, a hand-rolled `split(",")[0]` middleware) used
+  to break the `GenericIPAddressField` insert: on psycopg 3 Django adapts an
+  `inet` value with `ipaddress.ip_address`, whose `ValueError` for a
+  forwarded list (`a, b`) no `DatabaseError` handler catches — it turned a
+  gate's 401 into a 500, left an executed query without its row and broke
+  logout; on psycopg2 PostgreSQL refused it and the row was lost. A new
+  writer must go through the same helper. The throttle keys are not audit
+  rows and still use the raw value.
 ### OAuth tokens & client identity
 
 - **Logout revokes the user's MCP tokens and pending codes** — both
@@ -811,17 +1263,50 @@ The load-bearing invariants and footguns, grouped by layer:
   `Q(application__name=mcp_sql_settings.APPLICATION_NAME) |
   Q(application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX)`.
   Both shapes are required since the trailing dash on the prefix means a
-  plain `startswith` no longer matches the canonical row; one helper so the
-  token and `Grant` deletes can never disagree. Pending codes go first, so a
-  code issued just before logout cannot be exchanged after it (the sequential
-  case is pinned by `test_oauth.py::TestLogoutKillsPendingCode`; an exchange
-  already in progress at that instant is not covered). Refresh-token rows are
-  not deleted; tested with `REFRESH_TOKEN_EXPIRE_SECONDS=0`, one obtained
-  before logout yields no usable MCP token after it — DOT 3.4.1 answers
-  `invalid_grant`, DOT 3.2.0 mints a token with an empty scope (read from the
-  deleted access token) that the `mcp:sql` check refuses (pinned by the same
-  test class, which branches on the installed DOT version; CI runs the 3.2
-  floor and the newest 3.x).
+  plain `startswith` no longer matches the canonical row; one helper
+  (`_mcp_application_q`) so the deletes can never disagree. The same scope
+  deletes the user's `RefreshToken` rows too (they exist only with the
+  opt-in refresh grant, or left by a release up to and including 0.1.0b5)
+  and pending `Grant` rows (an unexchanged code would otherwise still mint a
+  token; the sequential case is pinned by
+  `test_oauth.py::TestLogoutKillsPendingCode`, an exchange already in
+  progress at that instant is not covered); a password change triggers the
+  same deletion (`pre_save` /
+  `post_save` with no `sender` — Django sends the saved class, so a
+  `sender=User` receiver misses proxies — after commit), with no session
+  table involved.
+- **Revocation on a multi-database install.** The logout / password-change
+  revocation (`signals._revoke_and_audit`) runs once the triggering
+  transaction commits: the password change's on the alias the user was
+  saved to, logout's on `default` (the signal carries no alias; a router
+  that puts sessions elsewhere means a rollback there does not hold it
+  back). It deletes on `db_for_write(AccessToken)` — DOT's OAuth models
+  share one database (the tokens reference each other, and all three,
+  `Grant` included, reference the user and the Application, so an install
+  that splits them fails at DOT's own inserts) and DOT opens its token
+  transactions there — explicitly for all three models, and writes the audit row in
+  the same transaction (a savepoint, so a failed audit write — a database
+  error or any other exception — is rolled back to it and logged, and
+  does not undo the deletes; on a separate audit database the audit row
+  commits just before the deletes). A failed deletion (a database error,
+  the bounded lock wait below running out, the connection lost — also
+  while the audit row is written: the savepoint cannot be rolled back
+  then, and Django would roll the deletes back silently on leaving the
+  block) rolls back all three deletes, is logged with `logger.exception`
+  only (no audit row: the access did not end) and is not retried;
+  "Revoked …" is logged only once the deletes committed. Nothing raised leaves `_revoke_and_audit`, its setup included (a router raising in `db_for_write`):
+  with no transaction open the callback runs inside `logout()` (before
+  the session is flushed) or inside the user's `save()`. If this thread has a transaction open on that
+  database and it is not the triggering one (`ATOMIC_REQUESTS`, an
+  `atomic()` around the view), the work runs on a separate connection in
+  a transaction of its own (`_outside_open_transaction`), so that
+  transaction's rollback cannot undo it. That connection does not see
+  rows the open transaction wrote and has not committed (such tokens
+  survive), and waits at most `_OWN_CONNECTION_LOCK_TIMEOUT` (5 s, on
+  PostgreSQL) for a row lock that transaction holds — waiting longer
+  would wait on itself; a database error is logged (Sentry) and not
+  retried. Pinned by `tests/test_multi_db_revocation.py` (a real second
+  database).
 - **Trailing dash on `APPLICATION_NAME_PREFIX` is structural, and the DCR
   suffix shape is checked.** Without the dash `startswith("mcp-sql")` would
   match BOTH the canonical `mcp-sql` row AND every DCR-minted
@@ -852,18 +1337,94 @@ The load-bearing invariants and footguns, grouped by layer:
 - **A declared client's redirects are decided from settings, not its row.**
   `MCPOAuth2Validator.validate_redirect_uri` / `get_default_redirect_uri`
   return the settings verdict for a declared client with no fall-through to
-  DOT's row-backed `super()`. The row's `redirect_uris` is written by
-  provisioning but read by nothing for a declared client, and is refreshed
-  only by `post_migrate`; deciding from it let an old callback keep working
-  (and refused a new one) until the next `migrate`. The audit trail follows
-  suit: `consts.identify_application` builds a recognised declared client's
+  DOT's row-backed `super()` (after the loopback re-check for a declared
+  `local` client). The row's `redirect_uris` is written by provisioning but
+  read by nothing for a declared client, and is refreshed only by
+  `post_migrate`; deciding from it let an old callback keep working (and
+  refused a new one) until the next `migrate`. The audit trail follows suit:
+  `consts.identify_application` builds a recognised declared client's
   `client_redirect` from its `CLIENTS` entry, so audit rows and enforcement
-  agree. Recognition, redirects and their attribution are all
-  settings-gated per request — keep it that way for any new declared-client
-  check.
+  agree. Recognition, redirects and their attribution are all settings-gated
+  per request — keep it that way for any new declared-client check.
+- **DOT stores redirect URIs whitespace-joined.** An `Application`'s
+  `redirect_uris` is ONE string; DOT reads it back with
+  `redirect_uris.split()`. So `/o/register` must refuse any submitted URI
+  for which `uri.split() != [uri]` — otherwise one URI carrying an embedded
+  separator (space, tab, CR/LF, or any other `str.split()` whitespace such
+  as `\x0b`, `\x1c`, NBSP, U+2028) is stored as two redirects, the second
+  off-machine, while `urlparse` only ever validated the first host. The
+  check deliberately uses DOT's own operation so the two cannot drift; never
+  replace it with a regex or a narrower character list. Releases up to and
+  including 0.1.0b5 lacked it, so `MCPOAuth2Validator` also re-applies
+  `_is_loopback_redirect` to the *requested* redirect
+  (`validate_redirect_uri`) and to the stored default used when a request
+  omits one (`get_default_redirect_uri` — oauthlib never validates that
+  default) of every non-cloud client — the off-machine entry of a row minted
+  before the
+  fix is refused at `/o/authorize/` without the operator having to find the
+  row (its loopback entries still authorize, like any DCR client's). Pinned
+  by `test_registration.py::TestDynamicClientRegistrationValidation` and
+  `::TestAuthorizeLoopbackRecheck`.
+- **The OAuth server is narrowed on the package's views; the validator
+  keeps install-wide backstops.** DOT serves its views from
+  `OAUTH2_SERVER_CLASS`, by default oauthlib's all-grants `Server`, which
+  left the password (an anonymous password oracle: `unauthorized_client` for
+  a right password, `invalid_grant` for a wrong one), client-credentials,
+  refresh-token, device-code and implicit paths reachable behind the
+  package's URLs, and it is why releases up to and including 0.1.0b5
+  accepted `plain` PKCE and renewed access through refresh tokens forever.
+  The package's views and auth class now run on `oauth_server.MCPServer`
+  (one response type, one grant — plus the refresh grant only when
+  `REFRESH_TOKEN_MAX_AGE_SECONDS` opts in — `S256` only, header-only
+  bearer), which the consumer's settings cannot widen. The traps that keep
+  it that way:
+  - DOT's `TokenView.post` sends the device-code grant to its own handler
+    BEFORE any server runs, and oauthlib's authorization-code grant also
+    accepts `grant_type=openid`; `MCPTokenView.post` therefore refuses every
+    other `grant_type` itself (and answers a refresh grant with a constant
+    `invalid_grant` while refresh is off — the MCP TypeScript SDK
+    re-authorizes only on `invalid_grant`). Keep those checks first.
+  - DOT caches a view's oauthlib core behind `hasattr(cls,
+    "_oauthlib_core")`, which a core cached on the STOCK parent view
+    satisfies, so a subclass that only sets `server_class` silently runs on
+    the all-grants server once any stock view in the process has served a
+    request. `MCPServerViewMixin.get_oauthlib_core` builds the core per call
+    instead (no cache, and the server follows the current settings); any new
+    package OAuth view must use the mixin, and `MCPOAuth2Authentication`
+    must verify through `get_mcp_oauthlib_core(CanonicalUriOAuthLibCore)`
+    (the RFC 8707 audience URL, see "Audience binding"), never DOT's
+    `get_oauthlib_core()` / `super().authenticate()`.
+  - Both pin DOT's form-body `OAuthLibCore` (the bearer check a subclass of
+    it that only rebuilds the request URL): the token guard and the RFC 8707
+    `resource` check read `request.POST`, and a consumer
+    `OAUTH2_BACKEND_CLASS` (e.g. the deprecated `JSONOAuthLibCore`) could
+    otherwise hand the server a body the checks never saw.
+  - Parameters DOT stores raw on a `Grant` (`code_challenge`, `nonce`,
+    `resource`, ...) are screened in `MCPAuthorizationView.dispatch` before
+    DOT runs; a NUL or an over-long value otherwise reached the INSERT
+    (DataError 500).
+  - The validator must be the install's `OAUTH2_VALIDATOR_CLASS` (boot
+    check), so it also serves stock DOT views a consumer mounts. Its
+    backstops (`is_pkce_required` → `True`, `get_code_challenge_method`
+    S256-only, `validate_user` → `False`, `_load_application` refusing a
+    control-character `client_id`, and the refresh policy in
+    `save_bearer_token` / `validate_refresh_token`) hold there too.
+    `get_code_challenge_method` is also what turns a stored non-S256 grant
+    into `invalid_grant` on `MCPServer` (the grant's method table alone
+    would answer `server_error`).
+  `MCPServer` relies on two oauthlib internals
+  (`AuthorizationCodeGrant._code_challenge_methods`, the per-grant
+  `refresh_token` flag), pinned by
+  `test_oauth_server.py::TestOauthlibInternals`; oauthlib is declared
+  `>=3.3.0,<5` for that reason. Before adding a policy hook, check that
+  oauthlib or DOT really calls it and pin it end to end through the URLs
+  (`test_oauth_server.py`, `test_refresh_tokens.py`,
+  `test_oauth.py::TestPKCEEnforcedEndToEnd`, `::TestRefreshRefused`), not
+  with a unit call alone.
+
 ### Curated-view migrations
 
-- **Curated-view migrations have two mandatory invariants** that any new
+- **Curated-view migrations have mandatory invariants** that any new
   view migration MUST uphold (see the "Curated-view pattern" section
   above for the full recipe):
   1. Forward SQL is `CREATE OR REPLACE VIEW`, not bare `CREATE VIEW`, for
@@ -880,3 +1441,8 @@ The load-bearing invariants and footguns, grouped by layer:
      state-only migration on every run, and `check-migrations` (CI gate)
      fails. The CreateModel mirrors the model's fields and
      `options={"managed": False, "db_table": ...}`.
+  3. A view that filters rows (any `WHERE` that hides rows, tenant scoping
+     included) is created `WITH (security_barrier)`; otherwise a cast in the
+     agent's `WHERE` runs on the hidden rows first and the error text leaks
+     their values (ledger F71). Column-only views are unaffected. Not
+     machine-checked yet.

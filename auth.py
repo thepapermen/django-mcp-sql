@@ -9,6 +9,11 @@ view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. See
 Option D session-trust, the body-cap rationale, and the isolation
 contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalDRF`.
 
+Bearer tokens are verified on the package's narrow `oauth_server.MCPServer`
+(header-only `HeaderOnlyBearer`), not on the consumer's `OAUTH2_SERVER_CLASS`,
+through `audience.CanonicalUriOAuthLibCore` (DOT's RFC 8707 audience check
+sees the URL discovery advertises).
+
 Every **resolved-user** rejection in `authenticate` (the defense-in-depth
 gates in `_evaluate_gates`, run once `_verify_bearer(...)` returns a
 user/token pair, plus `GATE_ERROR` when one of them raises) writes one
@@ -46,14 +51,14 @@ from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import absolute_url
-from mcp_sql.consts import client_ip
 from mcp_sql.consts import identify_application
 from mcp_sql.consts import is_mcp_application
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import audit_client_ip
+from mcp_sql.oauth_server import get_mcp_oauthlib_core
 from mcp_sql.schemas import AuthRejectionReason
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
-from oauth2_provider.settings import oauth2_settings
 from rest_framework import exceptions
 from rest_framework.exceptions import APIException
 from rest_framework.request import Request
@@ -213,36 +218,37 @@ class MCPOAuth2Authentication(OAuth2Authentication):
 
     def authenticate(self, request):
         # `_verify_bearer` calls `oauthlib_core.verify_request`, which
-        # extracts the body via `request.POST.items()`. For application/json
-        # request bodies (the MCP wire protocol's content type), DRF's
-        # JSONParser consumes the body stream as a side effect, leaving the
-        # downstream `request.body` access in `_invoke_wsgi_app` raising
+        # extracts the body via DRF's `request.POST`; that runs DRF's parsers
+        # (JSON for the MCP wire protocol, and the default form / multipart
+        # parsers on ANY method), consuming the body stream, so the
+        # downstream `request.body` access in `_invoke_wsgi_app` would raise
         # `RawPostDataException`. Force-cache the raw bytes on the underlying
-        # Django HttpRequest BEFORE super() runs so the MCP view can still
-        # re-seed `wsgi.input` from `request.body`. Gated to body-carrying
-        # JSON requests: this auth class is mounted ONLY on `/mcp/sql/`,
-        # which is JSON-RPC and rejects non-JSON content types via DRF's
-        # parser negotiation — so the JSON gate is exhaustive for paths
-        # that can actually reach the bridge, and the explicit method
-        # whitelist keeps GET/HEAD from flipping `_read_started=True` for
-        # free.
+        # Django HttpRequest BEFORE it runs — always, whatever the method
+        # or content type — so the MCP view can still re-seed `wsgi.input`
+        # from `request.body`.
         django_request = getattr(request, "_request", request)
         _enforce_body_size_cap(django_request)
-        # `/mcp/sql/` is JSON-RPC POST only (DRF parser negotiation rejects
-        # non-JSON content types upstream of this code), so we always have
-        # a body to materialise. The `hasattr` guard makes the force-cache
-        # idempotent — DRF body negotiation re-runs would otherwise raise
-        # `RawPostDataException` when the bridged WSGI worker re-reads.
+        # The `hasattr` guard makes the force-cache idempotent — a re-run
+        # would otherwise raise `RawPostDataException` when the bridged WSGI
+        # worker re-reads.
         if not hasattr(django_request, "_body"):
             _ = django_request.body
 
-        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate()` on an
-        # audience-canonical core) returns `None` on bad / expired / unknown /
-        # revoked tokens, and from DOT 3.4 on a token bound to another
-        # `resource` (it does NOT raise). The only paths that DO raise are
-        # `SuspiciousOperation` (hex-encoding bug) and re-raised `ValueError`
-        # from oauthlib — both indicate malformed transport, not credential
-        # probing; we let them bubble.
+        # Header-only bearer tokens (RFC 6750 §2.1) are the server's job:
+        # `_verify_bearer` runs on `MCPServer`, whose `HeaderOnlyBearer` never
+        # reads an `access_token` query or form parameter. A request carrying
+        # its token only there is simply unauthenticated — never looked up,
+        # not counted by the `bad_token` throttle (no `Authorization`
+        # header), answered with the ordinary 401 challenge — and beside a
+        # header the parameter is ignored: the header's token decides.
+
+        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate()` on
+        # `MCPServer` and an audience-canonical core) returns `None` on bad /
+        # expired / unknown / revoked tokens, and from DOT 3.4 on a token
+        # bound to another `resource` (it does NOT raise). The only paths
+        # that DO raise are `SuspiciousOperation` (hex-encoding bug) and
+        # re-raised `ValueError` from oauthlib — both indicate malformed
+        # transport, not credential probing; we let them bubble.
         #
         # We deliberately do NOT INSERT an `MCPAuthRejectionLog` row on
         # the `result is None` path: anonymous and bad-token traffic are
@@ -357,11 +363,14 @@ class MCPOAuth2Authentication(OAuth2Authentication):
 
     @staticmethod
     def _verify_bearer(request: Request) -> "tuple[Any, AccessToken] | None":
-        """DOT's `OAuth2Authentication.authenticate`, on a core that gives
-        DOT's RFC 8707 audience check the URL discovery advertises.
+        """DOT's `OAuth2Authentication.authenticate`, verifying on `MCPServer`
+        through a core that gives DOT's RFC 8707 audience check the URL
+        discovery advertises.
 
-        Same server and validator as DOT's `get_oauthlib_core()` (the
-        consumer's `OAUTH2_SERVER_CLASS` / `OAUTH2_VALIDATOR_CLASS`), but the
+        DOT's version builds its core from the consumer's `OAUTH2_SERVER_CLASS`
+        (`get_oauthlib_core()`), which could take the token from the query
+        string or a form body too; the package's server reads the
+        `Authorization` header only (`oauth_server.HeaderOnlyBearer`). The
         backend is `audience.CanonicalUriOAuthLibCore`: from DOT 3.4 a token
         bound to a `resource` is compared with the request URL, and DOT's own
         `build_absolute_uri` would say `http` behind a TLS-terminating proxy
@@ -370,11 +379,8 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         own challenge; `authenticate_header` here builds its own, so it is
         not carried over.
         """
-        server = oauth2_settings.OAUTH2_SERVER_CLASS(
-            oauth2_settings.OAUTH2_VALIDATOR_CLASS(), **oauth2_settings.server_kwargs
-        )
         try:
-            valid, r = CanonicalUriOAuthLibCore(server).verify_request(
+            valid, r = get_mcp_oauthlib_core(CanonicalUriOAuthLibCore).verify_request(
                 request, scopes=[]
             )
         except ValueError as error:
@@ -529,7 +535,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 client_redirect=client.redirect,
                 reason=reason,
                 error=error,
-                client_ip=client_ip(request),
+                client_ip=audit_client_ip(request.META.get("REMOTE_ADDR")),
                 started_at=timezone.now(),
             )
         except DatabaseError:

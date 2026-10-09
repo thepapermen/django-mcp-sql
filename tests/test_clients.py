@@ -325,7 +325,7 @@ class TestClientValidation:
     @pytest.mark.parametrize("entry", [CLAUDE, CURSOR_DESKTOP], ids=["cloud", "local"])
     def test_slug_overflowing_the_client_id_column_is_refused_at_boot(self, entry):
         """A derived client_id longer than DOT's `Application.client_id`
-        (100 on DOT 3.2, 255 on 3.4) or `name` (255) used to pass boot and
+        (255 on DOT 3.4) or `name` (255) used to pass boot and
         fail `migrate` with a DataError in `provision_mcp_clients`."""
         slug = "a" * (self._max_slug() + 1)
         with pytest.raises(ImproperlyConfigured, match="at most"):
@@ -669,6 +669,28 @@ class TestRedirectUnderPrefix:
             pytest.param(
                 "https://chatgpt.com:notaport/connector/oauth/x", id="malformed-port"
             ),
+            # Strict: no `@` in the authority at all, no query / fragment (not
+            # even a bare `?` / `#`), no `;params`.
+            pytest.param("https://@chatgpt.com/connector/oauth/x", id="empty-userinfo"),
+            pytest.param(
+                "https://:@chatgpt.com/connector/oauth/x", id="empty-userinfo-colon"
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x?next=https://evil.example",
+                id="query",
+            ),
+            pytest.param("https://chatgpt.com/connector/oauth/x?", id="bare-query"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#frag", id="fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#", id="bare-fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x;p=1", id="path-params"),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%3bnext=https://evil.example",
+                id="encoded-path-params",
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%253Bp=1",
+                id="double-encoded-path-params",
+            ),
         ],
     )
     def test_rejects_bypass_attempts(self, uri):
@@ -683,6 +705,129 @@ class TestRedirectUnderPrefix:
         assert _redirect_under_prefix(f"{bare}EVIL/steal", bare) is False
         assert _redirect_under_prefix(f"{bare}-attacker", bare) is False
         assert _redirect_under_prefix(f"{bare}/inst-42", bare) is True
+
+
+@pytest.mark.django_db
+class TestExactCloudClientMatchedExactly:
+    """An "exact" cloud client rides DOT's own matching, which is exact only
+    from django-oauth-toolkit 3.4.1 (the floor; RFC 9700 §2.1). DOT 3.4.0's
+    matcher still accepted the registered host with userinfo, extra query
+    parameters, a fragment or `;params` added. oauthlib's absolute-URI check
+    stops fragments and any userinfo longer than one character first (its
+    userinfo rule matches a single character), but on 3.4.0 a one-character
+    userinfo, the extra-query and the `;params` forms reached the consent page
+    (and then the code redirect)."""
+
+    @staticmethod
+    def _authorize(client, redirect_uri):
+        from urllib.parse import urlencode
+
+        from django.urls import reverse
+
+        params = {
+            "client_id": CLAUDE_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        return client.get(reverse("authorize") + "?" + urlencode(params))
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "https://attacker@claude.ai/api/mcp/auth_callback",
+            "https://a@claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
+            "https://claude.ai/api/mcp/auth_callback#frag",
+            "https://claude.ai/api/mcp/auth_callback;p=1",
+        ],
+        ids=["userinfo", "one-char-userinfo", "extra-query", "fragment", "path-params"],
+    )
+    def test_near_miss_of_the_registered_callback_is_refused(
+        self, client, settings, mcp_user, mcp_mfa_on, variant
+    ):
+        _provision(settings, {"claude": CLAUDE})
+        client.force_login(mcp_user)
+        response = self._authorize(client, variant)
+        assert response.status_code == 400, response.content
+        assert "Location" not in response
+
+    def test_registered_callback_gets_the_consent_page(
+        self, client, settings, mcp_user, mcp_mfa_on
+    ):
+        _provision(settings, {"claude": CLAUDE})
+        client.force_login(mcp_user)
+        response = self._authorize(client, CLAUDE_URI)
+        assert response.status_code == 200, response.content
+
+
+class TestDeclaredLocalClientLoopbackRecheck:
+    """Only a declared CLOUD client is exempt from the loopback re-check in
+    `MCPOAuth2Validator.validate_redirect_uri`. A declared `local` client's
+    callbacks are loopback by derivation, but its Application row is plain
+    data: one hand-edited to carry an off-machine redirect must not get a
+    code sent there, even though DOT's own matching of the row would accept
+    the stored value. Refused twice over since declared redirects are decided
+    from settings (the row is never read) — the loopback re-check stays as
+    the second guard."""
+
+    OFF_MACHINE = "https://evil.example/cb"
+
+    @staticmethod
+    def _params(redirect_uri):
+        return {
+            "client_id": CURSOR_DESKTOP_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+
+    def _provision_edited(self, settings):
+        from oauth2_provider.models import Application
+
+        _provision(settings, {"cursor-desktop": CURSOR_DESKTOP})
+        app = Application.objects.get(client_id=CURSOR_DESKTOP_ID)
+        app.redirect_uris = f"{app.redirect_uris} {self.OFF_MACHINE}"
+        app.save(update_fields=["redirect_uris"])
+
+    @pytest.mark.parametrize("method", ["get", "post"])
+    def test_off_machine_redirect_on_a_local_row_is_the_error_page(
+        self, client, settings, mcp_user, mcp_mfa_on, method
+    ):
+        from django.urls import reverse
+        from oauth2_provider.models import Grant
+
+        self._provision_edited(settings)
+        client.force_login(mcp_user)
+        params = self._params(self.OFF_MACHINE)
+        if method == "get":
+            response = client.get(reverse("authorize"), data=params)
+        else:
+            response = client.post(
+                reverse("authorize"), data={**params, "allow": "Authorize"}
+            )
+        assert response.status_code == 400, response.content
+        assert "Location" not in response
+        assert not Grant.objects.exists()
+
+    def test_declared_loopback_callback_still_gets_the_consent_page(
+        self, client, settings, mcp_user, mcp_mfa_on
+    ):
+        from django.urls import reverse
+
+        self._provision_edited(settings)
+        client.force_login(mcp_user)
+        response = client.get(
+            reverse("authorize"),
+            data=self._params(CURSOR_DESKTOP["REDIRECTS"][0]["URI"]),
+        )
+        assert response.status_code == 200, response.content
 
 
 class TestValidateRedirectUriOverride:
@@ -831,10 +976,11 @@ class TestValidateRedirectUriOverride:
     )
     def test_userinfo_at_the_prefix_rules_own_path_is_refused(self, settings, uri):
         """A prefix rule is not an exact callback: only `_redirect_under_prefix`
-        sees its URI, and it refuses any userinfo. DOT's matcher must not be
-        handed it — on DOT 3.2/3.3 that matcher compares the parsed hostname
-        and ignores userinfo, so it would admit this URI sitting exactly at
-        the prefix's own path."""
+        sees its URI, and it refuses any userinfo. The supported DOT (3.4.1+)
+        refuses userinfo in its own matcher too, so here this pins that the
+        refusal does not depend on DOT: a matcher that compares only the
+        parsed hostname (DOT before 3.4) would admit this URI sitting exactly
+        at the prefix's own path if it were ever handed the prefix's URI."""
         settings.MCP_SQL = _cfg({"chatgpt": CHATGPT})
         assert (
             MCPOAuth2Validator().validate_redirect_uri(CHATGPT_ID, uri, request=None)

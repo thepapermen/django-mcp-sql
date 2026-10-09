@@ -12,6 +12,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import pgcode
 from mcp_sql.executor import run_query
+from mcp_sql.parser import relation_of
 from mcp_sql.session import enter_readonly_session
 from mcp_sql.session import session_drift
 
@@ -206,16 +207,19 @@ class Command(BaseCommand):
                 msg = (
                     "Session GUC drift after enter_readonly_session: "
                     f"{drift}. The role / SET LOCAL contract is not in sync "
-                    "with sql/role_setup.sql; review session.EXPECTED_SESSION_GUCS."
+                    "with sql/role_setup.sql; review session.session_gucs()."
                 )
                 raise CommandError(msg)
             cur.execute("SELECT 1")
             assert cur.fetchone() == (1,)
-            cur.execute(f'SELECT 1 FROM "{table}" LIMIT 1')  # noqa: S608
+            # `table` is a `db_table` (`schema"."name` names another schema).
+            read = f"SELECT 1 FROM {grants.relation_sql(relation_of(table))} LIMIT 1"  # noqa: S608
+            cur.execute(read)
             cur.fetchall()
         self.stdout.write(
             self.style.SUCCESS(
-                f"Read path ok: SET LOCAL ROLE + 4 GUCs verified, "
+                "Read path ok: SET LOCAL ROLE + session GUCs (incl. the live "
+                f"transaction_read_only) verified, "
                 f"SELECT FROM {table} ok"
             )
         )
@@ -262,7 +266,8 @@ class Command(BaseCommand):
                 connections[mcp_sql_settings.DB_ALIAS].cursor() as cur,
             ):
                 enter_readonly_session(cur, role=profile.role)
-                cur.execute(f'INSERT INTO "{table}" DEFAULT VALUES')
+                relation = grants.relation_sql(relation_of(table))
+                cur.execute(f"INSERT INTO {relation} DEFAULT VALUES")
                 # INSERT did not raise. Force rollback so any side effect (in
                 # case the readonly guard is bypassed AND grants are
                 # misconfigured AND no NOT NULL columns block the row) is

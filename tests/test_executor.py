@@ -36,6 +36,7 @@ NOT tested (acknowledged gaps)
 """
 
 import datetime
+import decimal
 from decimal import Decimal
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -48,6 +49,7 @@ from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import _cap_cell
 from mcp_sql.executor import _cap_rows
 from mcp_sql.executor import _classify_db_error
+from mcp_sql.executor import audit_tool_call
 from mcp_sql.executor import run_query
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.schemas import OutcomeReason
@@ -87,6 +89,8 @@ def _stub_readonly_connections(monkeypatch):
     # `transaction.atomic(using="mcp_readonly")` would try to use a real
     # connection; replace with a no-op context manager.
     monkeypatch.setattr("mcp_sql.executor.transaction.atomic", MagicMock())
+    # ... and the always-rollback that runs inside it.
+    monkeypatch.setattr("mcp_sql.executor.transaction.set_rollback", MagicMock())
     return mock_cursor
 
 
@@ -336,17 +340,17 @@ class TestExecutorParserRejectAudit:
         self, settings, monkeypatch
     ):
         # A parseable-but-pathologically-deep AST can clear the parser yet
-        # overflow during the executor's LIMIT-injection serialization
-        # (`inject_limit(...).sql()`, outside the parser's own RecursionError
-        # guard). It must still be audited as PARSE_ERROR, not escape as an
-        # unaudited 500. Triggering real recursion here is impractical (parse
-        # overflows first), so we mock `inject_limit` to raise directly.
+        # overflow during the executor's LIMIT-injection serialization and
+        # round-trip check (`render_for_execution`, outside the parser's own
+        # RecursionError guard). It must still be audited as PARSE_ERROR, not
+        # escape as an unaudited 500. Triggering real recursion here is
+        # impractical (parse overflows first), so we mock it to raise.
         user = UserFactory()
 
         def boom(*args, **kwargs):
             raise RecursionError
 
-        monkeypatch.setattr("mcp_sql.executor.inject_limit", boom)
+        monkeypatch.setattr("mcp_sql.executor.render_for_execution", boom)
 
         with patch("mcp_sql.executor.connections") as mock_conns:
             mock_conns.databases = {"default": {}, "mcp_readonly": {}}
@@ -441,6 +445,63 @@ class TestAuditWriteResilience:
             "MCP audit row write failed" in record.getMessage()
             for record in caplog.records
         )
+
+
+@pytest.mark.django_db
+class TestClientIpAtTheExecutorBoundary:
+    """Review round 20: `run_query` and `audit_tool_call` are callable by a
+    consumer, which may pass `REMOTE_ADDR` as is. A forwarded list made the
+    audit insert raise `ValueError` on psycopg 3 (not a `DatabaseError`:
+    it escaped, a 500 with no audit row; on psycopg2 PostgreSQL refused it
+    and the row was lost). Every `MCPQueryLog` row goes through
+    `_audit_safely`, which stores one IP address or NULL."""
+
+    CASES = [
+        ("10.0.0.1, 10.0.0.2", None),
+        ("fe80::1%eth0", None),
+        ("example.com", None),
+        ("", None),
+        ("203.0.113.7", "203.0.113.7"),
+        ("2001:db8::7", "2001:db8::7"),
+    ]
+
+    @pytest.mark.parametrize(("given", "stored"), CASES)
+    def test_run_query(self, given, stored):
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            result = run_query(
+                user=UserFactory(),
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT * FROM auth_permission",
+                client_ip=given,
+            )
+        assert result.rejection_reason == OutcomeReason.SELECT_STAR.value
+        assert MCPQueryLog.objects.get().client_ip == stored
+
+    @pytest.mark.parametrize(("given", "stored"), CASES)
+    def test_audit_tool_call(self, given, stored):
+        audit_tool_call(
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            tool="list_tables",
+            client_ip=given,
+        )
+        assert MCPQueryLog.objects.get().client_ip == stored
+
+    def test_misconfigured_alias(self):
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}}
+            with pytest.raises(ExecutorMisconfiguredError):
+                run_query(
+                    user=UserFactory(),
+                    profile=_DEFAULT_PROFILE,
+                    raw_sql="SELECT id FROM auth_permission",
+                    client_ip="10.0.0.1, 10.0.0.2",
+                )
+        log = MCPQueryLog.objects.get()
+        assert log.rejection_reason == OutcomeReason.MISCONFIGURED.value
+        assert log.client_ip is None
 
 
 @pytest.mark.django_db
@@ -740,3 +801,145 @@ class TestExecutorHookFailureAudit:
             raw_sql="SELECT id FROM auth_permission",
         )
         self._assert_hook_misconfig(result)
+
+
+@pytest.mark.django_db
+class TestEveryParserFailureIsAudited:
+    """Tokenizer errors (`TokenError` is not a `ParseError`), the `re.error`
+    sqlglot 30.21 raises for some `UESCAPE` clauses, and the plain Python
+    exceptions sqlglot's function builders raised escaped `run_query` with
+    no audit row (ledger F31 / F103). Inputs sqlglot's own parser raises on
+    are audited `parse_error`, unless they hold an escape literal the
+    lexical check refuses: a `U&` form is `unsafe_literal` whether this
+    sqlglot parses `UESCAPE` (30.13+) or not (round 17). The conversion of
+    an arbitrary exception is pinned by `test_any_exception_inside_sqlglot_
+    is_a_parse_error`."""
+
+    @pytest.mark.parametrize(
+        ("raw_sql", "reason"),
+        [
+            ("SELECT 'unterminated", OutcomeReason.PARSE_ERROR),
+            ('SELECT "unterminated', OutcomeReason.PARSE_ERROR),
+            ("SELECT $$unterminated", OutcomeReason.PARSE_ERROR),
+            ("SELECT U&'x' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' UESCAPE '(' AS v", OutcomeReason.UNSAFE_LITERAL),
+            ("SELECT U&'x' UESCAPE '\\' AS v", OutcomeReason.UNSAFE_LITERAL),
+        ],
+        ids=[
+            "string",
+            "identifier",
+            "dollar",
+            "unicode-escape",
+            "uescape-paren",
+            "uescape-backslash",
+        ],
+    )
+    def test_audited(self, monkeypatch, raw_sql, reason):
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql=raw_sql
+        )
+        assert result.rejection_reason == reason.value
+        cursor.execute.assert_not_called()
+        log = MCPQueryLog.objects.get()
+        assert log.decision == MCPQueryLog.DECISION_REJECTED
+        assert log.rejection_reason == result.rejection_reason
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TypeError("builder"),
+            IndexError("builder"),
+            KeyError("builder"),
+            ValueError("builder"),
+            decimal.InvalidOperation("builder"),
+        ],
+        ids=["type-error", "index-error", "key-error", "value-error", "decimal"],
+    )
+    def test_any_exception_inside_sqlglot_is_a_parse_error(self, monkeypatch, error):
+        # sqlglot's function builders raised these on bad arguments
+        # (`date_part('', d)`, `var_map('')`, a `1e400` argument); calls are
+        # now kept as written, but any such exception stays a parse error.
+        def boom(*_a, **_k):
+            raise error
+
+        monkeypatch.setattr("mcp_sql.parser.sqlglot.parse", boom)
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            raw_sql="SELECT id FROM auth_permission",
+        )
+        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == "parse_error"
+
+    @pytest.mark.parametrize(
+        ("target", "reason"),
+        [
+            ("mcp_sql.executor.parse_and_validate", OutcomeReason.PARSE_ERROR),
+            ("mcp_sql.executor.render_for_execution", OutcomeReason.ROUNDTRIP_MISMATCH),
+        ],
+        ids=["parse", "render"],
+    )
+    def test_executor_backstop_audits_any_exception(self, monkeypatch, target, reason):
+        def boom(*_a, **_k):
+            msg = "parser bug"
+            raise KeyError(msg)
+
+        monkeypatch.setattr(target, boom)
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(),
+            profile=_DEFAULT_PROFILE,
+            raw_sql="SELECT id FROM auth_permission",
+        )
+        assert result.rejection_reason == reason.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == reason.value
+
+    def test_a_regex_error_inside_sqlglot_is_a_parse_error(self, monkeypatch):
+        import re
+
+        def boom(*_a, **_k):
+            msg = "unbalanced parenthesis"
+            raise re.error(msg)
+
+        monkeypatch.setattr("mcp_sql.parser.sqlglot.parse", boom)
+        cursor = _stub_readonly_connections(monkeypatch)
+        result = run_query(
+            user=UserFactory(), profile=_DEFAULT_PROFILE, raw_sql="SELECT 1"
+        )
+        assert result.rejection_reason == OutcomeReason.PARSE_ERROR.value
+        cursor.execute.assert_not_called()
+        assert MCPQueryLog.objects.get().rejection_reason == "parse_error"
+
+
+def test_table_columns_come_from_the_whitelisted_models():
+    """The parser tells `t.name` (a column) from attribute notation (the call
+    `name(t)`) with these (review round 6)."""
+    from mcp_sql.executor import _table_columns
+
+    columns = _table_columns({"auth.Permission": "auth_permission", "t": "t"})
+    assert {"id", "codename", "content_type_id"} <= columns["auth_permission"]
+    assert "t" not in columns  # no model: no columns known
+
+
+def test_table_columns_are_the_tables_own():
+    """A multi-table-inheritance child's table has only its own columns: a
+    parent field named `to_jsonb` would make `c.to_jsonb` (Postgres:
+    `to_jsonb(c)`, the whole row) look like a column (review round 11). A
+    proxy has its concrete model's table and columns."""
+    from mcp_sql.executor import _table_columns
+    from mcp_sql.tests.testapp.models import Gauge
+    from mcp_sql.tests.testapp.models import GaugeReading
+
+    child, parent = GaugeReading._meta.db_table, Gauge._meta.db_table
+    columns = _table_columns(
+        {
+            "mcp_sql_testapp.GaugeReading": child,
+            "mcp_sql_testapp.GaugeProxy": parent,
+        }
+    )
+    assert columns[child] == frozenset({"gauge_ptr_id", "reading"})
+    assert columns[parent] == frozenset({"id", "current_setting"})

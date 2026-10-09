@@ -7,6 +7,9 @@ app: under the test harness's `--nomigrations --create-db`, the managed table
 is built from model state, and the view is created by a fixture
 (`CREATE VIEW`) only for the one test that needs the real view to exist.
 
+`Gauge` has a column named like a denied function (`current_setting`), so the
+executor's model-column wiring is exercised end to end.
+
 `TestSession` is the stand-in for a consumer's session-with-user model so the
 opt-in session-existence gate (`MCP_SQL["SESSION_MODEL"]`) is exercisable under
 the package's standalone settings (stock `django.contrib.sessions.Session` has
@@ -30,6 +33,38 @@ class Widget(models.Model):
 
     def __str__(self) -> str:
         return f"Widget #{self.pk}: {self.name} ({self.kind})"
+
+
+class Gauge(models.Model):
+    """`g.current_setting` is this column to Postgres; the parser knows that
+    only from the model's columns (`executor._table_columns`), else it reads
+    the attribute-notation call `current_setting(g)` and refuses it."""
+
+    current_setting = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "mcp_sql_testapp"
+
+    def __str__(self) -> str:
+        return f"Gauge #{self.pk}"
+
+
+class GaugeReading(Gauge):
+    """A multi-table-inheritance child of `Gauge`: its own table holds only
+    `gauge_ptr_id` and `reading`; `current_setting` is the parent table's."""
+
+    reading = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "mcp_sql_testapp"
+
+
+class GaugeProxy(Gauge):
+    """A proxy of `Gauge`: the same table and columns."""
+
+    class Meta:
+        app_label = "mcp_sql_testapp"
+        proxy = True
 
 
 class MCPWidgetSecondProfileView(models.Model):

@@ -16,13 +16,13 @@ advertises (`views/discovery.py`), built here by `mcp_resource_url`:
   omitted, the path exactly the endpoint's with or without its trailing
   slash (the two spellings discovery serves) — and answer anything else
   `invalid_target` (`foreign_resource`, `invalid_target_error`). Enforced by
-  the package's views on every DOT version, so DOT below 3.4 (which ignores
-  `resource`) answers the same. Every accepted value is then rewritten to
-  ONE spelling, `canonical_resource_url` (`canonical_resources`), before DOT
-  reads it, at both steps: DOT 3.4+ compares the token request's `resource`
-  with the grant's as a string, and a client that sends one spelling to
-  `/o/authorize/` and another to `/o/token/` (Cursor: the slashed one, then
-  the slash-less one) was otherwise refused. A grant or refresh token stored
+  the package's views before DOT sees the value. Every accepted value is
+  then rewritten to ONE spelling, `canonical_resource_url`
+  (`canonical_resources`), before DOT reads it, at both steps: DOT compares
+  the token request's `resource` with the grant's as a string, and a
+  client that sends one spelling to `/o/authorize/` and another to
+  `/o/token/` (Cursor: the slashed one, then the slash-less one) was
+  otherwise refused. A grant or refresh token stored
   before that rewrite, under another accepted spelling, is matched by
   `use_granted_spelling` (the validator, at token issuance).
 - verification: `/mcp/sql/` hands DOT's audience check the request URL built
@@ -171,8 +171,8 @@ def canonical_resources(request: HttpRequest, values: Iterable[str]) -> list[str
     `/o/authorize/` on the query string and the consent form's field, so
     the grant stores this spelling, and at `/o/token/` on the form body (a
     token POST with a query string is refused by oauthlib), so the token
-    request carries the same string as the grant (DOT 3.4+ compares the two
-    as strings) and a token minted from a resource-less grant is bound to it
+    request carries the same string as the grant (DOT compares the two as
+    strings) and a token minted from a resource-less grant is bound to it
     too.
     """
     accepted = _accepted_keys(request)
@@ -208,7 +208,7 @@ def same_resource(first: str, second: str) -> bool:
 
 
 def _requested_resources(request: Any) -> list[str]:
-    """The token request's `resource` values as DOT (3.4+) reads them in
+    """The token request's `resource` values as DOT reads them in
     `_check_and_set_request_resource`: oauthlib keeps one value (the form
     body's last, else the query string's), and DOT recovers repeated body
     values from `decoded_body`."""
@@ -226,20 +226,17 @@ def _requested_resources(request: Any) -> list[str]:
 
 
 def _stored_resources(request: Any) -> list[str]:
-    """The `resource` list DOT (3.4+) holds this token request to: the
+    """The `resource` list DOT holds this token request to: the
     authorization code's grant's (looked up as DOT does), or the refresh
-    token's. Empty below DOT 3.4 (no such field) and when it carries none."""
+    token's. Empty when it carries none."""
     stored: Any = None
     if request.grant_type == "authorization_code":
-        grant_model = get_grant_model()
-        if hasattr(grant_model, "resource"):
-            stored = (
-                grant_model.objects.filter(
-                    code=request.code, application=request.client
-                )
-                .values_list("resource", flat=True)
-                .first()
-            )
+        stored = (
+            get_grant_model()
+            .objects.filter(code=request.code, application=request.client)
+            .values_list("resource", flat=True)
+            .first()
+        )
     elif request.grant_type == "refresh_token":
         instance = getattr(request, "refresh_token_instance", None)
         stored = getattr(instance, "resource", None)
@@ -262,7 +259,7 @@ def use_granted_spelling(request: Any) -> None:
     `invalid_target`. Values that name nothing stored are left for DOT to
     refuse; the token is bound to the stored string, which names the same
     resource. Called by `oauth.MCPOAuth2Validator.save_bearer_token`, before
-    DOT reads `request.resource`; a no-op below DOT 3.4.
+    DOT reads `request.resource`.
     """
     requested = _requested_resources(request)
     if not requested:

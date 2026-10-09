@@ -2,8 +2,9 @@
 JSON POST mints an `mcp-sql-<token>` Application with
 `skip_authorization=False` (so the client hits the consent screen,
 preventing silent-consent token theft) and loopback-only
-`redirect_uris` — the request's non-loopback URIs are filtered out and the
-registered subset echoed back, per RFC 7591 §3.2.1. See
+`redirect_uris` (`_is_loopback_redirect`, which `oauth.MCPOAuth2Validator`
+re-applies at `/o/authorize/`) — the request's non-loopback URIs are filtered
+out and the registered subset echoed back, per RFC 7591 §3.2.1. See
 `docs/architecture.md` "OAuth surface" + the `docs/oauth.md` runbook for the
 full security posture."""
 
@@ -27,6 +28,7 @@ from mcp_sql import throttle
 from mcp_sql.clients import DCR_TOKEN_BYTES
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import absolute_url
 from oauth2_provider.models import Application
 
@@ -497,18 +499,32 @@ def _is_parseable_uri(uri: str) -> bool:
 
 
 def _is_loopback_redirect(uri: str) -> bool:
+    if not uri.isascii() or not uri.isprintable():
+        # RFC 3986 URIs are printable ASCII. Anything else is either rewritten
+        # before parsing (`urlsplit` silently strips leading C0 controls, so
+        # the string we validated is not the one we would store) or rejected
+        # by the database on INSERT (NUL, lone surrogates — an uncaught 500).
+        # Refuse the whole class rather than enumerate the harmful characters.
+        # (`/o/register` refuses the invisible ones for the whole request
+        # first, `_requested_uris_error`; this predicate also judges the
+        # stored redirects `oauth.MCPOAuth2Validator` re-checks at
+        # `/o/authorize/`.)
+        return False
     if not _is_parseable_uri(uri):
         return False
     parsed = urlparse(uri)
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False
-    if parsed.username or parsed.password:
+    if "@" in parsed.netloc:
         # Reject a userinfo component (`http://user:pass@127.0.0.1/cb`): the
         # host is still loopback, so the bare hostname check below would pass,
         # but the userinfo is attacker-chosen and would be stored verbatim on
         # the Application. Refuse it so a registered redirect URI is exactly
-        # scheme + host + port + path with nothing to smuggle.
+        # scheme + host + port + path with nothing to smuggle. Test the raw
+        # `@`, not `.username`/`.password`: an EMPTY userinfo
+        # (`http://@127.0.0.1/cb`) parses to falsy `""`/`None` and would slip
+        # past (DOT 3.4.1+ tests for `@` in the netloc the same way).
         return False
     if uri.split() != [uri]:
         # Whitespace smuggling. `Application.redirect_uris` stores the list as
@@ -531,11 +547,21 @@ def _is_loopback_redirect(uri: str) -> bool:
     return parsed.hostname in _LOOPBACK_HOSTS
 
 
+def _registered_grant_types(requested: list[str]) -> list[str]:
+    """RFC 7591 §3.2.1: the supported subset of the requested grant types,
+    which the response echoes — `refresh_token` only while the opt-in
+    refresh grant is on (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`)."""
+    if refresh_tokens_enabled() and "refresh_token" in requested:
+        return ["authorization_code", "refresh_token"]
+    return ["authorization_code"]
+
+
 def _registration_response(
     request: HttpRequest,
     client_id: str,
     client_name: str,
     redirect_uris: list[str],
+    grant_types: list[str],
 ) -> JsonResponse:
     """RFC 7591 §3.2.1 success body.
 
@@ -549,7 +575,7 @@ def _registration_response(
             "client_id_issued_at": int(timezone.now().timestamp()),
             "client_name": client_name,
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
             # Same origin as the discovery document's `registration_endpoint`
@@ -607,8 +633,8 @@ def _client_metadata_error(body: dict[str, Any]) -> JsonResponse | None:
 def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
     """The whole-request refusals of `redirect_uris`, before the subset filter.
 
-    Returns an `invalid_redirect_uri` error response, or None. Two kinds of
-    input refuse the whole request, even beside a clean URI, instead of
+    Returns an `invalid_redirect_uri` error response, or None. Three kinds
+    of input refuse the whole request, even beside a clean URI, instead of
     dropping out of the loopback subset:
 
     - a request of the wrong shape: not a non-empty array, longer than
@@ -616,7 +642,9 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
       strictness `grant_types` / `response_types` get);
     - a character `_has_unacceptable_character` names, which must never be
       stored, echoed or logged (a NUL or lone surrogate failed at the
-      INSERT, an anonymous 500; invisible ones would spoof the audit trail).
+      INSERT, an anonymous 500; invisible ones would spoof the audit trail);
+    - whitespace inside an entry (a space included): a whitespace-smuggling
+      attempt (`_is_loopback_redirect`), never a callback a client uses.
 
     Everything else is judged per URI by the subset filter: a URI that is
     well-formed text but not a valid loopback callback (non-loopback,
@@ -642,6 +670,15 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
             "invalid_redirect_uri",
             "redirect_uris must not contain control, separator, surrogate, "
             "format or other invisible characters",
+        )
+    if any(uri.split() != [uri] for uri in requested_uris):
+        # Whitespace smuggling (`_is_loopback_redirect`): DOT reads the stored
+        # list back with `str.split()`, so one such string would become two
+        # registered redirects. Never a real callback, so the whole request
+        # is refused, not just that entry.
+        return _error(
+            "invalid_redirect_uri",
+            "each redirect_uris entry must be one URI, without whitespace",
         )
     return None
 
@@ -705,6 +742,10 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     metadata_error = _client_metadata_error(body)
     if metadata_error is not None:
         return metadata_error
+    # A list of strings from here on (`_client_metadata_error` checked it).
+    grant_types = _registered_grant_types(
+        body.get("grant_types", ["authorization_code"])
+    )
 
     # Optional (RFC 7591 §2). Absent, `null` or empty gets the default; any
     # other non-string is refused below. A falsy non-string (`0`, `false`,
@@ -759,7 +800,9 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     cfg = mcp_sql_config()
     threshold = cfg["BAD_TOKEN_IP_THRESHOLD"]
     if throttle.is_ip_blocked(ip, scope="register", threshold=threshold):
-        return _registration_response(request, client_id, client_name, redirect_uris)
+        return _registration_response(
+            request, client_id, client_name, redirect_uris, grant_types
+        )
 
     Application.objects.create(
         name=client_id,
@@ -777,7 +820,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         # attacker's PKCE verifier, and ends up with a 6h `mcp:sql` token
         # bound to the victim. The consent screen is CSRF-POST-only, so
         # the same phished GET cannot complete the dance. The curated
-        # `mcp-sql` Application requires consent too (migration 0015).
+        # `mcp-sql` Application requires consent too (migration 0016).
         skip_authorization=False,
         redirect_uris=" ".join(redirect_uris),
         algorithm="",
@@ -810,4 +853,6 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         ", ".join(redirect_uris),
     )
 
-    return _registration_response(request, client_id, client_name, redirect_uris)
+    return _registration_response(
+        request, client_id, client_name, redirect_uris, grant_types
+    )

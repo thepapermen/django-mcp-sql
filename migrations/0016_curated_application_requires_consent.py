@@ -41,7 +41,7 @@ class Migration(migrations.Migration):
     dependencies = [
         # The curated row is created by 0005, which already depends on the
         # oauth2_provider migrations it needs.
-        ("mcp_sql", "0014_mcpauthrejectionlog_reason_inactive"),
+        ("mcp_sql", "0015_mcpauthrejectionlog_reason_inactive"),
     ]
 
     operations = [
