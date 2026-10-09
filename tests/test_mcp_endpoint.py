@@ -428,6 +428,54 @@ class TestMcpEndpointHappyPath:
         assert "HTTP_AUTHORIZATION" not in seen_environs[0]
         assert "HTTP_COOKIE" not in seen_environs[0]
 
+    # The throttle keys its cache on the raw `REMOTE_ADDR` (a space in it
+    # warns: memcached would refuse such a key).
+    @pytest.mark.filterwarnings("ignore::django.core.cache.CacheKeyWarning")
+    @pytest.mark.parametrize(
+        ("remote_addr", "recorded"),
+        [
+            ("203.0.113.9", "203.0.113.9"),
+            # Review round 18: a value that is not one IP address (a
+            # forwarded list) made the audit insert raise `ValueError`
+            # (psycopg 3: a 500 from the tool call) or `DataError`
+            # (psycopg2: the row lost); a scoped IPv6 address was stored
+            # without its zone.
+            ("10.0.0.1, 10.0.0.2", None),
+            ("fe80::1%eth0", None),
+            ("", None),
+        ],
+    )
+    def test_client_ip_is_one_address_or_none(  # noqa: PLR0913 — fixtures
+        self,
+        mcp_user,
+        mcp_access_token,
+        mcp_mfa_on,
+        mcp_active_session,
+        monkeypatch,
+        remote_addr,
+        recorded,
+    ):
+        seen: dict = {}
+
+        class BuiltError(Exception):
+            pass
+
+        def build(**kwargs):
+            seen.update(kwargs)
+            raise BuiltError
+
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._build_mcp_server", build)
+        api_client = APIClient()
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}")
+        with pytest.raises(BuiltError):
+            api_client.post(
+                reverse("mcp_sql_endpoint"),
+                data=b"{}",
+                content_type="application/json",
+                REMOTE_ADDR=remote_addr,
+            )
+        assert seen["client_ip"] == recorded
+
 
 class TestInvokeWsgiApp:
     """The WSGI bridge helper re-seeds `wsgi.input` and captures headers/status."""

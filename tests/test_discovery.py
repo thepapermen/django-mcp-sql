@@ -88,7 +88,9 @@ class TestProtectedResourceMetadata:
         response = self._get()
         body = response.json()
         assert body["scopes_supported"] == ["mcp:sql"]
-        # DOT 3.2.0 only accepts header bearers by default.
+        # Header only — enforced by MCPOAuth2Authentication's own refusal of an
+        # `access_token` query/form parameter (DOT alone would accept both);
+        # pinned in test_auth_class.py::TestBearerTokenOnlyInHeader.
         assert body["bearer_methods_supported"] == ["header"]
 
     def test_no_auth_required(self):
@@ -211,9 +213,10 @@ class TestAuthorizationServerMetadata:
         assert body["scopes_supported"] == ["mcp:sql"]
         assert body["response_types_supported"] == ["code"]
         assert body["grant_types_supported"] == ["authorization_code"]
-        # S256 only — `MCPOAuth2Validator.validate_code_challenge_method`
-        # rejects `plain` at the validator layer; the advertised list must
-        # match the enforced list.
+        # S256 only — `MCPServer`'s grant refuses any other method at
+        # /o/authorize/ and `MCPOAuth2Validator.get_code_challenge_method`
+        # refuses a stored non-S256 grant at /o/token/; the advertised list
+        # must match the enforced one (pinned end to end in test_oauth.py).
         assert body["code_challenge_methods_supported"] == ["S256"]
         # Public client — PKCE is the client-auth proxy, no secret.
         assert body["token_endpoint_auth_methods_supported"] == ["none"]

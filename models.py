@@ -1,6 +1,30 @@
+import ipaddress
+
 from django.conf import settings
 from django.db import models
 from mcp_sql.schemas import AuthRejectionReason
+
+
+def audit_client_ip(remote_addr: object) -> str | None:
+    """`REMOTE_ADDR` as the audit tables' `client_ip` stores it: the value
+    when it is one IP address, else None.
+
+    `REMOTE_ADDR` is whatever the server or a real-IP middleware put there
+    (a forwarded list `"a, b"`, a hostname). Django adapts a
+    `GenericIPAddressField` value with `ipaddress.ip_address` on psycopg 3
+    (`ValueError`, not a `DatabaseError`); on psycopg2 PostgreSQL refuses
+    it (`DataError`): the audit insert failed. The row is kept, without the
+    address. A scoped IPv6 address (`fe80::1%eth0`) is None too: Django
+    would store it without its zone, another address."""
+    if not isinstance(remote_addr, str):
+        return None
+    try:
+        address = ipaddress.ip_address(remote_addr)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        return None
+    return remote_addr
 
 
 class MCPQueryLog(models.Model):
@@ -165,6 +189,10 @@ class MCPAuthRejectionLog(models.Model):
                 AuthRejectionReason.SESSION_LOGOUT,
                 "MCP tokens revoked on user logout",
             ),
+            (
+                AuthRejectionReason.PASSWORD_CHANGE,
+                "MCP tokens revoked on password change",
+            ),
         )
     )
 
@@ -198,3 +226,38 @@ class MCPAuthRejectionLog(models.Model):
         return (
             f"#{self.pk} {self.reason} user={who} {self.started_at:%Y-%m-%d %H:%M:%S}"
         )
+
+
+class MCPRefreshTokenFamily(models.Model):
+    """When the consent behind a refresh-token chain was given.
+
+    Only used when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables refresh
+    tokens. django-oauth-toolkit gives every refresh token a `token_family`
+    UUID, new at the authorization-code exchange and inherited on each
+    rotation; one row here records that family's consent time, written when
+    the exchange stores the first refresh token
+    (`MCPOAuth2Validator.save_bearer_token`). The hard cap is measured from
+    it, across rotations. DOT's own rows cannot carry it: `cleartokens`
+    deletes revoked (rotated) refresh tokens, so the chain's first row does
+    not survive. A family with no row here — refresh tokens from 0.1.0b5 or
+    earlier, or any written outside `save_bearer_token` — is refused.
+
+    Rows past the cap are pruned at each new exchange. Rows whose refresh
+    tokens are gone (revoked, deleted by `cleartokens`, or refresh switched
+    off again) are inert — a family is only consulted for a live refresh
+    token — and can be deleted at will, e.g. alongside `cleartokens`:
+    `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.
+    objects.filter(token_family__isnull=False).values("token_family"))
+    .delete()` (the `isnull` filter is required: `NOT IN` over a list
+    holding a NULL matches nothing).
+    """
+
+    token_family = models.UUIDField(primary_key=True)
+    consented_at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        verbose_name = "MCP refresh-token family"
+        verbose_name_plural = "MCP refresh-token families"
+
+    def __str__(self) -> str:
+        return f"{self.token_family} (consented {self.consented_at:%Y-%m-%d %H:%M})"

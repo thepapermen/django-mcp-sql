@@ -26,6 +26,7 @@ Deliberate omissions:
   override it per-test.
 """
 
+import copy
 import os
 
 SECRET_KEY = "mcp-sql-test-suite-not-a-secret"
@@ -83,6 +84,14 @@ DATABASES = {
     },
 }
 
+# A second database (same server, its own name) for the multi-database tests
+# (`test_multi_db_revocation.py`): a user saved to one database while the
+# tokens live in another. pytest-django creates its test database only when
+# a collected test asks for the alias.
+SECOND_DB_ALIAS = "second"
+DATABASES[SECOND_DB_ALIAS] = copy.deepcopy(DATABASES["default"])
+DATABASES[SECOND_DB_ALIAS]["NAME"] = f"{DATABASES['default']['NAME']}_second"
+
 DATABASE_ROUTERS = ["mcp_sql.db_router.McpSqlRouter"]
 
 LANGUAGE_CODE = "en-us"
@@ -136,6 +145,15 @@ MCP_SQL = {
     # FK; the in-package test app ships a minimal stand-in.
     "SESSION_MODEL": "mcp_sql_testapp.TestSession",
 }
+
+# Minimal security posture (`MCP_SQL_TEST_POSTURE=minimal`; CI runs the suite
+# under it as a separate job): an allow-all MFA checker and no session gate,
+# as an install without MFA or a session-with-user model runs. Tests that
+# exercise a gate configure it themselves (`mcp_mfa_on` / `mcp_mfa_off`, an
+# explicit `SESSION_MODEL`), so the same suite proves what holds without them.
+if os.environ.get("MCP_SQL_TEST_POSTURE") == "minimal":
+    MCP_SQL["MFA_CHECKER"] = "mcp_sql.tests.conftest.allow_all_mfa"
+    del MCP_SQL["SESSION_MODEL"]  # the in-package default: None, gate off
 
 OAUTH2_PROVIDER = {
     "OAUTH2_VALIDATOR_CLASS": "mcp_sql.oauth.MCPOAuth2Validator",

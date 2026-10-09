@@ -1,15 +1,69 @@
 """Custom DOT validator pinned to mcp-sql Applications + the single
-`mcp:sql` scope. S256-only PKCE enforcement lives here too. See
-`docs/architecture.md` "OAuth surface" for the full picture
-(consent-screen asymmetry, audience-binding policy, prefix semantics)."""
+`mcp:sql` scope, plus install-wide backstops for the narrow OAuth surface
+`oauth_server.MCPServer` enforces on the package's own endpoints (PKCE,
+refresh and password grants). See `docs/architecture.md` "OAuth surface" for
+the full picture (consent-screen asymmetry, audience-binding policy, prefix
+semantics)."""
 
+import hashlib
+import re
+from datetime import timedelta
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
+from django.db import router
+from django.db import transaction
+from django.utils import timezone
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.models import MCPRefreshTokenFamily
+from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
+from oauth2_provider.models import RefreshToken
 from oauth2_provider.oauth2_validators import OAuth2Validator
+
+if TYPE_CHECKING:
+    from django.http import QueryDict
+
+# C0 controls, DEL and C1 controls. No identifier or parameter of this OAuth
+# surface carries one, and a NUL reaching a Postgres text lookup or insert
+# raises an uncaught 500 (DataError).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _record_refresh_family(raw_refresh_token: str) -> None:
+    """Record the consent time of the chain `raw_refresh_token` starts, and
+    prune family records past the cap (their tokens are refused anyway)."""
+    checksum = hashlib.sha256(raw_refresh_token.encode("utf-8")).hexdigest()
+    family = (
+        RefreshToken.objects.filter(token_checksum=checksum)
+        .values_list("token_family", flat=True)
+        .first()
+    )
+    if family is None:
+        return  # nothing stored (DOT's grace-period reuse path): nothing new
+    now = timezone.now()
+    MCPRefreshTokenFamily.objects.get_or_create(
+        token_family=family, defaults={"consented_at": now}
+    )
+    MCPRefreshTokenFamily.objects.filter(
+        consented_at__lte=now
+        - timedelta(seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS)
+    ).delete()
+
+
+def has_control_character(*params: "QueryDict") -> bool:
+    """True if any key or value of the given query dicts carries a control
+    character (`_CONTROL_CHARS`). The OAuth views run it over the query
+    string and the form body before DOT or the server sees them."""
+    return any(
+        _CONTROL_CHARS.search(text)
+        for qd in params
+        for key, values in qd.lists()
+        for text in (key, *values)
+    )
 
 
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
@@ -22,7 +76,14 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     relaxation stays bounded to the provider's own origin:
 
     - scheme MUST be https (no downgrade),
-    - no userinfo component (`https://chatgpt.com@evil.com/...`),
+    - no `@` anywhere in the authority — no userinfo component at all, not even
+      an empty one (`https://chatgpt.com@evil.com/...`, `https://@chatgpt.com/`),
+    - no query, fragment or `;params` — not even a bare trailing `?` / `#`, which
+      parse to an empty `.query` / `.fragment`, so the raw string is tested.
+      The callback is a plain path, and DOT 3.4.1+ matches an exact URI the same
+      way (RFC 9700 §2.1). `urlsplit` (not `urlparse`) keeps `;params` in the
+      path, where they are refused — also percent-encoded (`%3b`), since the
+      check runs on the decoded path,
     - host must EXACTLY equal the prefix host (not `endswith`, so
       `chatgpt.com.evil.com` is rejected), and port must match with only a
       MISSING port normalised to the https default (an explicit `:443` equals
@@ -36,8 +97,8 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     Mirrors the care in `views/registration.py::_is_loopback_redirect`.
     """
     try:
-        got = urlparse(redirect_uri)
-        want = urlparse(prefix)
+        got = urlsplit(redirect_uri)
+        want = urlsplit(prefix)
         got_port, want_port = got.port, want.port
     except ValueError:
         # Malformed authority (e.g. a non-numeric port) — reject, fail-closed.
@@ -63,8 +124,10 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     want_port = 443 if want_port is None else want_port
     return (
         got.scheme == "https"  # no downgrade
-        and not got.username  # no userinfo smuggling ...
-        and not got.password  # ... in either field
+        and "@" not in got.netloc  # no userinfo, not even an empty one
+        and "?" not in redirect_uri  # no query, not even a bare `?` ...
+        and "#" not in redirect_uri  # ... nor a fragment / bare `#`
+        and ";" not in decoded_path  # no `;params`, raw or percent-encoded
         and bool(got.hostname)
         and got.hostname == want.hostname  # exact host, never `endswith`
         and got_port == want_port  # exact port (:443 == implicit https)
@@ -75,6 +138,22 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
 
 class MCPOAuth2Validator(OAuth2Validator):
     """Validator pinned to the mcp-sql Application surface + the single scope."""
+
+    def _load_application(self, client_id, request):
+        """No client lookup for a `client_id` carrying a control character.
+
+        DOT resolves every client through this (private) method: the
+        `client_id` of `/o/authorize/` (`validate_client_id`), of a public
+        client at `/o/token/` and `/o/revoke_token/`
+        (`authenticate_client_id`), and the one decoded from HTTP Basic
+        credentials there. A NUL in it reached the Postgres lookup and
+        raised an uncaught 500 — from anonymous requests, and from a header
+        the token view's parameter check cannot see. Pinned end to end by
+        `test_oauth_server.py::TestControlCharacters`.
+        """
+        if client_id and _CONTROL_CHARS.search(client_id):
+            return None
+        return super()._load_application(client_id, request)
 
     def validate_client_id(self, client_id, request, *args, **kwargs):
         """Accept the request only if `client_id` resolves to an mcp-sql Application.
@@ -96,15 +175,36 @@ class MCPOAuth2Validator(OAuth2Validator):
         return app is not None and is_mcp_application_name(app.name)
 
     def validate_redirect_uri(self, client_id, redirect_uri, request, *args, **kwargs):
-        """Admit a "prefix" cloud client's per-instance callback.
+        """Admit a "prefix" cloud client's per-instance callback; hold every
+        non-cloud client to a loopback redirect.
 
         For a settings-declared cloud client whose `REDIRECT_MATCH` is
         "prefix" (ChatGPT / Codex-cloud), accept any redirect under the
-        allowlisted host+path prefix via `_redirect_under_prefix`. EVERY other
-        client — "exact" cloud clients, the canonical `mcp-sql` row, and every
-        loopback DCR client — falls through to DOT's stock exact matching
-        against the Application's stored `redirect_uris`, so this override
-        neither widens nor weakens the loopback/exact paths.
+        allowlisted host+path prefix via `_redirect_under_prefix`. "Exact"
+        cloud clients fall through to DOT's stock exact matching against the
+        Application's stored `redirect_uris`.
+
+        EVERY other client — the canonical `mcp-sql` row and every DCR client
+        — must ALSO pass `_is_loopback_redirect` (the `/o/register` predicate)
+        on the requested URI before DOT's matching runs. Only declared cloud
+        clients may redirect off-machine; DOT's matching alone trusts whatever
+        the row stores, and a DCR row minted by <= 0.1.0b5 can store an
+        off-machine redirect smuggled through whitespace (see
+        `_is_loopback_redirect`). This re-check refuses such an entry here
+        without needing the operator to find and delete the row first (its
+        loopback entries keep working, like any DCR client's).
+
+        A ValueError from DOT's matching is a refusal, not a 500: such a row
+        can also store an unparseable port (`http://localhost:99999/cb`), and
+        DOT parses a stored `localhost` candidate's port while matching a
+        request for a different, valid one. (It port-wildcards loopback IPs,
+        so it never reads the port of a stored `127.0.0.1` / `[::1]`
+        candidate: a valid request on the same path matches, staying
+        loopback.)
+
+        The stored default used when a request omits `redirect_uri` never
+        reaches this method — `get_default_redirect_uri` below holds it to the
+        same rule.
 
         Why cloud clients need this + the exact-vs-prefix rationale:
         `docs/oauth.md` → "Cloud clients".
@@ -112,9 +212,35 @@ class MCPOAuth2Validator(OAuth2Validator):
         cloud = mcp_sql_settings.cloud_clients().get(client_id)
         if cloud is not None and cloud.redirect_match == "prefix":
             return _redirect_under_prefix(redirect_uri, cloud.redirect_uri)
-        return super().validate_redirect_uri(
-            client_id, redirect_uri, request, *args, **kwargs
-        )
+        if cloud is None and not _is_loopback_redirect(redirect_uri):
+            return False
+        try:
+            return super().validate_redirect_uri(
+                client_id, redirect_uri, request, *args, **kwargs
+            )
+        except ValueError:
+            return False
+
+    def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
+        """Hold a non-cloud client's stored default redirect to loopback.
+
+        When a request omits `redirect_uri`, oauthlib resolves the stored
+        default WITHOUT calling `validate_redirect_uri`, and a later non-fatal
+        error (missing `response_type`, a bad scope, ...) is then 302'd to it.
+        So a non-cloud row whose single stored redirect fails the loopback
+        predicate (e.g. a canonical row hand-edited to an off-machine URI)
+        would still send an error redirect there. Dropping such a default
+        makes oauthlib raise its fatal `MissingRedirectURIError` instead —
+        error page, no redirect. Declared cloud clients keep DOT's default.
+        """
+        uri = super().get_default_redirect_uri(client_id, request, *args, **kwargs)
+        if (
+            uri
+            and mcp_sql_settings.cloud_clients().get(client_id) is None
+            and not _is_loopback_redirect(uri)
+        ):
+            return None
+        return uri
 
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
         """Reject any token request that asks for scopes other than `mcp:sql`."""
@@ -127,15 +253,102 @@ class MCPOAuth2Validator(OAuth2Validator):
             client_id, scopes, client, request, *args, **kwargs
         )
 
-    def validate_code_challenge_method(self, request, code_challenge_method):
-        """Accept only `S256`; reject `plain` (and any other method).
+    # Install-wide backstops. The package's own endpoints run on
+    # `oauth_server.MCPServer`, which has no password or other extra grant
+    # (and a refresh grant only when `REFRESH_TOKEN_MAX_AGE_SECONDS` enables
+    # it) and accepts only S256 PKCE. This class is the install's
+    # `OAUTH2_VALIDATOR_CLASS`, so the hooks below also hold the line for a
+    # consumer who mounts DOT's stock views on DOT's stock server.
 
-        oauthlib accepts both `S256` and `plain` at runtime by default. The
-        OAUTH2_PROVIDER comment in `settings/base.py` flags this as a known
-        gap — `plain` PKCE is equivalent to no PKCE if the verifier ever
-        leaks, which gives a weaker guarantee than `S256` for negligible
-        client-side cost. The RFC 8414 discovery doc advertises only
-        `S256`; this validator ensures the server actually enforces what
-        the discovery doc promises.
+    def is_pkce_required(self, client_id, request):
+        """PKCE on every authorization, whatever `PKCE_REQUIRED` says.
+
+        Every MCP client is public, so PKCE is the only thing binding a code
+        to the client that asked for it. oauthlib compares the result with
+        `is True`, so it must be the literal.
         """
-        return code_challenge_method == "S256"
+        return True
+
+    def get_code_challenge_method(self, code, request):
+        """Only an `S256` grant can be exchanged.
+
+        `None` for any other stored method — `plain`, explicit or defaulted
+        from an omitted method, as every release up to and including 0.1.0b5
+        stored on request — makes oauthlib refuse the exchange with
+        `invalid_grant` ("Challenge method not found"), on any server.
+        """
+        method = super().get_code_challenge_method(code, request)
+        return method if method == "S256" else None
+
+    def save_bearer_token(self, token, request, *args, **kwargs):
+        """Store a refresh token only when refresh is enabled, and record
+        when its chain was consented to.
+
+        Refresh off (the default): drop `refresh_token` before DOT stores the
+        token. `MCPServer`'s grant does not generate one then, but DOT's
+        stock server does, and oauthlib serialises this same dict as the
+        `/o/token/` body after `save_token` (which calls this method) — so
+        the field is gone from a stock token view's response too, and DOT
+        creates no `RefreshToken` row.
+
+        Refresh on: a refresh token minted by the authorization-code exchange
+        starts a new chain (DOT gives it a fresh `token_family`); its consent
+        time is recorded in `MCPRefreshTokenFamily`, in the same transaction,
+        for `validate_refresh_token`'s hard cap. Rotations inherit the family
+        and record nothing. Expired family rows are pruned here too.
+        """
+        if not refresh_tokens_enabled():
+            token.pop("refresh_token", None)
+            return super().save_bearer_token(token, request, *args, **kwargs)
+        with transaction.atomic(using=router.db_for_write(RefreshToken)):
+            result = super().save_bearer_token(token, request, *args, **kwargs)
+            raw = token.get("refresh_token")
+            if raw and request.grant_type == "authorization_code":
+                _record_refresh_family(raw)
+        return result
+
+    def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
+        """Refresh only when enabled, and only within the chain's hard cap.
+
+        Refresh off: refuse every refresh grant (`invalid_grant`), including
+        refresh tokens minted by releases up to and including 0.1.0b5 (DOT
+        reads the documented `REFRESH_TOKEN_EXPIRE_SECONDS=0` as "no age
+        limit").
+
+        Refresh on: DOT's own checks (token known, not revoked, issued to
+        this client) and then the package's cap: the token's family must
+        have a consent record (`MCPRefreshTokenFamily`) younger than
+        `REFRESH_TOKEN_MAX_AGE_SECONDS`. Measured from the consent, across
+        rotations — unlike DOT's `REFRESH_TOKEN_EXPIRE_SECONDS`, a window
+        that slides with each new access token. A family with no record (a
+        token from 0.1.0b5 or earlier, or any written outside
+        `save_bearer_token`) is refused.
+        """
+        if not refresh_tokens_enabled():
+            return False
+        if not super().validate_refresh_token(
+            refresh_token, client, request, *args, **kwargs
+        ):
+            return False
+        family = getattr(request.refresh_token_instance, "token_family", None)
+        cutoff = timezone.now() - timedelta(
+            seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS
+        )
+        return (
+            family is not None
+            and MCPRefreshTokenFamily.objects.filter(
+                token_family=family, consented_at__gt=cutoff
+            ).exists()
+        )
+
+    def rotate_refresh_token(self, request):
+        """Always rotate: each refresh revokes the presented refresh token
+        and issues a new one (in the same family), whatever DOT's
+        `ROTATE_REFRESH_TOKEN` says."""
+        return True
+
+    def validate_user(self, username, password, client, request, *args, **kwargs):
+        """Refuse every password grant (`invalid_grant`) without calling
+        `authenticate()`, so a correct and a wrong password get the same
+        answer — no password oracle, even on DOT's stock token view."""
+        return False

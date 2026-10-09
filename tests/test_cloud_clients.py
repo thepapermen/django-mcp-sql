@@ -241,6 +241,28 @@ class TestRedirectUnderPrefix:
             pytest.param(
                 "https://chatgpt.com:notaport/connector/oauth/x", id="malformed-port"
             ),
+            # Strict: no `@` in the authority at all, no query / fragment (not
+            # even a bare `?` / `#`), no `;params`.
+            pytest.param("https://@chatgpt.com/connector/oauth/x", id="empty-userinfo"),
+            pytest.param(
+                "https://:@chatgpt.com/connector/oauth/x", id="empty-userinfo-colon"
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x?next=https://evil.example",
+                id="query",
+            ),
+            pytest.param("https://chatgpt.com/connector/oauth/x?", id="bare-query"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#frag", id="fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x#", id="bare-fragment"),
+            pytest.param("https://chatgpt.com/connector/oauth/x;p=1", id="path-params"),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%3bnext=https://evil.example",
+                id="encoded-path-params",
+            ),
+            pytest.param(
+                "https://chatgpt.com/connector/oauth/x%253Bp=1",
+                id="double-encoded-path-params",
+            ),
         ],
     )
     def test_rejects_bypass_attempts(self, uri):
@@ -255,6 +277,63 @@ class TestRedirectUnderPrefix:
         assert _redirect_under_prefix(f"{bare}EVIL/steal", bare) is False
         assert _redirect_under_prefix(f"{bare}-attacker", bare) is False
         assert _redirect_under_prefix(f"{bare}/inst-42", bare) is True
+
+
+@pytest.mark.django_db
+class TestExactCloudClientMatchedExactly:
+    """An "exact" cloud client rides DOT's own matching, which is exact only
+    from django-oauth-toolkit 3.4.1 (the floor; RFC 9700 §2.1). DOT 3.4.0's
+    matcher still accepted the registered host with userinfo, extra query
+    parameters, a fragment or `;params` added. oauthlib's absolute-URI check
+    stops fragments and any userinfo longer than one character first (its
+    userinfo rule matches a single character), but on 3.4.0 a one-character
+    userinfo, the extra-query and the `;params` forms reached the consent page
+    (and then the code redirect)."""
+
+    @staticmethod
+    def _authorize(client, redirect_uri):
+        from urllib.parse import urlencode
+
+        from django.urls import reverse
+
+        params = {
+            "client_id": CLAUDE_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "mcp:sql",
+            "state": "st4te",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+        }
+        return client.get(reverse("authorize") + "?" + urlencode(params))
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "https://attacker@claude.ai/api/mcp/auth_callback",
+            "https://a@claude.ai/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
+            "https://claude.ai/api/mcp/auth_callback#frag",
+            "https://claude.ai/api/mcp/auth_callback;p=1",
+        ],
+        ids=["userinfo", "one-char-userinfo", "extra-query", "fragment", "path-params"],
+    )
+    def test_near_miss_of_the_registered_callback_is_refused(
+        self, client, settings, mcp_user, mcp_mfa_on, variant
+    ):
+        _provision(settings, [CLAUDE])
+        client.force_login(mcp_user)
+        response = self._authorize(client, variant)
+        assert response.status_code == 400, response.content
+        assert "Location" not in response
+
+    def test_registered_callback_gets_the_consent_page(
+        self, client, settings, mcp_user, mcp_mfa_on
+    ):
+        _provision(settings, [CLAUDE])
+        client.force_login(mcp_user)
+        response = self._authorize(client, CLAUDE["REDIRECT_URI"])
+        assert response.status_code == 200, response.content
 
 
 class TestValidateRedirectUriOverride:

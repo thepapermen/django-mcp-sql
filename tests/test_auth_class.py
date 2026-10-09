@@ -9,18 +9,26 @@ classes (`SessionAuthentication`, `TokenAuthentication`) ignore the
 `Bearer` prefix.
 """
 
+import json
 from datetime import timedelta
 from http import HTTPStatus
 
 import pytest
+from django.core.cache import cache
+from django.test.client import BOUNDARY
+from django.test.client import MULTIPART_CONTENT
+from django.test.client import encode_multipart
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql.auth import MCP_REQUEST_BODY_MAX_BYTES
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.auth import PayloadTooLarge
+from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import AuthRejectionReason
 from mcp_sql.tests.conftest import SECOND_PROFILE_GROUP
+from oauth2_provider.oauth2_validators import OAuth2Validator
 from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory
 
 
@@ -60,7 +68,7 @@ class TestMCPOAuth2AuthenticationRejections:
         assert MCPOAuth2Authentication().authenticate(request) is None
 
     def test_expired_token_rejected(self, mcp_access_token, mcp_mfa_on):
-        # DOT's parent `OAuth2Authentication.authenticate` returns `None` for
+        # `_verify_bearer` (DOT's own authenticate logic) returns `None` for
         # invalid/expired tokens (no `AuthenticationFailed` raised). Our
         # subclass forwards that `None`, and DRF then treats the request as
         # anonymous — which the project's default `IsAuthenticated`
@@ -130,6 +138,7 @@ class TestMCPOAuth2AuthenticationRejections:
         row = MCPAuthRejectionLog.objects.get()
         assert row.reason == AuthRejectionReason.AMBIGUOUS_PROFILE
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_no_active_session_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
         """A token with all issuance-time properties intact but no live
         Django session for the user must still be rejected. This pins the
@@ -158,6 +167,7 @@ class TestMCPOAuth2AuthenticationRejections:
         assert user.pk == mcp_user.pk
         assert token.pk == mcp_access_token.pk
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_expired_session_rejected(
         self, mcp_user, mcp_access_token, mcp_mfa_on, mcp_active_session
     ):
@@ -244,6 +254,29 @@ class TestAuthRejectionAuditLog:
         assert log.reason == AuthRejectionReason.INACTIVE_OR_NON_STAFF
         assert log.user_id == mcp_user.pk
 
+    # The throttle keys its cache on the raw `REMOTE_ADDR` (a space in it
+    # warns: memcached would refuse such a key).
+    @pytest.mark.filterwarnings("ignore::django.core.cache.CacheKeyWarning")
+    @pytest.mark.usefixtures("_isolated_mcp_cache")
+    @pytest.mark.parametrize(
+        ("remote_addr", "recorded"),
+        [("198.51.100.4", "198.51.100.4"), ("10.0.0.1, 10.0.0.2", None)],
+    )
+    def test_audit_row_client_ip_is_one_address_or_none(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, remote_addr, recorded
+    ):
+        """Review round 18: a `REMOTE_ADDR` that is not one IP address made
+        the audit insert raise `ValueError` (psycopg 3 adapts `inet` with
+        `ipaddress.ip_address`), which escaped as a 500 instead of the 401."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        mcp_user.is_active = False
+        mcp_user.save()
+        request = _bearer_request_from_ip(mcp_access_token.token, remote_addr)
+        with pytest.raises(AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(request)
+        assert MCPAuthRejectionLog.objects.get().client_ip == recorded
+
     def test_no_mfa_writes_audit_row(self, mcp_user, mcp_access_token, mcp_mfa_off):
         from mcp_sql.models import MCPAuthRejectionLog
 
@@ -269,6 +302,7 @@ class TestAuthRejectionAuditLog:
         assert log.reason == AuthRejectionReason.NO_PERM
         assert log.user_id == mcp_user.pk
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_no_session_writes_audit_row(self, mcp_user, mcp_access_token, mcp_mfa_on):
         from mcp_sql.models import MCPAuthRejectionLog
 
@@ -337,6 +371,7 @@ class TestAuthRejectionAuditLog:
         assert MCPOAuth2Authentication().authenticate(request) is None
         assert MCPAuthRejectionLog.objects.count() == 0
 
+    @pytest.mark.usefixtures("session_gate_on")
     def test_audit_write_failure_does_not_mask_auth_failure(
         self, mcp_user, mcp_access_token, mcp_mfa_on, monkeypatch, caplog
     ):
@@ -525,10 +560,9 @@ class TestBadTokenIpBlock:
         self, mcp_mfa_on, settings, monkeypatch
     ):
         """When the IP is blocked the auth class returns None BEFORE
-        calling super().authenticate() — saves the DB SELECT under
-        sustained probing."""
+        the token lookup — saves the DB SELECT under sustained probing."""
         from django.core.cache import cache
-        from oauth2_provider.contrib.rest_framework import OAuth2Authentication
+        from oauth2_provider.oauth2_validators import OAuth2Validator
 
         settings.MCP_SQL = {**settings.MCP_SQL, "BAD_TOKEN_IP_THRESHOLD": 1}
 
@@ -536,19 +570,19 @@ class TestBadTokenIpBlock:
         # probe first; we're isolating the block behavior).
         cache.set("mcp_sql:bad_token:ip:203.0.113.99", 1, timeout=3600)
 
-        # Spy on DOT's authenticate to confirm it's never invoked.
+        # Spy on DOT's token lookup to confirm it's never invoked.
         calls = []
-        original = OAuth2Authentication.authenticate
+        original = OAuth2Validator._load_access_token
 
-        def spy(self, request):
-            calls.append(request)
-            return original(self, request)
+        def spy(self, token):
+            calls.append(token)
+            return original(self, token)
 
-        monkeypatch.setattr(OAuth2Authentication, "authenticate", spy)
+        monkeypatch.setattr(OAuth2Validator, "_load_access_token", spy)
 
         request = _bearer_request_from_ip("anything", "203.0.113.99")
         assert MCPOAuth2Authentication().authenticate(request) is None
-        assert calls == [], "DOT's authenticate must NOT be called on blocked IP"
+        assert calls == [], "DOT's token lookup must NOT run on a blocked IP"
 
     def test_block_does_not_apply_to_different_ip(self, mcp_mfa_on, settings):
         """One IP at threshold does not leak the block to a different IP."""
@@ -649,17 +683,11 @@ class TestOAuthTokenIsolationFromGlobalDRF:
 class TestAuthorizationHeaderRequired:
     """`bearer_methods_supported: ["header"]` in the RFC 9728 discovery
     document declares that the protected resource accepts bearer tokens
-    only via the `Authorization` header (RFC 6750 §2.1).
-
-    Pinning RFC 6750 §2.2 (form-body) and §2.3 (query) rejection at the
-    *behavior* layer would require monkeypatching DOT to look for the
-    token in body/query — DOT 3.2.0 simply doesn't have those code paths,
-    so a black-box test sending the token in body/query is indistinguishable
-    from sending no token at all, and provides no signal. We rely on DOT's
-    documented behavior here (`oauth2_provider.contrib.rest_framework.
-    OAuth2Authentication.authenticate` reads from the Authorization header
-    only); these tests pin the *presence* requirement, which is what we
-    actually own.
+    only via the `Authorization` header (RFC 6750 §2.1). These tests pin the
+    *presence* requirement; refusing a token sent any other way (RFC 6750
+    §2.2 form body, §2.3 query) is `MCPOAuth2Authentication`'s own guard —
+    DOT/oauthlib alone would accept both — pinned by
+    `TestBearerTokenOnlyInHeader` below.
     """
 
     def test_missing_authorization_header_returns_401(self, client):
@@ -692,6 +720,222 @@ class TestAuthorizationHeaderRequired:
             HTTP_AUTHORIZATION="Bearer ",
         )
         assert response.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}
+
+
+_MCP_URLS = ["/mcp/sql/", "/mcp/sql"]  # canonical route + the slash-less alias
+_INITIALIZE = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+)
+_ACCEPT = {"HTTP_ACCEPT": "application/json, text/event-stream"}
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("_isolated_mcp_cache", "mcp_mfa_on", "mcp_active_session")
+@pytest.mark.parametrize("url", _MCP_URLS)
+# DOT's own RFC 9700 nag for a query-string token: expected here, the point is
+# that the token is ignored all the same (`test_oauth_server.py` pins DOT's
+# opt-in setting that refuses such a request without it).
+@pytest.mark.filterwarnings(
+    "ignore:Presenting an OAuth 2.0 access token in the URI query string"
+    ":DeprecationWarning"
+)
+class TestBearerTokenOnlyInHeader:
+    """A bearer token is accepted from the `Authorization` header only.
+
+    oauthlib's stock `BearerToken` (and so DOT) also takes an `access_token`
+    from the query string or a form body when no header is present — every
+    release up to and including 0.1.0b5 authenticated
+    `/mcp/sql/?access_token=<token>`. On `MCPServer`'s `HeaderOnlyBearer`
+    such a parameter is not a credential: a request carrying a token only
+    there is unauthenticated (the ordinary 401 challenge, the same for a
+    valid and a bogus token), the parameter is never looked up, and beside a
+    header it is ignored — the header's token decides.
+    """
+
+    @pytest.fixture
+    def token_lookups(self, monkeypatch) -> list:
+        # Spy on DOT's token lookup: a parameter token must never reach it.
+        calls: list = []
+        original = OAuth2Validator._load_access_token
+
+        def spy(self, token):
+            calls.append(token)
+            return original(self, token)
+
+        monkeypatch.setattr(OAuth2Validator, "_load_access_token", spy)
+        return calls
+
+    def _assert_unauthenticated(self, response, token_lookups) -> None:
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
+        challenge = response["WWW-Authenticate"]
+        assert challenge.startswith('Bearer realm="api"')
+        assert "resource_metadata=" in challenge
+        assert "error=" not in challenge
+        assert token_lookups == []
+        # No `Authorization` header: anonymous traffic, not a resolved-user
+        # denial (no audit row) and not a bearer probe (no throttle count).
+        assert not MCPAuthRejectionLog.objects.exists()
+        assert cache.get("mcp_sql:bad_token:ip:127.0.0.1") is None
+
+    def test_header_only_is_served(self, client, url, mcp_access_token, token_lookups):
+        response = client.post(
+            url,
+            data=_INITIALIZE,
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert token_lookups == [mcp_access_token.token]
+
+    def test_valid_token_in_query_is_not_a_credential(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        response = client.post(
+            f"{url}?access_token={mcp_access_token.token}",
+            data=_INITIALIZE,
+            content_type="application/json",
+            **_ACCEPT,
+        )
+        self._assert_unauthenticated(response, token_lookups)
+
+    def test_bogus_token_in_query_gets_the_same_401(self, client, url, token_lookups):
+        # Same answer as for a valid token: the URL token is never checked.
+        response = client.post(
+            f"{url}?access_token=not-a-token",
+            data=_INITIALIZE,
+            content_type="application/json",
+            **_ACCEPT,
+        )
+        self._assert_unauthenticated(response, token_lookups)
+
+    def test_query_token_beside_a_valid_header_is_ignored(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        response = client.post(
+            f"{url}?access_token=not-a-token",
+            data=_INITIALIZE,
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.OK, response.content
+        assert token_lookups == [mcp_access_token.token]
+
+    def test_query_token_never_rescues_a_bad_header(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        # The valid parameter token is not a fallback for a failed header.
+        response = client.post(
+            f"{url}?access_token={mcp_access_token.token}",
+            data=_INITIALIZE,
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer not-a-token",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
+        assert token_lookups == ["not-a-token"]
+
+    def test_query_token_on_a_get_is_not_a_credential(
+        self, url, mcp_access_token, token_lookups
+    ):
+        # At the auth-class level: an authenticated GET opens the MCP
+        # transport's long-lived stream, so a regression must fail here, not
+        # hang the suite.
+        request = Request(
+            APIRequestFactory().get(f"{url}?access_token={mcp_access_token.token}")
+        )
+        assert MCPOAuth2Authentication().authenticate(request) is None
+        assert token_lookups == []
+
+    def test_valid_token_in_urlencoded_body_is_not_a_credential(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        response = client.post(
+            url,
+            data=f"access_token={mcp_access_token.token}",
+            content_type="application/x-www-form-urlencoded",
+            **_ACCEPT,
+        )
+        self._assert_unauthenticated(response, token_lookups)
+
+    def test_valid_token_in_multipart_body_is_not_a_credential(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        # The test client's default content type for a dict is multipart.
+        response = client.post(
+            url, data={"access_token": mcp_access_token.token}, **_ACCEPT
+        )
+        self._assert_unauthenticated(response, token_lookups)
+
+    def test_form_body_token_never_rescues_a_bad_header(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        response = client.post(
+            url,
+            data=f"access_token={mcp_access_token.token}",
+            content_type="application/x-www-form-urlencoded",
+            HTTP_AUTHORIZATION="Bearer not-a-token",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED, response.content
+        assert token_lookups == ["not-a-token"]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            (method, encoding)
+            for method in ("GET", "DELETE", "OPTIONS", "PUT")
+            for encoding in ("urlencoded", "multipart")
+        ],
+        ids=lambda case: "-".join(case),
+    )
+    def test_form_body_token_is_not_a_credential_on_any_method(
+        self, client, url, mcp_access_token, token_lookups, case
+    ):
+        method, encoding = case
+        # DOT reads the body through DRF's `Request.POST`, which parses a form
+        # body whatever the method (Django's own `request.POST` is POST-only).
+        # `Accept: application/json` only: were the token accepted, a GET would
+        # get a 406 here instead of opening the MCP stream.
+        if encoding == "urlencoded":
+            body = f"access_token={mcp_access_token.token}"
+            content_type = "application/x-www-form-urlencoded"
+        else:
+            body = encode_multipart(BOUNDARY, {"access_token": mcp_access_token.token})
+            content_type = MULTIPART_CONTENT
+        response = client.generic(
+            method,
+            url,
+            data=body,
+            content_type=content_type,
+            HTTP_ACCEPT="application/json",
+        )
+        self._assert_unauthenticated(response, token_lookups)
+
+    def test_json_body_field_named_access_token_is_not_inspected(
+        self, client, url, mcp_access_token, token_lookups
+    ):
+        # The JSON-RPC body is no token transport and is unaffected.
+        body = json.loads(_INITIALIZE)
+        body["params"]["access_token"] = "irrelevant"
+        response = client.post(
+            url,
+            data=json.dumps(body),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            **_ACCEPT,
+        )
+        assert response.status_code == HTTPStatus.OK, response.content
 
 
 @pytest.mark.django_db

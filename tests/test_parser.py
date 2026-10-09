@@ -7,23 +7,35 @@ UNION, and qualified column references to prove the validator doesn't
 over-reject normal SELECT shapes.
 """
 
+import re
+
 import pytest
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
 from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
+from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import OutcomeReason
 from sqlglot import exp
-from sqlglot import parse_one
 
 ALLOWED = {"auth_permission", "auth_group", "django_content_type"}
+# What the executor passes for those tables (`executor._table_columns`).
+COLUMNS = {
+    "auth_permission": frozenset({"id", "name", "content_type_id", "codename"}),
+    "auth_group": frozenset({"id", "name"}),
+    "django_content_type": frozenset({"id", "app_label", "model"}),
+}
 
 
 def _expect_reject(sql: str, reason: OutcomeReason, **kwargs) -> QueryRejectedError:
     allowed = kwargs.pop("allowed", ALLOWED)
     ban = kwargs.pop("ban_select_star", True)
+    columns = kwargs.pop("table_columns", None)
+    assert not kwargs, kwargs
     with pytest.raises(QueryRejectedError) as exc:
-        parse_and_validate(sql, allowed_tables=allowed, ban_select_star=ban)
+        parse_and_validate(
+            sql, allowed_tables=allowed, ban_select_star=ban, table_columns=columns
+        )
     assert exc.value.reason == reason, (
         f"expected {reason.value} got {exc.value.reason.value} for: {sql!r}"
     )
@@ -584,6 +596,163 @@ class TestDisallowedTable:
             allowed_tables=ALLOWED,
         )
 
+    # Review round 9: names match as Postgres matches them — a quoted name
+    # exactly, an unquoted one folded to lowercase — for whitelist entries
+    # (exact `db_table` spellings) and CTE names alike.
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT id FROM "auth_permission"',
+            'SELECT id FROM "Mixed_Table"',
+            "SELECT id FROM public.auth_permission",
+            'WITH "Users_User" AS (SELECT 1 AS id) SELECT id FROM "Users_User"',
+            "WITH users_user AS (SELECT 1 AS id) SELECT id FROM Users_User",
+            "WITH b AS (SELECT 1 AS id), a AS (SELECT id FROM b) SELECT id FROM a",
+        ],
+    )
+    def test_names_match_as_postgres_matches_them(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED | {"Mixed_Table"})
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Not the relations on the whitelist.
+            'SELECT id FROM "Auth_Permission"',
+            "SELECT id FROM mixed_table",
+            "SELECT id FROM Mixed_Table",
+            # A quoted CTE name is not the folded table name.
+            'WITH "Users_User" AS (SELECT 1 AS id) SELECT id FROM users_user',
+            # A CTE body sees only the CTEs before it, never itself.
+            "WITH users_user AS (SELECT id FROM users_user) SELECT id FROM users_user",
+            "WITH a AS (SELECT id FROM users_user), users_user AS (SELECT 1 AS id) "
+            "SELECT id FROM a",
+            # A schema-qualified name is the table, not the CTE.
+            "WITH users_user AS (SELECT 1 AS id) SELECT id FROM public.users_user",
+        ],
+    )
+    def test_a_name_postgres_resolves_elsewhere_is_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE)
+
+
+class TestSchemaQualifiedNames:
+    """Review round 16 (MiMo security, ledger F04 / F132): a whitelist entry is
+    a relation in a schema — `public`, or the schema a `db_table` written
+    `schema"."name` names — and a reference matches it only in that schema;
+    an unqualified name is the one in `public` (the read transaction pins
+    `search_path`). Before: the bare name matched in any schema."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM auth_permission",
+            "SELECT id FROM public.auth_permission",
+            'SELECT id FROM "public".auth_permission',
+            'SELECT id FROM "public"."auth_permission"',
+            "SELECT id FROM PUBLIC.Auth_Permission",
+            # Postgres accepts a database qualifier for the current database.
+            "SELECT id FROM mydb.public.auth_permission",
+            'SELECT id FROM public."Mixed_Table"',
+        ],
+    )
+    def test_the_whitelisted_relation_in_public(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED | {"Mixed_Table"})
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM analytics.auth_permission",
+            'SELECT id FROM "analytics"."auth_permission"',
+            "SELECT id FROM archive.auth_permission a",
+            # A quoted schema is not folded: `"Public"` is not `public`.
+            'SELECT id FROM "Public".auth_permission',
+            'SELECT id FROM "PUBLIC".auth_permission',
+            "SELECT id FROM public_x.auth_permission",
+            "SELECT id FROM mydb.analytics.auth_permission",
+            "SELECT p.id FROM auth_permission p JOIN analytics.auth_group g ON true",
+            "SELECT id FROM auth_permission WHERE id IN "
+            "(SELECT id FROM analytics.auth_permission)",
+            "WITH a AS (SELECT id FROM analytics.auth_permission) SELECT id FROM a",
+            # A CTE does not mask a qualified name, nor make it whitelisted.
+            "WITH auth_permission AS (SELECT 1 AS id) "
+            "SELECT id FROM analytics.auth_permission",
+        ],
+    )
+    def test_the_same_name_in_another_schema_is_refused(self, sql):
+        exc = _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE)
+        assert "is not on the MCP whitelist" in exc.detail
+
+    def test_the_refusal_names_the_schema_and_the_whitelisted_one(self):
+        exc = _expect_reject(
+            "SELECT id FROM analytics.auth_permission", OutcomeReason.DISALLOWED_TABLE
+        )
+        assert "'analytics.auth_permission'" in exc.detail
+        assert "is the one in schema 'public'" in exc.detail
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT relname FROM pg_catalog.pg_class",
+            "SELECT relname FROM mydb.pg_catalog.pg_class",
+            "SELECT table_name FROM mydb.information_schema.tables",
+            "SELECT id FROM pg_temp.auth_permission",
+            "SELECT id FROM pg_toast.auth_permission",
+        ],
+    )
+    def test_system_schemas_stay_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.SYSTEM_SCHEMA)
+
+    @pytest.mark.parametrize("entry", ['analytics"."widget', '"analytics"."widget"'])
+    def test_an_entry_in_another_schema(self, entry):
+        # Django quotes a `db_table` not already quoted, so both spellings
+        # name `analytics.widget`.
+        allowed = {entry}
+        for sql in (
+            "SELECT id FROM analytics.widget",
+            'SELECT id FROM "analytics"."widget"',
+            "SELECT id FROM ANALYTICS.WIDGET",
+        ):
+            parsed = parse_and_validate(sql, allowed_tables=allowed)
+            assert parsed.referenced_tables == {entry}
+        for sql in (
+            "SELECT id FROM widget",
+            "SELECT id FROM public.widget",
+            "SELECT id FROM other.widget",
+        ):
+            _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE, allowed=allowed)
+
+    def test_a_quoted_db_table_is_the_relation_in_public(self):
+        parsed = parse_and_validate(
+            "SELECT id FROM public.widget", allowed_tables={'"widget"'}
+        )
+        assert parsed.referenced_tables == {'"widget"'}
+
+    def test_columns_are_the_qualified_relations_own(self):
+        # `t.current_setting` is a column only of the relation that has one:
+        # the column map is keyed by relation, not by bare name.
+        allowed = {"auth_permission", 'analytics"."auth_permission'}
+        columns = {
+            "auth_permission": frozenset({"id", "current_setting"}),
+            'analytics"."auth_permission': frozenset({"id"}),
+        }
+        parse_and_validate(
+            "SELECT p.current_setting FROM auth_permission p",
+            allowed_tables=allowed,
+            table_columns=columns,
+        )
+        _expect_reject(
+            "SELECT p.current_setting FROM analytics.auth_permission p",
+            OutcomeReason.DISALLOWED_FUNCTION,
+            allowed=allowed,
+            table_columns=columns,
+        )
+        parse_and_validate(
+            "SELECT p.current_setting FROM analytics.auth_permission p",
+            allowed_tables=allowed,
+            table_columns={
+                '"analytics"."auth_permission"': frozenset({"current_setting"})
+            },
+        )
+
 
 class TestDisallowedFunction:
     @pytest.mark.parametrize(
@@ -739,6 +908,95 @@ class TestInjectLimit:
         assert "ORDER BY id DESC" in sql
         assert "LIMIT 11" in sql
 
+    @pytest.mark.parametrize(
+        ("limit", "capped"),
+        [
+            ("3.5", "LIMIT LEAST(CAST(3.5 AS BIGINT), 11)"),
+            ("2 + 3", "LIMIT LEAST(CAST(2 + 3 AS BIGINT), 11)"),
+            ("-1", "LIMIT LEAST(CAST(-1 AS BIGINT), 11)"),
+            (
+                "'NaN'::float8",
+                "LIMIT LEAST(CAST(CAST('NaN' AS DOUBLE PRECISION) AS BIGINT), 11)",
+            ),
+            (
+                "99999999999999999999",
+                "LIMIT LEAST(CAST(99999999999999999999 AS BIGINT), 11)",
+            ),
+            # A scalar subquery selecting a numeric value is numeric as
+            # written: `LEAST` over a float would turn its NaN into n (review
+            # round 9).
+            ("(SELECT 3)", "LIMIT LEAST(CAST((SELECT 3) AS BIGINT), 11)"),
+            (
+                "(SELECT 'NaN'::float8 AS x)",
+                "LIMIT LEAST(CAST((SELECT CAST('NaN' AS DOUBLE PRECISION) AS x) "
+                "AS BIGINT), 11)",
+            ),
+            (
+                "((SELECT 'Infinity'::float8))",
+                "LIMIT LEAST(CAST(((SELECT CAST('Infinity' AS DOUBLE PRECISION))) "
+                "AS BIGINT), 11)",
+            ),
+            # Not numeric as written: left to Postgres's type resolution (an
+            # explicit cast would run `'3'::text`, an error in a LIMIT).
+            ("(SELECT '3')", "LIMIT LEAST((SELECT '3'), 11)"),
+            (
+                "((SELECT 1) UNION (SELECT 2))",
+                "LIMIT LEAST(((SELECT 1) UNION (SELECT 2)), 11)",
+            ),
+            (
+                "(SELECT id FROM auth_permission)",
+                "LIMIT LEAST((SELECT id FROM auth_permission), 11)",
+            ),
+            ("'3'::text", "LIMIT LEAST(CAST('3' AS TEXT), 11)"),
+            ("'3 apples'", "LIMIT LEAST('3 apples', 11)"),
+            ("('3 apples')", "LIMIT LEAST(('3 apples'), 11)"),
+        ],
+    )
+    def test_keeps_a_limit_that_is_not_a_plain_integer(self, limit, capped):
+        # Review round 4: replacing it with the cap returned more rows than
+        # Postgres would (`LIMIT 3.5` is 4 rows), or rows where Postgres
+        # raises (`LIMIT -1`). Kept as written and capped, Postgres
+        # evaluates it exactly as it would have.
+        assert _executed(f"LIMIT {limit}").endswith(capped)
+
+    @pytest.mark.parametrize(
+        "limit",
+        [
+            "NULL",
+            "5",
+            "'5'",
+            "' +5 '",
+            "'9223372036854775807'",
+            # Parentheses change nothing: `('5000000000')` is still the
+            # bigint, not an int4 for `LEAST` (review round 9).
+            "(5)",
+            "('5000000000')",
+            "(('5'))",
+        ],
+    )
+    def test_replaces_no_limit_or_a_plain_integer(self, limit):
+        # `LIMIT '5'` is the bigint 5 to Postgres; `LEAST('…', n)` would read
+        # the string as int4 and overflow (review round 7).
+        assert _executed(f"LIMIT {limit}").endswith(" LIMIT 11")
+
+    def test_unwraps_a_parenthesised_query(self):
+        # `(SELECT ... LIMIT 5) LIMIT 11` is an error in Postgres.
+        ast = parse_and_validate(
+            "(SELECT id FROM auth_permission ORDER BY id LIMIT 5)",
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == 5
+        sql = render_for_execution(ast, 6, allowed_tables=ALLOWED)
+        assert sql == "SELECT id FROM auth_permission ORDER BY id LIMIT 6"
+
+
+def _executed(limit: str) -> str:
+    """The SQL the executor would send for `SELECT ... <limit>` with a cap
+    of 11 — through `FaithfulPostgres`, as production does."""
+    sql = f"SELECT id FROM auth_permission {limit}"  # noqa: S608
+    parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+    return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
 
 class TestExtractLimit:
     """`extract_limit` reads the user's `LIMIT N` so the executor can apply
@@ -771,17 +1029,378 @@ class TestExtractLimit:
         injected = inject_limit(ast, 11)
         assert extract_limit(injected) == 11
 
-    def test_non_integer_literal_limit_gives_up_cleanly(self):
-        # A string-literal LIMIT can't be reasoned about at parse time;
-        # `extract_limit` returns None and the executor falls back to its clamp.
-        ast = parse_one("SELECT id FROM auth_permission LIMIT '3 apples'")
-        assert extract_limit(ast) is None
+    @pytest.mark.parametrize(
+        ("limit", "value"),
+        [
+            ("'3 apples'", None),  # Postgres's error: kept for it to raise
+            ("2 + 3", None),  # an expression: kept for Postgres to evaluate
+            ("'12'", 12),
+            ("' +12 '", 12),
+            ("9223372036854775808", None),  # beyond bigint: Postgres's error
+            ("('5000000000')", 5000000000),  # parentheses: the same literal
+            ("((7))", 7),
+            ("(SELECT 7)", None),  # a query: kept for Postgres to evaluate
+        ],
+    )
+    def test_reads_only_what_postgres_reads_as_a_bigint(self, limit, value):
+        ast = parse_and_validate(
+            f"SELECT id FROM auth_permission LIMIT {limit}",  # noqa: S608
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == value
 
-    def test_non_literal_limit_expression_gives_up_cleanly(self):
-        # A LIMIT that is an expression (not a bare literal) is also opaque at
-        # parse time — same clean give-up path.
-        ast = parse_one("SELECT id FROM auth_permission LIMIT 2 + 3")
-        assert extract_limit(ast) is None
+
+class TestAttributeNotation:
+    """Review round 5: Postgres reads `x.f` / `(expr).f` as the call `f(x)`
+    when `x` has no column `f`, so a qualified name can call a function."""
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            (
+                "SELECT ('server_version'::text).current_setting AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            ("SELECT (true).current_schemas AS v", OutcomeReason.DISALLOWED_FUNCTION),
+            ("SELECT (0.1::float8).pg_sleep AS v", OutcomeReason.DISALLOWED_FUNCTION),
+            (
+                "SELECT (424242::bigint).pg_try_advisory_lock AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT auth_permission.pg_column_size AS v FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT (codename).current_setting AS v FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            ("SELECT (ARRAY[1, 2]).unnest AS v", OutcomeReason.DISALLOWED_CONSTRUCT),
+            (
+                "SELECT ('a,b'::text).regexp_split_to_table AS v",
+                OutcomeReason.DISALLOWED_CONSTRUCT,
+            ),
+            (
+                "SELECT p.to_jsonb AS v FROM auth_permission p",
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                "SELECT (p).row_to_json AS v FROM auth_permission p",
+                OutcomeReason.SELECT_STAR,
+            ),
+        ],
+    )
+    def test_denied_function_written_as_a_field(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 6: qualified names that ARE columns are columns,
+            # whatever function they are named like (owner rule: never
+            # refuse a column that exists).
+            "SELECT s.lo_bound FROM (SELECT min(id) AS lo_bound "
+            "FROM auth_permission) s",
+            "SELECT s.array_agg FROM (SELECT array_agg(id) FROM auth_permission) s",
+            "WITH c AS (SELECT count(*) AS currval FROM auth_permission) "
+            "SELECT c.currval FROM c",
+            "WITH c(pg_x) AS (SELECT 1) SELECT c.pg_x FROM c",
+            "SELECT x.pg_sleep FROM (SELECT 0.1::float8 AS v) AS x(pg_sleep)",
+            "SELECT x.pg_sleep FROM auth_permission AS x(pg_sleep)",
+            "SELECT '0/0'::pg_catalog.pg_lsn AS v",
+            "SELECT p.id, p.codename FROM auth_permission p",
+            # Denied functions attribute notation cannot reach (no argument,
+            # or two or more): ordinary column names.
+            "SELECT p.version, p.user, p.has_access FROM auth_permission p",
+            "SELECT (codename).upper AS v FROM auth_permission",
+        ],
+    )
+    def test_ordinary_qualified_names_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=COLUMNS)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 8 (regression from round 6): a bare `(x)` is the
+            # column `x` when a FROM item has one, so `(x).f` is `f(x)` —
+            # whatever columns the FROM item `x` has.
+            "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text "
+            "AS x, 1 AS current_setting) x",
+            "SELECT (x).pg_sleep AS v FROM (SELECT 0.1::float8 AS x, 1 AS pg_sleep) x",
+            # The column `x` from a sibling FROM item.
+            "SELECT (x).current_setting AS v FROM (SELECT 1 AS current_setting) x, "
+            "(SELECT 'server_version'::text AS x) y",
+            # An alias column list.
+            "SELECT (x).current_setting AS v FROM (SELECT 'server_version'::text, "
+            "1) x(x, current_setting)",
+            "SELECT (x).current_setting AS v FROM auth_permission x",
+            # `x` is also a column in scope: not provably the FROM item.
+            "SELECT x.current_setting AS v FROM (SELECT 'server_version'::text "
+            "AS x, 1 AS current_setting) x",
+            # A FROM item whose column names are not all known may have a
+            # column `s` (here `'x'::text` is named `text` by its type).
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 'x'::text) q",
+            "SELECT (text).current_setting FROM (SELECT 'server_version'::text) q, "
+            "(SELECT 1 AS current_setting) text",
+            "SELECT (s).pg_sleep FROM (SELECT * FROM (SELECT 1 AS pg_sleep) z) s",
+            # (A whitelisted table whose columns the caller did not pass.)
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            # A column `s` in scope wins over the row: `pg_sleep(s)`.
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep, 2 AS s) s",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2 AS S) q",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2) q(s)",
+            "SELECT (SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s) "
+            "FROM (SELECT 1 AS s) o",
+            # A scalar subquery's column is named by its own: `x`, not
+            # `pg_column_size`.
+            "SELECT s.pg_column_size FROM (SELECT (SELECT 1 AS x)) s",
+            # Quoted names compare case-sensitively: no column `pg_sleep`.
+            'SELECT s.pg_sleep FROM (SELECT 1 AS "Pg_Sleep") s',
+        ],
+    )
+    def test_parenthesised_name_or_undecidable_is_a_call(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT s."Pg_Sleep" FROM (SELECT 1 AS "Pg_Sleep") s',
+            'SELECT s.pg_sleep FROM (SELECT 1 AS "pg_sleep") s',
+            'SELECT s."pg_sleep" FROM (SELECT 1 AS pg_sleep) s',
+        ],
+    )
+    def test_quoted_column_names_match_as_postgres_matches_them(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 9: Postgres reads these as the column, provably.
+            "SELECT (s).copy FROM (SELECT 1 AS copy) s",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s",
+            'SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, (SELECT 2 AS "S") q',
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep UNION SELECT 2) s",
+            "SELECT (s).pg_sleep FROM (VALUES (1, 2)) s(pg_sleep)",
+            "SELECT (s).column1 FROM (VALUES (1, 2)) s",
+            # A VALUES list's columns are `column1`, ...: no column `p`.
+            "SELECT p.pg_sleep FROM (SELECT 9 AS pg_sleep) p, (VALUES (1)) v",
+            # A scalar subquery's column is named by its own.
+            "SELECT s.pg_column_size FROM (SELECT (SELECT 1 AS pg_column_size)) s",
+        ],
+    )
+    def test_provable_field_reads_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=COLUMNS)
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            # Review round 9 (fixed in round 8): a quoted alias is no column
+            # `to_jsonb` / `pg_typeof`, so `s.to_jsonb` is `to_jsonb(s)`.
+            (
+                'SELECT s.to_jsonb FROM (SELECT id, name AS "To_Jsonb" '
+                "FROM auth_permission) s",
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                'SELECT s.to_jsonb FROM auth_permission AS s("To_Jsonb")',
+                OutcomeReason.SELECT_STAR,
+            ),
+            (
+                'SELECT s.pg_typeof FROM auth_permission AS s("Pg_Typeof")',
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            # A quoted CTE is not the table: `to_jsonb(auth_permission)`.
+            (
+                'WITH "Auth_Permission" AS (SELECT 1 AS to_jsonb) '
+                "SELECT auth_permission.to_jsonb FROM auth_permission",
+                OutcomeReason.SELECT_STAR,
+            ),
+        ],
+    )
+    def test_a_quoted_alias_is_not_the_folded_name(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    def test_a_mixed_case_base_column_is_kept_exact(self):
+        # `p.to_jsonb` is the row when the table's column is `"To_Jsonb"`.
+        columns = {"auth_permission": frozenset({"id", "To_Jsonb"})}
+        parse_and_validate(
+            'SELECT p."To_Jsonb" FROM auth_permission p',
+            allowed_tables=ALLOWED,
+            table_columns=columns,
+        )
+        with pytest.raises(QueryRejectedError) as exc:
+            parse_and_validate(
+                "SELECT p.to_jsonb FROM auth_permission p",
+                allowed_tables=ALLOWED,
+                table_columns=columns,
+            )
+        assert exc.value.reason == OutcomeReason.SELECT_STAR
+
+    def test_a_base_table_column_is_a_column(self):
+        # The executor passes each whitelisted table's columns.
+        sql = "SELECT p.pg_x, p.to_jsonb FROM auth_permission p"
+        columns = {"auth_permission": frozenset({"id", "pg_x", "to_jsonb"})}
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=columns)
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION)  # columns unknown
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT p.concat FROM auth_permission p",
+            "SELECT p.quote_literal FROM auth_permission p",
+            "SELECT p.quote_nullable FROM auth_permission p",
+            "SELECT p.record_out FROM auth_permission p",
+            "SELECT p.record_send FROM auth_permission p",
+        ],
+    )
+    def test_whole_row_through_attribute_notation(self, sql):
+        _expect_reject(sql, OutcomeReason.SELECT_STAR)
+
+
+class TestDeniedCallsTheTreeDoesNotShow:
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            # sqlglot reads `copy(x)` here as a column `copy` with `AS (x)`.
+            (
+                "SELECT (SELECT copy(id)) AS c FROM auth_permission",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT c FROM (VALUES (copy(x))) AS v(c)",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            # Schema-qualified, sqlglot keeps these as plain calls.
+            (
+                "SELECT pg_catalog.generate_series(1, 3) AS v",
+                OutcomeReason.DISALLOWED_CONSTRUCT,
+            ),
+            ("SELECT public.unnest(ARRAY[1]) AS v", OutcomeReason.DISALLOWED_CONSTRUCT),
+        ],
+    )
+    def test_refused(self, sql, reason):
+        _expect_reject(sql, reason)
+
+    def test_an_alias_named_like_a_denied_function_is_not_a_call(self):
+        parse_and_validate(
+            "SELECT copy.a FROM (SELECT 1) AS copy(a)", allowed_tables=ALLOWED
+        )
+
+    def test_count_star_qualified_is_count(self):
+        parse_and_validate(
+            "SELECT pg_catalog.count(*) AS n FROM auth_permission",
+            allowed_tables=ALLOWED,
+        )
+
+
+class TestOperatorSigns:
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 2 %-3 AS v",
+            "SELECT ~-1 AS v",
+            # Review round 7: operators sqlglot reads that Postgres lacks.
+            "SELECT id FROM auth_permission WHERE id ==1",
+            "SELECT id FROM auth_permission WHERE id <=> 1",
+            "SELECT id FROM auth_permission WHERE codename ?? 'a'",
+            "SELECT id FROM auth_permission WHERE codename ~~~ 'a'",
+            # Review round 6: `=~`, `-~`, `*~` are one operator to Postgres.
+            "SELECT id=~1 AS v FROM auth_permission",
+            "SELECT -~id AS v FROM auth_permission",
+            "SELECT id*~1 AS v FROM auth_permission",
+        ],
+    )
+    def test_sign_postgres_reads_into_the_operator(self, sql):
+        # Postgres: the operators `%-` / `~-` (none exist); sqlglot: `% -3`.
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id >=-1 AS v FROM auth_permission",
+            "SELECT 1 <<-1 AS v",
+            # sqlglot reads these from several tokens, as one operator.
+            "SELECT codename !~ 'a' AS v, codename !~~ 'a%' AS w FROM auth_permission",
+        ],
+    )
+    def test_sign_postgres_reads_apart_is_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Review round 10: `^@` (starts with) was read as `^ (@ b)`; `!!`
+            # (tsquery negation) and `!` were read as `NOT`.
+            ("SELECT '10' ^@ '1' AS v", "'10' ^@ '1' AS v"),
+            (
+                "SELECT codename ^@'a'::text AS v FROM auth_permission",
+                "codename ^@ CAST",
+            ),
+            ("SELECT 'x' || 'abc' ^@ 'a' AS v", "'x' || 'abc' ^@ 'a' AS v"),
+            ("SELECT NOT 'abc' ^@ 'b' AS v", "NOT 'abc' ^@ 'b' AS v"),
+            ("SELECT 2 ^ @ -3 AS v", "2 ^ @ -3 AS v"),
+            (
+                "SELECT !! to_tsquery('simple', 'a') AS v",
+                "!! to_tsquery('simple', 'a')",
+            ),
+            ("SELECT !!'a'::tsquery AS v", "!! CAST('a' AS tsquery)"),
+            ("SELECT ! true AS v", "! TRUE AS v"),
+            ("SELECT NOT true AS v", "NOT TRUE AS v"),
+        ],
+    )
+    def test_operator_kept_as_written(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Review round 9: a parameter stays one (Postgres: "there is no
+            # parameter $1"); it was read as the prefix operator `@ 1`.
+            ("SELECT id FROM auth_permission WHERE id = $1", "id = $1"),
+            ("SELECT id FROM auth_permission WHERE id = $1::int", "CAST($1 AS INT)"),
+            ("SELECT id FROM auth_permission WHERE codename = $name", "= $name"),
+            ("SELECT @ -5 AS a, @x AS b FROM auth_permission", "@ -5 AS a, @ x AS b"),
+        ],
+    )
+    def test_parameter_is_not_the_at_operator(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+
+class TestQualify:
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM auth_permission QUALIFY row_number() OVER "
+            "(ORDER BY id) = 1",
+            # Review round 4: inside a subquery the injected LIMIT does not
+            # reach it, so the old end-of-render check let it through.
+            "SELECT id FROM auth_permission WHERE id IN (SELECT id FROM "
+            "auth_permission QUALIFY row_number() OVER (ORDER BY id) <= 2 "
+            "LIMIT 5)",
+            "WITH c AS (SELECT id FROM auth_permission QUALIFY row_number() "
+            "OVER (ORDER BY id) > 3 LIMIT 2) SELECT id FROM c",
+        ],
+        ids=["root", "subquery", "cte"],
+    )
+    def test_refused_anywhere(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+        # The clause is what is refused: the same query without it passes.
+        without = re.sub(
+            r" ?QUALIFY row_number\(\) OVER \(ORDER BY id( DESC)?\) [<>=]+ \d+",
+            "",
+            sql,
+        )
+        assert "QUALIFY" not in without
+        parse_and_validate(without, allowed_tables=ALLOWED)
+
+    def test_qualify_is_an_ordinary_name(self):
+        # Review round 5: `qualify` is a name to Postgres (`FROM t qualify`).
+        parse_and_validate(
+            "SELECT qualify.id FROM auth_permission qualify", allowed_tables=ALLOWED
+        )
 
 
 class TestTableValuedFunctionsInFrom:
@@ -814,10 +1433,1224 @@ class TestNoTableQuery:
         assert out.referenced_tables == set()
 
 
+class TestLexicalFidelity:
+    """Input whose sqlglot re-serialization would not mean the same thing to
+    Postgres is rejected as UNSAFE_LITERAL (ledger F32 and variants)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # E'\\' (one backslash) re-emits as e'\', swallowing its quote.
+            "SELECT E'\\\\' AS v, 'AS w, codename FROM auth_group --' AS x "
+            "FROM auth_permission",
+            "SELECT e'a\\nb' AS v FROM auth_permission",
+            "SELECT E'\\x27' AS v FROM auth_permission",
+            "SELECT E'\\u0027' AS v FROM auth_permission",
+            "SELECT E'\\'' AS v FROM auth_permission",
+            "SELECT id FROM auth_permission WHERE codename = E'a\\\\nb'",
+        ],
+        ids=["quote-swallow", "newline", "hex", "unicode", "escaped-quote", "where"],
+    )
+    def test_escape_string_with_backslash(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 AS $$x, version() AS v$$ FROM auth_permission",
+            "SELECT 1 AS $t$x FROM pg_class --$t$ FROM auth_permission",
+            "SELECT 1 AS $$x; RESET ROLE; SELECT 1 --$$ FROM auth_permission",
+            "SELECT 1 AS $$plain$$ FROM auth_permission",
+            "SELECT id FROM auth_permission AS $t$p$t$",
+            "SELECT 1 AS 'lit' FROM auth_permission",
+        ],
+        ids=[
+            "extra-projection",
+            "comment-tail",
+            "multi-statement",
+            "plain-dollar",
+            "table-alias",
+            "string",
+        ],
+    )
+    def test_identifier_written_as_a_string_constant(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT U&'d\\0061t' AS v FROM auth_permission",
+            "SELECT u&'x' AS v FROM auth_permission",
+            'SELECT U&"x" AS v FROM auth_permission',
+            "SELECT id FROM auth_permission WHERE codename = U&'2'",
+        ],
+    )
+    def test_unicode_escape(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Names sqlglot still folds onto its own nodes (typed functions
+            # and keyword-syntax functions): they would run unquoted.
+            'SELECT "count" (*) AS n FROM auth_permission',
+            'SELECT "Count"(id) AS n FROM auth_permission',
+            "SELECT \"Extract\"(year FROM DATE '2024-01-01') AS v",
+            "SELECT \"substring\"('abc' FROM 2) AS v",
+            # Wherever it appears (review round 4: after AS, ZONE, BOTH, ...).
+            'SELECT "Count"(id) AS (c) FROM auth_permission',
+            'SELECT now() AT TIME ZONE "Extract"(year FROM now()) AS v',
+            "SELECT trim(BOTH \"Count\"(id)::text FROM 'x') AS v FROM auth_permission",
+        ],
+    )
+    def test_quoted_function_name(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT "Lower"(codename) AS v FROM auth_permission',
+            'SELECT "public"."lower"(codename) AS v FROM auth_permission',
+            "SELECT \"Lower\"('AbC') AS (c)",
+            "SELECT now() AT TIME ZONE \"Lower\"('UTC') AS v",
+        ],
+    )
+    def test_quoted_function_name_kept_as_written(self, sql):
+        # Every other call is kept as written (`FaithfulPostgres`), quotes
+        # included, so Postgres resolves the name exactly as in the source.
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        rendered = render_for_execution(parsed.ast, 5, allowed_tables=ALLOWED)
+        quoted = sql[sql.index('"') : sql.index("(", sql.index('"'))]
+        assert quoted in rendered
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'a' 'b' AS v FROM auth_permission",
+            "SELECT 'a'\n'b' AS v FROM auth_permission",
+            "SELECT id FROM auth_permission WHERE codename = 'a' /* c */\n'b'",
+        ],
+        ids=["same-line", "newline", "comment-newline"],
+    )
+    def test_adjacent_string_constants(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT $u&$a, 2 AS y$u&$ AS v FROM auth_permission",
+            "SELECT $1t$x$1t$ AS v FROM auth_permission",
+        ],
+        ids=["ampersand", "leading-digit"],
+    )
+    def test_dollar_tag_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id & 3 AS v FROM auth_permission",
+            'SELECT c1 FROM (SELECT 1) AS "s"(c1)',
+            'SELECT c1 FROM (SELECT 1) "s"(c1)',
+            'SELECT c FROM auth_permission "p"(c)',
+            'WITH "q"(c1) AS (SELECT 1) SELECT c1 FROM "q"',
+            'WITH a AS (SELECT 1 AS x), "q"(c1) AS NOT MATERIALIZED (SELECT 1) '
+            'SELECT c1 FROM "q"',
+            'SELECT id::"numeric"(10, 2) AS v FROM auth_permission',
+            'SELECT CAST(id AS "Numeric"(10, 2)) AS v FROM auth_permission',
+            'SELECT codename AS "Lower" FROM auth_permission',
+            "SELECT 'a' || 'b' AS v FROM auth_permission",
+            "SELECT $t1$x$t1$ AS v, $$y$$ AS w FROM auth_permission",
+        ],
+        ids=[
+            "bitwise-and",
+            "derived-column-list",
+            "derived-column-list-no-as",
+            "table-alias-column-list",
+            "cte-column-list",
+            "later-cte-column-list",
+            "quoted-type-modifiers",
+            "quoted-type-modifiers-cast",
+            "quoted-alias",
+            "concat-operator",
+            "dollar-tags",
+        ],
+    )
+    def test_near_misses_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT E'it''s' AS v FROM auth_permission",
+            "SELECT 'a\\b' AS v FROM auth_permission",
+            "SELECT $$it's$$ AS v FROM auth_permission",
+            'SELECT codename AS "a b"" c" FROM auth_permission',
+            "SELECT codename AS é_x$1 FROM auth_permission",
+        ],
+        ids=[
+            "escape-string-no-backslash",
+            "standard-string",
+            "dollar-string",
+            "quoted-alias",
+            "unicode-alias",
+        ],
+    )
+    def test_faithful_forms_are_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    def test_before_every_ast_check(self):
+        # The checked tree cannot be trusted to be what runs, so this names
+        # the problem ahead of the table / system-schema checks.
+        _expect_reject("SELECT E'\\\\' FROM pg_class", OutcomeReason.UNSAFE_LITERAL)
+
+
+class TestIntervalsAndSubscriptsAsWritten:
+    """Review round 9: interval qualifiers and array subscripts, rendered as
+    Postgres reads them."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # A quoted word is an alias, not a field: 25 hours, not 0 days.
+            ("""SELECT INTERVAL '25 hours' "DAY\"""", 'AS "DAY"'),
+            ("""SELECT INTERVAL '1' "day\"""", """INTERVAL '1' AS "day\""""),
+            ("""SELECT INTERVAL '1' DAY "TO\"""", """INTERVAL '1' DAY AS "TO\""""),
+            # The precision of a seconds field (1.23 s, not a parse error).
+            ("SELECT INTERVAL '1.234' SECOND(2)", "INTERVAL '1.234' SECOND(2)"),
+            ("SELECT INTERVAL '1.234' SECOND (2)", "INTERVAL '1.234' SECOND(2)"),
+            ("SELECT INTERVAL '1' DAY TO SECOND(3)", "INTERVAL '1' DAY TO SECOND(3)"),
+            # The precision form: 1.235 s, not `INTERVAL '3' + INTERVAL ...`.
+            ("SELECT INTERVAL(3) '1.23456'", "INTERVAL(3) '1.23456'"),
+            (
+                """SELECT INTERVAL(3) '1.5' "SECOND\"""",
+                """INTERVAL(3) '1.5' AS "SECOND\"""",
+            ),
+        ],
+    )
+    def test_interval(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT INTERVAL(3) '1.5' SECOND",
+            # Postgres takes a precision on a seconds field only.
+            "SELECT INTERVAL '1' DAY(3)",
+            # A quoted alias, then a second one: Postgres's syntax error too.
+            """SELECT INTERVAL '1' "Day" AS v""",
+        ],
+    )
+    def test_interval_syntax_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A column named `array` / `list`, subscripted: sqlglot replaced
+            # it with the constructor `ARRAY[1]`.
+            'SELECT s."array"[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            'SELECT "array"[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            'SELECT s.array[1] FROM (SELECT ARRAY[5, 6] AS "array") AS s',
+            "SELECT list[1] FROM (SELECT ARRAY[5, 6] AS list) AS s",
+            "SELECT (ARRAY[1, 2])[1]",
+            "SELECT (ARRAY(SELECT 1))[1]",
+        ],
+    )
+    def test_subscript_kept(self, sql):
+        assert self._rendered(sql) == f"{sql} LIMIT 11"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres subscripts an array constructor only in parentheses;
+            # sqlglot added them, or dropped the query of `ARRAY(SELECT ...)`.
+            "SELECT ARRAY[1, 2][1]",
+            "SELECT ARRAY[[1, 2], [3, 4]][1][2]",
+            "SELECT json_object(ARRAY['a', 'b'][1:2]) AS a",
+            "SELECT ARRAY(SELECT 1)[1]",
+        ],
+    )
+    def test_unparenthesised_constructor_subscript_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+
+class TestPinnedBehaviour:
+    """Review round 10: behaviour no test pinned (its mutant survived)."""
+
+    _PG_SLEEP_COLUMN = {"auth_permission": frozenset({"pg_sleep", "id"})}
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            # An alias column list renames the first columns; the old name
+            # is gone, so `s.pg_sleep` is `pg_sleep(s)` to Postgres.
+            ("SELECT s.pg_sleep FROM (SELECT 1 AS pg_sleep) s(a)", None),
+            # The same for a whitelisted table's model columns.
+            ("SELECT x.pg_sleep FROM auth_permission AS x(a)", _PG_SLEEP_COLUMN),
+            ("SELECT x.pg_sleep FROM auth_permission AS x(a, b)", _PG_SLEEP_COLUMN),
+        ],
+    )
+    def test_a_renamed_column_is_gone(self, sql, columns):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION, table_columns=columns)
+
+    @pytest.mark.parametrize(
+        ("sql", "columns"),
+        [
+            ("SELECT s.a FROM (SELECT 1 AS pg_sleep) s(a)", None),
+            ("SELECT x.pg_sleep FROM auth_permission AS x", _PG_SLEEP_COLUMN),
+            # Output names through a cast and a subscript.
+            (
+                "SELECT s.pg_sleep FROM (SELECT x.pg_sleep::text "
+                "FROM (SELECT 1 AS pg_sleep) x) s",
+                None,
+            ),
+            (
+                "SELECT s.pg_sleep FROM (SELECT (x.pg_sleep)[1] "
+                "FROM (SELECT ARRAY[1] AS pg_sleep) x) s",
+                None,
+            ),
+            # Postgres ends an operator at `--` / `/*`.
+            ("SELECT 2 +-- c\n3 AS v", None),
+            ("SELECT 2 */*c*/3 AS v", None),
+            # `qualify` as a window name.
+            (
+                "SELECT sum(id) OVER qualify AS s FROM auth_permission "
+                "WINDOW qualify AS (ORDER BY id)",
+                None,
+            ),
+        ],
+    )
+    def test_accepted(self, sql, columns):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=columns)
+
+    def test_select_star_columns_are_not_known(self):
+        # With the `SELECT *` ban off, a `*` item's columns are unknown, so
+        # `(s).pg_sleep` may be `pg_sleep(s)` on a column `s`.
+        _expect_reject(
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep, * FROM auth_permission) s",
+            OutcomeReason.DISALLOWED_FUNCTION,
+            ban_select_star=False,
+        )
+
+    def test_star_field_is_a_column(self):
+        parse_and_validate(
+            "SELECT (s.*).pg_sleep FROM (SELECT 1 AS pg_sleep) s",
+            allowed_tables=ALLOWED,
+            ban_select_star=False,
+        )
+
+
+class TestReviewRound11:
+    """Review round 11 (Grok's final pass of A6-A9)."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A table's system columns are columns: `(tableoid).f` is
+            # `f(tableoid)`, whatever FROM item is named `tableoid`.
+            "SELECT (tableoid).pg_relation_filepath FROM auth_permission, "
+            "(SELECT 1 AS pg_relation_filepath) tableoid",
+            "SELECT (ctid).pg_sleep FROM auth_permission AS p(a, b, c, d), "
+            "(SELECT 1 AS pg_sleep) ctid",
+            "SELECT (xmin).pg_sleep FROM auth_permission, (SELECT 1 AS pg_sleep) xmin",
+            # ... and the A8 rule for `t.f` sees them too.
+            "SELECT tableoid.pg_relation_size FROM auth_permission, "
+            "(SELECT 1 AS pg_relation_size) tableoid",
+        ],
+    )
+    def test_system_columns_are_in_scope(self, sql):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION, table_columns=COLUMNS)
+
+    def test_a_row_field_beside_a_table_is_still_a_column(self):
+        parse_and_validate(
+            "SELECT (s).pg_sleep FROM (SELECT 1 AS pg_sleep) s, auth_permission",
+            allowed_tables=ALLOWED,
+            table_columns=COLUMNS,
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres: a syntax error after a complete interval qualifier;
+            # sqlglot read the word as an alias.
+            "SELECT INTERVAL '1' DAY TO",
+            "SELECT INTERVAL '1' DAY HOUR",
+            "SELECT INTERVAL '25 hours' DAY HOUR",
+            "SELECT INTERVAL '1' SECOND TO MINUTE",
+            "SELECT INTERVAL '1' DAY TO SECOND TO",
+            "SELECT INTERVAL '1' SECOND(2) TO",
+        ],
+    )
+    def test_a_field_after_the_qualifier_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            ("""SELECT INTERVAL '1' DAY "HOUR\"""", """INTERVAL '1' DAY AS "HOUR\""""),
+            ("SELECT INTERVAL '1' DAY AS hour", "INTERVAL '1' DAY AS hour"),
+            # A column `key` (PG16: `key_expression VALUE value`); sqlglot
+            # dropped it as the keyword, or the parser refused it.
+            (
+                "SELECT json_object(key VALUE id) FROM (SELECT 'k' AS key, 1 AS id) s",
+                "JSON_OBJECT(key: id)",
+            ),
+            (
+                'SELECT json_object("KEY" VALUE id) '
+                "FROM (SELECT 'k' AS \"KEY\", 1 AS id) s",
+                'JSON_OBJECT("KEY": id)',
+            ),
+        ],
+    )
+    def test_rendered_as_written(self, sql, rendered):
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        assert rendered in render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        "sql",
+        ["SELECT json_object(KEY 'a' VALUE 1)", "SELECT json_object(KEY a VALUE 1)"],
+    )
+    def test_key_keyword_form_stays_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+
+class TestReviewRound12:
+    """Review round 12 (final pass of A6-A11)."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres has six interval fields; any other word after the
+            # string is an alias (1 second named `week`), which sqlglot
+            # folded into the value as one of its own units (7 days).
+            ("SELECT INTERVAL '1' WEEK", "INTERVAL '1' AS WEEK"),
+            ("SELECT INTERVAL '1' DAYS", "INTERVAL '1' AS DAYS"),
+            ("SELECT INTERVAL '1' q", "INTERVAL '1' AS q"),
+            ("SELECT INTERVAL '1' hr", "INTERVAL '1' AS hr"),
+            # The string itself as written (sqlglot respelled its unit).
+            ("SELECT INTERVAL '1 week' AS v", "INTERVAL '1 week' AS v"),
+            ("SELECT INTERVAL '3 days ago' AS v", "INTERVAL '3 days ago' AS v"),
+        ],
+    )
+    def test_interval_word_is_an_alias(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres takes only an unsigned integer precision, then a
+            # string; sqlglot ran a sum or dropped parts.
+            "SELECT INTERVAL(3.0) '1.2'",
+            "SELECT INTERVAL(+3) '1.25'",
+            "SELECT INTERVAL(-1) '1 day'",
+            "SELECT INTERVAL(1 + 2) '1.2'",
+            "SELECT INTERVAL(3)",
+        ],
+    )
+    def test_interval_precision_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A quoted name is never a keyword to Postgres: the column.
+            'SELECT "user" FROM (SELECT 1 AS "user") s',
+            'SELECT "current_user", "session_user" FROM '
+            '(SELECT 1 AS "current_user", 2 AS "session_user") s',
+        ],
+    )
+    def test_quoted_builtin_name_is_a_column(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED)
+
+    def test_unquoted_builtin_name_stays_refused(self):
+        _expect_reject(
+            "SELECT user FROM (SELECT 1 AS id) s", OutcomeReason.DISALLOWED_FUNCTION
+        )
+
+    @pytest.mark.parametrize(
+        ("sql", "allowed"),
+        [
+            # Postgres folds only ASCII A-Z: a capital sigma is not the small
+            # one, and the Kelvin sign is not `k`.
+            ("SELECT id FROM \u03a3", {"\u03c3"}),
+            ("SELECT id FROM auth_permission_\u212a", {"auth_permission_k"}),
+            ("WITH \u03c3 AS (SELECT 1 AS id) SELECT id FROM \u03a3", {"t"}),
+        ],
+    )
+    def test_only_ascii_is_folded(self, sql, allowed):
+        _expect_reject(sql, OutcomeReason.DISALLOWED_TABLE, allowed=allowed)
+
+    def test_limit_reads_only_the_whitespace_postgres_skips(self):
+        ast = parse_and_validate(
+            "SELECT id FROM auth_permission LIMIT '5\u00a0'", allowed_tables=ALLOWED
+        ).ast
+        assert extract_limit(ast) is None  # Postgres: invalid input for bigint
+
+
+class TestReviewRound13:
+    """Review round 13 (Opus final review of A12): every string-constant
+    form after `INTERVAL` and in a LIMIT, ASCII-only interval field words."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # `E'…'` (sqlglot: `ByteString`) and `$$…$$` / `$tag$…$tag$`
+            # (`RawString`) are string constants to Postgres like `'…'`. A
+            # word after them is an alias (1 second named `week`; sqlglot
+            # folded it in as a unit, 7 days), a field qualifier applies.
+            ("SELECT INTERVAL E'1' week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL e'2' days", "SELECT INTERVAL '2' AS days LIMIT"),
+            ("SELECT INTERVAL $$1$$ week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL $t$1$t$ week", "SELECT INTERVAL '1' AS week LIMIT"),
+            ("SELECT INTERVAL $$3$$ q", "SELECT INTERVAL '3' AS q LIMIT"),
+            ('SELECT INTERVAL $$1$$ "day"', """SELECT INTERVAL '1' AS "day" LIMIT"""),
+            (
+                "SELECT INTERVAL $$25 hours$$ DAY",
+                "SELECT INTERVAL '25 hours' DAY LIMIT",
+            ),
+            ("SELECT INTERVAL E'25 hours' DAY", "SELECT INTERVAL '25 hours' DAY LIMIT"),
+            ("SELECT INTERVAL $$1-2$$ YEAR TO MONTH", "INTERVAL '1-2' YEAR TO MONTH"),
+            ("SELECT INTERVAL $$1 week$$ AS v", "SELECT INTERVAL '1 week' AS v LIMIT"),
+            # The precision form takes any string constant too (was refused).
+            ("SELECT INTERVAL(2) $$1.234$$", "SELECT INTERVAL(2) '1.234' LIMIT"),
+            ("SELECT INTERVAL(2) E'1.234'", "SELECT INTERVAL(2) '1.234' LIMIT"),
+            # The string ends the interval: sqlglot read `$$1$$ * 2` as the
+            # value and rendered `INTERVAL` alone.
+            ("SELECT INTERVAL $$1$$ * 2", "SELECT INTERVAL '1' * 2 LIMIT"),
+        ],
+    )
+    def test_every_string_constant_form_is_an_interval_string(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, as for `'…'` (it ran as 7 days).
+            "SELECT INTERVAL $$1$$ WEEK AS w",
+            "SELECT INTERVAL E'1' DAY HOUR",
+            "SELECT INTERVAL(2) $$1.5$$ SECOND",
+        ],
+    )
+    def test_string_constant_forms_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # A typed literal takes any string constant (was a parse error).
+            ("SELECT DATE $$2024-01-01$$", "SELECT CAST('2024-01-01' AS DATE) LIMIT"),
+            (
+                "SELECT TIMESTAMP E'2024-01-01 10:00'",
+                "SELECT CAST('2024-01-01 10:00' AS TIMESTAMP) LIMIT",
+            ),
+            ("SELECT bit $t$011$t$", """SELECT CAST('011' AS "bit") LIMIT"""),
+            # A backslash-free E-string is the plain string.
+            ("SELECT E'it''s' AS v", "SELECT 'it''s' AS v LIMIT"),
+            # Where sqlglot's parser takes only a string (`STRING_PARSERS`):
+            # an ESCAPE clause, a typed literal with a type modifier. Each
+            # was a parse error without it (review round 15).
+            (
+                "SELECT name ILIKE 'A%' ESCAPE E'#' AS v FROM auth_group",
+                "SELECT name ILIKE 'A%' ESCAPE '#' AS v FROM auth_group LIMIT",
+            ),
+            ("SELECT char(2) E'abcd' AS v", "SELECT CAST('abcd' AS CHAR(2)) AS v"),
+            (
+                "SELECT time(1) E'10:00:00.66' AS v",
+                "SELECT CAST('10:00:00.66' AS TIME(1)) AS v LIMIT",
+            ),
+        ],
+    )
+    def test_every_string_constant_form_is_a_string(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres has no sum of intervals: `+` is the operator.
+            # sqlglot rendered `INTERVAL '1 day' + INTERVAL '2'` (dropping
+            # `* INTERVAL '1 day'`).
+            (
+                "SELECT INTERVAL '1 day' + 2 * INTERVAL '1 day'",
+                "SELECT INTERVAL '1 day' + 2 * INTERVAL '1 day' LIMIT",
+            ),
+            ("SELECT INTERVAL '1 day' + 2", "SELECT INTERVAL '1 day' + 2 LIMIT"),
+            ("SELECT INTERVAL '1 day' + '1' week", "INTERVAL '1 day' + '1' AS week"),
+        ],
+    )
+    def test_plus_after_an_interval_is_the_operator(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    def test_interval_string_is_escaped(self):
+        # sqlglot pasted the value between quotes: the quotes inside became
+        # SQL (three projections, where Postgres reads one invalid interval).
+        expected = "SELECT INTERVAL '1 day'', name, ''b' FROM auth_group"
+        rendered = self._rendered(
+            "SELECT INTERVAL '1 day'', name, ''b' FROM auth_group"
+        )
+        assert expected in rendered
+        rendered = self._rendered(
+            "SELECT INTERVAL $$1 day', name, 'b$$ FROM auth_group"
+        )
+        assert expected in rendered
+
+    @pytest.mark.parametrize(
+        ("limit", "value"),
+        [
+            ("$$5000000000$$", 5000000000),
+            ("E'5000000000'", 5000000000),
+            ("$t$ +12 $t$", 12),
+            ("($$7$$)", 7),
+            ("$$5\u00a0$$", None),  # Postgres: invalid input for bigint
+            ("$$3 apples$$", None),
+        ],
+    )
+    def test_limit_reads_every_string_constant_form(self, limit, value):
+        ast = parse_and_validate(
+            f"SELECT id FROM auth_permission LIMIT {limit}",  # noqa: S608
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == value
+
+    def test_dollar_quoted_big_limit_is_the_bigint(self):
+        # `LEAST('5000000000', n)` would read it as int4 and overflow.
+        assert _executed("LIMIT $$5000000000$$").endswith(" LIMIT 11")
+
+    @pytest.mark.parametrize(
+        ("sql", "rendered"),
+        [
+            # Postgres folds only ASCII letters: a dotless i (U+0131) or a long s
+            # (U+017F) makes another word, an alias (`str.upper` made it a field).
+            ("SELECT INTERVAL '90 seconds' m\u0131nute", "AS m\u0131nute"),
+            ("SELECT INTERVAL '1.789' \u017fecond", "AS \u017fecond"),
+        ],
+    )
+    def test_interval_field_words_are_ascii(self, sql, rendered):
+        assert rendered in self._rendered(sql)
+
+    def test_non_ascii_field_word_after_to_is_a_parse_error(self):
+        _expect_reject(
+            "SELECT INTERVAL '1:02:03' HOUR TO m\u0131nute", OutcomeReason.PARSE_ERROR
+        )
+
+
+class TestReviewRound15:
+    """Review round 15 (Opus final review of A13): `INTERVAL` is a typed
+    literal only before a string constant or `(`; anywhere else it is an
+    ordinary name, a column `interval`."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("expression", "column"),
+        [
+            # sqlglot took the next operand as the interval's value: `+ 1`
+            # ran as `INTERVAL '1'`, `- 1` as `INTERVAL '-1'`, `+ '1'` as
+            # `INTERVAL '1'`, `- y` / `[1]` were dropped (`INTERVAL`),
+            # `~ '^m'` ran as `INTERVAL '^m'`, `COLLATE "C"` as `INTERVAL
+            # 'COLLATE C'`, `% 3` as `INTERVAL '?' + INTERVAL '3'`.
+            ("interval + 1", "1"),
+            ("interval - 1", "1"),
+            ("interval + '1'", "1"),
+            ("interval - y", "1"),
+            ("interval[1]", "ARRAY[5]"),
+            ("interval ~ '^m'", "'m'"),
+            ('interval COLLATE "C"', "'m'"),
+            ("interval % 3", "4"),
+            # `* 2` was refused as `SELECT *`; `/ 2`, `^ 2` were parse errors.
+            ("interval * 2", "1"),
+            ("interval / 2", "4"),
+            ("interval ^ 2", "3"),
+        ],
+    )
+    def test_interval_is_a_column(self, expression, column):
+        source = f"(SELECT {column} AS interval, 2 AS y)"
+        sql = f"SELECT {expression} AS v FROM {source} s"  # noqa: S608
+        expected = f"SELECT {expression} AS v FROM {source} AS s LIMIT 11"  # noqa: S608
+        assert self._rendered(sql) == expected
+
+    def test_interval_column_in_a_condition(self):
+        # sqlglot ran `WHERE INTERVAL '1' > 2`.
+        sql = (
+            "SELECT interval AS v FROM (SELECT 2 AS interval) AS s"
+            " WHERE interval + 1 > 2"
+        )
+        assert self._rendered(sql) == f"{sql} LIMIT 11"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, which sqlglot ran: a number, a
+            # national / bit / hex string, a second INTERVAL after `INTERVAL`
+            # (`INTERVAL 5 DAY` was 5 days, `INTERVAL N'1' week` 7 days).
+            "SELECT INTERVAL 5 DAY",
+            "SELECT INTERVAL 5",
+            "SELECT INTERVAL 5::text",
+            "SELECT INTERVAL N'1' week",
+            "SELECT INTERVAL B'1' week",
+            "SELECT INTERVAL X'1' week",
+            "SELECT INTERVAL INTERVAL '1 day'",
+            # A word, then a string: sqlglot read a typed literal of the
+            # type `INTERVAL <word>` (`y` as `YEAR`: 365 days).
+            "SELECT interval day '1'",
+            "SELECT interval DAY TO SECOND '1'",
+            "SELECT interval y '1' FROM (SELECT 1 AS interval, 2 AS y) s",
+            # `INTERVAL(` is always the precision form to Postgres, even
+            # with a column `interval` in scope.
+            "SELECT interval(1) AS v FROM (SELECT 1 AS interval) s",
+        ],
+    )
+    def test_interval_syntax_postgres_rejects(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    # Review round 16: left to sqlglot's `_parse_type`, `interval[` was read
+    # as an array type, so a slice of a column `interval` was a parse error
+    # (Postgres reads the column; A15 regression).
+    @pytest.mark.parametrize(
+        ("expression", "rendered"),
+        [
+            ("interval[:]", "interval[:]"),
+            ("interval[:1]", "interval[:1]"),
+            ("INTERVAL[:1]", "INTERVAL[:1]"),
+            ("interval [:1]", "interval[:1]"),
+            ("interval[ :1]", "interval[:1]"),
+            ("interval[1:]", "interval[1:]"),
+        ],
+    )
+    def test_a_slice_of_a_column_interval(self, expression, rendered):
+        source = "(SELECT ARRAY[5, 6] AS interval)"
+        sql = f"SELECT {expression} AS v FROM {source} s"  # noqa: S608
+        expected = f"SELECT {rendered} AS v FROM {source} AS s LIMIT 11"  # noqa: S608
+        assert self._rendered(sql) == expected
+
+    @pytest.mark.parametrize(
+        "sql", ["SELECT interval(1) '1.23' AS v", "SELECT interval (1) '1.23' AS v"]
+    )
+    def test_precision_form_is_kept(self, sql):
+        assert "SELECT INTERVAL(1) '1.23' AS v LIMIT" in self._rendered(sql)
+
+
+class TestReviewRound17:
+    """Interval type modifiers in a cast: `interval(p)` (sqlglot rendered
+    `INTERVAL p`, refused as `roundtrip_mismatch`) and `second(p)` after a
+    field (read as an alias list, a parse error) are kept as written; a
+    precision before a field stays Postgres's syntax error."""
+
+    @staticmethod
+    def _rendered(sql: str) -> str:
+        parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
+        return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            ("'12.345'::interval(1)", "CAST('12.345' AS INTERVAL(1))"),
+            ("CAST('1' AS interval(3))", "CAST('1' AS INTERVAL(3))"),
+            ("'1'::INTERVAL ( 1 )", "CAST('1' AS INTERVAL(1))"),
+            ("'{1}'::interval(1)[]", "CAST('{1}' AS INTERVAL(1)[])"),
+            ("'1'::interval second(2)", "CAST('1' AS INTERVAL SECOND(2))"),
+            ("'1'::interval second (2)", "CAST('1' AS INTERVAL SECOND(2))"),
+            (
+                "'1'::interval day to second(3)",
+                "CAST('1' AS INTERVAL DAY TO SECOND(3))",
+            ),
+            ("'{1}'::interval second(1)[]", "CAST('{1}' AS INTERVAL SECOND(1)[])"),
+            (
+                "'{{1}}'::interval second(1)[][]",
+                "CAST('{{1}}' AS INTERVAL SECOND(1)[][])",
+            ),
+        ],
+    )
+    def test_kept_as_written(self, written, rendered):
+        assert self._rendered(f"SELECT {written} AS v") == (
+            f"SELECT {rendered} AS v LIMIT 11"
+        )
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT '1'::interval(1) day to second AS v",
+            "SELECT '1'::interval(1) day AS v",
+            "SELECT '1'::interval minute(2) AS v",
+            "SELECT '1'::interval(1.0) AS v",
+        ],
+    )
+    def test_postgres_syntax_errors_stay_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+
+class TestReviewRound18:
+    """A word after `interval` / `interval(p)` in a cast that is not one of
+    Postgres's fields (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) is an alias.
+    sqlglot read a unit of its own list and normalised it: `'90'::interval
+    days` ran as `INTERVAL DAY` (90 days; Postgres: 90 seconds named
+    `days`), `h` as `HOUR`; `week` rendered `INTERVAL WEEK` (Postgres's
+    syntax error); `interval(1) secs` was refused. A fractional precision
+    is never a field's (`second(1.5)`)."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            ("'90'::interval days", "CAST('90' AS INTERVAL) AS days"),
+            ("'1'::interval h", "CAST('1' AS INTERVAL) AS h"),
+            ("'1'::interval week", "CAST('1' AS INTERVAL) AS week"),
+            ("'1'::interval Week, 2 AS b", "CAST('1' AS INTERVAL) AS Week, 2 AS b"),
+            ("'1'::interval s", "CAST('1' AS INTERVAL) AS s"),
+            ("'1.234'::interval(1) secs", "CAST('1.234' AS INTERVAL(1)) AS secs"),
+            ("'1.234'::interval ( 1 ) mins", "CAST('1.234' AS INTERVAL(1)) AS mins"),
+            ("'1'::interval \"day\"", "CAST('1' AS INTERVAL) AS \"day\""),
+            # Fields stay fields.
+            ("'1'::interval Day AS v", "CAST('1' AS INTERVAL DAY) AS v"),
+            ("'1'::interval second secs", "CAST('1' AS INTERVAL SECOND) AS secs"),
+            (
+                "'1'::interval day to second(3) AS v",
+                "CAST('1' AS INTERVAL DAY TO SECOND(3)) AS v",
+            ),
+            ("'{1}'::interval day[] AS v", "CAST('{1}' AS INTERVAL DAY[]) AS v"),
+        ],
+    )
+    def test_a_word_that_is_no_field_is_an_alias(self, written, rendered):
+        assert self._rendered(f"SELECT {written}") == (f"SELECT {rendered} LIMIT 11")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors (an alias where none may stand, or
+            # something after the alias), which ran before.
+            "SELECT CAST('1' AS interval h) AS v",
+            "SELECT 1 AS v FROM t WHERE '1'::interval week > '0'::interval",
+            "SELECT '1'::interval min to sec AS v",
+            "SELECT '1'::interval day to sec AS v",
+            "SELECT '1'::interval day to \"second\" AS v",
+            "SELECT '{1}'::interval h[] AS v",
+            "SELECT '1'::interval week::text",
+            "SELECT '1'::interval(1) secs[1]",
+            # A fractional precision (the `isdigit` guards).
+            "SELECT '1'::interval second(1.5) AS v",
+            "SELECT '1'::interval day to second(2.0) AS v",
+            "SELECT interval '1' second(1.5) AS v",
+        ],
+    )
+    def test_postgres_syntax_errors_are_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+
+class TestReviewRound19:
+    """The array part of a type name, in every position. sqlglot read
+    `<type> ARRAY` only before some tokens: at the end of the input `ARRAY`
+    was dropped (`'{a,b}'::text array` ran as `text`, `'{1}'::interval day
+    array` as one day), before a comma it became the alias `array`, before
+    an operator the query was refused; a bound after a type (`int[3]`) was
+    rendered as a subscript of the cast. `bit varying` ran as `bit(1)`; a
+    word after the quoted `"interval"` was dropped."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # `ARRAY` at the end of the input, before a comma, `)`, an
+            # alias, an operator; any case, a comment between.
+            ("'{a,b}'::text array", "CAST('{a,b}' AS TEXT[])"),
+            ("'{1,2}'::int ARRAY, 1 AS k", "CAST('{1,2}' AS INT[]), 1 AS k"),
+            ("1 AS k, '{1}'::int Array", "1 AS k, CAST('{1}' AS INT[])"),
+            ("('{1}'::int array)", "(CAST('{1}' AS INT[]))"),
+            ("'{1}'::int /* c */ array", "CAST('{1}' AS INT[])"),
+            ("'{1}'::int array AS v", "CAST('{1}' AS INT[]) AS v"),
+            ("'{1}'::int array v", "CAST('{1}' AS INT[]) AS v"),
+            ("'{1}'::int array = '{1}'", "CAST('{1}' AS INT[]) = '{1}'"),
+            ("'{1}'::int array || 2", "CAST('{1}' AS INT[]) || 2"),
+            ("'{1}'::int array IS NULL", "CAST('{1}' AS INT[]) IS NULL"),
+            ("'{1}'::int array::text", "CAST(CAST('{1}' AS INT[]) AS TEXT)"),
+            ("ARRAY[1]::text array", "CAST(ARRAY[1] AS TEXT[])"),
+            ("CAST('{1}' AS int array)", "CAST('{1}' AS INT[])"),
+            # `ARRAY[n]` and bounds: the type, as written.
+            ("'{1}'::int array[3]", "CAST('{1}' AS INT[3])"),
+            ("'{1}'::int ARRAY [ 03 ]", "CAST('{1}' AS INT[03])"),
+            (
+                "CAST('{1}' AS int array[2147483647])",
+                "CAST('{1}' AS INT[2147483647])",
+            ),
+            ("'{1}'::int[3]", "CAST('{1}' AS INT[3])"),
+            ("'{1}'::int[3][]", "CAST('{1}' AS INT[3][])"),
+            ("'{1}'::int[][3]", "CAST('{1}' AS INT[][3])"),
+            ("CAST('{1}' AS text[3])", "CAST('{1}' AS TEXT[3])"),
+            ("'{1.234}'::interval(1)[1]", "CAST('{1.234}' AS INTERVAL(1)[1])"),
+            # After every kind of type name.
+            ("'{1}'::interval array", "CAST('{1}' AS INTERVAL[])"),
+            ("'{1}'::interval day array", "CAST('{1}' AS INTERVAL DAY[])"),
+            ("'{1}'::interval(2) array", "CAST('{1}' AS INTERVAL(2)[])"),
+            (
+                "'{1}'::interval second(2) array",
+                "CAST('{1}' AS INTERVAL SECOND(2)[])",
+            ),
+            ("'{1}'::interval second(2)[2]", "CAST('{1}' AS INTERVAL SECOND(2)[2])"),
+            ("'{1}'::interval array days", "CAST('{1}' AS INTERVAL[]) AS days"),
+            ("'{1}'::timestamp with time zone array", "CAST('{1}' AS TIMESTAMPTZ[])"),
+            (
+                "'{1}'::double precision array[3]",
+                "CAST('{1}' AS DOUBLE PRECISION[3])",
+            ),
+            ("'{a}'::character varying(2) array", "CAST('{a}' AS VARCHAR(2)[])"),
+            ("'{1}'::numeric(5,2) array", "CAST('{1}' AS DECIMAL(5, 2)[])"),
+            ("'{1}'::pg_catalog.int4 array", "CAST('{1}' AS pg_catalog.int4[])"),
+            ("'{a}'::\"char\" array", "CAST('{a}' AS \"char\"[])"),
+            # `bit varying` (Postgres's `varbit`).
+            ("'10101'::bit varying", "CAST('10101' AS varbit)"),
+            ("'10101'::BIT VARYING, 1 AS k", "CAST('10101' AS varbit), 1 AS k"),
+            ("'10101'::bit varying (3)", "CAST('10101' AS varbit(3))"),
+            ("'{101}'::bit varying(2) array", "CAST('{101}' AS varbit(2)[])"),
+            ("bit varying '101'", "CAST('101' AS varbit)"),
+            # The quoted `"interval"` takes no field: a word after it is an
+            # alias, as after a qualified `interval`.
+            ("'90'::\"interval\" days", "CAST('90' AS \"interval\") AS days"),
+            (
+                "'90'::\"interval\" h, 1 AS k",
+                "CAST('90' AS \"interval\") AS h, 1 AS k",
+            ),
+            ("'90'::\"interval\"(1) secs", "CAST('90' AS \"interval\"(1)) AS secs"),
+            (
+                "'{9}'::\"interval\" array[2] days",
+                "CAST('{9}' AS \"interval\"[2]) AS days",
+            ),
+            (
+                "'90'::pg_catalog.interval days",
+                "CAST('90' AS pg_catalog.interval) AS days",
+            ),
+        ],
+    )
+    def test_rendered_as_postgres_reads_it(self, written, rendered):
+        assert self._rendered(f"SELECT {written}") == (f"SELECT {rendered} LIMIT 11")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Postgres's syntax errors, which ran (or ran as something else).
+            "SELECT '{1}'::int[] array",
+            "SELECT '{1}'::int array array",
+            "SELECT '{1}'::int array[1] array",
+            "SELECT '{1}'::int array[]",
+            "SELECT '{1}'::int array[2][3]",
+            "SELECT '{1}'::int array[+3]",
+            "SELECT '{1}'::int array[3.0]",
+            "SELECT '{1}'::int array[2147483648]",
+            "SELECT '{1}'::int[-1]",
+            "SELECT '{1}'::int[1.5]",
+            "SELECT CAST('{1}' AS int[id])",
+            "SELECT int[] '{1}'",
+            "SELECT int array '{1}'",
+            "SELECT '1'::bit varying(id)",
+            "SELECT '1'::bit varying(1.5)",
+            # `varying` belongs to `bit` / `character` only, written right
+            # after it; elsewhere it is an alias only after `AS`.
+            "SELECT '1'::bit(3) varying",
+            "SELECT '1'::\"bit\" varying",
+            "SELECT '1'::pg_catalog.bit varying",
+            "SELECT '1'::text varying",
+            "SELECT 1 array",
+            "SELECT 1 FROM auth_group array",
+            # An interval field after a type is an alias only after `AS`.
+            "SELECT '1'::int day",
+            "SELECT '{1}'::interval[] day",
+            "SELECT '{1}'::interval array day",
+            "SELECT '1'::interval day hour",
+            "SELECT '90'::\"interval\" day",
+            "SELECT '90'::\"interval\" day to second",
+            "SELECT '90'::pg_catalog.interval day",
+            "SELECT CAST('90' AS \"interval\" days)",
+        ],
+    )
+    def test_postgres_syntax_errors_are_refused(self, sql):
+        with pytest.raises(QueryRejectedError):
+            self._rendered(sql)
+
+    @pytest.mark.parametrize(
+        "bound", ["1.5", "1e3", "2147483648", "99999999999999999999"]
+    )
+    def test_a_bad_bound_is_a_parse_error_after_the_escape_check(self, bound):
+        # A bound that is no integer constant is sqlglot's `ParseError`, so
+        # the refused escape literal stays the audit reason.
+        _expect_reject(
+            f"SELECT E'a\\b' AS v, '{{1}}'::int[{bound}] AS w",
+            OutcomeReason.UNSAFE_LITERAL,
+        )
+        _expect_reject(
+            f"SELECT '{{1}}'::int ARRAY[{bound}] AS w", OutcomeReason.PARSE_ERROR
+        )
+
+    def test_sqlglot_matches_array_only_after_a_type(self):
+        """`_match` declines `TokenType.ARRAY` while sqlglot's own
+        `_parse_types` runs (the type suffix is read by `_array_suffix`). A
+        sqlglot matching it somewhere else too would need a look."""
+        import inspect
+
+        import sqlglot.parser
+
+        source = inspect.getsource(sqlglot.parser)
+        assert source.count("_match(TokenType.ARRAY)") == 1
+
+
+class TestReviewRound20:
+    """`OPERATOR(schema.op)`, the documented way to an operator outside
+    the pinned `search_path`, keeps its name as written. sqlglot joined the
+    texts of the tokens inside: `OPERATOR("MySchema".=)` ran as
+    `OPERATOR(MySchema.=)` (Postgres: the operator in `myschema`, another
+    one), `OPERATOR("my schema".=)` as `myschema.=`, `OPERATOR(pg_catalog.<
+    =)` (a Postgres syntax error) as `<=`. The prefix form was a parse
+    error, `x operator` lost its alias on sqlglot 30.7, and `!~ x` ran as
+    `! ~x`. Values against Postgres: the functional corpus."""
+
+    _rendered = staticmethod(TestReviewRound17._rendered)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # Quoted qualifiers stay quoted, unquoted ones as written.
+            ('1 OPERATOR("MySchema".=) 2', '1 OPERATOR("MySchema".=) 2'),
+            ('1 OPERATOR("my schema".=) 2', '1 OPERATOR("my schema".=) 2'),
+            ('1 OPERATOR("a""b".+) 2', '1 OPERATOR("a""b".+) 2'),
+            ("1 OPERATOR(MySchema.=) 2", "1 OPERATOR(MySchema.=) 2"),
+            ('1 OPERATOR("PG_CATALOG".+) 2', '1 OPERATOR("PG_CATALOG".+) 2'),
+            ("1 OPERATOR(db.pg_catalog.+) 2", "1 OPERATOR(db.pg_catalog.+) 2"),
+            ("1 OPERATOR(+) 2", "1 OPERATOR(+) 2"),
+            # What separates the tokens is dropped (Postgres: the same).
+            ("1 OPERATOR ( pg_catalog . + ) 2", "1 OPERATOR(pg_catalog.+) 2"),
+            ("1 OPERATOR(pg_catalog./* c */+) 2", "1 OPERATOR(pg_catalog.+) 2"),
+            # Chains, and an operand starting with a sign.
+            (
+                "1 OPERATOR(pg_catalog.+) 2 OPERATOR(pg_catalog.*) 3",
+                "1 OPERATOR(pg_catalog.+) 2 OPERATOR(pg_catalog.*) 3",
+            ),
+            ("1 OPERATOR(pg_catalog.+)-1", "1 OPERATOR(pg_catalog.+) -1"),
+            ("1 OPERATOR(pg_catalog.=) ANY ('{1}')", "OPERATOR(pg_catalog.=) ANY("),
+            # Prefix operators.
+            ("OPERATOR(pg_catalog.-) 2 + 3", "OPERATOR(pg_catalog.-) 2 + 3"),
+            ('OPERATOR("MySchema".-) 2', 'OPERATOR("MySchema".-) 2'),
+            (
+                "OPERATOR(pg_catalog.-) OPERATOR(pg_catalog.-) 5",
+                "OPERATOR(pg_catalog.-) OPERATOR(pg_catalog.-) 5",
+            ),
+            (
+                "1 OPERATOR(pg_catalog.+) OPERATOR(pg_catalog.-) 5",
+                "1 OPERATOR(pg_catalog.+) OPERATOR(pg_catalog.-) 5",
+            ),
+            ("- OPERATOR(pg_catalog.-) 5", "-OPERATOR(pg_catalog.-) 5"),
+            # Operators sqlglot cannot read bare (refused there).
+            ("'a' OPERATOR(pg_catalog.~<~) 'b'", "'a' OPERATOR(pg_catalog.~<~) 'b'"),
+            ("1 OPERATOR(pg_catalog.%-) 2", "1 OPERATOR(pg_catalog.%-) 2"),
+            ("OPERATOR(pg_catalog.|/) 16", "OPERATOR(pg_catalog.|/) 16"),
+            ("OPERATOR(pg_catalog.@-@) 1", "OPERATOR(pg_catalog.@-@) 1"),
+            # `operator` with no `(` after it is a name.
+            ("1 operator", "1 AS operator"),
+            ("1 operator, 2 AS k", "1 AS operator, 2 AS k"),
+            ("operator FROM (SELECT 1 AS operator) s", "SELECT operator FROM"),
+            # `!~ x` is one prefix operator to Postgres.
+            ("!~ 'a'", "!~ 'a'"),
+            ("'a' OPERATOR(pg_catalog.~) !~ 'b'", "OPERATOR(pg_catalog.~) !~ 'b'"),
+            ("! ~1", "! ~1"),
+            ("!!'a'::tsquery", "!! CAST('a' AS tsquery)"),
+        ],
+    )
+    def test_operator_form_kept_as_written(self, written, rendered):
+        assert rendered in self._rendered(f"SELECT {written}")
+
+    @pytest.mark.parametrize(
+        "operator",
+        [
+            # Postgres reads two operators, a syntax error in OPERATOR().
+            "pg_catalog.< =",
+            "pg_catalog.~ ~",
+            "pg_catalog.</**/=",
+            "pg_catalog.+-",
+            # Not an operator name.
+            "'x'",
+            "pg_catalog.pg_sleep",
+            "a b.+",
+            "pg_catalog.",
+            ".+",
+            "",
+            "e'x'.+",
+            "$$x$$.+",
+            '"x"(.+',
+        ],
+    )
+    def test_not_an_operator_name_is_a_parse_error(self, operator):
+        _expect_reject(f"SELECT 1 OPERATOR({operator}) 2", OutcomeReason.PARSE_ERROR)
+        _expect_reject(f"SELECT OPERATOR({operator}) 2", OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 OPERATOR(pg_catalog.+ AS v",
+            "SELECT OPERATOR(pg_catalog.-) AS v",
+            "SELECT operator(1) AS v",
+        ],
+    )
+    def test_incomplete_operator_form_is_a_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            (
+                "SELECT id FROM auth_permission WHERE id OPERATOR(pg_catalog.=) "
+                "pg_sleep(1)",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT pg_read_file('x') OPERATOR(pg_catalog.||) 'a' AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT OPERATOR(pg_catalog.-) pg_backend_pid() AS v",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT OPERATOR(\"MySchema\".-) set_config('a', 'b', true)::int",
+                OutcomeReason.DISALLOWED_FUNCTION,
+            ),
+            (
+                "SELECT 1 OPERATOR(pg_catalog.=) (SELECT max(id) FROM secret) AS v",
+                OutcomeReason.DISALLOWED_TABLE,
+            ),
+            (
+                "SELECT OPERATOR(pg_catalog.-) (SELECT max(oid) FROM pg_class) AS v",
+                OutcomeReason.SYSTEM_SCHEMA,
+            ),
+            (
+                "SELECT id, t OPERATOR(pg_catalog.=) t AS v FROM auth_permission t",
+                OutcomeReason.SELECT_STAR,
+            ),
+            # Outside the parentheses sqlglot's reading still counts.
+            (
+                "SELECT 1 OPERATOR(pg_catalog.+) 2 %-3 AS v",
+                OutcomeReason.UNSAFE_LITERAL,
+            ),
+            (
+                "SELECT 1 OPERATOR(pg_catalog.+) 2 == 3 AS v",
+                OutcomeReason.UNSAFE_LITERAL,
+            ),
+            ('SELECT 1 OPERATOR(U&"x".+) 2 AS v', OutcomeReason.UNSAFE_LITERAL),
+        ],
+    )
+    def test_the_operands_are_checked(self, sql, reason):
+        _expect_reject(sql, reason, table_columns=COLUMNS)
+
+    @pytest.mark.parametrize(
+        ("written", "rendered"),
+        [
+            # A quoted type name is one name to Postgres (none of these is
+            # a type); sqlglot read its text again as SQL (Opus final 11).
+            ("'101'::\"bit varying\"", "CAST('101' AS \"bit varying\")"),
+            ("CAST('101' AS \"bit varying\")", "CAST('101' AS \"bit varying\")"),
+            ("'{101}'::\"bit varying\"[]", "CAST('{101}' AS \"bit varying\"[])"),
+            ("'{1}'::\"int array\"", "CAST('{1}' AS \"int array\")"),
+            ("'{1}'::\"int[]\"", "CAST('{1}' AS \"int[]\")"),
+            ("'{1}'::\"int array\"[]", "CAST('{1}' AS \"int array\"[])"),
+            ("'{1}'::\"int array\"[3]", "CAST('{1}' AS \"int array\"[3])"),
+            ("'1'::\"double precision\"", "CAST('1' AS \"double precision\")"),
+            # Real types, quoted: kept as written, modifiers and brackets too.
+            ("'{1}'::\"int4\"[2]", "CAST('{1}' AS \"int4\"[2])"),
+            ("'{1}'::\"int4\" array", "CAST('{1}' AS \"int4\"[])"),
+            ("'1'::\"numeric\"(10, 2)", "CAST('1' AS \"numeric\"(10, 2))"),
+            ("'90'::\"interval\" days", "CAST('90' AS \"interval\") AS days"),
+            ("'{9}'::\"interval\"[]", "CAST('{9}' AS \"interval\"[])"),
+            ("'1'::\"pg_catalog\".int4", "CAST('1' AS \"pg_catalog\".int4)"),
+            # `nchar varying` is `varchar` (refused before; Opus final 11).
+            ("'ab'::nchar varying", "CAST('ab' AS VARCHAR)"),
+            ("'ab'::NCHAR VARYING(1)", "CAST('ab' AS VARCHAR(1))"),
+            ("CAST('ab' AS nchar /* c */ varying (1))", "CAST('ab' AS VARCHAR(1))"),
+            ("'{ab}'::nchar varying(1)[]", "CAST('{ab}' AS VARCHAR(1)[])"),
+            ("nchar varying 'ab'", "CAST('ab' AS VARCHAR)"),
+            ("'ab'::nchar \"varying\"", "CAST('ab' AS CHAR) AS \"varying\""),
+        ],
+    )
+    def test_type_name_as_written(self, written, rendered):
+        assert f"SELECT {rendered} LIMIT 11" == self._rendered(f"SELECT {written}")
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'ab'::nchar(1) varying",
+            "SELECT 'ab'::nchar varying(1.5)",
+            "SELECT 'ab'::nchar varying varying",
+        ],
+    )
+    def test_nchar_varying_syntax_errors(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
+        "sql", ["SELECT '1'::\"json\"(3)", "SELECT '1'::\"interval day\"(3)"]
+    )
+    def test_a_modifier_sqlglot_drops_from_a_quoted_type_is_refused(self, sql):
+        # sqlglot rendered the type without it (`"json"`), where Postgres
+        # errors: "type modifier is not allowed", "type does not exist".
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    def test_sqlglot_reads_operator_only_after_an_operand(self):
+        """sqlglot calls `_parse_operator` from its range parser only;
+        `FaithfulPostgres` adds the prefix form. A sqlglot reading
+        `OPERATOR(` somewhere else too would need a look."""
+        import inspect
+
+        import sqlglot.parser
+
+        source = inspect.getsource(sqlglot.parser)
+        assert source.count("self._parse_operator(") == 1
+
+
 class TestCheckOrdering:
     """Order of checks matters for the audit reason. Security-relevant
     reasons must win over ergonomic ones so the audit row names the actual
     problem, not an incidental one."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # Review round 17: since round 15 these fail to parse (a field
+            # before the string), which hid the refused escape literal.
+            "SELECT interval day E'a\\b' AS v",
+            "SELECT interval U&'1' AS v",
+            "SELECT E'a\\b' FROM t QUALIFY 1",
+        ],
+    )
+    def test_unsafe_literal_before_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    def test_system_schema_with_qualify_as_a_name(self):
+        # Review round 7: `qualify` is an ordinary name, so the tree is
+        # built and the catalog reference is what the audit row names.
+        _expect_reject("SELECT id FROM pg_class qualify", OutcomeReason.SYSTEM_SCHEMA)
+
+    def test_text_postgres_cannot_parse_is_a_parse_error_first(self):
+        # A QUALIFY clause is a syntax error to Postgres as to the parser:
+        # there is no tree to run the other checks on.
+        _expect_reject(
+            "SELECT id FROM pg_class QUALIFY row_number() OVER () = 1",
+            OutcomeReason.PARSE_ERROR,
+        )
 
     def test_writeable_cte_before_returning(self):
         # DELETE RETURNING inside a CTE: the WRITEABLE_CTE name is the real

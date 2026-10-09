@@ -1,6 +1,12 @@
 version = 1
 revision = 3
 requires-python = ">=3.11"
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform != 'win32'",
+    "python_full_version < '3.14' and sys_platform == 'win32'",
+    "python_full_version < '3.14' and sys_platform != 'win32'",
+]
 
 [[package]]
 name = "a2wsgi"
@@ -324,37 +330,44 @@ dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
     { name = "sqlglot" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "a2wsgi", specifier = ">=1.10,<2" },
-    { name = "django", specifier = ">=5.2,<6.0" },
+    { name = "django", specifier = ">=4.2,<6.1" },
     { name = "django-allauth", extras = ["mfa"], marker = "extra == 'allauth'", specifier = ">=65.14,<66" },
-    { name = "django-oauth-toolkit", specifier = ">=3.2,<4" },
-    { name = "djangorestframework", specifier = ">=3.15.2,<4" },
-    { name = "mcp", specifier = ">=1.27,<2" },
+    { name = "django-oauth-toolkit", specifier = ">=3.4.1,<4" },
+    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'typecheck'", specifier = ">=6" },
+    { name = "djangorestframework", specifier = ">=3.14,<4" },
+    { name = "djangorestframework-stubs", extras = ["compatible-mypy"], marker = "extra == 'typecheck'", specifier = ">=3.15" },
+    { name = "mcp", specifier = ">=1.28.1,<2" },
+    { name = "mypy", marker = "extra == 'typecheck'", specifier = ">=1.13" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'test'", specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
+    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5" },
     { name = "pytest-django", marker = "extra == 'test'", specifier = ">=4.8" },
     { name = "sqlglot", specifier = ">=30.7,<31" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
-provides-extras = ["allauth", "test"]
+provides-extras = ["allauth", "test", "typecheck"]
 
 [[package]]
 name = "django-oauth-toolkit"
-version = "3.2.0"
+version = "3.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "django" },
     { name = "jwcrypto" },
     { name = "oauthlib" },
     { name = "requests" },
+    { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/95/efd83b35c34b86eb2249d2b54c5eaf383c48f3f19034aa6f3807e37471b6/django_oauth_toolkit-3.2.0.tar.gz", hash = "sha256:c36761ae6810083d95a652e9c820046cde0d45a2e2a5574bbe7202656ec20bb6", size = 114211, upload-time = "2026-01-08T22:03:13.311Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/42/b3c6a5d7e204011a702cc02ababb756d10538645dfd188ea441e4c65a082/django_oauth_toolkit-3.4.1.tar.gz", hash = "sha256:c4de73c0765eed55a99ea0fa8433b20664dcc1f43930149cff569abed166c5c2", size = 256139, upload-time = "2026-08-21T03:45:36.538Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/cc/f27a784c0ecd13335abd9ef85ebb80dbc04945f919da5f496f56e3562751/django_oauth_toolkit-3.2.0-py3-none-any.whl", hash = "sha256:bd2cd2719b010231a2f370f927dbcc740454fb1d0dd7e7f4138f36227363dc26", size = 87077, upload-time = "2026-01-08T22:03:12.123Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/16/11cf2eacd7ac1c32908288b6d56fadef5676071a4ac0af7e626fd1abd3ef/django_oauth_toolkit-3.4.1-py3-none-any.whl", hash = "sha256:c47f2a70e83bade0a47a5e9b20e86030d8ed9c0a8f10ec4ed30446cad7291f2d", size = 163957, upload-time = "2026-08-21T03:45:34.904Z" },
 ]
 
 [[package]]
@@ -466,7 +479,7 @@ wheels = [
 
 [[package]]
 name = "mcp"
-version = "1.27.1"
+version = "1.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -484,9 +497,9 @@ dependencies = [
     { name = "typing-inspection" },
     { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/83/d1efe7c2980d8a3afa476f4e3d42d53dd54c0ab94c27bee5d755b45c8b73/mcp-1.27.1.tar.gz", hash = "sha256:0f47e1820f8f8f941466b39749eb1d1839a04caddca2bc60e9d46e8a99914924", size = 608458, upload-time = "2026-05-08T16:50:12.601Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/93/0142dc84a666daf8ad51a34268f34c12fd6fda4f3810c4be2504eecc8212/mcp-1.30.0.tar.gz", hash = "sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4", size = 680511, upload-time = "2026-09-07T14:34:15.845Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/73/42d9596facebdb533b7f0b86c1b0364ef350d1f8ba78b1052e8a58b48b65/mcp-1.27.1-py3-none-any.whl", hash = "sha256:1af3c4203b329430fde7a87b4fcb6392a041f5cb851fd68fc674016ab4e7c06f", size = 216260, upload-time = "2026-05-08T16:50:10.547Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/f4/e58bc33317c92a0203664daaf00bf6f41166cc0149e5d6870a03f7cd004a/mcp-1.30.0-py3-none-any.whl", hash = "sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0", size = 234581, upload-time = "2026-09-07T14:34:14.266Z" },
 ]
 
 [[package]]

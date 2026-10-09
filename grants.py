@@ -5,13 +5,14 @@ It loops `MCP_SQL["PROFILES"]`, reconciling each profile's role against
 that profile's whitelist independently (per-role drift — never global).
 
 - `strict=True`: preflight failures (role missing, no membership, self-
-  referential whitelist) raise `GrantsReconcileError`. Used by the
-  `mcp_sql_grants` deploy-pipeline command.
+  referential whitelist, overlong `db_table`) raise `GrantsReconcileError`.
+  Used by the `mcp_sql_grants` deploy-pipeline command.
 - `strict=False`: env-level preflight failures (role missing,
   no membership) log a WARNING and return an empty `DriftDiff` with
   `skipped_reason` set. Code-level misconfigs (self-referential
-  whitelist) raise regardless. Used by the `post_migrate` signal so a
-  fresh environment without `role_setup.sql` does not crash `migrate`.
+  whitelist, overlong `db_table`) raise regardless. Used by the
+  `post_migrate` signal so a fresh environment without `role_setup.sql`
+  does not crash `migrate`.
 - `apply=True`: also execute the GRANT / REVOKE statements implied by the
   diff. `apply=False` is read-only; the returned `DriftDiff` describes
   what WOULD have been done.
@@ -23,6 +24,7 @@ edit, not a refactor.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -31,13 +33,24 @@ from django.db import connection
 from django.db import transaction
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.parser import DEFAULT_SCHEMA
+from mcp_sql.parser import relation_of
 
 logger = logging.getLogger(__name__)
+
+# A relation as `(schema, name)`, each exactly as the catalog stores it.
+Relation = tuple[str, str]
+
+# PostgreSQL's identifier length limit in bytes (`NAMEDATALEN - 1`, the
+# server's `max_identifier_length`; 63 unless the server was built with
+# another `NAMEDATALEN`). A longer name is truncated wherever it is used.
+MAX_IDENTIFIER_BYTES = 63
 
 
 class GrantsReconcileError(Exception):
     """Strict-mode preflight failure (role missing, no membership) or
-    code-level misconfiguration (self-referential whitelist)."""
+    code-level misconfiguration (self-referential whitelist, a `db_table`
+    longer than PostgreSQL keeps)."""
 
 
 def _verify_default_alias() -> None:
@@ -67,16 +80,17 @@ class ProfileDrift:
     """Per-profile drift between a profile's declared whitelist and the
     SELECT grants on its Postgres role.
 
-    - `granted`, `revoked`: sorted `db_table` names to grant / revoke on
-      this profile's role (with `apply=False`) or that were granted /
-      revoked (with `apply=True`).
+    - `granted`, `revoked`: sorted relations, `(schema, name)`, to grant /
+      revoke on this profile's role (with `apply=False`) or that were
+      granted / revoked (with `apply=True`). `relation_sql` renders one for
+      SQL, `relation_display` for a message.
     - `skipped_reason`: non-empty in lenient mode when this profile's
       env-level preflight failed (`"role_missing"` / `"no_membership"`);
       both action lists are empty and the apply path is a no-op for it.
     """
 
-    granted: list[str] = field(default_factory=list)
-    revoked: list[str] = field(default_factory=list)
+    granted: list[Relation] = field(default_factory=list)
+    revoked: list[Relation] = field(default_factory=list)
     skipped_reason: str = ""
 
     @property
@@ -97,11 +111,11 @@ class DriftDiff:
     per_profile: dict[str, ProfileDrift] = field(default_factory=dict)
 
     @property
-    def granted(self) -> list[str]:
+    def granted(self) -> list[Relation]:
         return sorted({t for d in self.per_profile.values() for t in d.granted})
 
     @property
-    def revoked(self) -> list[str]:
+    def revoked(self) -> list[Relation]:
         return sorted({t for d in self.per_profile.values() for t in d.revoked})
 
     @property
@@ -148,21 +162,78 @@ def declared_tables(profile: Profile) -> dict[str, str]:
     return out
 
 
-def granted_tables(role: str) -> set[str]:
-    """The public-schema tables on which `role` currently holds SELECT."""
+def quote_ident(identifier: str) -> str:
+    """`identifier` as a quoted SQL identifier that names exactly it.
+
+    Every `"` is doubled (the relations come from the catalog, where any
+    role that can create a relation chooses its name: `x" FROM r; DROP …`
+    is a valid table name). A name with a character that does not print
+    (a newline, a control or format character) is written as a Unicode
+    escape identifier, `U&"…"` with each such character as `\\+XXXXXX`,
+    so a printed statement is one line and shows what it names; Postgres
+    reads it as the same identifier."""
+    if identifier.isprintable():
+        return '"' + identifier.replace('"', '""') + '"'
+    body = "".join(
+        c if c.isprintable() and c != "\\" else f"\\+{ord(c):06X}" for c in identifier
+    )
+    return 'U&"' + body.replace('"', '""') + '"'
+
+
+def relation_sql(relation: Relation) -> str:
+    """A relation as a schema-qualified SQL name, `"public"."t"`: GRANT and
+    REVOKE name the relation the parser matches, never whatever the app
+    role's own `search_path` finds first."""
+    schema, name = relation
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+_PLAIN_NAME = re.compile(r"[a-z_][a-z0-9_]*")
+
+
+def relation_display(relation: Relation) -> str:
+    """A relation for a message: the bare name for a plainly named relation
+    in `DEFAULT_SCHEMA`, else `relation_sql` (quoted, so a crafted name
+    cannot pass for another relation or another line)."""
+    schema, name = relation
+    if schema == DEFAULT_SCHEMA and _PLAIN_NAME.fullmatch(name):
+        return name
+    return relation_sql(relation)
+
+
+def granted_tables(role: str) -> set[Relation]:
+    """Every relation outside the system schemas on which `role` currently
+    holds SELECT, as `(schema, name)`.
+
+    Not only `public`: a grant on a relation in another schema (a
+    `GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO <role>`, or a
+    same-named copy of a whitelisted table) is a grant nothing declares, so
+    the drift check reports it and `--apply` revokes it. The names are
+    whatever the relations' owners chose; they are compared as tuples and
+    rendered for SQL only through `relation_sql`.
+
+    Limits of the inventory (`information_schema.role_table_grants`):
+    materialized views are not listed, nor are grants to `PUBLIC` or grants
+    the role holds only through membership in another role (ledger F42 /
+    F64); relations in temporary schemas are skipped. With
+    `PIN_SEARCH_PATH` off, a relation shadowing a whitelisted name and
+    readable through any of these is served to the agent and never
+    reported (docs/architecture.md "`search_path` is pinned only on
+    request")."""
     _verify_default_alias()
     with connection.cursor() as cur:
         cur.execute(
-            """
-            SELECT table_name
+            r"""
+            SELECT table_schema, table_name
             FROM information_schema.role_table_grants
             WHERE grantee = %s
               AND privilege_type = 'SELECT'
-              AND table_schema = 'public'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_schema NOT LIKE 'pg\_%%'
             """,
             [role],
         )
-        return {row[0] for row in cur.fetchall()}
+        return {(str(schema), str(name)) for schema, name in cur.fetchall()}
 
 
 def role_exists(role: str) -> bool:
@@ -205,6 +276,25 @@ def self_referential_entries(profile: Profile) -> list[str]:
     ]
 
 
+def overlong_entries(profile: Profile) -> list[str]:
+    """The profile's `ALLOWED_MODELS` entries whose `db_table` has a schema
+    or table name longer than `MAX_IDENTIFIER_BYTES` (UTF-8 bytes).
+
+    PostgreSQL truncates such a name (on a character boundary) wherever it
+    appears, so the catalog lists the truncated name: the inventory never
+    shows the declared relation, and each `--apply` granted it and revoked
+    the truncated one in turn. The reconciler refuses such a whitelist
+    regardless of strict/lenient mode; the fix is a shorter `db_table`."""
+    return [
+        f"{entry} ({table!r})"
+        for entry, table in declared_tables(profile).items()
+        if any(
+            len(part.encode("utf-8")) > MAX_IDENTIFIER_BYTES
+            for part in relation_of(table)
+        )
+    ]
+
+
 def _verify_view_parity(profile: Profile) -> None:
     """Raise on column-list drift between unmanaged whitelist models and their views.
 
@@ -233,11 +323,11 @@ def _verify_view_parity(profile: Profile) -> None:
         model_columns = {f.column for f in model._meta.fields}
         with connection.cursor() as cur:
             # `table` comes from `model._meta.db_table` (Django model
-            # metadata, not user input). Ruff's S608 false-positives
-            # f-string SQL even when the only interpolation is a trusted
-            # Django identifier — there is no parameterisable form for
-            # the table name in `SELECT * FROM ...`.
-            cur.execute(f'SELECT * FROM "{table}" LIMIT 0')  # noqa: S608
+            # metadata, not user input), quoted by `relation_sql` all the
+            # same; there is no parameterisable form for the table name in
+            # `SELECT * FROM ...`.
+            probe = f"SELECT * FROM {relation_sql(relation_of(table))} LIMIT 0"  # noqa: S608
+            cur.execute(probe)
             view_columns = {col.name for col in cur.description}
         if model_columns != view_columns:
             mismatches.append(
@@ -261,23 +351,43 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
 
     See module docstring for the strict/apply matrix. Returns a
     `DriftDiff` whose `per_profile` maps each profile name to its
-    `ProfileDrift`. Self-referential whitelist entries and view-parity
-    drift always raise (`GrantsReconcileError`) — those are code-level
-    misconfigurations, not env-level state. In strict mode a missing role
-    or membership raises; in lenient mode that profile is skipped with a
-    WARNING and the others are still reconciled.
+    `ProfileDrift`. Self-referential whitelist entries, an overlong
+    `db_table` and view-parity drift always raise (`GrantsReconcileError`)
+    — those are code-level misconfigurations, not env-level state. In
+    strict mode a missing role or membership raises; in lenient mode that
+    profile is skipped with a WARNING and the others are still reconciled.
+
+    Every profile is checked and its drift computed before anything is
+    applied, and all profiles' GRANT / REVOKE statements run in one
+    transaction: a refusal of any profile changes no grant (review round
+    19: the profiles before the refused one had been applied already).
+    Roles are unique per profile (boot-validated), so one profile's
+    changes never alter another's drift.
     """
     _verify_default_alias()
     result = DriftDiff()
-    for profile in mcp_sql_settings.profiles().values():
-        result.per_profile[profile.name] = _reconcile_profile(
-            profile, strict=strict, apply=apply
-        )
+    profiles = list(mcp_sql_settings.profiles().values())
+    for profile in profiles:
+        result.per_profile[profile.name] = _profile_drift(profile, strict=strict)
+    if apply and result.changed:
+        with transaction.atomic():
+            for profile in profiles:
+                _apply_drift(profile.role, result.per_profile[profile.name])
     return result
 
 
 def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> ProfileDrift:
-    """Reconcile one profile's role against its declared whitelist.
+    """Reconcile one profile's role against its declared whitelist (the
+    checks and the drift of `_profile_drift`, then `_apply_drift`)."""
+    drift = _profile_drift(profile, strict=strict)
+    if apply and drift.changed:
+        with transaction.atomic():
+            _apply_drift(profile.role, drift)
+    return drift
+
+
+def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
+    """Check one profile and compute its role's drift; nothing is applied.
 
     Drift is computed strictly per role — declared-for-this-profile minus
     granted-to-this-profile's-role — so a table shared with another
@@ -289,6 +399,16 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
         msg = (
             f"Refusing to grant on mcp_sql models for profile {profile.name!r}: "
             f"{bad!r}. Remove these entries from the profile's ALLOWED_MODELS."
+        )
+        raise GrantsReconcileError(msg)
+
+    too_long = overlong_entries(profile)
+    if too_long:
+        msg = (
+            f"Refusing to reconcile grants for profile {profile.name!r}: "
+            f"{too_long!r} name a relation longer than PostgreSQL's "
+            f"{MAX_IDENTIFIER_BYTES}-byte identifier limit, which it "
+            "truncates: shorten Meta.db_table."
         )
         raise GrantsReconcileError(msg)
 
@@ -322,17 +442,24 @@ def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> Profil
     # statements against an out-of-sync view.
     _verify_view_parity(profile)
 
-    declared = set(declared_tables(profile).values())
+    # Relations, `(schema, name)`, on both sides (`"t"` and `t` are the same
+    # table; `s"."t` is not `t`).
+    declared = {relation_of(table) for table in declared_tables(profile).values()}
     current = granted_tables(profile.role)
-    drift = ProfileDrift(
+    return ProfileDrift(
         granted=sorted(declared - current),
         revoked=sorted(current - declared),
     )
-    if apply and drift.changed:
-        role = profile.role
-        with transaction.atomic(), connection.cursor() as cur:
-            for table in drift.granted:
-                cur.execute(f'GRANT SELECT ON "{table}" TO {role};')
-            for table in drift.revoked:
-                cur.execute(f'REVOKE SELECT ON "{table}" FROM {role};')  # noqa: S608
-    return drift
+
+
+def _apply_drift(role: str, drift: ProfileDrift) -> None:
+    """Run the GRANT / REVOKE statements `drift` implies for `role`, in the
+    caller's transaction."""
+    with connection.cursor() as cur:
+        # `role` is boot-validated as a plain identifier
+        # (`validation._PG_IDENTIFIER_RE`), as for `SET LOCAL ROLE`.
+        for relation in drift.granted:
+            cur.execute(f"GRANT SELECT ON {relation_sql(relation)} TO {role};")
+        for relation in drift.revoked:
+            revoke = f"REVOKE SELECT ON {relation_sql(relation)} FROM {role};"  # noqa: S608
+            cur.execute(revoke)

@@ -93,7 +93,7 @@ class TestReconcileGrantsStrict:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"auth_permission"}
+        patched_grants["granted_tables"].return_value = {("public", "auth_permission")}
         result = reconcile_grants(strict=True, apply=True)
         assert result.granted == []
         assert result.revoked == []
@@ -103,10 +103,10 @@ class TestReconcileGrantsStrict:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"orphaned_table"}
+        patched_grants["granted_tables"].return_value = {("public", "orphaned_table")}
         result = reconcile_grants(strict=True, apply=True)
-        assert result.granted == ["auth_permission"]
-        assert result.revoked == ["orphaned_table"]
+        assert result.granted == [("public", "auth_permission")]
+        assert result.revoked == [("public", "orphaned_table")]
         assert result.changed
 
 
@@ -158,7 +158,7 @@ class TestReconcileGrantsLenient:
         }
         patched_grants["granted_tables"].return_value = set()
         result = reconcile_grants(strict=False, apply=True)
-        assert result.granted == ["auth_permission"]
+        assert result.granted == [("public", "auth_permission")]
         assert not result.skipped_reason
 
 

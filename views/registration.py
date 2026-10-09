@@ -1,9 +1,10 @@
 """RFC 7591 dynamic client registration at `/o/register`. Anonymous
 JSON POST mints an `mcp-sql-<token>` Application with
 `skip_authorization=False` (so the client hits the consent screen,
-preventing silent-consent token theft) and a loopback-only
-`redirect_uri`. See `docs/architecture.md` "OAuth surface" + the
-`docs/oauth.md` runbook for the full security posture."""
+preventing silent-consent token theft) and loopback-only
+`redirect_uris` (`_is_loopback_redirect`, which `oauth.MCPOAuth2Validator`
+re-applies at `/o/authorize/`). See `docs/architecture.md` "OAuth
+surface" + the `docs/oauth.md` runbook for the full security posture."""
 
 import json
 import secrets
@@ -19,6 +20,7 @@ from django.views.decorators.http import require_POST
 from mcp_sql import throttle
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
 from oauth2_provider.models import Application
 
 # RFC 8252 §7.3 specifies `127.0.0.1` and `[::1]` as the loopback hostnames
@@ -43,18 +45,62 @@ def _error(
 
 
 def _is_loopback_redirect(uri: str) -> bool:
-    parsed = urlparse(uri)
+    if uri.split() != [uri]:
+        # The Application stores its redirect URIs as ONE whitespace-joined
+        # string, and DOT reads them back with `redirect_uris.split()`. A
+        # single submitted URI containing any `str.split()` whitespace —
+        # not only space/tab/CR/LF, but also e.g. `\x0b`, `\x1c`, NBSP,
+        # U+2028 — would therefore be stored as TWO OR MORE registered
+        # redirects, while `urlparse` below only ever sees the first
+        # (loopback) host: an off-machine redirect smuggled past the check.
+        # Deliberately the SAME operation DOT performs, so the two can't drift.
+        return False
+    if not uri.isascii() or not uri.isprintable():
+        # RFC 3986 URIs are printable ASCII. Anything else is either rewritten
+        # before parsing (`urlsplit` silently strips leading C0 controls, so
+        # the string we validated is not the one we would store) or rejected
+        # by the database on INSERT (NUL, lone surrogates — an uncaught 500).
+        # Refuse the whole class rather than enumerate the harmful characters.
+        return False
+    try:
+        parsed = urlparse(uri)
+        # `.port` is parsed lazily and raises on a non-numeric or out-of-range
+        # port (`:abc`, `:99999`). DOT reads it when matching at
+        # `/o/authorize/`, so a URI it cannot parse must never be stored.
+        _ = parsed.port
+    except ValueError:
+        # Malformed authority (`http://[::1/cb`, an unparseable port, a netloc
+        # that changes under NFKC): a client error, answered with the normal
+        # 400 rather than an uncaught 500.
+        return False
     if parsed.scheme != "http":
         # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
         return False
-    if parsed.username or parsed.password:
+    if "@" in parsed.netloc:
         # Reject a userinfo component (`http://user:pass@127.0.0.1/cb`): the
         # host is still loopback, so the bare hostname check below would pass,
         # but the userinfo is attacker-chosen and would be stored verbatim on
         # the Application. Refuse it so a registered redirect URI is exactly
-        # scheme + host + port + path with nothing to smuggle.
+        # scheme + host + port + path with nothing to smuggle. Test the raw
+        # `@`, not `.username`/`.password`: an EMPTY userinfo
+        # (`http://@127.0.0.1/cb`) parses to falsy `""`/`None` and would slip
+        # past (DOT 3.4.1+ tests for `@` in the netloc the same way).
         return False
     return parsed.hostname in _LOOPBACK_HOSTS
+
+
+def _is_string_list(value: object) -> bool:
+    """True iff `value` is a JSON array of strings (RFC 7591 §2 metadata shape)."""
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _registered_grant_types(requested: list[str]) -> list[str]:
+    """RFC 7591 §3.2.1: the supported subset of the requested grant types,
+    which the response echoes — `refresh_token` only while the opt-in
+    refresh grant is on (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]`)."""
+    if refresh_tokens_enabled() and "refresh_token" in requested:
+        return ["authorization_code", "refresh_token"]
+    return ["authorization_code"]
 
 
 def _registration_response(
@@ -62,6 +108,7 @@ def _registration_response(
     client_id: str,
     client_name: str,
     redirect_uris: list[str],
+    grant_types: list[str],
 ) -> JsonResponse:
     """RFC 7591 §3.2.1 success body.
 
@@ -75,7 +122,7 @@ def _registration_response(
             "client_id_issued_at": int(timezone.now().timestamp()),
             "client_name": client_name,
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
             "registration_client_uri": request.build_absolute_uri(
@@ -92,7 +139,12 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     """RFC 7591 §3 client registration endpoint."""
     try:
         body = json.loads(request.body)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # `ValueError` covers `JSONDecodeError` and the `UnicodeDecodeError` an
+        # invalid-UTF-8 body raises; `RecursionError` a pathologically nested
+        # document (a few KB of brackets on Python 3.11, tens of KB on 3.12+ —
+        # either way under the 64 KiB body cap).
+        # Both are client errors, not 500s.
         return _error("invalid_client_metadata", "Request body is not valid JSON")
 
     if not isinstance(body, dict):
@@ -120,18 +172,26 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     # client reads the response and learns what we actually allow.
     # We require `authorization_code` + `code` to be present in the
     # request so a client asking for ONLY `client_credentials` (i.e.
-    # not the OAuth 2.1 native-app pattern) is refused outright.
+    # not the OAuth 2.1 native-app pattern) is refused outright. Each must
+    # be a JSON array of strings (RFC 7591 §2): `in` on anything else either
+    # raises (null, a number → a 500) or substring-matches a plain string.
     requested_grant_types = body.get("grant_types", ["authorization_code"])
-    if "authorization_code" not in requested_grant_types:
+    if (
+        not _is_string_list(requested_grant_types)
+        or "authorization_code" not in requested_grant_types
+    ):
         return _error(
             "invalid_client_metadata",
-            "grant_types must include 'authorization_code'",
+            "grant_types must be an array of strings including 'authorization_code'",
         )
     requested_response_types = body.get("response_types", ["code"])
-    if "code" not in requested_response_types:
+    if (
+        not _is_string_list(requested_response_types)
+        or "code" not in requested_response_types
+    ):
         return _error(
             "invalid_client_metadata",
-            "response_types must include 'code'",
+            "response_types must be an array of strings including 'code'",
         )
     # Public client only. We don't accept confidential-client schemes
     # because we don't issue client_secrets. The default `"none"` for
@@ -143,6 +203,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             "Only token_endpoint_auth_method='none' is supported (public client)",
         )
 
+    grant_types = _registered_grant_types(requested_grant_types)
     client_name = body.get("client_name") or "Unnamed MCP client"
     # PREFIX carries the trailing dash; the joined form is
     # `mcp-sql-<urlsafe16>` (no double-dash).
@@ -170,7 +231,9 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     cfg = mcp_sql_config()
     threshold = cfg["BAD_TOKEN_IP_THRESHOLD"]
     if throttle.is_ip_blocked(ip, scope="register", threshold=threshold):
-        return _registration_response(request, client_id, client_name, redirect_uris)
+        return _registration_response(
+            request, client_id, client_name, redirect_uris, grant_types
+        )
 
     Application.objects.create(
         name=client_id,
@@ -202,4 +265,6 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
         threshold=threshold,
     )
 
-    return _registration_response(request, client_id, client_name, redirect_uris)
+    return _registration_response(
+        request, client_id, client_name, redirect_uris, grant_types
+    )

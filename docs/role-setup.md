@@ -174,13 +174,23 @@ docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> 
     -c "SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'mcp_readonly_role';"
 ```
 
-Expected (one row, four GUCs):
+Expected (one row, five GUCs):
 
 ```
       rolname      |                              rolconfig
 -------------------+----------------------------------------------------------------------
- mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s}
+ mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on}
 ```
+
+With `MCP_SQL["PIN_SEARCH_PATH"] = True`, a sixth,
+`"search_path=public, pg_temp"`, if you applied the role default for it
+(`mcp_sql_role_setup --emit-sql` prints it then; in `sql/role_setup.sql` it
+is the commented-out line — uncomment it). Optional either way: these
+defaults are inert under `SET ROLE` (the read path sets every guard with
+`SET LOCAL`, the pinned `search_path` included), and `mcp_sql_smoke`'s
+session check passes without it. An older role carrying the
+`search_path` default with the pin off is harmless for the same reason;
+`ALTER ROLE mcp_readonly_role RESET search_path` removes it.
 
 **3. App role is a member of `mcp_readonly_role`:**
 
@@ -240,7 +250,7 @@ Grants already in sync; no action.
 Or, after adding `auth.Permission` to the whitelist:
 
 ```
-GRANT SELECT ON "auth_permission" TO mcp_readonly_role;
+GRANT SELECT ON "public"."auth_permission" TO mcp_readonly_role;
 Applied: +1 grant(s), -0 revoke(s).
 ```
 
@@ -301,25 +311,63 @@ echo "exit: $?"
 **3. DB-side ground truth** — `information_schema.role_table_grants`
 lists every grant on `mcp_readonly_role`, sourced directly from PG's
 catalog. The set of tables here must match the `default` profile's
-`ALLOWED_MODELS` `_meta.db_table` resolutions exactly (substitute the role
-name for another profile):
+`ALLOWED_MODELS` `_meta.db_table` resolutions exactly — in every schema,
+not only `public` (substitute the role name for another profile):
 
 ```sh
 docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> -d <db_name> -c "
-SELECT table_name, privilege_type
+SELECT table_schema, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'mcp_readonly_role'
-ORDER BY table_name;
+ORDER BY table_schema, table_name;
 "
 ```
 
 Expected (with `auth.Permission` whitelisted):
 
 ```
-   table_name    | privilege_type
------------------+----------------
- auth_permission | SELECT
+ table_schema |   table_name    | privilege_type
+--------------+-----------------+----------------
+ public       | auth_permission | SELECT
 ```
+
+A whitelisted `db_table` is the relation in `public`, unless the
+`db_table` names a schema (`schema"."name`, Django's spelling of a
+schema-qualified table; the role then also needs `USAGE` on that schema,
+which the package does not grant). The parser refuses a qualified
+reference to a relation in any other schema. An unqualified name is the
+relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
+read path then pins `search_path` to `public, pg_temp`) — **set it**,
+unless an extension the agents use lives outside `public` (with the pin
+on they can still call it as `ext.f(…)` / `OPERATOR(ext.op)`). With the
+default (`False`) Postgres resolves it through the database's own
+`search_path`, so a schema listed ahead of `public`, a `"$user"` schema
+named after the profile role, or a temporary relation (table or view) on
+the backend shadows a whitelisted table wherever the profile role may
+read the shadowing relation — and a grant to `PUBLIC` is enough for
+that. Without any right on the whitelisted tables, any role with
+`CREATE` on the database (by default its owner, often the app's login)
+can create the `"$user"` schema, and another session on the same backend
+(e.g. under transaction-mode pooling) can create the temporary relation;
+a DBA's database- or login-level `search_path` does the same by
+accident. The drift check (`mcp_sql_grants`) does **not** see such a
+shadow: its inventory lists only direct grants to the profile role, not
+grants to `PUBLIC`, through role membership, on materialized views or
+on temporary relations. See `docs/architecture.md` → "`search_path` is
+pinned only on request" for what each mode guarantees. In both modes a
+direct SELECT grant to the profile role on a relation in another schema
+(a `GRANT SELECT ON ALL TABLES IN SCHEMA …`, a same-named copy of a
+whitelisted table) is drift:
+the check reports it as "granted but not declared" (shown quoted,
+`"schema"."name"`) and `--apply` revokes it. The names come from whoever
+owns the relations, so the command quotes each identifier (an embedded
+`"` doubled) in what it prints and runs.
+
+Not in this view, so not checked by `mcp_sql_grants` either: SELECT on a
+materialized view, grants to `PUBLIC`, and grants the profile role holds
+only through membership in another role. Check those by hand
+(`has_table_privilege('mcp_readonly_role', 'schema.relation', 'SELECT')`)
+if the database has them.
 
 A divergence between this query and the profile's `ALLOWED_MODELS` means
 `grants_check` would report drift; the apply step has not run (or has not
@@ -345,7 +393,7 @@ python manage.py mcp_sql_smoke
 Expected output:
 
 ```
-Read path ok: SET LOCAL ROLE + 4 GUCs verified, SELECT FROM auth_permission ok
+Read path ok: SET LOCAL ROLE + session GUCs (incl. the live transaction_read_only) verified, SELECT FROM auth_permission ok
 Audit table mcp_sql_mcpquerylog unreadable (pgcode=42501) — 0002_revoke_audit_grants is in effect.
 Write attempt rejected as expected: ReadOnlySqlTransaction (pgcode=25006)
 ```
