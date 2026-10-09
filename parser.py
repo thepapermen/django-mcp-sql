@@ -530,8 +530,9 @@ class FaithfulPostgres(Postgres):
     - `x IS NOT NULL` / `x NOTNULL` stay as written on sqlglot versions that
       build `NOT x IS NULL` (different for a row value).
     - The operators `@ x`, `@-@ x`, `a ^@ b`, `!! q` and `! x` stay as
-      written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` and `!` as
-      `NOT`. A parameter `$1` stays a parameter.
+      written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` (30.22:
+      `STARTS_WITH(a, b)`, at the comparison level) and `!` as `NOT`. A
+      parameter `$1` stays a parameter.
     - `current_timestamp` / `current_time` keep the precision written.
     - `OPERATOR(schema.op)` keeps its name as written (sqlglot rebuilt it
       from its tokens' texts: a quoted schema came back unquoted, `< =`
@@ -549,6 +550,16 @@ class FaithfulPostgres(Postgres):
     JSONPathTokenizer = Postgres.jsonpath_tokenizer_class
 
     class Parser(_PostgresParser):
+        # sqlglot 30.22 lexes `^@` as one token and parses it at the
+        # comparison level as `exp.StartsWith`, rendered `STARTS_WITH(a,
+        # b)`: not as written, and grouped below operators Postgres binds
+        # more loosely (`a ^@ b = c`). `_parse_exponent` reads it instead,
+        # on every version.
+        RANGE_PARSERS = {
+            token: parse
+            for token, parse in _PostgresParser.RANGE_PARSERS.items()
+            if token.name != "CARET_AT"
+        }
         FUNCTIONS = {
             name: build
             for name, build in Postgres.Parser.FUNCTIONS.items()
@@ -1243,18 +1254,30 @@ class FaithfulPostgres(Postgres):
                 and token.start == before.end + 1
             )
 
-        def _starts_with_operator(self) -> bool:
-            """`^@` (starts with) at the current token: `^` and `@` written
-            together, which sqlglot reads as `^ (@ x)`."""
+        def _starts_with_operator(self) -> int:
+            """How many tokens `^@` (starts with) at the current token takes:
+            one where sqlglot lexes it as one (30.22), two for `^` and `@`
+            written together, which older versions read as `^ (@ x)`; 0 if
+            it is not there."""
             token = self._curr
-            return (
-                token is not None
-                and token.token_type == TokenType.CARET
-                and self._index + 1 < len(self._tokens)
-                and self._tokens[self._index + 1].token_type == TokenType.PARAMETER
-                and self._tokens[self._index + 1].text == "@"
-                and self._tokens[self._index + 1].start == token.end + 1
+            if token is None:
+                return 0
+            if token.token_type.name == "CARET_AT":
+                return 1
+            following = (
+                self._tokens[self._index + 1]
+                if self._index + 1 < len(self._tokens)
+                else None
             )
+            if (
+                token.token_type == TokenType.CARET
+                and following is not None
+                and following.token_type == TokenType.PARAMETER
+                and following.text == "@"
+                and following.start == token.end + 1
+            ):
+                return 2
+            return 0
 
         def _parse_exponent(self) -> exp.Expression | None:
             # sqlglot's own loop, plus `a ^@ b` (starts with), which it read
@@ -1263,8 +1286,8 @@ class FaithfulPostgres(Postgres):
             # Postgres groups it as written.
             this: exp.Expression | None = self._parse_unary()
             while True:
-                if self._starts_with_operator():
-                    self._advance(2)
+                if taken := self._starts_with_operator():
+                    self._advance(taken)
                     this = self.expression(
                         _InfixOperator(
                             this=this, expression=self._parse_unary(), op="^@"

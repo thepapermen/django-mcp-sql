@@ -1442,6 +1442,9 @@ class TestOperatorSigns:
             ),
             ("SELECT 'x' || 'abc' ^@ 'a' AS v", "'x' || 'abc' ^@ 'a' AS v"),
             ("SELECT NOT 'abc' ^@ 'b' AS v", "NOT 'abc' ^@ 'b' AS v"),
+            # sqlglot 30.22 lexes `^@` as one token and rendered
+            # `STARTS_WITH(...)`, below `=`.
+            ("SELECT 'abc' ^@ 'a' = true AS v", "'abc' ^@ 'a' = TRUE AS v"),
             ("SELECT 2 ^ @ -3 AS v", "2 ^ @ -3 AS v"),
             (
                 "SELECT !! to_tsquery('simple', 'a') AS v",
