@@ -129,18 +129,13 @@ MCP_SQL = {
             "ALLOWED_MODELS": [],
         },
     },
-    "BAN_SELECT_STAR": True,
-    "LIMITS": {
-        "DEFAULT_LIMIT": 10,
-        "HARD_LIMIT": 100,
-        "BYTES_LIMIT": 256 * 1024,
-    },
-    "VOLUME_ALERT_THRESHOLDS": {
-        "allowed": {3600: 50, 86400: 150},
-        "rejected": {3600: 50, 86400: 150},
-    },
-    "BAD_TOKEN_IP_THRESHOLD": 100,
-    "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
+    # LIMITS / BAN_SELECT_STAR / VOLUME_ALERT_THRESHOLDS / BAD_TOKEN_IP_* are
+    # deliberately NOT declared: the in-package defaults carry exactly these
+    # values, so omitting them means the suite exercises the defaulting path
+    # the way a real consumer does. Tests needing different values override
+    # per-case. CLIENTS is likewise left to the shipped default (claude,
+    # chatgpt, cursor) — `test_clients.py` pins both the default set and the
+    # empty-dict off-switch.
     # The runtime session-existence gate needs a session model with a `user`
     # FK; the in-package test app ships a minimal stand-in.
     "SESSION_MODEL": "mcp_sql_testapp.TestSession",
@@ -163,5 +158,7 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
+    # ALLOWED_REDIRECT_URI_SCHEMES deliberately unset, so the suite runs on
+    # DOT's default (["http", "https"]) — the path a real consumer is on. The
+    # tests that care narrow it per-case.
 }

@@ -5,7 +5,7 @@ Mounts:
   permission, inspect the audit tables).
 - `/` — everything `mcp_sql` exposes: `/o/authorize/`, `/o/token/`,
   `/o/revoke_token/`, `/o/register`, `/mcp/sql/`,
-  `/.well-known/oauth-protected-resource/mcp/sql`,
+  `/.well-known/oauth-protected-resource/mcp/sql` (and `…/mcp/sql/`),
   `/.well-known/oauth-authorization-server/o`.
 """
 

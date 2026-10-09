@@ -1,7 +1,7 @@
 """DRF auth class + 413 body cap for the `/mcp/sql/` endpoint.
 
 `MCPOAuth2Authentication` re-runs every issuance-time gate on every
-request (scope, application-name match, is_active+is_staff, MFA,
+request (scope, application-name match, is_active, MFA,
 single-profile assignment via `resolve_profile`, live Django session).
 Mounted on the MCP
 view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. See
@@ -10,11 +10,15 @@ Option D session-trust, the body-cap rationale, and the isolation
 contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalDRF`.
 
 Bearer tokens are verified on the package's narrow `oauth_server.MCPServer`
-(header-only `HeaderOnlyBearer`), not on the consumer's `OAUTH2_SERVER_CLASS`.
+(header-only `HeaderOnlyBearer`), not on the consumer's `OAUTH2_SERVER_CLASS`,
+through `audience.CanonicalUriOAuthLibCore` (DOT's RFC 8707 audience check
+sees the URL discovery advertises).
 
-Every **resolved-user** rejection in `authenticate` (the six defense-
-in-depth gates below `_verify_bearer(...)` returns a user/token
-pair) writes one `MCPAuthRejectionLog` row via `_audit_rejection`.
+Every **resolved-user** rejection in `authenticate` (the defense-in-depth
+gates in `_evaluate_gates`, run once `_verify_bearer(...)` returns a
+user/token pair, plus `GATE_ERROR` when one of them raises) writes one
+`MCPAuthRejectionLog` row via `_audit_rejection`. A token with no user is
+refused before the gates and logged at WARNING (the table needs a user).
 Anonymous / bad-token traffic is deliberately NOT audited at this
 layer — that high-volume noise floor goes through django-axes-on-Redis
 (Phase 4), not the default DB, to avoid write amplification and audit-
@@ -23,11 +27,14 @@ table bloat under sustained probing. Separate audit table from
 evaluated, and conflating them would pollute Phase 4's daily-volume
 "queries per user" aggregation with rejection counts. The audit write
 is best-effort: a DB failure during `MCPAuthRejectionLog.objects.create`
-is `logger.exception`-logged but does not mask the underlying
-`AuthenticationFailed` — the agent always sees the rejection.
+is `logger.exception`-logged but does not mask the underlying denial —
+`AuthenticationFailed` (401 with the `WWW-Authenticate` challenge) for a
+gate that decided, `GateUnavailable` (503, no challenge) for `GATE_ERROR` —
+so the agent always sees the rejection.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -39,10 +46,13 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import throttle
+from mcp_sql.audience import CanonicalUriOAuthLibCore
 from mcp_sql.conf import ResolutionOutcome
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
-from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.consts import absolute_url
+from mcp_sql.consts import identify_application
+from mcp_sql.consts import is_mcp_application
 from mcp_sql.decorators import normalize_content_length
 from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.models import audit_client_ip
@@ -55,6 +65,7 @@ from rest_framework.request import Request
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
+    from mcp_sql.conf import Profile
     from oauth2_provider.models import AccessToken
 
 logger = logging.getLogger(__name__)
@@ -79,6 +90,28 @@ _AMBIGUOUS_WARN_DEDUP_SECONDS = 3600
 # The anonymous OAuth endpoints carry only sub-KB form/JSON and get their
 # own tighter cap via `decorators.cap_request_body`.
 MCP_REQUEST_BODY_MAX_BYTES = 1024 * 1024
+
+
+class GateUnavailable(APIException):
+    """503 for a per-request gate that RAISED instead of deciding.
+
+    Still a denial (fail-closed, audited as `GATE_ERROR`), but deliberately
+    not a 401: a 401 carries the `WWW-Authenticate` challenge, and MCP
+    clients answer any 401 with a full OAuth re-authorization (the
+    TypeScript SDK does so unconditionally) that would hit the same failing
+    MFA backend or session store, and leave a hosted connector needing a
+    manual reconnect. A 503 says "the server cannot verify you right now,
+    retry", which is what happened. DRF adds `WWW-Authenticate` only to
+    `NotAuthenticated` / `AuthenticationFailed`, so this response has none.
+    """
+
+    status_code = 503
+    default_detail = "MCP access could not be verified; try again later."
+    default_code = "gate_unavailable"
+    # DRF's stock exception handler turns `wait` into `Retry-After` (as it
+    # does for `Throttled`), telling a client when retrying makes sense. A
+    # consumer with a custom `EXCEPTION_HANDLER` may drop it; the 503 stands.
+    wait = 30
 
 
 class PayloadTooLarge(APIException):
@@ -112,6 +145,42 @@ def _enforce_body_size_cap(django_request: HttpRequest) -> None:
         raise PayloadTooLarge
 
 
+@dataclass(frozen=True)
+class _Denial:
+    """A per-request gate's refusal: the audit reason and the denial message.
+
+    The message is the 401 detail (`AuthenticationFailed`), or for
+    `GATE_ERROR` the 503's (`GateUnavailable`).
+    """
+
+    reason: AuthRejectionReason
+    message: str
+
+
+def _warn_ambiguous_once(user: "AbstractBaseUser") -> None:
+    """Deduped WARNING for an AMBIGUOUS_PROFILE denial.
+
+    The paging Sentry ERROR fired once at assignment time (signals.py); a
+    retrying agent must not respam, hence one WARNING per user per
+    `_AMBIGUOUS_WARN_DEDUP_SECONDS`. The dedup is a cache call, and a cache
+    fault there must not turn the denial (already audited) into a 500: on any
+    cache error the WARNING is emitted anyway, signal over silence.
+    """
+    try:
+        first = cache.add(
+            f"mcp_sql:ambiguous_warned:{user.pk}", 1, _AMBIGUOUS_WARN_DEDUP_SECONDS
+        )
+    except Exception:  # noqa: BLE001 — any cache backend fault; the denial stands
+        first = True
+    if first:
+        logger.warning(
+            "MCP profile resolution ambiguous for user %s (pk=%s): "
+            "assigned to >1 profile; denying until resolved.",
+            user.get_username(),
+            user.pk,
+        )
+
+
 class MCPOAuth2Authentication(OAuth2Authentication):
     """OAuth2 bearer auth + per-request user-state revalidation."""
 
@@ -121,14 +190,33 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # Resource Metadata URL via the `resource_metadata` parameter.
         # Without it the client receives a clean 401 but has nowhere to
         # discover the authorization endpoint and the flow stalls.
-        # The absolute URL is built per request so the value is correct
-        # behind any reverse proxy / hostname.
-        metadata_url = request.build_absolute_uri(
-            reverse("mcp_sql_protected_resource_metadata")
-        )
+        # Built per request so the value is correct behind any reverse proxy
+        # / hostname, and through `consts.absolute_url` so this URL carries
+        # the SAME hardened scheme as the documents it points at. It is the
+        # bootstrap pointer for the whole dance, so a plain
+        # `build_absolute_uri` here would reintroduce, on the one URL that
+        # starts discovery, both problems `absolute_url` exists to prevent: a
+        # client deriving its RFC 9728 resource identifier from an `http`
+        # challenge is handed an `https` `resource` and must discard the
+        # document per §3.3, and the pointer itself would be plaintext for an
+        # on-path attacker to answer with a forged `authorization_servers`.
+        #
+        # The pointer also follows the trailing-slash spelling of the URL the
+        # client actually requested. RFC 9728 §3.3's second clause: metadata
+        # reached through this `resource_metadata` parameter MUST carry a
+        # `resource` identical to the URL the client sent the request to. The
+        # document echoes the spelling of its own path
+        # (`discovery._resource_identifier`), so a `/mcp/sql/` request pointed
+        # at the slash-less document would be handed `…/mcp/sql` — a mismatch
+        # the client must discard. `request.path` is one of the two literal
+        # transport routes Django matched, never free text.
+        metadata_path = reverse("mcp_sql_protected_resource_metadata")
+        if request.path.endswith("/"):
+            metadata_path += "/"
+        metadata_url = absolute_url(request, metadata_path)
         return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 
-    def authenticate(self, request):  # noqa: C901, PLR0912 — linear defense-in-depth chain reads better than extracted helpers
+    def authenticate(self, request):
         # `_verify_bearer` calls `oauthlib_core.verify_request`, which
         # extracts the body via DRF's `request.POST`; that runs DRF's parsers
         # (JSON for the MCP wire protocol, and the default form / multipart
@@ -154,14 +242,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # header), answered with the ordinary 401 challenge — and beside a
         # header the parameter is ignored: the header's token decides.
 
-        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate`, on
-        # `MCPServer`) returns `None` on bad / expired / unknown / revoked
-        # tokens (it does NOT raise — it yields the anonymous result). The
-        # only paths from it that DO raise
-        # are `SuspiciousOperation`
-        # (hex-encoding bug) and re-raised `ValueError` from oauthlib —
-        # both indicate malformed transport, not credential probing; we
-        # let them bubble.
+        # `_verify_bearer` (DOT's `OAuth2Authentication.authenticate()` on
+        # `MCPServer` and an audience-canonical core) returns `None` on bad /
+        # expired / unknown / revoked tokens, and from DOT 3.4 on a token
+        # bound to another `resource` (it does NOT raise). The only paths
+        # that DO raise are `SuspiciousOperation` (hex-encoding bug) and
+        # re-raised `ValueError` from oauthlib — both indicate malformed
+        # transport, not credential probing; we let them bubble.
         #
         # We deliberately do NOT INSERT an `MCPAuthRejectionLog` row on
         # the `result is None` path: anonymous and bad-token traffic are
@@ -217,11 +304,102 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             return None
         user, token = result
 
+        # A token with no user cannot be put through the per-user gates, and
+        # DOT allows one (`AccessToken.user` is nullable: a `client_credentials`
+        # token from a second OAuth use case on the same install, or a row made
+        # in a shell). Refuse it before any gate dereferences `user`. The
+        # rejection table is keyed to a real user, so the record is a log
+        # line: a WARNING naming the token and its client, one per request
+        # (not deduplicated, and below Sentry's default ERROR event level, so
+        # it shows in the logs, not as a page).
+        if user is None:
+            application = getattr(token, "application", None)
+            logger.warning(
+                "MCP token pk=%s (application %r) has no user; refused",
+                token.pk,
+                getattr(application, "name", None),
+            )
+            msg = "Token is not bound to a user."
+            raise exceptions.AuthenticationFailed(msg)
+
         # Defense-in-depth: re-check every gate the issuance flow checked.
         # A revoked permission, removed MFA device, or deactivated account
         # invalidates outstanding tokens immediately (without waiting for
-        # the next 6h expiry).
+        # the next 6h expiry). A gate that RAISES (a consumer MFA checker
+        # failing, a DB blip in profile resolution, a bad SESSION_MODEL) is a
+        # denial too: audited as GATE_ERROR and answered 503 (see
+        # `GateUnavailable` for why not 401), never an unaudited 500.
+        # Deliberately broad: whatever the failure, the only safe answer is
+        # "not verified", and the traceback goes to the log.
+        try:
+            verdict = self._evaluate_gates(user, token)
+        except Exception:
+            logger.exception(
+                "MCP per-request gate raised for user pk=%s; denying (gate_error)",
+                user.pk,
+            )
+            verdict = _Denial(
+                AuthRejectionReason.GATE_ERROR, str(GateUnavailable.default_detail)
+            )
+        if isinstance(verdict, _Denial):
+            self._audit_rejection(
+                request,
+                reason=verdict.reason,
+                error=verdict.message,
+                user=user,
+                token=token,
+            )
+            if verdict.reason == AuthRejectionReason.AMBIGUOUS_PROFILE:
+                _warn_ambiguous_once(user)
+            if verdict.reason == AuthRejectionReason.GATE_ERROR:
+                raise GateUnavailable
+            raise exceptions.AuthenticationFailed(verdict.message)
 
+        # All gates passed — bind the resolved profile for the view's tool
+        # closures. Set on the underlying HttpRequest; DRF's Request proxies
+        # attribute access to it, so the view reads `request.mcp_profile`.
+        django_request.mcp_profile = verdict
+        return user, token
+
+    @staticmethod
+    def _verify_bearer(request: Request) -> "tuple[Any, AccessToken] | None":
+        """DOT's `OAuth2Authentication.authenticate`, verifying on `MCPServer`
+        through a core that gives DOT's RFC 8707 audience check the URL
+        discovery advertises.
+
+        DOT's version builds its core from the consumer's `OAUTH2_SERVER_CLASS`
+        (`get_oauthlib_core()`), which could take the token from the query
+        string or a form body too; the package's server reads the
+        `Authorization` header only (`oauth_server.HeaderOnlyBearer`). The
+        backend is `audience.CanonicalUriOAuthLibCore`: from DOT 3.4 a token
+        bound to a `resource` is compared with the request URL, and DOT's own
+        `build_absolute_uri` would say `http` behind a TLS-terminating proxy
+        that discovery (and so the token's `resource`) spells `https`. DOT's
+        version also keeps oauthlib's `oauth2_error` on the request for its
+        own challenge; `authenticate_header` here builds its own, so it is
+        not carried over.
+        """
+        try:
+            valid, r = get_mcp_oauthlib_core(CanonicalUriOAuthLibCore).verify_request(
+                request, scopes=[]
+            )
+        except ValueError as error:
+            if str(error) == "Invalid hex encoding in query string.":
+                raise SuspiciousOperation(error) from error
+            raise
+        return (r.user, r.access_token) if valid else None
+
+    @staticmethod
+    def _evaluate_gates(  # noqa: PLR0911 — one return per gate reads better than a table
+        user: "AbstractBaseUser", token: "AccessToken"
+    ) -> "Profile | _Denial":
+        """Run the per-request gates in order; the bound profile, or a denial.
+
+        Pure decision: no audit write, no raise of its own (an exception from
+        a gate propagates to `authenticate`, which turns it into GATE_ERROR).
+        The order is the cheap in-memory checks first, the session lookup's
+        DB round-trip last.
+        """
         # Application binding: the validator pins issuance to the `mcp-sql*`
         # name prefix (the curated `mcp-sql` Application from migration 0005
         # plus any RFC 7591 dynamically-registered `mcp-sql-<token>` clients),
@@ -229,92 +407,44 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # `AccessToken.objects.create()` in a shell, a second OAuth use case
         # ever being added) would bypass that gate. Re-verify on every
         # request — `mcp:sql` scope is necessary but not sufficient; the
-        # token MUST also be tied to an MCP-purpose Application.
-        # DOT enforces a non-nullable FK to `Application` on every token,
-        # so `token.application` is always present here. The check below
-        # only validates the *identity* of that Application.
-        if not is_mcp_application_name(token.application.name):
-            msg = "Token was not issued by an mcp-sql Application."
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.BAD_APPLICATION,
-                error=msg,
-                user=user,
-                token=token,
+        # token MUST also be tied to an MCP-purpose Application (recognised
+        # by name, and only while its `client_id` equals that name —
+        # `consts.classify_application`). DOT's FK to `Application` is
+        # nullable, so a token with none is refused here too.
+        application = token.application
+        if not is_mcp_application(application):
+            return _Denial(
+                AuthRejectionReason.BAD_APPLICATION,
+                "Token was not issued by an mcp-sql Application.",
             )
-            raise exceptions.AuthenticationFailed(msg)
-
         scopes = (token.scope or "").split()
         if mcp_sql_settings.SCOPE not in scopes:
-            msg = "Token does not carry the mcp:sql scope."
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.BAD_SCOPE,
-                error=msg,
-                user=user,
-                token=token,
+            return _Denial(
+                AuthRejectionReason.BAD_SCOPE,
+                "Token does not carry the mcp:sql scope.",
             )
-            raise exceptions.AuthenticationFailed(msg)
-        if not (user.is_active and user.is_staff):
-            msg = "User is not an active staff member."
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.INACTIVE_OR_NON_STAFF,
-                error=msg,
-                user=user,
-                token=token,
-            )
-            raise exceptions.AuthenticationFailed(msg)
+        if not user.is_active:
+            return _Denial(AuthRejectionReason.INACTIVE, "User account is inactive.")
         if not mcp_sql_settings.MFA_CHECKER(user):
-            msg = "User does not have a verified TOTP device."
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.NO_MFA,
-                error=msg,
-                user=user,
-                token=token,
+            return _Denial(
+                AuthRejectionReason.NO_MFA,
+                "User does not have a verified TOTP device.",
             )
-            raise exceptions.AuthenticationFailed(msg)
         # Profile binding replaces the old single `use_mcp_session` perm gate.
         # `resolve_profile` reads the user's EXPLICIT permission assignments
         # (blind to is_superuser) and binds exactly one profile, or denies.
         outcome = mcp_sql_settings.resolve_profile(user)
         if outcome is ResolutionOutcome.NO_PERM:
-            msg = "User holds no MCP profile permission."
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.NO_PERM,
-                error=msg,
-                user=user,
-                token=token,
+            return _Denial(
+                AuthRejectionReason.NO_PERM,
+                "User holds no MCP profile permission.",
             )
-            raise exceptions.AuthenticationFailed(msg)
         if outcome is ResolutionOutcome.AMBIGUOUS_PROFILE:
-            msg = (
+            return _Denial(
+                AuthRejectionReason.AMBIGUOUS_PROFILE,
                 "User is assigned to more than one MCP profile; access is "
-                "denied until exactly one remains."
+                "denied until exactly one remains.",
             )
-            self._audit_rejection(
-                request,
-                reason=AuthRejectionReason.AMBIGUOUS_PROFILE,
-                error=msg,
-                user=user,
-                token=token,
-            )
-            # Deduped WARNING only; the paging Sentry ERROR fired once at
-            # assignment time (signals.py). A retrying agent must not respam.
-            if cache.add(
-                f"mcp_sql:ambiguous_warned:{user.pk}",
-                1,
-                _AMBIGUOUS_WARN_DEDUP_SECONDS,
-            ):
-                logger.warning(
-                    "MCP profile resolution ambiguous for user %s (pk=%s): "
-                    "assigned to >1 profile; denying until resolved.",
-                    user.get_username(),
-                    user.pk,
-                )
-            raise exceptions.AuthenticationFailed(msg)
         # Session-existence gate (opt-in): see module docstring for the
         # design rationale. One indexed lookup against the configured
         # session table by `user_id` + `expire_date`. Kept last so the
@@ -335,44 +465,12 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             if not session_model.objects.filter(
                 user=user, expire_date__gt=timezone.now()
             ).exists():
-                msg = (
+                return _Denial(
+                    AuthRejectionReason.NO_SESSION,
                     "No active web session — re-login at the Django UI to "
-                    "re-issue MCP access."
+                    "re-issue MCP access.",
                 )
-                self._audit_rejection(
-                    request,
-                    reason=AuthRejectionReason.NO_SESSION,
-                    error=msg,
-                    user=user,
-                    token=token,
-                )
-                raise exceptions.AuthenticationFailed(msg)
-
-        # All gates passed — bind the resolved profile for the view's tool
-        # closures. Set on the underlying HttpRequest; DRF's Request proxies
-        # attribute access to it, so the view reads `request.mcp_profile`.
-        django_request.mcp_profile = outcome
-        return user, token
-
-    @staticmethod
-    def _verify_bearer(request: Request) -> "tuple[Any, AccessToken] | None":
-        """DOT's `OAuth2Authentication.authenticate`, verifying on `MCPServer`.
-
-        DOT's version builds its core from the consumer's `OAUTH2_SERVER_CLASS`
-        (`get_oauthlib_core()`), which could take the token from the query
-        string or a form body too; the package's core reads the
-        `Authorization` header only (`oauth_server.HeaderOnlyBearer`). DOT's
-        version also keeps oauthlib's `oauth2_error` on the request for its
-        own challenge; `authenticate_header` here builds its own, so it is
-        not carried over.
-        """
-        try:
-            valid, r = get_mcp_oauthlib_core().verify_request(request, scopes=[])
-        except ValueError as error:
-            if str(error) == "Invalid hex encoding in query string.":
-                raise SuspiciousOperation(error) from error
-            raise
-        return (r.user, r.access_token) if valid else None
+        return outcome
 
     def _audit_rejection(
         self,
@@ -399,7 +497,7 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         of being swallowed silently.
 
         Sentry exposure on the audit-write failure path is bounded by
-        construction: only the six resolved-user gates can reach this
+        construction: only the resolved-user gates can reach this
         method, all low-volume (a real user with revoked perm / removed
         MFA / dead session / scope drift). The compound "DB unreachable +
         sustained probing" scenario that would flood Sentry through
@@ -407,15 +505,20 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         bad-token path is intercepted earlier and writes to a Redis
         counter instead (see `throttle.record_attempt`).
 
-        Sits inside DRF's request `ATOMIC_REQUESTS=True` transaction on
-        the default alias. The row commits when DRF turns the subsequent
-        `AuthenticationFailed` into the 401 response (DRF treats 4xx as a
-        successful HTTP cycle and commits the request transaction). If a
-        future caller ever wraps an explicit `transaction.atomic()` block
-        around the gate sequence in `authenticate()` and re-raises inside
-        it, the audit write would roll back with the inner block — guard
-        such a wrapper with `savepoint=False` or move the audit write to
-        `transaction.on_commit` to preserve the invariant.
+        Must NOT run inside a transaction that the rejection rolls back.
+        DRF's exception handler calls `set_rollback()` for every
+        `APIException` — the `AuthenticationFailed` (or, for `GATE_ERROR`,
+        `GateUnavailable`) raised right after this write included — on any
+        `ATOMIC_REQUESTS` connection, so inside the request transaction the
+        row would be discarded while the 401 (or 503) still goes out.
+        `views.mcp_endpoint.mcp_endpoint` is therefore non-atomic for every
+        alias (`_EveryAlias`): no request transaction exists on
+        whichever alias holds this table, and the row commits on insert
+        (autocommit). Pinned by `test_auth_class.py`'s
+        `TestRejectionAuditSurvivesAtomicRequests` and
+        `TestEveryAliasIsNonAtomic`. Never wrap the gate sequence in
+        `transaction.atomic()` for the same reason (`on_commit` would not
+        help: its callbacks are dropped on rollback).
         """
         try:
             # `user` is the package-agnostic `AbstractBaseUser`; django-stubs
@@ -423,11 +526,13 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             # so reports the supertype as incompatible. The package genuinely
             # accepts any user model, so the plugin's check is stricter than
             # the contract — suppress just this kwarg.
+            client = identify_application(token.application)
             MCPAuthRejectionLog.objects.create(
                 user=user,  # type: ignore[misc]
                 token_pk=str(token.pk),
-                application_name=token.application.name,
-                client_redirect=token.application.redirect_uris or "",
+                application_name=client.name,
+                client_kind=client.kind,
+                client_redirect=client.redirect,
                 reason=reason,
                 error=error,
                 client_ip=audit_client_ip(request.META.get("REMOTE_ADDR")),

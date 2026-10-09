@@ -33,6 +33,8 @@ from django.db.models.signals import pre_save
 from django.dispatch import receiver
 from django.http import HttpRequest
 from django.utils import timezone
+from mcp_sql.clients import ClientKind
+from mcp_sql.clients import DeclaredClient
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
@@ -43,6 +45,8 @@ from mcp_sql.schemas import AuthRejectionReason
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+
+    from oauth2_provider.models import Application
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +101,22 @@ def _revoke_and_audit_on_logout(*, user, client_ip, logged_out_at):
         reason=AuthRejectionReason.SESSION_LOGOUT,
         event="logout",
         committed=DEFAULT_DB_ALIAS,
+    )
+
+
+def _mcp_application_q() -> Q:
+    """Rows (tokens, grants) whose `application` is part of the MCP surface.
+
+    Matches BOTH the curated `mcp-sql` Application (exact name) AND every
+    `mcp-sql-` Application — DCR-minted `mcp-sql-<token>` and settings-declared
+    `mcp-sql-{cloud,local}.<slug>`. The prefix carries a trailing dash, so a
+    `startswith` on it does NOT match the canonical name — that's why the
+    Q-OR is required. One helper so the access-token, refresh-token and
+    pending-code deletes can never disagree about which Applications are
+    MCP's.
+    """
+    return Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
+        application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
     )
 
 
@@ -202,13 +222,7 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
         from oauth2_provider.models import Grant
         from oauth2_provider.models import RefreshToken
 
-        # Match BOTH the curated `mcp-sql` Application (exact name) AND every
-        # DCR-minted `mcp-sql-<token>` Application (prefix). The prefix carries
-        # a trailing dash, so a `startswith` on it does NOT match the canonical
-        # name — that's why the Q-OR is required here.
-        mcp_apps = Q(application__name=mcp_sql_settings.APPLICATION_NAME) | Q(
-            application__name__startswith=mcp_sql_settings.APPLICATION_NAME_PREFIX
-        )
+        mcp_apps = _mcp_application_q()
         # DOT's OAuth models live in one database: the tokens reference
         # each other, and all three (`Grant` included, which references no
         # token) reference the user and the Application by foreign key, so
@@ -513,28 +527,37 @@ def provision_mcp_profiles(sender: AppConfig | None, **kwargs: object) -> None:
 
 
 @receiver(post_migrate)
-def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> None:
-    """Materialise one OAuth `Application` row per `MCP_SQL["CLOUD_CLIENTS"]`
-    entry (opt-in cloud-client support).
+def provision_mcp_clients(sender: AppConfig | None, **kwargs: object) -> None:
+    """Materialise one OAuth `Application` row per `MCP_SQL["CLIENTS"]` entry.
 
-    Full login flow + provider onboarding: `docs/oauth.md` → "Cloud clients".
+    Full login flow + provider onboarding: `docs/oauth.md` → "Clients".
 
     Same config-derived, idempotent shape as `provision_mcp_profiles`:
     settings is the source of truth; the row exists ONLY to satisfy DOT's
     non-null `Grant` / `AccessToken` FK to `Application` (a client_id must
     resolve to a real row before a code/token can be persisted). Reuses the
     curated migration-0005 posture (public client, authorization-code, PKCE,
-    no secret) EXCEPT `skip_authorization=False`: a cloud client's non-loopback
-    redirect makes the consent screen load-bearing — it is what breaks the
-    silent-GET phishing chain the loopback rule otherwise prevents.
+    no secret) EXCEPT `skip_authorization=False`: a declared client's fixed,
+    shared redirect makes the consent screen load-bearing — it is what breaks
+    the silent-GET phishing chain the loopback rule otherwise prevents.
 
     `update_or_create` keeps the row's stored `redirect_uris` in sync with
-    settings on every migrate. Rows for entries later REMOVED from settings are
-    deliberately NOT deleted here: recognition is settings-gated
-    (`consts.is_mcp_application_name` only accepts a cloud client while its
-    entry is present), so a removed client is denied at the next request
-    regardless of a lingering row, and logout revocation still covers it via
-    the `mcp-sql-` prefix. Empty CLOUD_CLIENTS (the default) is a no-op.
+    settings on every migrate, as a copy nothing in the package reads for a
+    recognised declared client: `oauth.MCPOAuth2Validator` decides its
+    redirects, and `consts.identify_application` builds its audit
+    `client_redirect`, from settings at every request, so a changed or
+    removed callback applies without a `migrate`. It never touches issued
+    `AccessToken` rows, and the redirect is checked only at the next
+    authorization, so a changed callback does not disconnect anyone
+    mid-session.
+
+    Rows for entries later REMOVED from settings are deliberately NOT deleted
+    — deletion cascades to live tokens in the middle of a `migrate`, and it
+    isn't needed: recognition is settings-gated
+    (`consts.classify_application_name` accepts a declared client only while
+    its entry is present), so a removed client is denied at the next request
+    regardless of a lingering row. They are named in a WARNING instead, so an
+    operator can clean up deliberately.
 
     Fires under the same full-plan `migrate` assumption as
     `provision_mcp_profiles` — `oauth2_provider`'s tables exist by the time
@@ -548,7 +571,8 @@ def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> N
 
     from oauth2_provider.models import Application
 
-    for client in mcp_sql_settings.cloud_clients().values():
+    clients = mcp_sql_settings.clients()
+    for client in clients.values():
         Application.objects.update_or_create(
             client_id=client.client_id,
             defaults={
@@ -556,23 +580,63 @@ def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> N
                 "client_secret": "",
                 "client_type": Application.CLIENT_PUBLIC,
                 "authorization_grant_type": Application.GRANT_AUTHORIZATION_CODE,
-                # Consent required for cloud clients — see docstring.
+                # Consent required for declared clients — see docstring.
                 "skip_authorization": False,
-                "redirect_uris": client.redirect_uri,
+                "redirect_uris": " ".join(client.redirect_uris),
                 "algorithm": "",
             },
         )
         # Surface the value the operator must paste into the provider's
         # connector, at the moment they run `migrate` — the derived client_id
-        # is otherwise easy to miss. (Also findable via `docs/oauth.md` and
-        # `mcp_sql_settings.cloud_clients()`.)
+        # is otherwise easy to miss. (Also printed on demand by the
+        # `mcp_sql_clients` management command.)
         logger.info(
-            "MCP cloud client %r provisioned — paste client_id %r into your "
+            "MCP client %r (%s) provisioned — paste client_id %r into your "
             "provider's connector as the OAuth Client ID (leave the secret "
-            "blank); callback %s.",
+            "blank); callbacks: %s.",
             client.name,
+            client.kind.value,
             client.client_id,
-            client.redirect_uri,
+            ", ".join(client.redirect_uris),
+        )
+
+    _warn_about_stale_clients(Application, clients)
+
+
+def _warn_about_stale_clients(
+    application_model: type["Application"], clients: dict[str, DeclaredClient]
+) -> None:
+    """Name any provisioned declared-client row no longer backed by settings.
+
+    Those rows are inert — recognition is settings-gated, so their tokens are
+    already rejected — but a lingering `Application` still owns live token
+    rows and still resolves at `/o/authorize/` far enough to reach the
+    recognition check. Deleting it here would cascade those tokens away during
+    a `migrate`, which is not a decision a provisioning hook should make
+    silently, so this only reports.
+
+    Matched on the two declared namespaces (`<prefix>cloud.` / `<prefix>local.`)
+    so the curated row and DCR-minted rows are never implicated.
+    """
+    prefix = mcp_sql_settings.APPLICATION_NAME_PREFIX
+    namespaces = [
+        f"{prefix}{kind.value}." for kind in (ClientKind.CLOUD, ClientKind.LOCAL)
+    ]
+    query = Q()
+    for namespace in namespaces:
+        query |= Q(client_id__startswith=namespace)
+    stale = sorted(
+        application_model.objects.filter(query)
+        .exclude(client_id__in=list(clients))
+        .values_list("client_id", flat=True)
+    )
+    if stale:
+        logger.warning(
+            "MCP client Application row(s) %s are no longer declared in "
+            "MCP_SQL['CLIENTS']. They are already de-recognised (their tokens "
+            "are rejected), but the rows and any tokens they own still exist — "
+            "delete them in the admin when you are sure nobody needs them.",
+            ", ".join(repr(name) for name in stale),
         )
 
 

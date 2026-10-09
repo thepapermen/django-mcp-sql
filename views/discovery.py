@@ -3,14 +3,15 @@ Metadata at `.well-known/...` endpoints. Anonymous GET, CSRF-exempt,
 no side effects. See `docs/architecture.md` "OAuth surface"
 + "Watch out" host-trust bullet for the full design rationale."""
 
-from django.conf import settings
 from django.http import HttpRequest
 from django.http import JsonResponse
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_safe
+from mcp_sql.audience import mcp_resource_url
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.conf import refresh_tokens_enabled
+from mcp_sql.consts import absolute_url
 
 
 def _grant_types_supported() -> list[str]:
@@ -32,16 +33,50 @@ def _issuer(request: HttpRequest) -> str:
     plenty else (admin, API, the MCP transport itself).
 
     RFC 8414 §2 requires the issuer to be an https URL except for
-    loopback / development. Stage and prod trust traefik's
-    `X-Forwarded-Proto: https` via `SECURE_PROXY_SSL_HEADER`, so
-    `request.scheme` is honest after middleware unpacking. As defense
-    in depth against a misbehaving reverse proxy, we force `https`
-    whenever `DEBUG` is off — under that condition the project is
-    unambiguously a non-loopback deploy. Local dev (`DEBUG=True`) keeps
-    `request.scheme` so http is honest.
+    loopback / development; `consts.absolute_url` is what enforces that, and
+    every other URL in both discovery documents (and the 401 challenge's
+    `resource_metadata` pointer) goes through the same helper so the whole
+    surface agrees on one origin.
     """
-    scheme = request.scheme if settings.DEBUG else "https"
-    return f"{scheme}://{request.get_host()}/o"
+    return absolute_url(request, "/o")
+
+
+def _resource_identifier(request: HttpRequest) -> str:
+    """The RFC 9728 `resource` value, spelled the way the client asked for it.
+
+    RFC 9728 §3.3 requires the returned `resource` to be *identical* to the
+    resource identifier the client inserted the well-known suffix into, and
+    says the document "MUST NOT be used" on mismatch. Clients disagree on
+    trailing-slash normalisation — Cursor Desktop requests the slash-less
+    metadata path and then enforces §3.3 (it aborts the dance after consent,
+    before the token exchange); Claude Code requests the same path but does
+    not enforce; Claude.ai's web connector strips the slash off the transport
+    POST instead. Advertising one fixed spelling therefore breaks whichever
+    half of the ecosystem normalises the other way.
+
+    So `urls.py` serves this document at BOTH `.../mcp/sql` and
+    `.../mcp/sql/`, and we echo whichever spelling was used. That satisfies
+    both clauses of §3.3: a client that built the metadata URL from its own
+    identifier gets that identifier back, and a client that followed the 401
+    `resource_metadata` pointer gets the URL it sent the request to, because
+    `auth.MCPOAuth2Authentication.authenticate_header` picks the pointer's
+    spelling from the request path. (A client that requests `/mcp/sql/` but
+    then builds a slash-less metadata URL on its own — or vice versa — is
+    comparing two different identifiers, and no single document can satisfy
+    it.) Both spellings route to the same transport view, so the audience a
+    client derives from this value reaches the same endpoint either way.
+    Nothing here is attacker-controlled: `request.path` can only be one of the
+    two literal routes Django matched.
+
+    The value is built by `audience.mcp_resource_url`, which is also what
+    `/o/authorize/` and `/o/token/` compare an RFC 8707 `resource` with and
+    how `/mcp/sql/` builds the URL DOT audience-checks a token against, so
+    the advertised identifier is the one a token can be bound to.
+    """
+    canonical = mcp_resource_url(request)
+    if request.path.endswith("/"):
+        return canonical
+    return canonical.removesuffix("/")
 
 
 def _cors(response: JsonResponse) -> JsonResponse:
@@ -64,11 +99,14 @@ def protected_resource_metadata(request):
     `access_token` from the query string or a form body, but
     `MCPOAuth2Authentication` verifies on `oauth_server.MCPServer`, whose
     `HeaderOnlyBearer` reads the `Authorization` header only.
+
+    Served at two paths; `resource` echoes the one used — see
+    `_resource_identifier` for why.
     """
     return _cors(
         JsonResponse(
             {
-                "resource": request.build_absolute_uri(reverse("mcp_sql_endpoint")),
+                "resource": _resource_identifier(request),
                 # Sourced from `MCP_SQL["RESOURCE_NAME"]` (defaults to
                 # "MCP SQL"; consuming projects typically override this so
                 # discovery / `claude mcp add <name> ...` slugs stay
@@ -103,15 +141,11 @@ def authorization_server_metadata(request):
         JsonResponse(
             {
                 "issuer": _issuer(request),
-                "authorization_endpoint": request.build_absolute_uri(
-                    reverse("authorize")
-                ),
-                "token_endpoint": request.build_absolute_uri(reverse("token")),
-                "revocation_endpoint": request.build_absolute_uri(
-                    reverse("revoke-token")
-                ),
-                "registration_endpoint": request.build_absolute_uri(
-                    reverse("oauth_dynamic_client_registration")
+                "authorization_endpoint": absolute_url(request, reverse("authorize")),
+                "token_endpoint": absolute_url(request, reverse("token")),
+                "revocation_endpoint": absolute_url(request, reverse("revoke-token")),
+                "registration_endpoint": absolute_url(
+                    request, reverse("oauth_dynamic_client_registration")
                 ),
                 "scopes_supported": [mcp_sql_settings.SCOPE],
                 "response_types_supported": ["code"],

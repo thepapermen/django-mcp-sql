@@ -8,9 +8,14 @@ CSRF/CORS posture."""
 import asyncio
 import functools
 import io
+import logging
 import threading
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import asdict
+from http import HTTPStatus
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 from wsgiref.types import WSGIApplication
 
@@ -18,7 +23,9 @@ from a2wsgi import ASGIMiddleware
 from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.db import close_old_connections
+from django.http import HttpRequest
 from django.http import HttpResponse
+from django.http import HttpResponseNotAllowed
 from django.views.decorators.csrf import csrf_exempt
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -27,7 +34,10 @@ from mcp_sql import executor
 from mcp_sql import fencing
 from mcp_sql import grants
 from mcp_sql.auth import MCPOAuth2Authentication
+from mcp_sql.clients import NO_CLIENT
+from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.consts import identify_application
 from mcp_sql.models import audit_client_ip
 from mcp_sql.schemas import ToolName
 from rest_framework.decorators import api_view
@@ -43,6 +53,9 @@ from typing_extensions import TypedDict
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
     from mcp_sql.conf import Profile
+
+
+logger = logging.getLogger(__name__)
 
 
 class ColumnInfo(TypedDict):
@@ -240,7 +253,7 @@ def _build_mcp_server(
     profile: "Profile",
     token_id: str,
     client_ip: str | None,
-    client_redirect: str = "",
+    client: ClientIdentity = NO_CLIENT,
 ) -> FastMCP:
     """Construct a FastMCP server with tools closed over the authenticated
     principal and its bound `profile` (access tier). Called per-request so
@@ -288,7 +301,7 @@ def _build_mcp_server(
             tool=ToolName.LIST_TABLES,
             token_id=token_id,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
         )
         return tables
 
@@ -321,7 +334,7 @@ def _build_mcp_server(
             tool=ToolName.DESCRIBE_TABLE,
             token_id=token_id,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             detail=f"describe_table({name!r})",
         )
         if name not in tables.values():
@@ -391,7 +404,7 @@ def _build_mcp_server(
             limit=limit,
             token_id=token_id,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
         )
         return fencing.fence_query_result(asdict(result))
 
@@ -466,12 +479,76 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     return response
 
 
+class _EveryAlias(set[str]):
+    """A `_non_atomic_requests` set that contains every database alias.
+
+    Django's `non_atomic_requests` records one alias per application (the
+    bare decorator: only `default`), and `BaseHandler.make_view_atomic`
+    wraps the view in `transaction.atomic(using=alias)` for every
+    `ATOMIC_REQUESTS` alias NOT in the set. A consumer whose router sends
+    `mcp_sql`'s audit tables to another `ATOMIC_REQUESTS` alias would so keep
+    losing rejection rows (DRF's `set_rollback()` marks every such
+    connection). Listing the aliases at import would miss any configured
+    later; answering "yes" for any alias covers them all, whenever and
+    however `DATABASES` is read. Django only ever tests membership on, or
+    `add`s to, this attribute.
+    """
+
+    def __contains__(self, alias: object) -> bool:
+        return True
+
+
+def _non_atomic_for_every_alias(
+    view: Callable[[HttpRequest], HttpResponse],
+) -> Callable[[HttpRequest], HttpResponse]:
+    """`@transaction.non_atomic_requests`, for every alias (`_EveryAlias`)."""
+    view._non_atomic_requests = _EveryAlias()  # type: ignore[attr-defined]
+    return view
+
+
+@_non_atomic_for_every_alias
 @csrf_exempt
-@api_view(["GET", "POST", "DELETE"])
+def mcp_endpoint(request: HttpRequest) -> HttpResponse:
+    """The /mcp/sql/ entry point: POST only, refused before DRF otherwise.
+
+    The transport is stateless with JSON responses (`_build_mcp_server`), so
+    every MCP exchange is one POST. The Streamable HTTP spec's GET (a
+    server-to-client SSE stream) and DELETE (ending a session) have nothing to
+    serve here, and the spec says a server without the GET stream answers
+    405. Refusing them HERE, before DRF, is what matters: forwarded into the
+    bridge, a GET made the SDK open an SSE stream that never ends (or, with
+    `Last-Event-ID`, return without any response), and `_invoke_wsgi_app`
+    waited on it forever, pinning the worker thread and its DB connection.
+    Before DRF also means before content negotiation and authentication: no
+    DB query, and the TypeScript SDK's post-initialize GET (`Accept:
+    text/event-stream` only, which DRF would answer 406) gets the 405 it
+    treats as "no stream offered" rather than an error. The Python SDK opens
+    its GET stream (and sends DELETE) only when the server issued an
+    `Mcp-Session-Id`, which a stateless server never does.
+
+    POST goes on to `_mcp_transport`, the DRF view that authenticates.
+
+    Non-atomic for EVERY alias (`_EveryAlias`, below): the view never runs
+    inside a consumer's `ATOMIC_REQUESTS` transaction, whichever alias holds
+    the audit tables. Nothing here needs one (the tools run on
+    pool threads with their own connections and write their audit rows in
+    autocommit), and inside one the gates' `MCPAuthRejectionLog` rows were
+    lost: DRF's exception handler marks every `ATOMIC_REQUESTS` transaction
+    for rollback on any `APIException`, the gates' `AuthenticationFailed`
+    included. Outside it, each row commits as it is written. It also keeps
+    the main thread from holding an open transaction for the whole exchange.
+    """
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    response: HttpResponse = _mcp_transport(request)
+    return response
+
+
+@api_view(["POST"])
 @authentication_classes([MCPOAuth2Authentication])
 @permission_classes([IsAuthenticated])
-def mcp_endpoint(request):
-    """The /mcp/sql/ entry point.
+def _mcp_transport(request):
+    """The DRF half of `mcp_endpoint`, reached only by POST.
 
     Auth runs via the DRF auth class; the view self-declares
     `IsAuthenticated` so anonymous requests are rejected with 401 +
@@ -487,15 +564,12 @@ def mcp_endpoint(request):
     user = request.user
     token = request.auth
     token_id = str(token.pk) if token is not None else ""
-    # The OAuth redirect_uri the token was issued against (the token's
-    # Application's registered `redirect_uris`) — recorded on the audit rows
-    # for cloud-provider attribution: the provider's true callback for an
-    # "exact" cloud client, the host+path prefix for a "prefix" one, the
-    # loopback URI for canonical / DCR clients. `token.application` is a
-    # non-null FK on every DOT AccessToken, so this is safe when a token is set.
-    client_redirect = (
-        (token.application.redirect_uris or "") if token is not None else ""
-    )
+    # Which OAuth client presented this token — its Application name, the
+    # derived `ClientKind`, and its allowed callbacks (declared or registered)
+    # — recorded on every audit row this request produces. `token.application`
+    # is a non-null FK on every DOT AccessToken, so this is safe whenever a
+    # token is set.
+    client = identify_application(token.application) if token is not None else NO_CLIENT
     # Behind a reverse proxy the consumer's real-IP middleware (if wired —
     # see docs/architecture.md "the per-IP throttle trusts YOUR deployment's
     # IP handling") has already rewritten `REMOTE_ADDR` to the derived
@@ -527,18 +601,167 @@ def mcp_endpoint(request):
         profile=profile,
         token_id=token_id,
         client_ip=client_ip,
-        client_redirect=client_redirect,
+        client=client,
     )
+    return _invoke_wsgi_app(_bridge(server), request)
+
+
+def _bridge(server: FastMCP) -> WSGIApplication:
+    """The per-request FastMCP app as a WSGI callable, on the shared loop.
+
+    Layering, outermost first: a2wsgi's `ASGIMiddleware` (with a bounded
+    `wait_time`, so the WSGI side never waits indefinitely for the ASGI task
+    to wind down after the response ended), `_guard_bridge` (deadline +
+    guaranteed complete response), `_wrap_lifespan`, the SDK app.
+    """
     # a2wsgi's `ASGIMiddleware` is a WSGI application by construction, but its
     # stubbed `__call__` is not recognised as the `WSGIApplication` callable
     # shape — assert the contract here rather than loosen `_invoke_wsgi_app`.
-    wsgi_app = cast(
+    return cast(
         "WSGIApplication",
         ASGIMiddleware(
-            _wrap_lifespan(server.streamable_http_app()), loop=_get_asgi_loop()
+            _guard_bridge(_wrap_lifespan(server.streamable_http_app())),
+            loop=_get_asgi_loop(),
+            wait_time=_BRIDGE_WIND_DOWN_SECONDS,
         ),
     )
-    return _invoke_wsgi_app(wsgi_app, request)
+
+
+# Hard ceiling on one bridged MCP exchange. Far above any legitimate request:
+# a tool call is at most one statement under the session's 5 s
+# `statement_timeout` (`session.EXPECTED_SESSION_GUCS`), its 1 s
+# `lock_timeout`, a parse of a <= 1 MiB body and an audit insert. Below
+# gunicorn's default 30 s worker timeout is not the goal (a gthread or ASGI
+# worker has no such timeout at all); never pinning a thread forever is.
+_BRIDGE_DEADLINE_SECONDS = 30.0
+# After the response is complete, how long a2wsgi waits for the ASGI task
+# (lifespan exit, SDK cleanup) before cancelling it and releasing the thread.
+_BRIDGE_WIND_DOWN_SECONDS = 5.0
+
+
+def _guard_bridge(asgi_app):
+    """Guarantee the WSGI side of the bridge always gets a complete response.
+
+    a2wsgi's WSGI half blocks until the ASGI app sends a message, and stops
+    only on a final `http.response.body` (or an exception). An app that never
+    finishes its response, or returns without starting one, therefore pins
+    the calling thread forever: `_invoke_wsgi_app`'s `b"".join` never
+    returns, client disconnects included. That is how a GET once pinned the
+    worker (the SDK's never-ending SSE stream, and its no-response
+    `Last-Event-ID` replay). `mcp_endpoint` now refuses GET outright; this is
+    the bridge-level backstop for any path, present or future, that leaves a
+    response unfinished:
+
+    - the app runs under `_BRIDGE_DEADLINE_SECONDS`, then is cancelled;
+    - whenever it ends (normally, or cut off) without having sent its final
+      body, this sends one: a `500` if it ended on its own without a
+      response, a `504` if the deadline cut it off before one started, or
+      just the closing empty chunk if the response had already started.
+
+    Every send runs as its own task, shielded from the deadline's
+    cancellation, and is awaited before the completion messages go out. So
+    the flags below record only what a2wsgi actually received, and a message
+    a cancelled app was in the middle of sending is never half-delivered
+    (a2wsgi takes a lock per message that only its WSGI half releases).
+
+    An exception raised by the app, a `TimeoutError` of its own included, is
+    left to a2wsgi, which answers 500 (or re-raises into `_invoke_wsgi_app` if
+    the body had started); the guard then logs nothing and sends nothing, but
+    still lets a send in flight finish first.
+    """
+
+    async def call(scope, receive, send):
+        started = finished = closed = False
+        # In send order, so the failure that surfaces is deterministic.
+        in_flight: list[asyncio.Task[None]] = []
+
+        async def deliver(message):
+            nonlocal started, finished
+            await send(message)
+            started = started or message["type"] == "http.response.start"
+            finished = finished or (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            )
+
+        async def tracked_send(message):
+            if closed:
+                # The guard has let go (the app returned or failed): a send
+                # the app left scheduled must not reach a2wsgi afterwards.
+                msg = "ASGI send after the MCP bridge exchange ended"
+                raise RuntimeError(msg)
+            task = asyncio.ensure_future(deliver(message))
+            in_flight.append(task)
+            await asyncio.shield(task)
+
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+        try:
+            async with asyncio.timeout(_BRIDGE_DEADLINE_SECONDS) as deadline:
+                await asgi_app(scope, receive, tracked_send)
+        except TimeoutError:
+            # Only the deadline firing is a 504. A `TimeoutError` the app
+            # raised itself is an app exception like any other: a2wsgi's.
+            if not deadline.expired():
+                raise
+            status = HTTPStatus.GATEWAY_TIMEOUT
+        finally:
+            # On EVERY exit, the exception paths included: no new send may
+            # start, and every send still in flight (not just the latest) is
+            # settled before anything else happens, so no message is left
+            # half-delivered on the shared loop (a2wsgi's per-message lock is
+            # released only once its WSGI half has taken the message).
+            closed = True
+            if in_flight:
+                await asyncio.wait(in_flight)
+        for task in in_flight:
+            # A failed send is this exchange's failure; with several, the
+            # earliest send's, every time.
+            task.result()
+        if not finished:
+            await _complete_response(scope, send, started=started, status=status)
+
+    return call
+
+
+async def _complete_response(
+    scope: dict[str, Any],
+    send: Callable[[dict[str, Any]], Awaitable[None]],
+    *,
+    started: bool,
+    status: HTTPStatus,
+) -> None:
+    """Send what an unfinished response is missing so a2wsgi's WSGI half stops.
+
+    A whole `status` response if none started, else the closing empty chunk;
+    logged at ERROR either way.
+    """
+    logger.error(
+        "MCP bridge: %s %s %s; answering the client and releasing the thread",
+        scope.get("method"),
+        scope.get("path"),
+        (
+            f"did not complete within {_BRIDGE_DEADLINE_SECONDS}s"
+            if status == HTTPStatus.GATEWAY_TIMEOUT
+            else "ended without completing its response"
+        ),
+    )
+    if not started:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": status.phrase.encode(),
+                "more_body": False,
+            }
+        )
+        return
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def _wrap_lifespan(asgi_app):
