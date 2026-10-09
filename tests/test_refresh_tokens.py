@@ -8,6 +8,7 @@ password change revokes refresh tokens along with access tokens.
 """
 
 import hashlib
+import re
 import secrets
 from datetime import timedelta
 from http import HTTPStatus
@@ -32,6 +33,7 @@ from mcp_sql.oauth_server import MCPServer
 from mcp_sql.schemas import AuthRejectionReason
 from mcp_sql.tests.refresh_flow import CAP as _CAP
 from mcp_sql.tests.refresh_flow import LOOPBACK as _LOOPBACK
+from mcp_sql.tests.refresh_flow import consent as _consent
 from mcp_sql.tests.refresh_flow import consent_and_exchange as _consent_and_exchange
 from mcp_sql.tests.refresh_flow import refresh as _refresh
 from mcp_sql.tests.refresh_flow import s256_pair as _s256_pair
@@ -858,3 +860,46 @@ def test_documented_family_prune_deletes_only_orphaned_families(mcp_user, mcp_ap
     assert list(
         MCPRefreshTokenFamily.objects.values_list("token_family", flat=True)
     ) == [live]
+
+
+def _documented_token_delete_snippet() -> str:
+    """The token-delete shell snippet of docs/oauth.md → "Revoking access"."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "docs" / "oauth.md").read_text()
+    (snippet,) = [
+        block
+        for block in re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+        if "get_grant_model().objects.filter(user__email=u)" in block
+    ]
+    return snippet
+
+
+@pytest.mark.usefixtures("refresh_on", "mcp_mfa_on")
+def test_documented_token_delete_snippet_revokes_the_user_only(
+    client, mcp_app, mcp_user, mcp_user_factory, use_mcp_perm
+):
+    """The operator snippet deletes the user's pending codes, chains'
+    consent records, refresh and access tokens, and nobody else's."""
+    from django.test import Client
+
+    other = mcp_user_factory(is_active=True, is_staff=True)
+    other.user_permissions.add(use_mcp_perm)
+    for user, email in ((mcp_user, "alice@example.com"), (other, "bob@example.com")):
+        user.email = email
+        user.save(update_fields=["email"])
+    _consent_and_exchange(client, mcp_user)
+    _consent_and_exchange(Client(), other)
+    families = dict(
+        RefreshToken.objects.values_list("user_id", "token_family").distinct()
+    )
+    _consent(client, mcp_user)  # a pending code of the user's
+
+    exec(_documented_token_delete_snippet(), {})  # noqa: S102
+
+    for model in (Grant, RefreshToken, AccessToken):
+        assert not model.objects.filter(user=mcp_user).exists(), model
+        assert model is Grant or model.objects.filter(user=other).exists(), model
+    assert set(
+        MCPRefreshTokenFamily.objects.values_list("token_family", flat=True)
+    ) == {families[other.pk]}

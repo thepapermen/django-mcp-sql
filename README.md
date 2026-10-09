@@ -370,7 +370,9 @@ OAUTH2_PROVIDER = {
     # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
     # opts in (with its own hard cap from the consent), so
     # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
-    # DOT reads 0 as "no age limit".)
+    # DOT reads 0 as "no age limit".) With refresh on, set it to at least
+    # that cap and schedule `cleartokens`, or rotated-out refresh tokens
+    # are never deleted (docs/oauth.md -> "Refresh tokens (opt-in)").
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.
