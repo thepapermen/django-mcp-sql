@@ -48,6 +48,42 @@ DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
         "table_to_xml_and_xmlschema",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        # The same hole through the other built-ins and stock extensions
+        # that run SQL given as text (or a query built from a relation /
+        # schema name given as text) under `mcp_readonly_role`, outside
+        # this parser:
+        # - `ts_stat(sqlquery text [, weights text])` runs `sqlquery`;
+        # - `ts_rewrite(query tsquery, select text)` runs `select` (the
+        #   3-arg `ts_rewrite(query, target, substitute)` runs nothing but
+        #   is refused by name too — owner decision: one rule per name);
+        # - `schema_to_xml*(schema name, ...)` / `database_to_xml*(...)`
+        #   dump every table of a schema / of the database the role can
+        #   SELECT, whitelisted or not;
+        # - `tablefunc`'s `connectby(relname text, ...)` and `xml2`'s
+        #   `xpath_table(..., relname text, ..., criteria text)` build a
+        #   query from their text arguments and run it (`tablefunc`'s
+        #   `crosstab*` family: the `crosstab` prefix below).
+        # The inner query skips the whitelist, schema scoping,
+        # `BAN_SELECT_STAR` and this deny list:
+        # `ts_stat('SELECT to_tsvector(pg_advisory_lock(1)::text)')` takes
+        # a session-level lock that outlives the read transaction's
+        # rollback on a pooled connection (verified on PostgreSQL 15), a
+        # `dblink` call reaches the network, and the `*_to_xml` dumps are
+        # one unbounded scalar. In FROM they are already refused by the
+        # empty-name `exp.Table` guard (`_check_tables`); this covers every
+        # other position — projection, WHERE, nested, schema-qualified,
+        # quoted, attribute notation (`('…'::text).ts_stat` is
+        # `ts_stat('…')` to Postgres).
+        "ts_stat",
+        "ts_rewrite",
+        "schema_to_xml",
+        "schema_to_xmlschema",
+        "schema_to_xml_and_xmlschema",
+        "database_to_xml",
+        "database_to_xmlschema",
+        "database_to_xml_and_xmlschema",
+        "connectby",
+        "xpath_table",
         # Server-state / identity leaks. PG returns version banners, role
         # names, and network topology via these built-ins — useful for an
         # attacker doing reconnaissance about what role the executor runs
@@ -107,8 +143,18 @@ DENIED_BARE_KEYWORDS: frozenset[str] = frozenset(
 # bits and are introspection tools, not query helpers. Both prefixes are
 # opt-out: there is no allowlist today, since an agent doing exploration of
 # whitelisted business tables does not need any of them. Revisit if a
-# legitimate use case appears.
-DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = ("dblink_", "lo_", "pg_", "has_")
+# legitimate use case appears. `crosstab*` covers `tablefunc`'s
+# `crosstab(source_sql text [, category_sql text | N int])` /
+# `crosstab2..4(source_sql text)`, which run their text argument as SQL (see
+# the `ts_stat` comment above), plus the `crosstab_<suffix>(text)` wrappers
+# its documentation tells a DBA to create over the same C function.
+DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = (
+    "dblink_",
+    "lo_",
+    "pg_",
+    "has_",
+    "crosstab",
+)
 # Set-returning functions (SRFs). In a FROM clause these are caught by the
 # empty-name `exp.Table` guard in `_check_tables`; in the PROJECTION they are
 # not, and they fan one input row out to many — `generate_series` is the
