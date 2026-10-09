@@ -13,6 +13,7 @@ from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import pgcode
 from mcp_sql.executor import run_query
 from mcp_sql.parser import relation_of
+from mcp_sql.session import SQLCursor
 from mcp_sql.session import enter_readonly_session
 from mcp_sql.session import session_drift
 
@@ -23,14 +24,35 @@ EXPECTED_REJECTION_PGCODES = frozenset(
     {PGCODE_READ_ONLY_SQL_TRANSACTION, PGCODE_INSUFFICIENT_PRIVILEGE}
 )
 AUDIT_TABLE = "mcp_sql_mcpquerylog"
+# Whether `PUBLIC` (grantee oid 0) holds CREATE on a schema, read from its
+# ACL. A NULL `nspacl` means `acldefault('n', owner)` — owner-only on every
+# PostgreSQL version; PostgreSQL 14 and earlier give `PUBLIC` CREATE on
+# `public` through an explicit ACL entry that initdb writes (15+ no longer
+# does), which `aclexplode` sees like any other.
+PUBLIC_MAY_CREATE_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM pg_namespace AS n, "
+    "aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) AS a "
+    "WHERE n.nspname = %s AND a.grantee = 0 AND a.privilege_type = 'CREATE')"
+)
+
+
+def public_may_create_in(cursor: SQLCursor, schema: str = "public") -> bool:
+    """Whether every role (`PUBLIC`) may create objects in `schema` — and so
+    plant a function or operator overload there that beats the built-in
+    one for a better-matching argument type (docs/architecture.md
+    "overloads in `public`"). `False` for a schema that does not exist."""
+    cursor.execute(PUBLIC_MAY_CREATE_SQL, [schema])
+    row = cursor.fetchone()
+    return row is not None and bool(row[0])
 
 
 class Command(BaseCommand):
     help = (
         "Smoke-check the MCP SQL pipeline. Phase 1 default mode opens the "
         "mcp_readonly alias, enters the read-only session, verifies GUC "
-        "drift, proves the audit table is unreadable, and proves a write is "
-        "rejected. Pass --run-query <sql> to exercise the Phase 2 executor "
+        "drift, proves the audit table is unreadable, proves a write is "
+        "rejected, and warns while PUBLIC holds CREATE on schema public. "
+        "Pass --run-query <sql> to exercise the Phase 2 executor "
         "end-to-end: parse → LIMIT N+1 → readonly tx → row caps → audit."
     )
 
@@ -110,6 +132,7 @@ class Command(BaseCommand):
         self._verify_read_path(profile, table)
         self._verify_audit_unreadable(profile)
         self._verify_write_rejected(profile, table)
+        self._check_public_schema_create()
 
     @staticmethod
     def _smoke_profile(name: str | None) -> Profile:
@@ -299,3 +322,37 @@ class Command(BaseCommand):
             "mcp_sql_grants --apply did NOT grant INSERT."
         )
         raise CommandError(msg)
+
+    def _check_public_schema_create(self) -> None:
+        """Warn (not fail) while `PUBLIC` holds CREATE on schema `public`.
+
+        A warning, unlike the checks above: those prove the package's own
+        contract (role, GUC guards, audit revoke, read-only transaction)
+        and fail when it is broken. This one is a database-wide hardening
+        the package recommends but does not apply — it is PostgreSQL 14's
+        default, and an app login that does not own `public` creates its
+        own tables through it there — so failing would fail every smoke
+        run on a stock PostgreSQL 14 install for a setting the operator
+        must change outside the package (docs/role-setup.md)."""
+        with connections[mcp_sql_settings.DB_ALIAS].cursor() as cur:
+            exposed = public_may_create_in(cur)
+        if not exposed:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "Schema public: PUBLIC holds no CREATE (no role without "
+                    "a grant can plant an overload there)."
+                )
+            )
+            return
+        self.stdout.write(
+            self.style.WARNING(
+                "WARNING: PUBLIC holds CREATE on schema public (PostgreSQL "
+                "14's default), so any role can plant a function or operator "
+                "overload there (e.g. public.lower(varchar)) that beats the "
+                "built-in for a better-matching argument type, with "
+                "PIN_SEARCH_PATH on too, and runs on the values the agent's "
+                "query passes it. Recommended: REVOKE CREATE ON SCHEMA public "
+                "FROM PUBLIC (grant CREATE to the app's login first if it "
+                "creates its tables through PUBLIC). See docs/role-setup.md."
+            )
+        )

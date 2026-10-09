@@ -22,7 +22,8 @@ deployments have just the in-package `default` profile and its
 | Reconcile grants in CI | Every PR | Wire `mcp_sql_grants --apply` against your CI's ephemeral test cluster | CI step exits 0 |
 | Detect grants drift (advisory) | Every `migrate` | `python manage.py migrate` — the `post_migrate` signal in `mcp_sql.signals` LOGs a WARNING when any profile's grants drift from its whitelist. Does NOT apply. | WARNING line absent from migrate output |
 | Audit grants drift | Pre-deploy verification on stage/prod | `python manage.py mcp_sql_grants` | exit 0 = in sync |
-| End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected" |
+| End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected", no `WARNING` line |
+| Stop overload planting in `public` (recommended) | Once per database, PostgreSQL 14 and earlier | `REVOKE CREATE ON SCHEMA public FROM PUBLIC` (after granting the app's login `CREATE`; see below) | `mcp_sql_smoke` prints "PUBLIC holds no CREATE" |
 | Executor smoke (full pipeline) | With a whitelisted table | `python manage.py mcp_sql_smoke --run-query "SELECT id FROM auth_permission LIMIT 5"` | `QueryResult` printed, audit row created |
 | Add user to MCP cohort | Onboarding / role change | Admin: add user to the profile's group (`default` profile's is `mcp_sql_users`) | user resolves to exactly one profile (`resolve_profile`) |
 | Revoke a user's MCP tokens | Incident / off-boarding | Pending codes first, then tokens, for every OAuth Application the user holds: `get_grant_model().objects.filter(user=user).delete(); get_access_token_model().objects.filter(user=user).delete()` (both from `oauth2_provider.models`; see `oauth.md` → "Revoking access"). Logging the user out does the same for MCP Applications only | After the snippet: `get_grant_model().objects.filter(user=user).count() == 0` and the same for `get_access_token_model()`. After a logout: a `session_logout` row in `MCPAuthRejectionLog` naming what was revoked (rows of non-MCP Applications remain) |
@@ -131,6 +132,59 @@ There is no management command for this. Role creation requires
 superuser, which the deploy pipeline does not have; the SQL has to be
 applied by a DBA via `psql` regardless, so a Django wrapper would add
 indirection without value.
+
+---
+
+## Revoke `CREATE` on schema `public` from `PUBLIC` (recommended)
+
+On PostgreSQL 14 and earlier every role (`PUBLIC`) may create objects in
+schema `public`; PostgreSQL 15 dropped that default. Any role that can
+create there can plant a function or operator **overload** the agent's
+queries then call instead of the built-in one (the CVE-2018-1058 class):
+Postgres picks the best-matching argument types across every schema on
+the `search_path` before `pg_catalog`'s place on it matters, so
+`public.lower(varchar)` beats `pg_catalog.lower(text)` for a `varchar`
+column, and an `=(varchar, varchar)` in `public` beats the built-in
+`=(text, text)` — with `MCP_SQL["PIN_SEARCH_PATH"] = True` too, since
+`public` stays on the path. The parser's deny list matches names and
+cannot see it. The planted function runs on the values the agent's query
+passes it (whitelisted columns its owner may have no right to read) and
+returns whatever it likes. See `docs/architecture.md` → "In both modes:
+overloads in `public`".
+
+As a superuser (or the schema's owner), connected to the **application's
+database** (schema privileges are per database):
+
+```sql
+-- PostgreSQL 14 and earlier: if the app's login does not own schema
+-- `public` (there it is owned by the bootstrap superuser), it creates its
+-- own tables through PUBLIC's CREATE — grant it explicitly first, or its
+-- next migration fails:
+GRANT CREATE ON SCHEMA public TO <app_role>;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+`sql/role_setup.sql` and `mcp_sql_role_setup --emit-sql` carry the
+`REVOKE` as their last statement, **commented out**: the package does not
+change a database-wide privilege the consumer's app may depend on.
+Uncomment it once the app's login has its own `CREATE`, or run it by
+hand. `mcp_sql_smoke` prints a `WARNING` line while `PUBLIC` still holds
+`CREATE` on `public` (a warning, not a failure: the smoke command fails
+only when the package's own contract is broken). To check by hand:
+
+```sql
+SELECT EXISTS (
+    SELECT 1 FROM pg_namespace AS n,
+        aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) AS a
+    WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'CREATE'
+) AS public_may_create;
+-- Expected after the REVOKE: f
+```
+
+The roles that keep `CREATE` on `public` (its owner, the app's login) can
+still plant an overload; they can already change the app's tables, so the
+revoke narrows the planters to parties the app already trusts with its
+schema.
 
 ---
 
@@ -396,7 +450,15 @@ Expected output:
 Read path ok: SET LOCAL ROLE + session GUCs (incl. the live transaction_read_only) verified, SELECT FROM auth_permission ok
 Audit table mcp_sql_mcpquerylog unreadable (pgcode=42501) — 0002_revoke_audit_grants is in effect.
 Write attempt rejected as expected: ReadOnlySqlTransaction (pgcode=25006)
+Schema public: PUBLIC holds no CREATE (no role without a grant can plant an overload there).
 ```
+
+The fourth line reads `WARNING: PUBLIC holds CREATE on schema public …`
+instead while every role may create objects in `public` (PostgreSQL 14's
+default) — see [Revoke `CREATE` on schema `public` from
+`PUBLIC`](#revoke-create-on-schema-public-from-public-recommended). The
+command still exits 0: it is a recommended hardening, not the package's
+contract.
 
 If the third line shows `pgcode=42501 (insufficient_privilege)`, that is
 also healthy — it means the readonly guard did not catch the write but the

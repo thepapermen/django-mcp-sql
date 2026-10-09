@@ -156,6 +156,15 @@ the package itself never imports `sentry_sdk`.
 >   `mcp_sql_grants` does not report. See
 >   [docs/architecture.md](docs/architecture.md) "`search_path` is pinned
 >   only on request".
+> - **Revoke `CREATE` on schema `public` from `PUBLIC`** (PostgreSQL 14 and
+>   earlier grant it; 15+ does not). Any role that can create there can
+>   plant a function or operator overload — `public.lower(varchar)` — that
+>   Postgres prefers to the built-in for a better-matching argument type,
+>   with the pin on too, and that runs on the values the agent's query
+>   passes it; the parser's deny list matches names and cannot see it.
+>   `mcp_sql_smoke` warns while `PUBLIC` holds it. See
+>   [docs/role-setup.md](docs/role-setup.md) "Revoke `CREATE` on schema
+>   `public` from `PUBLIC`".
 > - **Don't expose this surface to a privileged agent.** Keep the read-only
 >   SQL context separate from any agent that also holds act/exfiltrate tools,
 >   so a malicious row has nothing to pivot into.

@@ -16,7 +16,9 @@ Mirrors `role_setup.sql`'s shape exactly: an idempotent `CREATE ROLE … NOLOGIN
 commented out), and the membership `GRANT … TO <app_role>` block
 that reads the connecting role from the psql variable `app_role` via a
 `SET LOCAL` + `current_setting` dance (psql does not substitute `:'…'` inside
-`DO $$ … $$`). Run as:
+`DO $$ … $$`), and the recommended `REVOKE CREATE ON SCHEMA public FROM
+PUBLIC`, commented out as in the static file (it changes a database-wide
+privilege the consumer's app may rely on). Run as:
 
     python manage.py mcp_sql_role_setup --emit-sql | psql ... -v app_role=<role>
 """
@@ -33,6 +35,23 @@ _HEADER = (
     "-- GRANT to the connecting app role. Mirrors mcp_sql/sql/role_setup.sql;\n"
     "-- review before running. Apply as a superuser, passing the connecting role\n"
     "-- via -v app_role=<role>. Idempotent: re-running must not fail.\n"
+)
+
+# Mirrors role_setup.sql's commented-out step, verbatim.
+_PUBLIC_SCHEMA_BLOCK = (
+    "-- Recommended hardening, NOT applied by this script — uncomment to apply,\n"
+    "-- connected to the application's database (schema privileges are\n"
+    "-- per-database, unlike the roles above). PostgreSQL 14 and earlier let every\n"
+    "-- role (PUBLIC) create objects in schema `public`; 15+ no longer do. A role\n"
+    "-- that can create there can plant a function or operator overload (e.g.\n"
+    "-- `public.lower(varchar)`) that beats the built-in one for a better-matching\n"
+    '-- argument type, with or without MCP_SQL["PIN_SEARCH_PATH"], and runs on the\n'
+    "-- values the agent's query passes it; the parser's deny list matches names\n"
+    "-- and cannot see it. Not applied automatically: on PostgreSQL 14 an app\n"
+    "-- login that does not own `public` creates its own tables through this very\n"
+    "-- grant, so give it CREATE first (GRANT CREATE ON SCHEMA public TO <app_role>).\n"
+    "-- `mcp_sql_smoke` warns while PUBLIC holds it. See docs/role-setup.md.\n"
+    "-- REVOKE CREATE ON SCHEMA public FROM PUBLIC;\n"
 )
 
 
@@ -118,5 +137,6 @@ class Command(BaseCommand):
             _HEADER,
             *[_role_block(role) for role in roles],
             _membership_block(roles),
+            _PUBLIC_SCHEMA_BLOCK,
         ]
         self.stdout.write("\n".join(blocks))

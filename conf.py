@@ -347,7 +347,9 @@ DEFAULTS: dict[str, Any] = {
     # needs lives outside `public` (or `pg_catalog`): with it on, such an
     # extension loses its unqualified functions and operators (`ext.f(...)`,
     # `OPERATOR(ext.op)`). The schema-qualified whitelist check and the
-    # every-schema grants inventory apply either way. See
+    # every-schema grants inventory apply either way. Neither mode stops a
+    # function / operator overload planted in `public` (`public` stays on
+    # the path): revoke `PUBLIC`'s CREATE there (docs/role-setup.md). See
     # docs/architecture.md "`search_path`".
     "PIN_SEARCH_PATH": False,
 }

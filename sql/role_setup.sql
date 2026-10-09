@@ -54,6 +54,20 @@ ALTER ROLE mcp_readonly_role SET standard_conforming_strings = on;
 -- the per-transaction `SET LOCAL search_path`, which applies without it.
 -- ALTER ROLE mcp_readonly_role SET search_path = public, pg_temp;
 
+-- Recommended hardening, NOT applied by this script — uncomment to apply,
+-- connected to the application's database (schema privileges are
+-- per-database, unlike the roles above). PostgreSQL 14 and earlier let every
+-- role (PUBLIC) create objects in schema `public`; 15+ no longer do. A role
+-- that can create there can plant a function or operator overload (e.g.
+-- `public.lower(varchar)`) that beats the built-in one for a better-matching
+-- argument type, with or without MCP_SQL["PIN_SEARCH_PATH"], and runs on the
+-- values the agent's query passes it; the parser's deny list matches names
+-- and cannot see it. Not applied automatically: on PostgreSQL 14 an app
+-- login that does not own `public` creates its own tables through this very
+-- grant, so give it CREATE first (GRANT CREATE ON SCHEMA public TO <app_role>).
+-- `mcp_sql_smoke` warns while PUBLIC holds it. See docs/role-setup.md.
+-- REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
 BEGIN;
 
 SET LOCAL mcp_sql.app_role = :'app_role';

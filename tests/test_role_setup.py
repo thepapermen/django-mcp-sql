@@ -20,6 +20,7 @@ import mcp_sql
 import pytest
 from django.core.management import call_command
 from django.db import connection
+from mcp_sql.management.commands.mcp_sql_smoke import public_may_create_in
 from mcp_sql.session import EXPECTED_SESSION_GUCS
 from mcp_sql.session import PINNED_SEARCH_PATH
 
@@ -128,3 +129,38 @@ def test_each_default_means_the_guard_value_to_postgres(pin, source, pattern, ex
             cur.execute(f"SET LOCAL {name} = {value}")
             cur.execute(f"SHOW {name}")
             assert cur.fetchone() == (expected[name],), name
+
+
+_REVOKE_PUBLIC_CREATE = "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+
+
+def _public_schema_block(sql: str) -> str:
+    """The commented-out `REVOKE CREATE ON SCHEMA public FROM PUBLIC` step:
+    the comment paragraph that ends with it."""
+    lines = sql.splitlines()
+    end = lines.index(f"-- {_REVOKE_PUBLIC_CREATE}")
+    start = end
+    while start > 0 and lines[start - 1].startswith("-- "):
+        start -= 1
+    return "\n".join(lines[start : end + 1])
+
+
+def test_public_create_revoke_is_recommended_commented_out_in_both(pin):
+    """Both carry the overload-hijacking hardening as the same commented
+    block, never as an active statement: it changes a database-wide
+    privilege the consumer's app may create its tables through (PostgreSQL
+    14's default), so a DBA opts in."""
+    emitted, static = _emit_sql(), _static_sql()
+    for sql in (emitted, static):
+        assert not re.search(r"^\s*REVOKE", sql, re.MULTILINE)
+    assert _public_schema_block(emitted) == _public_schema_block(static)
+    assert "NOT applied by this script" in _public_schema_block(static)
+
+
+@pytest.mark.django_db
+def test_the_commented_revoke_closes_public_create():
+    with connection.cursor() as cur:
+        cur.execute("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        assert public_may_create_in(cur)
+        cur.execute(_REVOKE_PUBLIC_CREATE)
+        assert not public_may_create_in(cur)
