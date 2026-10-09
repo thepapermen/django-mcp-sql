@@ -10,12 +10,14 @@ empty-`ALLOWED_MODELS` guard.
 """
 
 import io
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.db import transaction
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.management.commands import mcp_sql_smoke
@@ -282,3 +284,26 @@ class TestPublicSchemaCreate:
             "_verify_write_rejected",
             "_check_public_schema_create",
         ]
+
+
+@pytest.mark.django_db
+class TestReadPathMissingTable:
+    """An unqualified whitelisted `db_table` whose table is only in another
+    schema (`mcp_sql.E001`) made the read-path check fail with a bare
+    `ProgrammingError`."""
+
+    def test_names_the_relation_and_e001(self, monkeypatch):
+        monkeypatch.setattr(mcp_sql_smoke, "connections", _AliasedConnections())
+        monkeypatch.setattr(
+            mcp_sql_smoke,
+            "transaction",
+            SimpleNamespace(atomic=lambda using: transaction.atomic()),
+        )
+        cmd = Command(stdout=io.StringIO())
+        profile = Command._smoke_profile(None)
+        with pytest.raises(CommandError) as exc:
+            cmd._verify_read_path(profile, "mcp_sql_smoke_no_such_table")
+        message = str(exc.value)
+        assert message.startswith("mcp_sql_smoke_no_such_table does not exist")
+        assert "mcp_sql.E001" in message
+        assert "check --database default" in message
