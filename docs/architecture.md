@@ -169,7 +169,8 @@ and a single-tier consumer is a behaviour-preserving config.
   static `WHERE`). A universal table shared across tiers can be exposed to a
   narrower tier as a `WHERE <discriminator> = '<value>'` view; the role gets
   SELECT on the view only. RLS is deferred (role-keyed RLS only enforces *through* a
-  view on PG15+ `security_invoker`; the CI/test image is PG14).
+  view on PG15+ `security_invoker`; the supported floor is still PG14 on Django ≤ 6.0,
+  PG15 only on Django 6.1).
 - **Per-user scoping = the dormant `SESSION_CONTEXT` hook, NOT a feature.** A
   profile may set `SESSION_CONTEXT` to a dotted path
   `callable(user, profile) -> Mapping[str, str] | None` (default `None`;
