@@ -22,6 +22,8 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.management.base import SystemCheckError
 from django.db import connection
+from django.test.utils import override_system_checks
+from mcp_sql.checks import check_whitelist_schemas
 from mcp_sql.grants import quote_ident
 from mcp_sql.grants import relation_sql
 from mcp_sql.parser import relation_of
@@ -266,6 +268,15 @@ class TestE001PendingMigrations:
     still to apply; the `post_migrate` grants pipeline names it if it is
     still wrong once they ran."""
 
+    @staticmethod
+    def _migrate() -> None:
+        """`manage.py migrate` with its system checks on (a programmatic
+        `call_command` skips them unless asked), E001 the only one
+        registered: other test modules register throwaway models that
+        Django's own model checks refuse."""
+        with override_system_checks([check_whitelist_schemas]):
+            call_command("migrate", skip_checks=False, verbosity=0)
+
     @pytest.fixture
     def migrations_at(self, elsewhere, settings):
         def point_at(module: str) -> None:
@@ -279,7 +290,7 @@ class TestE001PendingMigrations:
 
     def test_migrate_runs_and_creates_it(self, migrations_at):
         migrations_at(f"{_MIGRATIONS}.creates")
-        call_command("migrate", skip_checks=False, verbosity=0)
+        self._migrate()
         with connection.cursor() as cur:
             cur.execute("SELECT to_regclass(%s)", [f"public.{_NAME}"])
             assert cur.fetchone()[0] is not None
@@ -291,7 +302,7 @@ class TestE001PendingMigrations:
         and the next check (nothing pending now) is E001."""
         migrations_at(f"{_MIGRATIONS}.noop")
         with caplog.at_level(ERROR, logger="mcp_sql.signals"):
-            call_command("migrate", skip_checks=False, verbosity=0)
+            self._migrate()
         assert _FOUND in caplog.text
         [error] = _e001(databases=["default"])
         assert _ENTRY in error.msg
