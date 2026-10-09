@@ -147,6 +147,14 @@ the package itself never imports `sentry_sdk`.
 >   whitelist at [curated, column-limited PostgreSQL views](docs/architecture.md#curated-view-pattern)
 >   that drop the attacker-controllable free-text columns, rather than at raw
 >   tables.
+> - **Set `MCP_SQL["PIN_SEARCH_PATH"] = True`.** With the default (`False`),
+>   a party with no right on your tables — any role with `CREATE` on the
+>   database, or another session on the same pooled backend — can plant a
+>   same-named relation readable by `PUBLIC` and have the agent read *its*
+>   rows under a whitelisted name (curated view included), which
+>   `mcp_sql_grants` does not report. See
+>   [docs/architecture.md](docs/architecture.md) "`search_path` is pinned
+>   only on request".
 > - **Don't expose this surface to a privileged agent.** Keep the read-only
 >   SQL context separate from any agent that also holds act/exfiltrate tools,
 >   so a malicious row has nothing to pivot into.
@@ -161,8 +169,9 @@ the package itself never imports `sentry_sdk`.
 
 The package depends on Postgres features that don't port: `SET LOCAL ROLE`
 into a NOLOGIN role, `statement_timeout` / `lock_timeout` /
-`idle_in_transaction_session_timeout` / `default_transaction_read_only`
-GUCs, PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
+`idle_in_transaction_session_timeout` / `default_transaction_read_only` /
+`standard_conforming_strings` GUCs (and `search_path`, with the opt-in
+pin), PG-only error codes (`57014`, `42501`), `CREATE OR REPLACE VIEW`
 semantics, sqlglot's `dialect='postgres'`. There is no design path to
 MySQL / SQLite without a parallel implementation — hence `django-mcp-sql`
 not `django-mcp-mysql` etc.
@@ -318,6 +327,24 @@ MCP_SQL = {
     #     {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
     #      "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
     # ],
+    # Opt-in refresh tokens (default 0 = OFF): rotating, and refused once this
+    # many seconds have passed since the user's consent. See docs/oauth.md
+    # "Refresh tokens (opt-in)".
+    # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
+    # search_path pin — RECOMMENDED, but off by default (False). On, every
+    # read transaction runs SET LOCAL search_path = public, pg_temp, so an
+    # unqualified table name is the whitelisted one in `public`. Off, names
+    # resolve through the database's own search_path: any role with CREATE
+    # on the database (a schema named after the profile role) or another
+    # session on the same backend (a temporary relation, e.g. under
+    # transaction-mode pgbouncer) can plant a same-named relation readable
+    # through a grant to PUBLIC, without any right on your tables, and the
+    # agent reads its rows under the whitelisted name; mcp_sql_grants does
+    # not detect it. Leave it off only if an extension the agent uses lives
+    # outside `public` — and even then, with it on, the agent can write
+    # `ext.f(x)` / `OPERATOR(ext.op)`.
+    # See docs/architecture.md "`search_path` is pinned only on request".
+    "PIN_SEARCH_PATH": True,
 }
 
 OAUTH2_PROVIDER = {
@@ -325,9 +352,19 @@ OAUTH2_PROVIDER = {
     "SCOPES": {"mcp:sql": "Read-only SQL surface for MCP agents"},
     "DEFAULT_SCOPES": ["mcp:sql"],
     "ACCESS_TOKEN_EXPIRE_SECONDS": 6 * 3600,
+    # Moot for MCP: the package's OAuth endpoints mint no refresh tokens and
+    # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
+    # opts in (with its own hard cap from the consent), so
+    # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
+    # DOT reads 0 as "no age limit".)
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
+    # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
+    # in the URL query string outright, without DOT's per-request warning.
+    # The package never accepts such a token either way.
+    "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
     # "http" alone is fine loopback-only (the default); add "https" whenever
     # CLOUD_CLIENTS is non-empty, or the app won't boot.
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],   # RFC 8252 loopback; add "https" for cloud clients
@@ -372,7 +409,7 @@ the package (importable consumers find them under `mcp_sql/docs/`):
 ## Compatibility
 
 - **Python**: 3.11–3.14 (which ones depends on the Django line — see the table below)
-- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14 and 15.
+- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
 
 ### Supported combinations
 
@@ -383,10 +420,10 @@ Django needs a higher minimum DRF:
 
 | Django  | Python      | PostgreSQL | DRF (supported) | django-oauth-toolkit |
 |---------|-------------|------------|-----------------|----------------------|
-| 4.2 LTS | 3.11, 3.12  | 14+        | 3.14 – 3.17     | 3.2 – 3.4            |
-| 5.2 LTS | 3.11 – 3.13 | 14+        | 3.15 – 3.18     | 3.2 – 3.4            |
-| 6.0     | 3.12 – 3.14 | 14+        | 3.17 – 3.18     | 3.3 – 3.4            |
-| 6.1     | 3.12 – 3.14 | 15+        | 3.18            | 3.3 – 3.4            |
+| 4.2 LTS | 3.11, 3.12  | 14+        | 3.14 – 3.17     | 3.4.1+               |
+| 5.2 LTS | 3.11 – 3.13 | 14+        | 3.15 – 3.18     | 3.4.1+               |
+| 6.0     | 3.12 – 3.14 | 14+        | 3.17 – 3.18     | 3.4.1+               |
+| 6.1     | 3.12 – 3.14 | 15+        | 3.18            | 3.4.1+               |
 
 - The DRF floor is **3.14** — the lowest we support, i.e. what a legacy
   Django 4.2 app is likely already pinning. Each Django line has its own DRF
@@ -412,12 +449,14 @@ Django needs a higher minimum DRF:
   2026-04-07; security fixes published since then ship only for Django 5.2
   and later. The package keeps supporting 4.2 for apps that can't move yet,
   but running it is a risk you carry — plan the upgrade.
-- `django-oauth-toolkit` starts at 3.3 on the 6.0/6.1 rows because 3.3 is
-  the first release that declares Django 6.0; no release declares 6.1 yet.
-  The suite does pass on 6.1 with DOT 3.2.0, 3.3.0, and 3.4.1 (CI runs only
-  the newest DOT on 6.x).
-- `mcp`, `sqlglot`, `a2wsgi`, and `pydantic` are not Django-version-coupled
-  within their declared ranges.
+- `django-oauth-toolkit`, `oauthlib`, `mcp`, `sqlglot`, `a2wsgi`, and
+  `pydantic` are not Django-version-coupled within their declared ranges.
+  django-oauth-toolkit is floored at **3.4.1** on every row: earlier releases
+  have an unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed
+  in 3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
+  §2.1). No DOT release declares Django 6.1 yet; the suite passes on 6.1
+  with DOT 3.4.1. `oauthlib` (3.3.0+, below 5) is declared directly because
+  the package builds its OAuth server from oauthlib's classes.
 
 ### Dropping into an existing app with an older pinned DRF
 
@@ -439,16 +478,20 @@ The `allauth` extra (`django-mcp-sql[allauth]`) wires the TOTP gate to
 
 The standalone suite (`make test`, settings in `tests/settings.py`) runs in CI
 (`.github/workflows/ci.yml`) across every row above, plus pinned floor legs and
-the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14 (Django ≤ 6.0) and
-15 (Django 6.1, plus one 6.0 leg).
+the DRF 3.14 + Django 4.2 legacy leg, against PostgreSQL 14 (Django ≤ 6.0),
+15 (Django 6.1, plus one 6.0 leg) and 16 (one 6.0 leg).
 
 ## Postgres role setup
 
 Once per environment, a DBA with PG superuser rights applies
 `sql/role_setup.sql` to create the `mcp_readonly_role` role + the
 role-level guard GUCs (`statement_timeout`, `lock_timeout`,
-`idle_in_transaction_session_timeout`, `default_transaction_read_only`)
-and grant the role membership to the consuming app's PG user. The script
+`idle_in_transaction_session_timeout`, `default_transaction_read_only`,
+`standard_conforming_strings` — the executor also sets each per
+transaction with `SET LOCAL`; the `search_path = public, pg_temp` default,
+commented out in the file, is for installs that turn on
+`MCP_SQL["PIN_SEARCH_PATH"]`) and grant the role membership to the
+consuming app's PG user. The script
 is idempotent and is parameterised by a `-v app_role=<role>` psql
 variable so a single SQL file works across deployments whose app role
 differs.

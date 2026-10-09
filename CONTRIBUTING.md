@@ -34,8 +34,8 @@ Django 6.1, which refuses PostgreSQL 14. Run against a superuser connection so t
 role-isolation tests execute instead of skipping. CI runs the same suite
 across the Django 4.2/5.2/6.0/6.1 lines on Python 3.11–3.14 (a ragged
 per-line subset of each line's interpreters) against PostgreSQL 14 — 15 for
-Django 6.1, which refuses 14, and for one 6.0 leg (see the matrix in
-`.github/workflows/ci.yml`).
+Django 6.1, which refuses 14, and for one 6.0 leg; 16 for another 6.0 leg
+(see the matrix in `.github/workflows/ci.yml`).
 
 ## Expectations
 

@@ -22,6 +22,8 @@ jobs:
       # matrix has no defaults, so an omitted key would be empty: 14 (the
       # floor for Django <=6.0) except Django 6.1, which refuses 14 at connect
       # (floor 15); the 6.0 × 3.14 leg also runs 15 so 6.0 sees both majors.
+      # One leg runs a newer PostgreSQL, so the SQL corpus entries that need
+      # it (PG15/16 functions, PG16 numeric constants) run in CI too.
       matrix:
         include:
           - { python-version: "3.11", django: "4.2", postgres: "14" }
@@ -30,7 +32,7 @@ jobs:
           - { python-version: "3.12", django: "5.2", postgres: "14" }
           - { python-version: "3.13", django: "5.2", postgres: "14" }
           - { python-version: "3.12", django: "6.0", postgres: "14" }
-          - { python-version: "3.13", django: "6.0", postgres: "14" }
+          - { python-version: "3.13", django: "6.0", postgres: "16" }
           - { python-version: "3.14", django: "6.0", postgres: "15" }
           - { python-version: "3.12", django: "6.1", postgres: "15" }
           - { python-version: "3.13", django: "6.1", postgres: "15" }
@@ -147,16 +149,73 @@ jobs:
           cat > /tmp/min-constraints.txt <<'EOF'
           django==4.2.*
           djangorestframework==3.14
-          django-oauth-toolkit==3.2
+          django-oauth-toolkit==3.4.1
+          oauthlib==3.3.0
           sqlglot==30.7
-          mcp==1.27
+          mcp==1.28.1
           a2wsgi==1.10
           pydantic==2.11
           django-allauth==65.14
           EOF
       - name: Install package + test deps at floors
         run: pip install -e '.[allauth,test]' -c /tmp/min-constraints.txt
+      - name: Apply every migration to a fresh database
+        # The suite runs with --nomigrations, so this is what executes the
+        # hand-written RunSQL migrations (e.g. the REVOKEs in 0002 / 0008 /
+        # 0013) on the floor stack; the package tables must end unreadable
+        # to mcp_readonly_role.
+        env:
+          PGPASSWORD: postgres
+        # Every table migrate creates is first granted to the role (default
+        # privileges), so the check is not vacuous: the package's own tables
+        # must have been REVOKEd, and `auth_user` (a positive control) must
+        # still be readable.
+        run: |
+          createdb -h 127.0.0.1 -U postgres mcp_sql_migrate
+          psql -h 127.0.0.1 -U postgres -d mcp_sql_migrate -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO mcp_readonly_role"
+          MCP_SQL_TEST_PG_DB=mcp_sql_migrate python -m django migrate --settings=mcp_sql.tests.settings
+          psql -h 127.0.0.1 -U postgres -d mcp_sql_migrate -Atc "SELECT has_table_privilege('mcp_readonly_role', 'auth_user', 'SELECT')" | grep -qx t
+          psql -h 127.0.0.1 -U postgres -d mcp_sql_migrate -Atc "SELECT bool_or(has_table_privilege('mcp_readonly_role', t, 'SELECT')) FROM unnest(ARRAY['mcp_sql_mcpquerylog', 'mcp_sql_mcpauthrejectionlog', 'mcp_sql_mcprefreshtokenfamily']) t" | grep -qx f
       - name: Run the test suite
+        run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+  # Minimal security posture: the whole suite again with an allow-all
+  # MFA_CHECKER and no SESSION_MODEL (`MCP_SQL_TEST_POSTURE=minimal`, read by
+  # tests/settings.py), as an install without MFA or a session-with-user model
+  # runs. Tests of a specific gate turn it on themselves, so this proves the
+  # access control that holds without the optional layers (auth class,
+  # authorize gate, token endpoint, refresh, revocation).
+  test-minimal-posture:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Django is unpinned here, so newest-resolve picks the newest in-range
+        # line (6.1), which refuses PostgreSQL 14 — raise this to the newest
+        # line's floor whenever the Django cap is widened.
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bootstrap the MCP read-only role
+        run: >-
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres
+          -v ON_ERROR_STOP=1 -v app_role=postgres -f sql/role_setup.sql
+      - name: Install package + test deps
+        run: pip install -e '.[allauth,test]'
+      - name: Run the suite under the minimal posture
+        env:
+          MCP_SQL_TEST_POSTURE: minimal
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
   # Single representative run (newest-resolve on the current Python) that

@@ -8,7 +8,7 @@
 # from anywhere via `make -C source/mcp_sql <target>`. Targets ship with
 # the package, so after extraction they're at the package repo root.
 
-.PHONY: help build test test-install typecheck clean
+.PHONY: help build test test-minimal test-install typecheck clean
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -30,6 +30,12 @@ test: ## Run the package test suite standalone (requires uv + a reachable PG —
 	uv venv .venv-test --python python3 --allow-existing
 	uv pip install --python .venv-test/bin/python -e '.[allauth,test]'
 	.venv-test/bin/python -m pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+test-minimal: ## Run the suite under the minimal security posture (allow-all MFA, no SESSION_MODEL), as CI's test-minimal-posture job does.
+	@command -v uv >/dev/null || { echo "uv not found on PATH — install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
+	uv venv .venv-test --python python3 --allow-existing
+	uv pip install --python .venv-test/bin/python -e '.[allauth,test]'
+	MCP_SQL_TEST_POSTURE=minimal .venv-test/bin/python -m pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
 hooks: ## Install the pre-commit git hook (run once per clone).
 	@command -v pre-commit >/dev/null || { echo "pre-commit not found — install with: pipx install pre-commit (or pip install pre-commit)"; exit 1; }
