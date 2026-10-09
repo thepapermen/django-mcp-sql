@@ -117,9 +117,12 @@ below precisely because they do **not** announce themselves.
   there and the login's `search_path` finds one of that name in another
   schema, the new database system check fails `migrate` (and `check
   --database default`) before anything is applied. It used to fail later,
-  inside `migrate`, with a bare `ProgrammingError`. Name the schema in
-  `db_table` (`'schema"."name'`), or run `migrate --skip-checks` to get past
-  it while fixing the model.
+  inside `migrate`, with a bare `ProgrammingError`. An entry whose app still
+  has migrations to apply is not checked (one of them may create the table
+  in `public`); the `post_migrate` grants check logs it if it is still wrong
+  afterwards. Name the schema in `db_table` (`'schema"."name'`), or run
+  `migrate --skip-checks` when another app's migration creates the
+  relation.
 - **`mcp_sql_grants --apply` can now exit 1.** When PostgreSQL silently skips
   a `GRANT` / `REVOKE` (the login does not own the relation; see "Fixed"),
   the whole apply is rolled back and the command fails naming each relation,
@@ -355,7 +358,12 @@ below precisely because they do **not** announce themselves.
   `migrate`** (`relation "public.<name>" does not exist`, or a bare
   `ProgrammingError` from `post_migrate` for an unmanaged entry). `migrate` now
   stops first on `mcp_sql.E001`, and `mcp_sql_grants` and the `post_migrate`
-  drift check name the schema and the remedy.
+  drift check name the schema and the remedy (before the role checks, so
+  also before `role_setup.sql` has run). `mcp_sql_smoke` reports a
+  whitelisted table missing from `public` as a command error pointing at the
+  check, not a bare `ProgrammingError`.
+- **`mcp_sql_grants --apply` counted every profile in its summary** ("across
+  N profile(s)"), not the ones whose grants it changed.
 - **A declared client's redirects followed its `Application` row, not
   settings.** Its exact callbacks were matched by DOT against the row's
   `redirect_uris`, which provisioning refreshes only in `post_migrate`. So
