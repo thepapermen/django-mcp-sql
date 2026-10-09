@@ -165,12 +165,13 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ```
 
 `sql/role_setup.sql` and `mcp_sql_role_setup --emit-sql` carry the
-`REVOKE` as their last statement, **commented out**: the package does not
-change a database-wide privilege the consumer's app may depend on.
-Uncomment it once the app's login has its own `CREATE`, or run it by
-hand. `mcp_sql_smoke` prints a `WARNING` line while `PUBLIC` still holds
-`CREATE` on `public` (a warning, not a failure: the smoke command fails
-only when the package's own contract is broken). To check by hand:
+`REVOKE` as their last statement (after the membership `BEGIN … COMMIT`
+block), **commented out**: the package does not change a database-wide
+privilege the consumer's app may depend on. Uncomment it once the app's
+login has its own `CREATE`, or run it by hand. `mcp_sql_smoke` prints a
+`WARNING` line while `PUBLIC` still holds `CREATE` on `public` (a
+warning, not a failure: the smoke command fails only when the package's
+own contract is broken). To check by hand:
 
 ```sql
 SELECT EXISTS (
@@ -375,7 +376,7 @@ before continuing.
 ```sh
 python manage.py mcp_sql_grants
 echo "exit: $?"
-# Expected: "Grants in sync." / exit: 0
+# Expected: "Grants in sync; no action." / exit: 0
 ```
 
 **3. DB-side ground truth** — `information_schema.role_table_grants`
@@ -473,26 +474,28 @@ python manage.py mcp_sql_smoke
 Expected output:
 
 ```
+Smoking profile 'default' (role mcp_readonly_role).
 Read path ok: SET LOCAL ROLE + session GUCs (incl. the live transaction_read_only) verified, SELECT FROM auth_permission ok
 Audit table mcp_sql_mcpquerylog unreadable (pgcode=42501) — 0002_revoke_audit_grants is in effect.
 Write attempt rejected as expected: ReadOnlySqlTransaction (pgcode=25006)
 Schema public: PUBLIC holds no CREATE (no role without a grant can plant an overload there).
 ```
 
-The fourth line reads `WARNING: PUBLIC holds CREATE on schema public …`
+The last line reads `WARNING: PUBLIC holds CREATE on schema public …`
 instead while every role may create objects in `public` (PostgreSQL 14's
 default) — see [Revoke `CREATE` on schema `public` from
 `PUBLIC`](#revoke-create-on-schema-public-from-public-recommended). The
 command still exits 0: it is a recommended hardening, not the package's
 contract.
 
-If the third line shows `pgcode=42501 (insufficient_privilege)`, that is
+If the `Write attempt` line shows `pgcode=42501` (insufficient_privilege), that is
 also healthy — it means the readonly guard did not catch the write but the
 grants did. If it shows any other pgcode, the smoke command exits with a
 security alarm. See the command's source for the diagnostic message.
 
-If `MCP_READONLY_DATABASE_URL` is not set, the command writes a friendly
-"skipping smoke check" message and exits 0.
+If the read alias (`MCP_SQL["DB_ALIAS"]`, `mcp_readonly` by default) is
+not in `DATABASES` (`MCP_READONLY_DATABASE_URL` not set), the command
+prints a message ending `Skipping smoke check.` and exits 0.
 
 ### `--run-query` mode (full parser + executor)
 
@@ -511,6 +514,7 @@ python manage.py mcp_sql_smoke --as-user mcp-smoke@example.com \
 Expected output (abridged):
 
 ```
+Smoking profile 'default' (role mcp_readonly_role).
 run_query attributed to: <staff user>
   columns: ['id', 'codename']
   row_count: 5
