@@ -333,6 +333,9 @@ step above.
 The receiver is **lenient** about environment state: if the role is
 missing (fresh env, DBA hasn't applied `role_setup.sql`) or membership
 is absent, it logs a WARNING and returns rather than crashing `migrate`.
+A whitelisted unqualified `db_table` found only outside `public` (below)
+is logged at ERROR before the role is looked at, so a fresh environment's
+first `migrate` names it too.
 
 ### Pre-deploy drift check
 
@@ -404,7 +407,10 @@ schema-qualified table; the role then also needs `USAGE` on that schema,
 which the package does not grant). An unqualified `db_table` whose table
 lives only in another schema on the app login's `search_path` is an
 error — system check `mcp_sql.E001` on `migrate` / `check --database
-default`, and a refusal from `mcp_sql_grants` naming the schema: qualify
+default` (not while the model's app has migrations to apply: after them
+the `post_migrate` check logs it if it still holds; when another app's
+migration creates the relation, `migrate --skip-checks` gets past it), and
+a refusal from `mcp_sql_grants` naming the schema: qualify
 the `db_table`, or for a third-party model whitelist your own unmanaged
 model with a qualified `db_table`, or a curated view in `public`
 (`docs/architecture.md` → "Whitelist contract"). The parser refuses a qualified

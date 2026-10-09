@@ -6,7 +6,8 @@ IDs are `mcp_sql.<level><nnn>`, Django's `<app label>.<E|W><number>` shape:
   default` and in Django's test runner, never on a plain `check` or at
   `runserver`): a whitelisted model's unqualified `db_table` names no
   relation in `public` while the login's `search_path` finds it in another
-  schema (`grants.relations_off_default_schema`).
+  schema (`grants.relations_off_default_schema`), unless the model's app
+  has migrations still to apply.
 - `mcp_sql.W001` (`Tags.security`, deploy-only: `check --deploy`):
   `MCP_SQL["PIN_SEARCH_PATH"]` is off, so a relation earlier on the
   `search_path` can shadow a whitelisted name unreported.
@@ -25,6 +26,9 @@ from django.core.checks import Warning as CheckWarning
 from django.core.checks import register
 from django.db import DEFAULT_DB_ALIAS
 from django.db import connections
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.migrations.executor import MigrationExecutor
+from django.db.models import Model
 from mcp_sql.conf import mcp_sql_settings
 
 
@@ -46,6 +50,17 @@ def check_whitelist_schemas(
     database on Django 4.2 through 6.1), so the error stops a `manage.py
     migrate` up front rather than at `post_migrate`.
 
+    Running first is also why an entry whose app has a migration still to
+    apply is skipped (`_apps_with_pending_migrations`): that migration may
+    be the one that creates the relation in `public`, and failing on it
+    stopped, on every run, the `migrate` that would have created it (with a
+    remedy naming the other schema's same-named relation). If the relation
+    is still not in `public` once they ran, the `post_migrate` receiver
+    logs the reconciler's refusal (`grants._verify_off_default_schema`)
+    and the next `migrate` / check reports E001. The hint names
+    `migrate --skip-checks` for a relation that a migration of another app
+    creates.
+
     Runs on the `default` alias only, through the connection the grants
     pipeline uses (`grants._verify_default_alias`): that is where
     `mcp_sql_grants` and the `post_migrate` receiver resolve and grant, as
@@ -60,30 +75,63 @@ def check_whitelist_schemas(
         return []
     if app_configs is not None and not any(a.name == "mcp_sql" for a in app_configs):
         return []
-    if connections[DEFAULT_DB_ALIAS].vendor != "postgresql":
+    connection = connections[DEFAULT_DB_ALIAS]
+    if connection.vendor != "postgresql":
         return []
     from mcp_sql.grants import off_default_schema_message
     from mcp_sql.grants import relations_off_default_schema
 
+    pending: set[str] | None = None
     errors: list[CheckMessage] = []
     for profile in mcp_sql_settings.profiles().values():
-        tables: dict[str, str] = {}
-        models = {}
-        for entry in profile.allowed_models:
-            try:
-                models[entry] = apps.get_model(entry)
-            except (LookupError, ValueError):
-                continue
-            tables[entry] = models[entry]._meta.db_table
+        models = _installed_models(profile.allowed_models)
+        tables = {entry: model._meta.db_table for entry, model in models.items()}
         off = relations_off_default_schema(tables)
+        if not off:
+            continue
+        if pending is None:
+            # Built once, and only when there is something to report: it
+            # imports every app's migrations.
+            pending = _apps_with_pending_migrations(connection)
         for entry, schema in sorted(off.items()):
+            if models[entry]._meta.app_label in pending:
+                continue
             message, remedy = off_default_schema_message(
                 profile.name, entry, tables[entry], schema
             )
+            hint = (
+                f"{remedy} If a migration of another app creates the relation "
+                "in public, run `manage.py migrate --skip-checks` (the "
+                "post_migrate grants check then logs this error if it is still "
+                "wrong)."
+            )
             errors.append(
-                Error(message, hint=remedy, obj=models[entry], id="mcp_sql.E001")
+                Error(message, hint=hint, obj=models[entry], id="mcp_sql.E001")
             )
     return errors
+
+
+def _installed_models(entries: Iterable[str]) -> dict[str, type[Model]]:
+    """`{entry: model}` for the `ALLOWED_MODELS` entries whose app is
+    installed."""
+    models = {}
+    for entry in entries:
+        try:
+            models[entry] = apps.get_model(entry)
+        except (LookupError, ValueError):
+            continue
+    return models
+
+
+def _apps_with_pending_migrations(connection: BaseDatabaseWrapper) -> set[str]:
+    """The labels of the apps with a migration `migrate` would apply on
+    `connection` (to every app's latest migration, as a bare `migrate`
+    does). Read as `migrate` reads it (`MigrationExecutor`): with no
+    `django_migrations` table yet (a fresh database) every migration is
+    pending, and an app without migrations has none."""
+    executor = MigrationExecutor(connection)
+    plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+    return {migration.app_label for migration, _backwards in plan}
 
 
 @register(Tags.security, deploy=True)
