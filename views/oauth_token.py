@@ -1,7 +1,15 @@
 """DOT's `TokenView` / `RevokeTokenView` on the narrow `MCPServer`, plus the
-token-endpoint guard. See `oauth_server.py` for what the server admits and why."""
+token-endpoint guard and the RFC 8707 `resource` check at `/o/token/`. See
+`oauth_server.py` for what the server admits and why, and `audience.py` for
+why a `resource` must name this server's MCP endpoint, and why every accepted
+one is rewritten to one spelling."""
+
+from typing import Any
 
 from django.http import HttpResponse
+from mcp_sql.audience import canonical_resources
+from mcp_sql.audience import foreign_resource
+from mcp_sql.audience import invalid_target_error
 from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.oauth import has_control_character
 from mcp_sql.oauth_server import MCPServerViewMixin
@@ -21,12 +29,35 @@ def _error_response(error: errors.OAuth2Error) -> HttpResponse:
     return response
 
 
+def _use_canonical_resource(request: Any) -> None:
+    """Rewrite every `resource` in this token request's form body — the
+    body DOT parses is `request.POST` (`OAuthLibCore.extract_body`) — to
+    `audience.canonical_resource_url` (`canonical_resources`; the caller has
+    refused a foreign one already). A `resource` in the query string is not
+    rewritten: oauthlib's token endpoint refuses every POST that carries a
+    query string (`invalid_request`, "URL query parameters are not
+    allowed") before it reads one."""
+    if "resource" in request.POST:
+        body = request.POST.copy()
+        body.setlist("resource", canonical_resources(request, body.getlist("resource")))
+        request.POST = body
+
+
 class MCPTokenView(MCPServerViewMixin, TokenView):
-    """`/o/token/`: the authorization-code exchange and nothing else."""
+    """`/o/token/`: the authorization-code exchange and nothing else, with a
+    foreign `resource` refused.
+
+    `MCPServerViewMixin` pins the oauthlib backend to DOT's form-body
+    `OAuthLibCore`, built per call, so the parameters DOT reads are the ones
+    `post`'s checks read (`request.POST`): a consumer's `OAUTH2_BACKEND_CLASS`
+    (e.g. DOT's deprecated `JSONOAuthLibCore`) would otherwise parse a JSON
+    body the checks never saw, and its `resource` would reach the token.
+    """
 
     def post(self, request, *args, **kwargs):
         """Refuse anything but one `grant_type=authorization_code` (or, when
-        refresh is enabled, `refresh_token`) up front.
+        refresh is enabled, `refresh_token`) up front, then a control
+        character in any parameter, then a foreign `resource`.
 
         `MCPServer` already handles only that grant, but DOT's `TokenView.post`
         sends `grant_type=urn:ietf:params:oauth:grant-type:device_code` to its
@@ -49,7 +80,29 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
 
         A control character in any other parameter (query or body) is an
         `invalid_request`: a NUL in `code` or `client_id` otherwise reached a
-        Postgres lookup and raised an uncaught 500.
+        Postgres lookup and raised an uncaught 500. A NUL in `resource` gets
+        this answer too.
+
+        Then `invalid_target` unless every `resource` (query or form body,
+        repeated or not — oauthlib reads both) is this server's MCP endpoint
+        as discovery advertises it. From DOT 3.4 a `resource` sent here is
+        stored on the access token when the grant carries none (DOT checks
+        it only against a grant's own `resource`), and DOT then refuses that
+        token at `/mcp/sql/` unless it names that endpoint. The check runs
+        before DOT, so the authorization code is not consumed and the client
+        can retry.
+
+        The check accepts any equivalent spelling (`foreign_resource`), and
+        every accepted value is then rewritten to the one spelling the
+        authorization step stored on the grant
+        (`audience.canonical_resource_url`) before DOT reads it: when the
+        grant carries a `resource`, DOT requires each value to be one of the
+        grant's, as a string, so a client that sends another spelling here
+        than at `/o/authorize/` (Cursor) was refused with DOT's own
+        `invalid_target`. A grant or refresh token stored before that
+        rewrite under another spelling is matched by the validator
+        (`audience.use_granted_spelling`). With a resource-less grant the
+        token is bound to the same canonical string.
         """
         grant_types = request.POST.getlist("grant_type")
         refresh = refresh_tokens_enabled()
@@ -68,6 +121,10 @@ class MCPTokenView(MCPServerViewMixin, TokenView):
                     description="Control character in a request parameter."
                 )
             )
+        resources = request.GET.getlist("resource") + request.POST.getlist("resource")
+        if foreign_resource(request, resources) is not None:
+            return _error_response(invalid_target_error(request))
+        _use_canonical_resource(request)
         return super().post(request, *args, **kwargs)
 
 

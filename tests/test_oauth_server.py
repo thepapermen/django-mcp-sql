@@ -257,8 +257,10 @@ class TestAuthorizeEndpointResponseTypes:
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         }
+        # The curated client requires consent (migration 0016): the code comes
+        # from the consent POST.
         query = _authorize_query(
-            client.get(reverse("authorize") + "?" + urlencode(params))
+            client.post(reverse("authorize"), {**params, "allow": "Authorize"})
         )
         response = client.post(
             reverse("token"),
@@ -717,8 +719,13 @@ class TestAuthorizeParameterScreening:
     def test_boundary_values_still_issue_a_code(self, client, mcp_app, mcp_user):
         client.force_login(mcp_user)
         params = self._params(code_challenge="A" * 128, nonce="n" * 255)
+        # The GET passes the screen (the consent page: the curated client
+        # requires consent since migration 0016); the consent POST issues it.
+        page = client.get(reverse("authorize") + "?" + urlencode(params))
+        assert page.status_code == HTTPStatus.OK, page.content
+        assert b'id="authorizationForm"' in page.content
         query = _authorize_query(
-            client.get(reverse("authorize") + "?" + urlencode(params))
+            client.post(reverse("authorize"), {**params, "allow": "Authorize"})
         )
         assert "code" in query
 

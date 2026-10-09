@@ -18,6 +18,8 @@ from django.db import connections
 from django.db import transaction
 from django.utils import timezone
 from mcp_sql import observability
+from mcp_sql.clients import NO_CLIENT
+from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
@@ -64,7 +66,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     limit: int | None = None,
     token_id: str = "",
     client_ip: str | None = None,
-    client_redirect: str = "",
+    client: ClientIdentity = NO_CLIENT,
 ) -> QueryResult:
     """Validate, execute, and audit a single read-only SQL query.
 
@@ -72,10 +74,10 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     bound access tier (its `ALLOWED_MODELS` become the table whitelist, its
     `role` is entered via `SET LOCAL ROLE`, its optional `SESSION_CONTEXT`
     hook sets per-row GUCs, and its name is recorded on the audit row).
-    `token_id`, `client_ip`, and `client_redirect` (the OAuth redirect_uri the
-    token was issued against, recorded for cloud-provider attribution) are
-    optional. `limit` is clamped to `[DEFAULT_LIMIT, HARD_LIMIT]` from
-    `MCP_SQL["LIMITS"]`.
+    `token_id`, `client_ip`, and `client` (which OAuth client presented the
+    token — name, derived kind, and allowed callbacks (declared or
+    registered), recorded for attribution) are optional. `limit` is clamped to
+    `[DEFAULT_LIMIT, HARD_LIMIT]` from `MCP_SQL["LIMITS"]`.
     """
     started_at = timezone.now()
     db_alias = mcp_sql_settings.DB_ALIAS
@@ -88,7 +90,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -128,7 +130,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=rejection.detail,
         )
         return QueryResult(
@@ -163,7 +165,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             truncated=False,
             result_bytes=0,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
         )
         return QueryResult(row_count=0, duration_ms=0)
     # LIMIT-injection re-serializes (and may copy) the AST. `parse_and_validate`
@@ -196,7 +198,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             normalized_sql=parsed.normalized_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=msg,
         )
         return QueryResult(
@@ -225,7 +227,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             normalized_sql=parsed.normalized_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=rejection.detail,
         )
         return QueryResult(
@@ -249,7 +251,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -281,7 +283,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             wrapped_sql=wrapped_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             exc=exc,
         )
     t0 = perf_counter_ns()
@@ -316,7 +318,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             started_at=started_at,
             duration_ms=duration_ms,
             client_ip=client_ip,
-            client_redirect=client_redirect,
+            client=client,
             error=str(exc),
         )
         return QueryResult(
@@ -356,7 +358,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
         truncated=truncated,
         result_bytes=result_bytes,
         client_ip=client_ip,
-        client_redirect=client_redirect,
+        client=client,
     )
     return QueryResult(
         columns=columns,
@@ -375,7 +377,7 @@ def audit_tool_call(  # noqa: PLR0913
     tool: str,
     token_id: str = "",
     client_ip: str | None = None,
-    client_redirect: str = "",
+    client: ClientIdentity = NO_CLIENT,
     detail: str = "",
 ) -> None:
     """Write one `MCPQueryLog` row for a metadata tool call.
@@ -398,7 +400,7 @@ def audit_tool_call(  # noqa: PLR0913
         raw_sql=detail,
         started_at=timezone.now(),
         client_ip=client_ip,
-        client_redirect=client_redirect,
+        client=client,
     )
 
 
@@ -412,7 +414,7 @@ def _hook_failure(  # noqa: PLR0913
     wrapped_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
-    client_redirect: str,
+    client: ClientIdentity,
     exc: Exception,
 ) -> QueryResult:
     """Audit + structure a SESSION_CONTEXT-hook failure.
@@ -441,7 +443,7 @@ def _hook_failure(  # noqa: PLR0913
         wrapped_sql=wrapped_sql,
         started_at=started_at,
         client_ip=client_ip,
-        client_redirect=client_redirect,
+        client=client,
         error=error,
     )
     return QueryResult(
@@ -459,7 +461,7 @@ def _audit_misconfig(  # noqa: PLR0913
     raw_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
-    client_redirect: str,
+    client: ClientIdentity,
     error: str,
 ) -> None:
     """Write a `decision='rejected'` audit row for an operator-error path.
@@ -480,19 +482,23 @@ def _audit_misconfig(  # noqa: PLR0913
         raw_sql=raw_sql,
         started_at=started_at,
         client_ip=client_ip,
-        client_redirect=client_redirect,
+        client=client,
         error=error,
     )
 
 
 class AuditFields(TypedDict):
-    """Keyword payload for `_audit_safely` — the shape of one
+    """Keyword payload for `_audit_safely` — the per-query half of one
     `MCPQueryLog.objects.create`. The eight required keys are written on
     every code path (allowed or rejected); the rest are filled in as the
     pipeline progresses (parse → execute → cap). Typing `**fields` against
     this `TypedDict` (PEP 692) makes a typo'd field name or wrong value
     type at any call site a static error instead of a runtime
-    `create()` failure."""
+    `create()` failure.
+
+    The client-attribution columns are NOT here: they arrive as one
+    `ClientIdentity` and `_audit_safely` expands it, so adding a future
+    attribution field touches that one function instead of every call site."""
 
     user: "AbstractBaseUser"
     profile: str
@@ -502,7 +508,6 @@ class AuditFields(TypedDict):
     raw_sql: str
     started_at: "datetime.datetime"
     client_ip: str | None
-    client_redirect: NotRequired[str]
     error: NotRequired[str]
     normalized_sql: NotRequired[str]
     wrapped_sql: NotRequired[str]
@@ -513,8 +518,16 @@ class AuditFields(TypedDict):
     tool: NotRequired[str]
 
 
-def _audit_safely(**fields: Unpack[AuditFields]) -> None:
+def _audit_safely(
+    *, client: ClientIdentity = NO_CLIENT, **fields: Unpack[AuditFields]
+) -> None:
     """Best-effort wrapper for every `MCPQueryLog.objects.create` call site.
+
+    `client` is expanded into the three attribution columns here — the single
+    place they are written, and (via `ClientIdentity.build`) the single place
+    the registered-redirect string is bounded to the column width. An
+    over-long value would otherwise raise `DataError`, get swallowed by the
+    handler below, and lose the audit row entirely.
 
     Audit-row writes happen on the `default` alias after the readonly tx
     (or the parser-reject path) has already produced its side effects.
@@ -541,7 +554,12 @@ def _audit_safely(**fields: Unpack[AuditFields]) -> None:
     """
     fields["client_ip"] = audit_client_ip(fields.get("client_ip"))
     try:
-        MCPQueryLog.objects.create(**fields)
+        MCPQueryLog.objects.create(
+            application_name=client.name,
+            client_kind=client.kind,
+            client_redirect=client.redirect,
+            **fields,
+        )
     except DatabaseError:
         # Pull out the reason so the log message stays grep-friendly even
         # if the full payload is dropped by the structured logging layer.
@@ -563,6 +581,8 @@ def _audit_safely(**fields: Unpack[AuditFields]) -> None:
             user_id=user.pk,
             decision=fields["decision"],
             user_label=user.get_username(),
+            client_name=client.name,
+            client_kind=client.kind,
         )
     except Exception:
         logger.exception("MCP volume tripwire failed; query response unaffected")

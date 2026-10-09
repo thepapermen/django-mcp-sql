@@ -109,7 +109,8 @@ Three MCP tools mounted at `/mcp/sql/`:
 | `run_query(sql, limit=None)` | Validates + executes a single SELECT. Returns `{columns, rows, row_count, truncated, duration_ms, hint, rejection_reason, error, data_handling}`. The `rows`/`error` fields come back inside a prompt-injection fence — see [Security model](#security-model--prompt-injection--untrusted-data). |
 
 Every call writes one append-only `MCPQueryLog` audit row. Every auth
-rejection writes one `MCPAuthRejectionLog` row (six resolved-user gates;
+rejection writes one `MCPAuthRejectionLog` row (the resolved-user gates,
+including a gate that fails with an error, which is a denial too;
 anonymous / bad-token probing goes through Django-cache counters with a
 silent per-IP block, not the audit table — use a shared cache backend
 (Redis, Memcached) in production: with a per-process backend like LocMem
@@ -273,12 +274,16 @@ DATABASES = {
 
 DATABASE_ROUTERS = ["mcp_sql.db_router.McpSqlRouter"]
 
+# Every MCP_SQL key has an in-package default (see `mcp_sql/conf.py` DEFAULTS),
+# so declare only what you change. Two things are worth setting on day one:
+# each profile's ALLOWED_MODELS (the default whitelist is empty, so nothing is
+# readable) and MFA_CHECKER (the default denies every user). Both defaults are
+# useless-but-safe on purpose — an unconfigured install grants nothing.
 MCP_SQL = {
-    # At least one access tier (profile) is REQUIRED — the package validates
-    # this at startup and refuses to boot without it. The `default` profile
-    # below reproduces the original single-tier behaviour; add more entries
-    # for multi-tier setups, each with its own unique ROLE /
-    # PERMISSION_CODENAME / GROUP_NAME. See docs/architecture.md "Profiles".
+    # One entry per access tier. The `default` profile below is the
+    # single-tier setup; add more for multi-tier, each with its own unique
+    # ROLE / PERMISSION_CODENAME / GROUP_NAME. See docs/architecture.md
+    # "Profiles".
     "PROFILES": {
         "default": {
             "ROLE": "mcp_readonly_role",  # NOLOGIN PG role entered via SET LOCAL ROLE
@@ -290,43 +295,40 @@ MCP_SQL = {
             # "SESSION_CONTEXT": "your_app.scoping.context",  # optional per-row hook
         },
     },
-    "BAN_SELECT_STAR": True,
-    "LIMITS": {"DEFAULT_LIMIT": 10, "HARD_LIMIT": 100, "BYTES_LIMIT": 256 * 1024},
-    # Per-user volume tripwires: {decision: {window_seconds: threshold}}.
-    # Crossing emits one Sentry ERROR per (user, decision, window) bucket;
-    # it alerts, it never blocks.
-    "VOLUME_ALERT_THRESHOLDS": {
-        "allowed": {3600: 50, 86400: 150},
-        "rejected": {3600: 50, 86400: 150},
-    },
-    "BAD_TOKEN_IP_THRESHOLD": 100,
-    "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     # MFA gate (fail-closed) — set this before onboarding anyone. The default
     # `deny_unconfigured_mfa` returns False for EVERY user, so the whole MCP
     # surface is locked out (the app logs a startup WARNING) until you wire a
     # real check. django-allauth projects use:
     # "MFA_CHECKER": "allauth.mfa.utils.is_mfa_enabled",
-    # Optional overrides — see `mcp_sql/conf.py` DEFAULTS for the full list:
+    #
+    # Declared clients — Claude.ai, ChatGPT, and Cursor's hosted agents ship
+    # ON. Each provisions a public/PKCE `Application` at `migrate`; run
+    # `manage.py mcp_sql_clients` for the client_id to paste into the
+    # provider's connector (secret blank). They need a public HTTPS origin to
+    # be reachable, and are inert until someone actually connects one.
+    # A declared key replaces its default wholesale, so `"CLIENTS": {}` runs
+    # loopback-only and a smaller dict keeps just what it names.
+    # See docs/oauth.md "Clients".
+    # "CLIENTS": {},
+    #
+    # Other overrides, all defaulted — see `mcp_sql/conf.py` DEFAULTS:
     # "RESOURCE_NAME": "My App",
+    # "BAN_SELECT_STAR": True,
+    # "LIMITS": {"DEFAULT_LIMIT": 10, "HARD_LIMIT": 100, "BYTES_LIMIT": 256 * 1024},
+    # Per-user volume tripwires: {decision: {window_seconds: threshold}}.
+    # Crossing emits one Sentry ERROR per (user, decision, window) bucket;
+    # it alerts, it never blocks.
+    # "VOLUME_ALERT_THRESHOLDS": {
+    #     "allowed": {3600: 50, 86400: 150},
+    #     "rejected": {3600: 50, 86400: 150},
+    # },
+    # "BAD_TOKEN_IP_THRESHOLD": 100,
+    # "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     # "SESSION_MODEL": "your_app.Session",  # opt-in runtime session-existence gate;
                                             # must be a session model with a `user` FK
                                             # (stock `django.contrib.sessions.Session`
                                             # does NOT qualify — its absence of a `user`
                                             # column is why the default is `None`)
-    # Opt-in cloud MCP clients (Claude.ai, ChatGPT). Omitted / empty (default)
-    # = OFF, loopback only. Each entry provisions a public/PKCE `Application` at
-    # `migrate` and gives you a `mcp-sql-cloud.<NAME>` client_id to paste into
-    # the provider's connector (secret blank). Needs a public HTTPS origin and
-    # "https" in ALLOWED_REDIRECT_URI_SCHEMES below (or the app won't boot).
-    # See docs/oauth.md "Cloud clients".
-    # "CLOUD_CLIENTS": [
-    #     # Claude.ai / Claude Desktop — OAuth client ID is: mcp-sql-cloud.claude
-    #     {"NAME": "claude",  "REDIRECT_MATCH": "exact",
-    #      "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback"},
-    #     # ChatGPT / Codex — OAuth client ID is: mcp-sql-cloud.chatgpt
-    #     {"NAME": "chatgpt", "REDIRECT_MATCH": "prefix",
-    #      "REDIRECT_URI": "https://chatgpt.com/connector/oauth/"},
-    # ],
     # Opt-in refresh tokens (default 0 = OFF): rotating, and refused once this
     # many seconds have passed since the user's consent. See docs/oauth.md
     # "Refresh tokens (opt-in)".
@@ -365,9 +367,15 @@ OAUTH2_PROVIDER = {
     # in the URL query string outright, without DOT's per-request warning.
     # The package never accepts such a token either way.
     "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
-    # "http" alone is fine loopback-only (the default); add "https" whenever
-    # CLOUD_CLIENTS is non-empty, or the app won't boot.
-    "ALLOWED_REDIRECT_URI_SCHEMES": ["http"],   # RFC 8252 loopback; add "https" for cloud clients
+    # ALLOWED_REDIRECT_URI_SCHEMES is deliberately NOT set: DOT already
+    # defaults it to ["http", "https"], which covers both shapes this package
+    # admits (RFC 8252 loopback and the declared clients' https callbacks).
+    # It is install-global — it governs redirect handling for every OAuth
+    # application in your project — so narrowing it is a decision to make on
+    # purpose, not by pasting. If you do narrow it, the app refuses to boot
+    # (and says why) unless it keeps "http" — always, because /o/register
+    # mints RFC 8252 loopback callbacks — and "https" while any https client
+    # is declared.
 }
 ```
 
@@ -454,9 +462,11 @@ Django needs a higher minimum DRF:
   django-oauth-toolkit is floored at **3.4.1** on every row: earlier releases
   have an unauthenticated open redirect at `/o/authorize/` (DOT #1719, fixed
   in 3.4.0) and match redirect URIs loosely (exact since 3.4.1, RFC 9700
-  §2.1). No DOT release declares Django 6.1 yet; the suite passes on 6.1
-  with DOT 3.4.1. `oauthlib` (3.3.0+, below 5) is declared directly because
-  the package builds its OAuth server from oauthlib's classes.
+  §2.1). Every supported release stores an RFC 8707 `resource` on a token and
+  audience-checks it (see `docs/oauth.md`). No DOT release declares Django
+  6.1 yet; the suite passes on 6.1 with DOT 3.4.1. `oauthlib` (3.3.0+, below
+  5) is declared directly because the package builds its OAuth server from
+  oauthlib's classes.
 
 ### Dropping into an existing app with an older pinned DRF
 

@@ -171,15 +171,17 @@ class MCPServer(
         RevocationEndpoint.__init__(self, request_validator)
 
 
-def get_mcp_oauthlib_core() -> Any:
+def get_mcp_oauthlib_core(core_class: type[OAuthLibCore] = OAuthLibCore) -> Any:
     """DOT's `get_oauthlib_core()`, on `MCPServer` instead of the consumer's
-    `OAUTH2_SERVER_CLASS`, and always with DOT's form-body `OAuthLibCore`
+    `OAUTH2_SERVER_CLASS`, and always with DOT's form-body `OAuthLibCore` or
+    the given subclass of it, never the consumer's `OAUTH2_BACKEND_CLASS`
     (same validator and server kwargs). Built per call, as DOT's own DRF
-    authentication class does."""
+    authentication class does. `/mcp/sql/` passes
+    `audience.CanonicalUriOAuthLibCore` (`auth._verify_bearer`)."""
     server = MCPServer(
         oauth2_settings.OAUTH2_VALIDATOR_CLASS(), **oauth2_settings.server_kwargs
     )
-    return OAuthLibCore(server)
+    return core_class(server)
 
 
 class MCPServerViewMixin(OAuthLibMixin):

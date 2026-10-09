@@ -29,20 +29,20 @@ from pydantic import ValidationError
 
 _ROLE = "mcp_readonly_role"
 _PIN_SQL = "SET LOCAL search_path = 'public', 'pg_temp'"
-_CLOUD_CLIENT = {
-    "NAME": "example",
-    "REDIRECT_MATCH": "exact",
-    "REDIRECT_URI": "https://example.com/callback",
+_CLIENT = {
+    "LABEL": "Example",
+    "REDIRECTS": [{"MATCH": "exact", "URI": "https://example.com/callback"}],
 }
 # Each an unknown key's path into the settings dict (a list index for a
-# CLOUD_CLIENTS entry), as pydantic reports it.
+# REDIRECTS rule), as pydantic reports it.
 _UNKNOWN_KEYS: list[tuple[str | int, ...]] = [
     ("PIN_SEARCHPATH",),
     ("pin_search_path",),
     ("SEARCH_PATH",),
     ("LIMITS", "EXTRA"),
     ("PROFILES", "default", "EXTRA"),
-    ("CLOUD_CLIENTS", 0, "EXTRA"),
+    ("CLIENTS", "example", "EXTRA"),
+    ("CLIENTS", "example", "REDIRECTS", 0, "EXTRA"),
 ]
 
 
@@ -86,8 +86,9 @@ class TestSetting:
     def test_an_unknown_key_refuses_to_boot(self, path):
         # A typo would otherwise leave the pin silently off. Refused at any
         # level: `extra="forbid"` on `McpSqlSettings` reaches the nested
-        # TypedDicts (LIMITS, a PROFILES entry, a CLOUD_CLIENTS entry) too.
-        cfg = {**copy.deepcopy(VALID), "CLOUD_CLIENTS": [dict(_CLOUD_CLIENT)]}
+        # TypedDicts (LIMITS, a PROFILES entry, a CLIENTS entry and its
+        # REDIRECTS rules) too.
+        cfg = {**copy.deepcopy(VALID), "CLIENTS": {"example": copy.deepcopy(_CLIENT)}}
         container: Any = cfg
         for step in path[:-1]:
             container = container[step]
@@ -107,7 +108,7 @@ class TestSetting:
     def test_the_unknown_key_baseline_is_valid(self):
         # The cases above differ from this only by the unknown key.
         validate_mcp_sql_settings(
-            {**copy.deepcopy(VALID), "CLOUD_CLIENTS": [dict(_CLOUD_CLIENT)]}
+            {**copy.deepcopy(VALID), "CLIENTS": {"example": copy.deepcopy(_CLIENT)}}
         )
 
 

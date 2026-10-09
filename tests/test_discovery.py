@@ -19,6 +19,7 @@ negative test pins that they don't accidentally inherit any auth gate.
 """
 
 from http import HTTPStatus
+from urllib.parse import urlparse
 
 import pytest
 from django.urls import reverse
@@ -45,7 +46,15 @@ class TestProtectedResourceMetadata:
         # `testserver`. Building the expected URL from the view's own helper
         # would be a tautology — the assertion has to use a value composed
         # *independently* of the view's URL-construction code path.
-        assert body["resource"] == f"http://testserver{reverse('mcp_sql_endpoint')}"
+        #
+        # The named route is the slash-less spelling, so the identifier it
+        # returns is slash-less too (RFC 9728 §3.3 — see the class below).
+        # `https` because the suite runs with DEBUG off, the same hardening
+        # `issuer` gets: scheme is half the identifier, and advertising an
+        # `http` resource beside an `https` issuer fails §3.3 for any client
+        # that reached the document over TLS.
+        transport = reverse("mcp_sql_endpoint")
+        assert body["resource"] == f"https://testserver{transport.removesuffix('/')}"
 
     def test_resource_name_honors_mcp_sql_override(self, settings):
         # Package contract: the discovery document surfaces whatever the
@@ -136,6 +145,132 @@ class TestProtectedResourceMetadata:
 
 
 @pytest.mark.django_db
+class TestResourceIdentifierMatchesMetadataPath:
+    """RFC 9728 §3.3: `resource` MUST equal the identifier the client built
+    the metadata URL from, or the client MUST NOT use the document.
+
+    Regression cover for a real interop break: the document used to advertise
+    `.../mcp/sql/` (trailing slash, straight off `reverse()`) while being
+    served only at `.../oauth-protected-resource/mcp/sql`. Lenient clients
+    (Claude Code, Cursor CLI) ignored the mismatch; Cursor Desktop enforced
+    §3.3 and aborted the dance after consent but before the token exchange,
+    so the surface was simply unreachable from it. Worse, the path implied by
+    the advertised identifier 404'd, so no client could retrieve the document
+    the spec-correct way either.
+
+    Both spellings are now served and the identifier echoes the one used, and
+    the 401 challenge points at the spelling that matches the request.
+    """
+
+    PRM = "/.well-known/oauth-protected-resource/mcp/sql"
+
+    @pytest.mark.parametrize("suffix", ["", "/"])
+    def test_both_spellings_are_served(self, suffix):
+        response = APIClient().get(self.PRM + suffix)
+        assert response.status_code == HTTPStatus.OK
+
+    @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
+    @pytest.mark.parametrize("suffix", ["", "/"])
+    def test_resource_echoes_the_path_the_client_used(
+        self, suffix, debug, scheme, settings
+    ):
+        # The §3.3 invariant, asserted directly: strip the well-known prefix
+        # back off the request path and the result must be exactly the path
+        # component of the advertised `resource`.
+        #
+        # Parametrised over BOTH halves of the identifier. The trailing slash
+        # was the half that broke Cursor Desktop; the scheme is the other half
+        # — `build_absolute_uri` trusts `request.scheme`, so a TLS-terminating
+        # proxy that does not forward `X-Forwarded-Proto` used to produce an
+        # `http` resource for a client that asked over `https`, failing §3.3
+        # just as surely.
+        settings.DEBUG = debug
+        path = self.PRM + suffix
+        body = APIClient().get(path).json()
+        expected = f"{scheme}://testserver" + path.replace(
+            "/.well-known/oauth-protected-resource", "", 1
+        )
+        assert body["resource"] == expected
+
+    @pytest.mark.parametrize("suffix", ["", "/"])
+    def test_advertised_identifier_resolves_to_the_transport(self, suffix):
+        # The other half of the contract: whichever spelling we hand back has
+        # to be a URL that actually reaches the MCP endpoint. A 401 (not 404)
+        # is the pass condition — the transport is there, it just wants a
+        # bearer token.
+        body = APIClient().get(self.PRM + suffix).json()
+        resource_path = urlparse(body["resource"]).path
+        response = APIClient().post(resource_path, {}, format="json")
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+    @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
+    @pytest.mark.parametrize("transport", ["/mcp/sql/", "/mcp/sql"])
+    def test_challenge_pointer_leads_back_to_the_requested_url(
+        self, transport, debug, scheme, settings
+    ):
+        """§3.3's SECOND clause: metadata reached through the 401's
+        `resource_metadata` pointer MUST carry a `resource` identical to the
+        URL the client sent its request to.
+
+        The pointer used to be the slash-less document unconditionally, so a
+        client that requested the documented `https://<host>/mcp/sql/` was
+        handed `resource=https://<host>/mcp/sql` — a mismatch it must discard.
+        Asserted end to end the way a client walks it: draw the 401, follow
+        the pointer, compare.
+        """
+        settings.DEBUG = debug
+        challenge = APIClient().post(transport, {}, format="json")["WWW-Authenticate"]
+        pointer = challenge.split('resource_metadata="', 1)[1].rstrip('"')
+        slash = "/" if transport.endswith("/") else ""
+        assert pointer == f"{scheme}://testserver{self.PRM}{slash}"
+        body = APIClient().get(urlparse(pointer).path).json()
+        assert body["resource"] == f"{scheme}://testserver{transport}"
+
+    @pytest.mark.parametrize(("debug", "scheme"), [(True, "http"), (False, "https")])
+    def test_every_advertised_url_shares_one_origin(self, debug, scheme, settings):
+        """The whole discovery surface must agree on one `scheme://host`.
+
+        The original defect was `resource` disagreeing with the path it was
+        served at; the same root cause — composing URLs two different ways —
+        also had the AS document advertising `http://…/o/authorize/` next to
+        an `https://…/o` issuer whenever the TLS terminator did not forward
+        `X-Forwarded-Proto`. Any client comparing the two would see the AS
+        endpoints as belonging to a different origin than the issuer that
+        named them. One assertion over every absolute URL in both documents
+        catches the whole family.
+        """
+        settings.DEBUG = debug
+        prm = APIClient().get(self.PRM).json()
+        asm = APIClient().get(reverse("oauth_authorization_server_metadata")).json()
+        urls = [
+            prm["resource"],
+            *prm["authorization_servers"],
+            asm["issuer"],
+            asm["authorization_endpoint"],
+            asm["token_endpoint"],
+            asm["revocation_endpoint"],
+            asm["registration_endpoint"],
+        ]
+        # ...and the `WWW-Authenticate` challenge, which is where a client
+        # actually starts: it derives its resource identifier from this URL, so
+        # a challenge on a different origin than the document it points at
+        # reintroduces the §3.3 mismatch on the very first hop.
+        challenge = APIClient().post("/mcp/sql/", {}, format="json")["WWW-Authenticate"]
+        urls.append(challenge.split('resource_metadata="', 1)[1].rstrip('"'))
+        origins = {f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in urls}
+        assert origins == {f"{scheme}://testserver"}, origins
+
+    def test_the_two_spellings_are_the_only_difference(self):
+        # Everything except `resource` must be byte-identical across the two
+        # paths — a future edit that made the alias diverge (a different
+        # issuer, a narrower scope list) would be a silent split-brain.
+        slashless = APIClient().get(self.PRM).json()
+        slashed = APIClient().get(self.PRM + "/").json()
+        assert slashless.pop("resource") != slashed.pop("resource")
+        assert slashless == slashed
+
+
+@pytest.mark.django_db
 class TestAuthorizationServerMetadata:
     """RFC 8414 metadata for the DOT-backed AS."""
 
@@ -187,24 +322,26 @@ class TestAuthorizationServerMetadata:
     def test_endpoint_urls_match_registered_routes(self):
         response = self._get()
         body = response.json()
-        # Hard-coded `http://testserver` is APIClient's default Host. The
-        # expected URLs are composed independently of the view's
-        # `build_absolute_uri` call so the assertion catches a regression
-        # in URL composition (rather than verifying the view's helper
-        # equals itself).
+        # Hard-coded `https://testserver` — APIClient's default Host, and the
+        # scheme the suite's DEBUG-off settings harden to. The expected URLs
+        # are composed independently of the view's own URL construction so the
+        # assertion catches a composition regression rather than verifying the
+        # view's helper equals itself.
         assert (
-            body["authorization_endpoint"] == f"http://testserver{reverse('authorize')}"
+            body["authorization_endpoint"]
+            == f"https://testserver{reverse('authorize')}"
         )
-        assert body["token_endpoint"] == f"http://testserver{reverse('token')}"
+        assert body["token_endpoint"] == f"https://testserver{reverse('token')}"
         assert (
-            body["revocation_endpoint"] == f"http://testserver{reverse('revoke-token')}"
+            body["revocation_endpoint"]
+            == f"https://testserver{reverse('revoke-token')}"
         )
         # RFC 7591 §3 dynamic client registration. Claude Code's MCP SDK
         # refuses to complete OAuth without this advertised — pinned here
         # so a regression that dropped the field would fail loudly.
         assert (
             body["registration_endpoint"]
-            == f"http://testserver{reverse('oauth_dynamic_client_registration')}"
+            == f"https://testserver{reverse('oauth_dynamic_client_registration')}"
         )
 
     def test_advertised_capabilities(self):

@@ -21,6 +21,7 @@ from django.test.client import encode_multipart
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql.auth import MCP_REQUEST_BODY_MAX_BYTES
+from mcp_sql.auth import GateUnavailable
 from mcp_sql.auth import MCPOAuth2Authentication
 from mcp_sql.auth import PayloadTooLarge
 from mcp_sql.models import MCPAuthRejectionLog
@@ -96,15 +97,18 @@ class TestMCPOAuth2AuthenticationRejections:
         mcp_user.is_active = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
+        with pytest.raises(AuthenticationFailed, match="inactive"):
             MCPOAuth2Authentication().authenticate(request)
 
-    def test_non_staff_user_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
+    def test_non_staff_user_is_accepted(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, mcp_active_session
+    ):
+        # No staff requirement: the explicit profile assignment is the gate.
         mcp_user.is_staff = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
-            MCPOAuth2Authentication().authenticate(request)
+        user, _token = MCPOAuth2Authentication().authenticate(request)
+        assert user.pk == mcp_user.pk
 
     def test_no_mfa_rejected(self, mcp_access_token, mcp_mfa_off):
         request = _bearer_request(mcp_access_token.token)
@@ -239,6 +243,42 @@ class TestAuthRejectionAuditLog:
         assert log.application_name == mcp_app.name
         assert "mcp:sql scope" in log.error
 
+    @pytest.mark.parametrize(
+        ("remote_addr", "stored"),
+        [("not-an-ip", None), ("a:b:zz", None), ("fe80::1%eth0", None)],
+    )
+    def test_non_ip_remote_addr_still_writes_the_row(
+        self, mcp_user, mcp_access_token, gate_posture, remote_addr, stored
+    ):
+        """A front end that puts non-IP text into `REMOTE_ADDR` (uvicorn
+        `--forwarded-allow-ips='*'` copying a client's `X-Forwarded-For`)
+        used to turn the denial into a 500 (psycopg 3 `ValueError` at the
+        insert) or silently drop the row (psycopg2 `DataError`)."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        mcp_user.is_active = False
+        mcp_user.save(update_fields=["is_active"])
+        request = APIRequestFactory().post(
+            "/mcp/sql/",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            REMOTE_ADDR=remote_addr,
+        )
+        with pytest.raises(AuthenticationFailed):
+            MCPOAuth2Authentication().authenticate(request)
+
+        log = MCPAuthRejectionLog.objects.get()
+        assert log.reason == AuthRejectionReason.INACTIVE
+        assert log.client_ip == stored
+
+    def test_legacy_inactive_or_non_staff_reason_stays_valid(self):
+        # Rows written by 0.1.x carry `inactive_or_non_staff`; the choice must
+        # survive so those rows still validate and display (migration 0015).
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        choices = dict(MCPAuthRejectionLog._meta.get_field("reason").choices)
+        assert AuthRejectionReason.INACTIVE_OR_NON_STAFF in choices
+        assert AuthRejectionReason.INACTIVE in choices
+
     def test_inactive_user_writes_audit_row(
         self, mcp_user, mcp_access_token, mcp_mfa_on
     ):
@@ -251,7 +291,7 @@ class TestAuthRejectionAuditLog:
             MCPOAuth2Authentication().authenticate(request)
 
         log = MCPAuthRejectionLog.objects.get()
-        assert log.reason == AuthRejectionReason.INACTIVE_OR_NON_STAFF
+        assert log.reason == AuthRejectionReason.INACTIVE
         assert log.user_id == mcp_user.pk
 
     # The throttle keys its cache on the raw `REMOTE_ADDR` (a space in it
@@ -426,6 +466,276 @@ class TestAuthRejectionAuditLog:
         assert MCPAuthRejectionLog.objects.count() == 0
 
 
+@pytest.mark.django_db
+class TestGateFailuresAreAuditedDenials:
+    """A gate that raises is a denial: 503 plus a `gate_error` row, never a
+    500 with no trace. Fails closed either way, but the unaudited 500 left
+    no record of who was refused. 503 rather than 401 so clients do not
+    start an OAuth re-authorization that would fail the same way."""
+
+    def _assert_gate_error(self, token, user):
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        with pytest.raises(GateUnavailable, match="could not be verified"):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.GATE_ERROR
+        assert row.user_id == user.pk
+
+    def test_endpoint_answers_503_without_a_challenge(  # noqa: PLR0913 — fixtures
+        self, client, mcp_user, mcp_access_token, gate_posture, settings, monkeypatch
+    ):
+        """Owner decision: a raising gate is a 503, not a 401. A 401 carries
+        `WWW-Authenticate`, which sends MCP clients into a full OAuth
+        re-authorization that would fail the same way during an MFA-backend
+        or session-store outage. Still a denial, still audited."""
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "MFA_CHECKER": "mcp_sql.tests.conftest._mfa_checker_raises",
+        }
+        reached = []
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app",
+            lambda *args, **kwargs: reached.append(1),
+        )
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+        )
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert "WWW-Authenticate" not in response
+        assert response["Retry-After"] == "30"
+        assert reached == []
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.GATE_ERROR
+
+    def test_raising_mfa_checker(
+        self, mcp_user, mcp_access_token, gate_posture, settings, caplog
+    ):
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "MFA_CHECKER": "mcp_sql.tests.conftest._mfa_checker_raises",
+        }
+        self._assert_gate_error(mcp_access_token, mcp_user)
+        assert "simulated MFA backend outage" in caplog.text
+
+    def test_raising_profile_resolution(
+        self, mcp_user, mcp_access_token, gate_posture, monkeypatch
+    ):
+        from django.db import OperationalError
+
+        def boom(user):
+            msg = "simulated default-DB outage"
+            raise OperationalError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.mcp_sql_settings.resolve_profile", boom)
+        self._assert_gate_error(mcp_access_token, mcp_user)
+
+    def test_raising_session_lookup(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, monkeypatch, settings
+    ):
+        # The session gate on explicitly: the minimal test posture
+        # (`MCP_SQL_TEST_POSTURE=minimal`) runs with `SESSION_MODEL=None`.
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "SESSION_MODEL": "mcp_sql_testapp.TestSession",
+        }
+
+        def boom(name):
+            msg = f"No installed app with label {name!r}."
+            raise LookupError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.apps.get_model", boom)
+        self._assert_gate_error(mcp_access_token, mcp_user)
+
+    def test_ambiguous_warning_dedup_cache_fault_still_denies(  # noqa: PLR0913 — fixtures
+        self,
+        two_profiles,
+        mcp_user,
+        mcp_access_token,
+        gate_posture,
+        monkeypatch,
+        caplog,
+    ):
+        """The once-per-hour WARNING dedup is a cache call; a cache fault
+        there must not turn the AMBIGUOUS_PROFILE denial into a 500."""
+        import logging
+
+        from django.contrib.auth.models import Group
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        def boom(*args, **kwargs):
+            msg = "simulated cache timeout"
+            raise TimeoutError(msg)
+
+        monkeypatch.setattr("mcp_sql.auth.cache.add", boom)
+        mcp_user.groups.add(Group.objects.get(name=SECOND_PROFILE_GROUP))
+        with (
+            caplog.at_level(logging.WARNING, logger="mcp_sql.auth"),
+            pytest.raises(AuthenticationFailed, match="more than one MCP profile"),
+        ):
+            MCPOAuth2Authentication().authenticate(
+                _bearer_request(mcp_access_token.token)
+            )
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.AMBIGUOUS_PROFILE
+        # Without the dedup the warning is still emitted (signal over silence).
+        assert "MCP profile resolution ambiguous" in caplog.text
+
+
+@pytest.mark.django_db
+class TestTokensMissingUserOrApplication:
+    """DOT allows `AccessToken.user` and `.application` to be NULL (e.g. a
+    `client_credentials` token from a second OAuth use case on the same
+    install, or a shell-minted row). Neither may reach a gate that assumes
+    them: a userless token on an MCP app was an unaudited 500
+    (`None.is_active`), and on another app a 401 whose audit insert failed on
+    the non-null `user` FK."""
+
+    def _token(self, *, user, application):
+        import secrets
+
+        from oauth2_provider.models import AccessToken
+
+        return AccessToken.objects.create(
+            user=user,
+            token="t_" + secrets.token_urlsafe(16),
+            application=application,
+            expires=timezone.now() + timedelta(hours=1),
+            scope="mcp:sql",
+        )
+
+    @pytest.mark.parametrize("mcp_named_app", [True, False])
+    def test_userless_token_is_a_logged_401(
+        self, client, mcp_app, gate_posture, caplog, mcp_named_app
+    ):
+        import logging
+
+        from mcp_sql.models import MCPAuthRejectionLog
+        from oauth2_provider.models import Application
+
+        application = (
+            mcp_app
+            if mcp_named_app
+            else Application.objects.create(
+                name="some-other-service",
+                client_type=Application.CLIENT_CONFIDENTIAL,
+                authorization_grant_type=Application.GRANT_CLIENT_CREDENTIALS,
+            )
+        )
+        token = self._token(user=None, application=application)
+        with caplog.at_level(logging.WARNING, logger="mcp_sql.auth"):
+            response = client.post(
+                reverse("mcp_sql_endpoint"),
+                data=b"{}",
+                content_type="application/json",
+                HTTP_AUTHORIZATION=f"Bearer {token.token}",
+            )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+        assert response["WWW-Authenticate"].startswith('Bearer realm="api"')
+        # The rejection table is keyed to a real user, so the record is the
+        # WARNING naming the token and its client.
+        assert MCPAuthRejectionLog.objects.count() == 0
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "no user" in r.getMessage() and str(token.pk) in r.getMessage()
+            for r in warnings
+        )
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_applicationless_token_is_an_audited_bad_application(
+        self, mcp_user, gate_posture
+    ):
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        token = self._token(user=mcp_user, application=None)
+        with pytest.raises(AuthenticationFailed, match="mcp-sql Application"):
+            MCPOAuth2Authentication().authenticate(_bearer_request(token.token))
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.BAD_APPLICATION
+        assert row.user_id == mcp_user.pk
+        assert row.application_name == ""
+
+
+@pytest.mark.django_db(transaction=True)
+class TestRejectionAuditSurvivesAtomicRequests:
+    """Rejection rows must outlive DRF's rollback under `ATOMIC_REQUESTS`.
+
+    The documented deployment runs the default alias with
+    `ATOMIC_REQUESTS=True`, and DRF's exception handler marks every
+    `ATOMIC_REQUESTS` transaction for rollback on ANY `APIException`,
+    including the `AuthenticationFailed` each gate raises right after writing
+    its audit row. Inside the request transaction, every gate denial was
+    therefore rolled back while the 401 still went out. `mcp_endpoint` is
+    `non_atomic_requests`, so the row is written in autocommit and survives.
+
+    Transactional (`transaction=True`) because a rollback only shows when the
+    request's transaction is a real one, not a savepoint in the test's.
+    """
+
+    def test_inactive_user_rejection_row_is_committed(
+        self, client, mcp_user, mcp_access_token, gate_posture, monkeypatch
+    ):
+        from django.db import connections
+        from mcp_sql.models import MCPAuthRejectionLog
+
+        monkeypatch.setitem(
+            connections["default"].settings_dict, "ATOMIC_REQUESTS", value=True
+        )
+        mcp_user.is_active = False
+        mcp_user.save(update_fields=["is_active"])
+
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+        )
+
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+        assert response["WWW-Authenticate"].startswith('Bearer realm="api"')
+        row = MCPAuthRejectionLog.objects.get()
+        assert row.reason == AuthRejectionReason.INACTIVE
+        assert row.user_id == mcp_user.pk
+
+    def test_endpoint_opts_out_of_atomic_requests(self):
+        from mcp_sql.views.mcp_endpoint import mcp_endpoint
+
+        assert "default" in mcp_endpoint._non_atomic_requests
+
+
+class TestEveryAliasIsNonAtomic:
+    """The opt-out covers every alias, not only `default`.
+
+    DRF's `set_rollback()` marks every `ATOMIC_REQUESTS` connection, so a
+    consumer whose router sends `mcp_sql`'s audit tables to another alias
+    with `ATOMIC_REQUESTS=True` lost every rejection row to the 401 while a
+    bare `@non_atomic_requests` (which records only `default`) let Django
+    wrap the view in that alias's transaction. No DB needed: this asks
+    Django's own handler what it would wrap.
+    """
+
+    def test_handler_wraps_the_view_in_no_alias_transaction(self, monkeypatch):
+        from django.core.handlers.base import BaseHandler
+        from django.db import connections
+        from mcp_sql.views.mcp_endpoint import mcp_endpoint
+
+        for alias in ("audit", "reporting"):
+            monkeypatch.setitem(
+                connections.settings,
+                alias,
+                {**connections.settings["default"], "ATOMIC_REQUESTS": True},
+            )
+        monkeypatch.setitem(
+            connections.settings["default"], "ATOMIC_REQUESTS", value=True
+        )
+        assert BaseHandler().make_view_atomic(mcp_endpoint) is mcp_endpoint
+
+
 def _bearer_request_from_ip(token: str, ip: str):
     """Build a DRF request carrying `Authorization: Bearer <token>` + REMOTE_ADDR.
 
@@ -570,7 +880,10 @@ class TestBadTokenIpBlock:
         # probe first; we're isolating the block behavior).
         cache.set("mcp_sql:bad_token:ip:203.0.113.99", 1, timeout=3600)
 
-        # Spy on DOT's token lookup to confirm it's never invoked.
+        # Spy on DOT's token lookup to confirm it's never invoked (the
+        # bearer check no longer goes through DOT's DRF `authenticate`, so a
+        # spy there would pass vacuously). Control: the same request from an
+        # unblocked IP does reach it.
         calls = []
         original = OAuth2Validator._load_access_token
 
@@ -583,6 +896,9 @@ class TestBadTokenIpBlock:
         request = _bearer_request_from_ip("anything", "203.0.113.99")
         assert MCPOAuth2Authentication().authenticate(request) is None
         assert calls == [], "DOT's token lookup must NOT run on a blocked IP"
+        request = _bearer_request_from_ip("anything", "203.0.113.100")
+        assert MCPOAuth2Authentication().authenticate(request) is None
+        assert calls == ["anything"]
 
     def test_block_does_not_apply_to_different_ip(self, mcp_mfa_on, settings):
         """One IP at threshold does not leak the block to a different IP."""
@@ -920,7 +1236,14 @@ class TestBearerTokenOnlyInHeader:
             content_type=content_type,
             HTTP_ACCEPT="application/json",
         )
-        self._assert_unauthenticated(response, token_lookups)
+        # `/mcp/sql/` is POST-only: every other method is a 405 before DRF and
+        # the auth class run, so the body is never read as a credential at
+        # all (no lookup, no audit row, no throttle count).
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        assert response["Allow"] == "POST"
+        assert token_lookups == []
+        assert not MCPAuthRejectionLog.objects.exists()
+        assert cache.get("mcp_sql:bad_token:ip:127.0.0.1") is None
 
     def test_json_body_field_named_access_token_is_not_inspected(
         self, client, url, mcp_access_token, token_lookups

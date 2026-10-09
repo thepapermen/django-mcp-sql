@@ -15,17 +15,21 @@ from urllib.parse import urlsplit
 from django.db import router
 from django.db import transaction
 from django.utils import timezone
+from mcp_sql.audience import use_granted_spelling
+from mcp_sql.clients import ClientKind
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.conf import refresh_tokens_enabled
-from mcp_sql.consts import is_mcp_application_name
+from mcp_sql.consts import is_mcp_application
 from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.views.registration import _is_loopback_redirect
 from oauth2_provider.models import Application
 from oauth2_provider.models import RefreshToken
+from oauth2_provider.models import redirect_to_uri_allowed
 from oauth2_provider.oauth2_validators import OAuth2Validator
 
 if TYPE_CHECKING:
     from django.http import QueryDict
+    from mcp_sql.clients import DeclaredClient
 
 # C0 controls, DEL and C1 controls. No identifier or parameter of this OAuth
 # surface carries one, and a NUL reaching a Postgres text lookup or insert
@@ -69,7 +73,7 @@ def has_control_character(*params: "QueryDict") -> bool:
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
     """True iff `redirect_uri` is a safe https URL sitting under `prefix`.
 
-    Used only for "prefix" cloud clients (ChatGPT / Codex-cloud), whose
+    Used only for `MATCH: "prefix"` rules (ChatGPT / Codex-cloud), whose
     callback is per-instance — `https://chatgpt.com/connector/oauth/{id}` —
     and so cannot be pre-registered as an exact URI. The match is deliberately
     strict, hardened against the classic redirect-allowlist bypasses so the
@@ -92,7 +96,7 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
       (`%2e%2e`, `%252e%252e`, ...) — above the prefix path,
     - path must start with the prefix path, anchored at a `/` segment boundary
       so a sibling like `.../oauthEVIL` cannot slip past a bare prefix (also
-      enforced at config time by `validation._validate_cloud_redirect_uri`).
+      enforced at config time by `validation._validate_redirect_uri`).
 
     Mirrors the care in `views/registration.py::_is_loopback_redirect`.
     """
@@ -132,8 +136,44 @@ def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
         and got.hostname == want.hostname  # exact host, never `endswith`
         and got_port == want_port  # exact port (:443 == implicit https)
         and ".." not in decoded_path.split("/")  # no traversal (literal/encoded)
+        # ...and no backslash, which a browser's WHATWG parser treats as `/`
+        # in an https URL, so `..\` would be traversal by another spelling.
+        # oauthlib's absolute-URI check and Django's `iri_to_uri` (`\` ->
+        # `%5C`) each already stop it upstream; refused here as well so the
+        # path anchor does not depend on either.
+        and "\\" not in decoded_path
         and got.path.startswith(want_path)  # under the allowlisted path
     )
+
+
+def _is_declared_cloud(declared: "DeclaredClient | None") -> bool:
+    """True for a settings-declared client of kind `cloud` — the only clients
+    whose callbacks may leave the machine."""
+    return declared is not None and declared.kind is ClientKind.CLOUD
+
+
+def _declared_redirect_allowed(declared: "DeclaredClient", redirect_uri: str) -> bool:
+    """A declared client's redirect, decided from SETTINGS alone.
+
+    Prefix rules through `_redirect_under_prefix`; exact rules through DOT's
+    own matcher (`redirect_to_uri_allowed`, the function behind
+    `Application.redirect_uri_allowed`) run on the declared exact URIs, so an
+    exact rule means exactly what DOT's matching of a stored `redirect_uris`
+    means on the installed DOT version — only the list comes from
+    `MCP_SQL["CLIENTS"]` instead of the provisioned row. That row is
+    refreshed only by `post_migrate` (`signals.provision_mcp_clients`), so
+    reading it let a callback changed or removed in settings keep working,
+    and refused the new one, until the next `migrate`.
+
+    A `ValueError` from DOT's parsing (a request port no parser takes, e.g.
+    `:99999`, on a declared host) is a refusal, not a 500.
+    """
+    if any(_redirect_under_prefix(redirect_uri, p) for p in declared.prefixes):
+        return True
+    try:
+        return bool(redirect_to_uri_allowed(redirect_uri, list(declared.exact_uris)))
+    except ValueError:
+        return False
 
 
 class MCPOAuth2Validator(OAuth2Validator):
@@ -160,11 +200,13 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         DOT's default looks up by `client_id` and binds the Application onto
         `request.client`. We let it do that, then verify the resulting
-        Application is a recognised mcp-sql shape via `is_mcp_application_name`:
+        Application is a recognised mcp-sql client via `is_mcp_application`:
         the curated `mcp-sql` row, a dynamically-registered `mcp-sql-<token>`
-        row, OR a settings-declared `mcp-sql-cloud.<name>` cloud client. An
-        Application whose name matches none of these (e.g. some unrelated OAuth
-        client added later) is rejected here.
+        row, OR a settings-declared `mcp-sql-{cloud,local}.<slug>` client,
+        each only while its `client_id` equals its `name`. An Application that
+        matches none of these (e.g. some unrelated OAuth client added later,
+        or a row named like an MCP client under another client_id) is
+        rejected here.
         """
         if not super().validate_client_id(client_id, request, *args, **kwargs):
             return False
@@ -172,27 +214,37 @@ class MCPOAuth2Validator(OAuth2Validator):
             getattr(request, "client", None)
             or Application.objects.filter(client_id=client_id).first()
         )
-        return app is not None and is_mcp_application_name(app.name)
+        return is_mcp_application(app)
 
     def validate_redirect_uri(self, client_id, redirect_uri, request, *args, **kwargs):
-        """Admit a "prefix" cloud client's per-instance callback; hold every
-        non-cloud client to a loopback redirect.
+        """A declared client's redirect is decided by settings; every other
+        client's by DOT against its row; and every client that is not a
+        declared cloud client is held to a loopback redirect.
 
-        For a settings-declared cloud client whose `REDIRECT_MATCH` is
-        "prefix" (ChatGPT / Codex-cloud), accept any redirect under the
-        allowlisted host+path prefix via `_redirect_under_prefix`. "Exact"
-        cloud clients fall through to DOT's stock exact matching against the
-        Application's stored `redirect_uris`.
+        For a settings-declared client (`mcp_sql_settings.clients()`), only
+        `_declared_redirect_allowed` decides: its prefix rules
+        (`_redirect_under_prefix`, for ChatGPT / Codex-cloud's per-instance
+        callbacks) and its exact rules (DOT's matcher on the declared exact
+        URIs). There is no fall-through to `super()`: the provisioned row's
+        `redirect_uris` is a copy refreshed only on `migrate`, and recognition
+        is already settings-gated per request — so are redirects. A callback
+        changed in settings takes effect at the next request (old refused, new
+        accepted), and a removed rule stops being admissible at once. The
+        canonical `mcp-sql` row and every DCR client get DOT's stock matching
+        against their own rows.
 
-        EVERY other client — the canonical `mcp-sql` row and every DCR client
-        — must ALSO pass `_is_loopback_redirect` (the `/o/register` predicate)
-        on the requested URI before DOT's matching runs. Only declared cloud
-        clients may redirect off-machine; DOT's matching alone trusts whatever
-        the row stores, and a DCR row minted by <= 0.1.0b5 can store an
-        off-machine redirect smuggled through whitespace (see
-        `_is_loopback_redirect`). This re-check refuses such an entry here
-        without needing the operator to find and delete the row first (its
-        loopback entries keep working, like any DCR client's).
+        EVERY client that is not a declared cloud client — the canonical
+        `mcp-sql` row, every DCR client, every declared local client — must
+        ALSO pass `_is_loopback_redirect` (the `/o/register` predicate) on the
+        requested URI first. Only declared cloud clients may redirect
+        off-machine; DOT's matching alone trusts whatever the row stores, and
+        a DCR row minted by <= 0.1.0b5 can store an off-machine redirect
+        smuggled through whitespace (see `_is_loopback_redirect`). This
+        re-check refuses such an entry here without needing the operator to
+        find and delete the row first (its loopback entries keep working, like
+        any DCR client's). A declared local client's callbacks are
+        `http://localhost` ones by derivation (`clients.derive_kind`), and
+        prefix rules are https-only, so the check costs it nothing.
 
         A ValueError from DOT's matching is a refusal, not a 500: such a row
         can also store an unparseable port (`http://localhost:99999/cb`), and
@@ -200,20 +252,23 @@ class MCPOAuth2Validator(OAuth2Validator):
         request for a different, valid one. (It port-wildcards loopback IPs,
         so it never reads the port of a stored `127.0.0.1` / `[::1]`
         candidate: a valid request on the same path matches, staying
-        loopback.)
+        loopback.) The same holds for the settings path
+        (`_declared_redirect_allowed`). A REQUEST port no parser takes
+        (`http://localhost:99999/cb`) never reaches DOT for a curated or DCR
+        client: `_is_loopback_redirect` refuses it first.
 
-        The stored default used when a request omits `redirect_uri` never
-        reaches this method — `get_default_redirect_uri` below holds it to the
-        same rule.
+        The default used when a request omits `redirect_uri` never reaches
+        this method — `get_default_redirect_uri` below holds it to the same
+        rules.
 
-        Why cloud clients need this + the exact-vs-prefix rationale:
-        `docs/oauth.md` → "Cloud clients".
+        Why declared clients need this + the exact-vs-prefix rationale:
+        `docs/oauth.md` → "Clients".
         """
-        cloud = mcp_sql_settings.cloud_clients().get(client_id)
-        if cloud is not None and cloud.redirect_match == "prefix":
-            return _redirect_under_prefix(redirect_uri, cloud.redirect_uri)
-        if cloud is None and not _is_loopback_redirect(redirect_uri):
+        declared = mcp_sql_settings.clients().get(client_id)
+        if not _is_declared_cloud(declared) and not _is_loopback_redirect(redirect_uri):
             return False
+        if declared is not None:
+            return _declared_redirect_allowed(declared, redirect_uri)
         try:
             return super().validate_redirect_uri(
                 client_id, redirect_uri, request, *args, **kwargs
@@ -222,23 +277,37 @@ class MCPOAuth2Validator(OAuth2Validator):
             return False
 
     def get_default_redirect_uri(self, client_id, request, *args, **kwargs):
-        """Hold a non-cloud client's stored default redirect to loopback.
+        """The default redirect: from settings for a declared client, and held
+        to loopback for every client that is not a declared cloud client.
 
-        When a request omits `redirect_uri`, oauthlib resolves the stored
-        default WITHOUT calling `validate_redirect_uri`, and a later non-fatal
-        error (missing `response_type`, a bad scope, ...) is then 302'd to it.
-        So a non-cloud row whose single stored redirect fails the loopback
-        predicate (e.g. a canonical row hand-edited to an off-machine URI)
-        would still send an error redirect there. Dropping such a default
-        makes oauthlib raise its fatal `MissingRedirectURIError` instead —
-        error page, no redirect. Declared cloud clients keep DOT's default.
+        When an authorization request omits `redirect_uri`, oauthlib resolves
+        the default WITHOUT calling `validate_redirect_uri`, and a later
+        non-fatal error (missing `response_type`, a bad scope, ...) is then
+        302'd to it. When a token request omits it, the default is the value
+        `confirm_redirect_uri` compares with the grant's (a mismatch refuses
+        the exchange).
+
+        A declared client's default comes from settings, not the provisioned
+        row (which would bring back a callback since changed or removed in
+        settings): its callback only when it declares exactly one rule and
+        that rule is exact — as DOT gives one only for a single stored URI; a
+        prefix is not a callback. Every other client gets DOT's default from
+        its row.
+
+        A default that fails the loopback predicate for a client that is not
+        a declared cloud client (e.g. a canonical row hand-edited to an
+        off-machine URI) is dropped too. A dropped default makes oauthlib
+        raise its fatal `MissingRedirectURIError` instead — at `/o/authorize/`
+        the error page, no redirect.
         """
-        uri = super().get_default_redirect_uri(client_id, request, *args, **kwargs)
-        if (
-            uri
-            and mcp_sql_settings.cloud_clients().get(client_id) is None
-            and not _is_loopback_redirect(uri)
-        ):
+        declared = mcp_sql_settings.clients().get(client_id)
+        if declared is None:
+            uri = super().get_default_redirect_uri(client_id, request, *args, **kwargs)
+        elif len(declared.redirects) == 1 and declared.exact_uris:
+            uri = declared.exact_uris[0]
+        else:
+            uri = None
+        if uri and not _is_declared_cloud(declared) and not _is_loopback_redirect(uri):
             return None
         return uri
 
@@ -296,7 +365,16 @@ class MCPOAuth2Validator(OAuth2Validator):
         time is recorded in `MCPRefreshTokenFamily`, in the same transaction,
         for `validate_refresh_token`'s hard cap. Rotations inherit the family
         and record nothing. Expired family rows are pruned here too.
+
+        First, the token request's RFC 8707 `resource` is put in the grant's
+        (or refresh token's) own spelling when it is another spelling of it
+        (`audience.use_granted_spelling`): `MCPTokenView` sends DOT one
+        canonical spelling, and grants issued since store that same string;
+        one stored before under another accepted spelling (the slashed one,
+        an uppercase host) would otherwise fail DOT's string comparison in
+        `_check_and_set_request_resource`, which `super()` runs first.
         """
+        use_granted_spelling(request)
         if not refresh_tokens_enabled():
             token.pop("refresh_token", None)
             return super().save_bearer_token(token, request, *args, **kwargs)

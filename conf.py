@@ -8,12 +8,20 @@ when a key is missing, and resolves dotted-path entries listed in
 `IMPORT_STRINGS` to their callable / class at first read.
 
 Every `MCP_SQL[...]` key the package consumes flows through
-`mcp_sql_settings.X` instead of `settings.MCP_SQL["X"]`, so the in-package
-default, dotted-path resolution, and reload semantics live in one place.
-The package ships as-is when extracted to PyPI as `django-mcp-sql` — the
-consuming project sets only the keys it needs to override (`RESOURCE_NAME`,
-`MFA_CHECKER`, `SESSION_MODEL` are the load-bearing ones); everything else
-picks up the in-package default.
+`mcp_sql_settings.X` (or the `mcp_sql_config()` mapping view) instead of
+`settings.MCP_SQL["X"]`, so the in-package default, dotted-path resolution,
+and reload semantics live in one place.
+
+**Every key carries a default** — `settings.MCP_SQL` may declare any subset,
+or be absent entirely. In practice a real deployment sets two: `MFA_CHECKER`
+(the default denies everyone, fail-closed) and each profile's
+`ALLOWED_MODELS` (the default whitelist is empty, so no table is readable).
+Both defaults are deliberately useless-but-safe: an unconfigured install
+grants nothing rather than guessing.
+
+One merge rule, applied identically by the accessor and by
+`merged_config()`: a declared key replaces its default **wholesale**, never
+member-by-member.
 
 Cached values flush on `setting_changed` so `pytest-django`'s
 `@override_settings` (and the `settings` fixture) re-read between tests.
@@ -31,6 +39,8 @@ from django.conf import settings
 from django.core.signals import setting_changed
 from django.dispatch import receiver
 from django.utils.module_loading import import_string
+from mcp_sql.clients import DeclaredClient
+from mcp_sql.clients import build_clients
 
 if TYPE_CHECKING:
     from mcp_sql.validation import McpSqlSettings
@@ -52,33 +62,6 @@ class Profile:
     group_name: str
     allowed_models: tuple[str, ...]
     session_context: Callable[..., Mapping[str, str] | None] | None = None
-
-
-@dataclass(frozen=True)
-class CloudClient:
-    """One operator-declared cloud MCP client (opt-in).
-
-    Built by `MCPSQLSettings.cloud_clients()` from each
-    `MCP_SQL["CLOUD_CLIENTS"]` entry. `client_id` is the derived, stable
-    Application name / client_id (`<APPLICATION_NAME_PREFIX>cloud.<name>`).
-    The `.` after "cloud" is structural: it keeps the id disjoint from the
-    DCR `<prefix><22 url-safe chars>` shape (a `.` is not in the
-    urlsafe-base64 alphabet), so recognition never leaks through the DCR
-    branch and removing the entry fully de-recognises it. `redirect_match`
-    is "exact" (one fixed provider callback, e.g. Claude.ai) or "prefix"
-    (per-instance callbacks under a fixed host+path, e.g. ChatGPT);
-    `redirect_uri` is that exact URL or that host+path prefix.
-
-    How the cloud login works end-to-end (provider onboarding, the consent +
-    6h re-consent flow, exact-vs-prefix redirect matching, and the governing
-    OAuth 2.1 / PKCE / MCP-authorization spec links): see `docs/oauth.md` →
-    "Cloud clients".
-    """
-
-    name: str
-    client_id: str
-    redirect_match: str
-    redirect_uri: str
 
 
 class ResolutionOutcome(Enum):
@@ -206,7 +189,7 @@ DEFAULTS: dict[str, Any] = {
     #                         unique across profiles (resolution counts
     #                         distinct codenames — see `resolve_profile`).
     #   GROUP_NAME          — Django Group carrying that permission; admins
-    #                         add staff to it to confer the tier.
+    #                         add users to it to confer the tier.
     #   ALLOWED_MODELS      — this tier's `app_label.ModelName` whitelist.
     #   SESSION_CONTEXT     — OPTIONAL dotted path to
     #                         `callable(user, profile) -> Mapping[str, str]
@@ -235,18 +218,97 @@ DEFAULTS: dict[str, Any] = {
             "ALLOWED_MODELS": [],
         },
     },
-    # === Cloud clients (opt-in) ===
+    # === Declared clients ===
     #
-    # Operator-declared cloud MCP clients (Claude.ai, ChatGPT/Codex) that
-    # authenticate against a provider-hosted HTTPS callback instead of an
-    # RFC 8252 loopback address. Empty (default) = OFF; `/o/register` DCR stays
-    # loopback-only regardless. Each entry provisions a public/PKCE Application
-    # at `migrate` and yields a client_id to paste into the provider's connector
-    # (secret blank): "<APPLICATION_NAME_PREFIX>cloud.<NAME>" (default:
-    # "mcp-sql-cloud.<NAME>"; `migrate` logs it). NAME = slug; REDIRECT_MATCH =
-    # "exact" | "prefix"; REDIRECT_URI = the https callback or host+path prefix.
-    # Runbook (onboarding, prerequisites, matching): docs/oauth.md "Cloud clients".
-    "CLOUD_CLIENTS": [],
+    # MCP clients that authenticate against a FIXED callback rather than
+    # registering themselves through RFC 7591 DCR. Each entry provisions a
+    # public/PKCE `Application` at `migrate` whose derived client_id the
+    # operator pastes into the provider's connector (secret blank) — the
+    # `mcp_sql_clients` management command prints them.
+    #
+    # Keyed by slug. `LABEL` is the operator-authored name shown on the
+    # consent screen; `REDIRECTS` is a list of {"MATCH": "exact"|"prefix",
+    # "URI": ...} rules, so one provider means one client_id even when it
+    # calls back from several shapes.
+    #
+    # The client_id namespace is DERIVED from the redirect scheme —
+    # all-https yields "<PREFIX>cloud.<slug>", all-loopback yields
+    # "<PREFIX>local.<slug>", and a mixed entry is a boot error. See
+    # `clients.py` for why (short version: one client_id must never span a
+    # provider-hosted and a machine-local surface, or the audit trail cannot
+    # tell them apart).
+    #
+    # These ship ON. A declared key replaces its default wholesale, so
+    # `"CLIENTS": {}` turns them all off and a smaller dict keeps only what
+    # it names. OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] must contain
+    # "http" always (/o/register mints RFC 8252 loopback callbacks) and
+    # "https" while any https client is declared; DOT's own default has both.
+    # Runbook: docs/oauth.md → "Clients".
+    "CLIENTS": {
+        "claude": {
+            "LABEL": "Claude.ai",
+            "REDIRECTS": [
+                {"MATCH": "exact", "URI": "https://claude.ai/api/mcp/auth_callback"},
+            ],
+        },
+        "chatgpt": {
+            "LABEL": "ChatGPT",
+            # Per-instance callback (`/connector/oauth/{id}`) — prefix-matched
+            # by `oauth._redirect_under_prefix`, anchored at the trailing `/`.
+            "REDIRECTS": [
+                {"MATCH": "prefix", "URI": "https://chatgpt.com/connector/oauth/"},
+            ],
+        },
+        "cursor": {
+            "LABEL": "Cursor",
+            # Cursor's hosted surface (web + Cursor Agents) only. Its desktop
+            # app and CLI register through DCR against a fixed loopback port
+            # and so get their own `mcp-sql-<token>` identity — deliberately
+            # NOT a second URI here, which would merge two trust surfaces
+            # under one client_id. docs/oauth.md covers the static-config
+            # fallback for operators who need it.
+            "REDIRECTS": [
+                {
+                    "MATCH": "exact",
+                    "URI": "https://www.cursor.com/agents/mcp/oauth/callback",
+                },
+            ],
+        },
+    },
+    # === Query limits ===
+    #
+    # DEFAULT_LIMIT applies when neither the caller nor the SQL sets one;
+    # HARD_LIMIT caps every query regardless (the executor clamps to
+    # `min(kwarg, SQL LIMIT, HARD_LIMIT)`); BYTES_LIMIT caps the serialized
+    # result payload. Deliberately conservative — an agent that needs more
+    # rows can ask for them explicitly up to HARD_LIMIT, whereas a generous
+    # default silently ships large result sets to a model context.
+    "LIMITS": {
+        "DEFAULT_LIMIT": 10,
+        "HARD_LIMIT": 100,
+        "BYTES_LIMIT": 256 * 1024,
+    },
+    # Reject `SELECT *` (`parser.parse_and_validate`), forcing explicit
+    # column lists: bounds what a broad query can surface, and keeps a later
+    # column addition from silently widening every existing agent query.
+    "BAN_SELECT_STAR": True,
+    # === Observability ===
+    #
+    # `{decision: {window_seconds: threshold}}` per-user query-volume
+    # tripwires (`observability.record_query_volume`). One `logger.error` —
+    # i.e. one Sentry event — per (user, decision, window) crossing. ALERT
+    # ONLY: crossing a threshold never blocks a query.
+    "VOLUME_ALERT_THRESHOLDS": {
+        "allowed": {3600: 50, 86400: 150},
+        "rejected": {3600: 50, 86400: 150},
+    },
+    # Silent per-IP block shared by the bad-bearer path on `/mcp/sql/` and
+    # anonymous DCR at `/o/register` (`throttle`). Once an IP crosses
+    # THRESHOLD within WINDOW_SECONDS it keeps getting normal-looking
+    # responses that do nothing — a visible 429 would let an attacker pace
+    # just under the limit.
+    "BAD_TOKEN_IP_THRESHOLD": 100,
+    "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     # === Refresh tokens (opt-in) ===
     #
     # Hard cap, in seconds, on a refresh-token chain, measured from the
@@ -315,7 +377,7 @@ class MCPSQLSettings:
     def __init__(self) -> None:
         self._cached: dict[str, Any] = {}
         self._profiles: dict[str, Profile] | None = None
-        self._cloud_clients: dict[str, CloudClient] | None = None
+        self._clients: dict[str, DeclaredClient] | None = None
 
     def __getattr__(self, name: str) -> Any:
         # `__getattr__` is only called when the attribute is NOT already
@@ -344,7 +406,7 @@ class MCPSQLSettings:
         """
         self._cached.clear()
         self._profiles = None
-        self._cloud_clients = None
+        self._clients = None
 
     def profiles(self) -> dict[str, Profile]:
         """Resolve `MCP_SQL["PROFILES"]` into `{name: Profile}`.
@@ -371,32 +433,30 @@ class MCPSQLSettings:
         self._profiles = built
         return built
 
-    def cloud_clients(self) -> dict[str, CloudClient]:
-        """Resolve `MCP_SQL["CLOUD_CLIENTS"]` into `{client_id: CloudClient}`.
+    def clients(self) -> dict[str, DeclaredClient]:
+        """Resolve `MCP_SQL["CLIENTS"]` into `{client_id: DeclaredClient}`.
 
         Keyed by the derived `client_id` so recognition
-        (`consts.is_mcp_application_name`) and the redirect validator
-        (`oauth.MCPOAuth2Validator.validate_redirect_uri`) can look it up by
-        the client_id DOT presents. Cached until `reload()`, so
-        `@override_settings(MCP_SQL=...)` re-reads between tests. Empty (the
-        default) means the opt-in cloud-client feature is off.
+        (`consts.classify_application`) and the redirect validator
+        (`oauth.MCPOAuth2Validator.validate_redirect_uri` /
+        `get_default_redirect_uri`, which decide a declared client's
+        redirects from this, never from the provisioned row) can look it up
+        by the client_id DOT presents. Cached until `reload()`, so
+        `@override_settings(MCP_SQL=...)` re-reads between tests.
+
+        Normalisation lives in `clients.build_clients`, which boot validation
+        calls on the same input — so what the validator blessed at startup and
+        what the runtime uses can never drift. A malformed entry raises
+        `ValueError` here; in a validated process that is unreachable, and in
+        a test that overrode settings past the validator it is the intended
+        loud failure.
         """
-        if self._cloud_clients is not None:
-            return self._cloud_clients
-        prefix = self.APPLICATION_NAME_PREFIX
+        if self._clients is not None:
+            return self._clients
         user_cfg = getattr(settings, "MCP_SQL", {})
-        raw = user_cfg.get("CLOUD_CLIENTS", DEFAULTS["CLOUD_CLIENTS"])
-        built: dict[str, CloudClient] = {}
-        for entry in raw:
-            name = entry["NAME"]
-            client_id = f"{prefix}cloud.{name}"
-            built[client_id] = CloudClient(
-                name=name,
-                client_id=client_id,
-                redirect_match=entry["REDIRECT_MATCH"],
-                redirect_uri=entry["REDIRECT_URI"],
-            )
-        self._cloud_clients = built
+        raw = user_cfg.get("CLIENTS", DEFAULTS["CLIENTS"])
+        built = build_clients(raw, self.APPLICATION_NAME_PREFIX)
+        self._clients = built
         return built
 
     def resolve_profile(self, user: Any) -> Profile | ResolutionOutcome:
@@ -443,18 +503,44 @@ def refresh_tokens_enabled() -> bool:
     return bool(mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS > 0)
 
 
-def mcp_sql_config() -> "McpSqlSettings":
-    """Typed view of the raw `settings.MCP_SQL` dict.
+def merge_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """`DEFAULTS` overlaid with `cfg`. See `merged_config` for the rule.
 
-    The required keys that carry no in-package default (LIMITS,
-    BAN_SELECT_STAR, VOLUME_ALERT_THRESHOLDS, BAD_TOKEN_IP_*) are read
-    straight from `settings.MCP_SQL` rather than through the defaulting
-    `mcp_sql_settings` accessor; `validate_mcp_sql_settings` has already
-    pinned their shape to `McpSqlSettings` at startup, so this casts the
-    raw mapping to that validated TypedDict for typed key access at the
-    consuming call sites.
+    Shallow by construction: a value that came from `DEFAULTS` is the SAME
+    object every caller gets. Never mutate what this returns — poking
+    `mcp_sql_config()["LIMITS"]["HARD_LIMIT"]` would rewrite the module-level
+    default for the whole process. Rebind the key instead.
     """
-    return cast("McpSqlSettings", settings.MCP_SQL)
+    return {**DEFAULTS, **cfg}
+
+
+def merged_config() -> dict[str, Any]:
+    """`DEFAULTS` overlaid with the consumer's `settings.MCP_SQL`.
+
+    ONE merge rule, no exceptions: a declared key replaces its default
+    **wholesale**. Declaring `LIMITS` means declaring all three of its
+    members — a per-member merge would let a consumer end up running a value
+    they never wrote and cannot find in their settings file, which is a worse
+    failure than a `KeyError` at boot (and boot validation raises exactly
+    that, by name). This is the same rule `MCPSQLSettings.__getattr__`
+    applies per attribute; keeping the two identical is why the accessor and
+    this function can be used interchangeably.
+
+    `settings.MCP_SQL` may be absent entirely — the package boots on
+    defaults.
+    """
+    return merge_config(getattr(settings, "MCP_SQL", {}))
+
+
+def mcp_sql_config() -> "McpSqlSettings":
+    """Typed view of the merged `MCP_SQL` config.
+
+    `validate_mcp_sql_settings` has already pinned the merged mapping's shape
+    to `McpSqlSettings` at startup, so this casts it to that validated
+    TypedDict for typed key access at the consuming call sites (executor
+    LIMITS / BAN_SELECT_STAR, observability thresholds, throttle knobs).
+    """
+    return cast("McpSqlSettings", merged_config())
 
 
 @receiver(setting_changed)

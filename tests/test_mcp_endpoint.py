@@ -1,23 +1,33 @@
 """Tests for the `/mcp/sql/` view and its tool callables."""
 
+import asyncio
 import io
+import json
 import secrets
+import threading
 from datetime import timedelta
 from http import HTTPStatus
 from unittest.mock import MagicMock
 
 import pytest
+from a2wsgi import ASGIMiddleware
 from asgiref.sync import async_to_sync
 from django.test import override_settings
 from django.urls import resolve
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import fencing
+from mcp_sql.clients import NO_CLIENT
+from mcp_sql.clients import ClientIdentity
+from mcp_sql.clients import ClientKind
 from mcp_sql.conf import Profile
 from mcp_sql.schemas import ToolName
+from mcp_sql.views import mcp_endpoint as mcp_endpoint_module
 from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
+from mcp_sql.views.mcp_endpoint import _bridge
 from mcp_sql.views.mcp_endpoint import _build_mcp_server
 from mcp_sql.views.mcp_endpoint import _get_asgi_loop
+from mcp_sql.views.mcp_endpoint import _guard_bridge
 from mcp_sql.views.mcp_endpoint import _invoke_wsgi_app
 from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from rest_framework.test import APIClient
@@ -29,6 +39,12 @@ _DEFAULT_PROFILE = Profile(
     group_name="mcp_sql_users",
     allowed_models=("auth.Permission",),
     session_context=None,
+)
+
+_CLAUDE_IDENTITY = ClientIdentity(
+    name="mcp-sql-cloud.claude",
+    kind=ClientKind.CLOUD,
+    redirect="https://claude.ai/api/mcp/auth_callback",
 )
 
 
@@ -56,6 +72,75 @@ class TestEndpointRouting:
         # would raise RuntimeError -> 500 here.
         resp = client.post("/mcp/sql", data="{}", content_type="application/json")
         assert resp.status_code == 401
+
+
+@pytest.mark.django_db
+class TestOnlyPostReachesTheTransport:
+    """Every method but POST is refused with 405 before DRF and the bridge.
+
+    The transport is stateless with JSON responses, so a GET stream (and a
+    DELETE ending a session) has no purpose here. Forwarding a GET into the
+    bridge used to pin the worker thread forever: the SDK answered with an
+    SSE stream that never ends, or (with `Last-Event-ID`) with no response at
+    all, and the bridge waited for a body that never came. The refusal runs
+    before authentication, so it costs no DB query, and a GET from an MCP
+    client gets the spec's "no SSE stream here" answer, 405, which the
+    TypeScript SDK treats as expected rather than as an error.
+    """
+
+    @pytest.mark.parametrize("path", ["/mcp/sql/", "/mcp/sql"])
+    @pytest.mark.parametrize(
+        "method", ["get", "delete", "put", "patch", "head", "options"]
+    )
+    def test_non_post_is_405_before_auth_and_bridge(  # noqa: PLR0913 — fixtures + two parametrize axes
+        self,
+        client,
+        mcp_access_token,
+        mcp_mfa_on,
+        mcp_active_session,
+        monkeypatch,
+        method,
+        path,
+    ):
+        reached = []
+
+        def _record(name):
+            def _hook(*args, **kwargs):
+                reached.append(name)
+
+            return _hook
+
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app", _record("bridge")
+        )
+        monkeypatch.setattr(
+            "mcp_sql.auth.MCPOAuth2Authentication.authenticate", _record("auth")
+        )
+        response = getattr(client, method)(
+            path,
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            HTTP_ACCEPT="application/json, text/event-stream",
+            HTTP_LAST_EVENT_ID="0",
+        )
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        assert response["Allow"] == "POST"
+        assert reached == []
+
+    def test_post_stays_csrf_exempt(self):
+        """The split into a plain view + DRF view keeps `/mcp/sql/` exempt:
+        a CSRF-enforcing client's anonymous POST gets the auth challenge,
+        not Django's CSRF 403."""
+        from django.test import Client
+
+        response = Client(enforce_csrf_checks=True).post(
+            reverse("mcp_sql_endpoint"), data=b"{}", content_type="application/json"
+        )
+        assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+    def test_anonymous_get_is_405_too(self, client):
+        response = client.get(reverse("mcp_sql_endpoint"))
+        assert response.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        assert response["Allow"] == "POST"
 
 
 class TestSharedAsgiLoop:
@@ -149,7 +234,7 @@ class TestBuildMcpServer:
                 "tool": ToolName.LIST_TABLES,
                 "token_id": "t1",
                 "client_ip": "127.0.0.1",
-                "client_redirect": "",
+                "client": NO_CLIENT,
             }
         ]
 
@@ -204,7 +289,7 @@ class TestBuildMcpServer:
         captured: dict = {}
 
         def fake_run_query(  # noqa: PLR0913
-            *, user, profile, raw_sql, limit, token_id, client_ip, client_redirect
+            *, user, profile, raw_sql, limit, token_id, client_ip, client
         ):
             captured.update(
                 user=user,
@@ -213,7 +298,7 @@ class TestBuildMcpServer:
                 limit=limit,
                 token_id=token_id,
                 client_ip=client_ip,
-                client_redirect=client_redirect,
+                client=client,
             )
             return QueryResult(row_count=0)
 
@@ -226,7 +311,7 @@ class TestBuildMcpServer:
             profile=_DEFAULT_PROFILE,
             token_id="tok-42",  # noqa: S106 — opaque DB id, not a credential
             client_ip="10.0.0.7",
-            client_redirect="https://claude.ai/api/mcp/auth_callback",
+            client=_CLAUDE_IDENTITY,
         )
         run_query = server._tool_manager.get_tool("run_query").fn
         # `run_query` is `async def` so the FastMCP SDK can `await` it from
@@ -246,7 +331,7 @@ class TestBuildMcpServer:
         assert captured["limit"] == 5
         assert captured["token_id"] == "tok-42"
         assert captured["client_ip"] == "10.0.0.7"
-        assert captured["client_redirect"] == "https://claude.ai/api/mcp/auth_callback"
+        assert captured["client"] is _CLAUDE_IDENTITY
 
 
 @pytest.mark.django_db
@@ -280,6 +365,53 @@ class TestAuditToolCall:
         assert row.duration_ms is None
         assert row.row_count is None
         assert row.truncated is False
+
+    def test_non_ip_client_ip_is_stored_as_null(self, mcp_user):
+        """`_audit_safely` normalises `client_ip` itself, so no caller can
+        lose a row to a non-IP value (psycopg 3 raised `ValueError` out of
+        the audit wrapper, psycopg2 a swallowed `DataError`)."""
+        from mcp_sql import executor
+        from mcp_sql.models import MCPQueryLog
+
+        executor.audit_tool_call(
+            user=mcp_user,
+            profile=_DEFAULT_PROFILE,
+            tool=ToolName.LIST_TABLES,
+            client_ip="not-an-ip, 203.0.113.9",
+        )
+        assert MCPQueryLog.objects.get().client_ip is None
+
+
+@pytest.mark.django_db
+class TestViewNormalisesClientIp:
+    """The view hands the tools a normalised `client_ip` (or None)."""
+
+    def test_non_ip_remote_addr_reaches_the_tools_as_none(
+        self, client, mcp_access_token, mcp_active_session, gate_posture, monkeypatch
+    ):
+        from django.http import HttpResponse
+
+        seen = {}
+
+        def capture(**kwargs):
+            seen.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._build_mcp_server", capture)
+        monkeypatch.setattr("mcp_sql.views.mcp_endpoint._bridge", lambda server: None)
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint._invoke_wsgi_app",
+            lambda app, request: HttpResponse(status=200),
+        )
+        response = client.post(
+            reverse("mcp_sql_endpoint"),
+            data=b"{}",
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}",
+            REMOTE_ADDR="not-an-ip",
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert seen["client_ip"] is None
 
 
 @pytest.mark.django_db
@@ -387,7 +519,7 @@ class TestMcpEndpointHappyPath:
             return [b'{"ok": true}']
 
         class StubASGIMiddleware:
-            def __init__(self, asgi_app, loop=None):
+            def __init__(self, asgi_app, loop=None, wait_time=None):
                 # `loop=` mirrors the real `a2wsgi.ASGIMiddleware` signature:
                 # the view passes the process-global loop (see C1) so the
                 # bridge stops leaking a loop+thread per request.
@@ -592,6 +724,302 @@ class TestInvokeWsgiApp:
             "HTTP_X_USER_EMAIL",
         ):
             assert key not in environ, f"{key!r} leaked through — allowlist regression"
+
+
+def _bridge_request(method: str = "POST", body: bytes = b"", **headers: str):
+    """A minimal request object carrying what `_invoke_wsgi_app` forwards."""
+    request = MagicMock()
+    request.META = {
+        "REQUEST_METHOD": method,
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "80",
+        "SERVER_PROTOCOL": "HTTP/1.1",
+        "HTTP_HOST": "testserver",
+        "CONTENT_TYPE": "application/json",
+        "HTTP_ACCEPT": "application/json, text/event-stream",
+        "wsgi.url_scheme": "http",
+        **headers,
+    }
+    request.body = body
+    return request
+
+
+def _invoke_bounded(wsgi_app, request, *, limit: float = 10.0):
+    """Run `_invoke_wsgi_app` on a daemon thread and fail if it pins it.
+
+    Without the guard these exchanges never return, so the thread (not the
+    test runner) is what gets stuck; the assertion names the regression.
+    """
+    result = {}
+
+    def target():
+        result["response"] = _invoke_wsgi_app(wsgi_app, request)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(limit)
+    assert not worker.is_alive(), "the bridge pinned the calling thread"
+    return result["response"]
+
+
+def _guarded(asgi_app):
+    """Compose a raw ASGI app the way `_bridge` composes the FastMCP one."""
+    return ASGIMiddleware(
+        _guard_bridge(asgi_app),
+        loop=_get_asgi_loop(),
+        wait_time=mcp_endpoint_module._BRIDGE_WIND_DOWN_SECONDS,
+    )
+
+
+class TestBridgeGuard:
+    """An unfinished ASGI response can never pin the WSGI thread.
+
+    a2wsgi's WSGI half waits for the app's next message and stops only on a
+    final body, so an app that never finishes its response, or ends without
+    starting one, used to block `_invoke_wsgi_app` forever. `_guard_bridge`
+    bounds the app with `_BRIDGE_DEADLINE_SECONDS` and always completes the
+    response.
+    """
+
+    def test_app_that_never_answers_is_cut_off_with_504(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
+
+        async def silent(scope, receive, send):
+            await asyncio.sleep(3600)
+
+        response = _invoke_bounded(_guarded(silent), _bridge_request())
+        assert response.status_code == HTTPStatus.GATEWAY_TIMEOUT
+
+    def test_app_that_returns_without_a_response_gets_500_at_once(self, monkeypatch):
+        # A deadline far beyond the join limit: the 500 must come from the
+        # app having ended, not from the deadline.
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+
+        async def returns_nothing(scope, receive, send):
+            return
+
+        response = _invoke_bounded(_guarded(returns_nothing), _bridge_request())
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+    def test_app_raising_timeout_error_is_not_reported_as_the_deadline(
+        self, monkeypatch, caplog
+    ):
+        """Only the bridge's own deadline is a 504. A `TimeoutError` the app
+        raises itself is an app exception like any other (a2wsgi's 500),
+        and must not be logged as the 30 s deadline firing."""
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+
+        async def raises(scope, receive, send):
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)
+
+        response = _invoke_bounded(_guarded(raises), _bridge_request())
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert "did not complete within" not in caplog.text
+
+    def test_app_exception_waits_for_the_in_flight_send(self):
+        """An app that raises while a send is still in flight must not leave
+        that shielded send behind: a2wsgi takes a per-message lock that only
+        its WSGI half releases, so an abandoned send is a half-delivered
+        message on the shared loop. The guard settles it before the
+        exception propagates."""
+        release = asyncio.Event()
+        delivered = []
+
+        async def send(message):
+            if message.get("more_body"):
+                await release.wait()
+            delivered.append(message["type"])
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            pending = asyncio.ensure_future(
+                send({"type": "http.response.body", "body": b"x", "more_body": True})
+            )
+            await asyncio.sleep(0)  # the chunk is now in flight
+            pending.cancel()  # the app's own sender gives up...
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)  # ...and the app fails
+
+        async def scenario():
+            guarded = asyncio.ensure_future(
+                _guard_bridge(app)({"type": "http"}, receive, send)
+            )
+            await asyncio.sleep(0.05)
+            settled_before_release = guarded.done()
+            release.set()
+            with pytest.raises(TimeoutError, match="upstream read timed out"):
+                await guarded
+            return settled_before_release
+
+        settled_before_release = asyncio.run(scenario())
+        assert settled_before_release is False
+        assert delivered == ["http.response.start", "http.response.body"]
+
+    def test_app_exception_waits_for_every_in_flight_send(self):
+        """Two sends in flight when the app fails: the guard settles both,
+        not just the latest, before the exception propagates. The earlier
+        one is released last, so settling only the latest would let the
+        guard finish while it is still pending."""
+        gates = {b"a": asyncio.Event(), b"b": asyncio.Event()}
+        delivered = []
+
+        async def send(message):
+            body = message.get("body")
+            if body in gates:
+                await gates[body].wait()
+            delivered.append(body or message["type"])
+
+        senders = []
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            for chunk in (b"a", b"b"):
+                message = {
+                    "type": "http.response.body",
+                    "body": chunk,
+                    "more_body": True,
+                }
+                senders.append(asyncio.ensure_future(send(message)))
+                await asyncio.sleep(0)
+            msg = "upstream read timed out"
+            raise TimeoutError(msg)
+
+        async def scenario():
+            guarded = asyncio.ensure_future(
+                _guard_bridge(app)({"type": "http"}, None, send)
+            )
+            await asyncio.sleep(0.05)
+            gates[b"b"].set()  # the latest send completes...
+            await asyncio.sleep(0.05)
+            done_with_a_pending = guarded.done()  # ...the earlier one has not
+            gates[b"a"].set()
+            with pytest.raises(TimeoutError):
+                await guarded
+            return done_with_a_pending
+
+        assert asyncio.run(scenario()) is False
+        assert delivered[1:] == [b"b", b"a"]
+
+    def test_first_failed_send_in_send_order_is_the_one_surfaced(self):
+        """When several sends fail, the exception that surfaces is the one of
+        the earliest send, every time, not whichever a set happens to yield."""
+
+        class SendFailedError(Exception):
+            pass
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                await asyncio.sleep(0)
+                raise SendFailedError(message["body"].decode())
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            pending = [
+                asyncio.ensure_future(
+                    send({"type": "http.response.body", "body": f"{i}".encode()})
+                )
+                for i in range(8)
+            ]
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        async def scenario():
+            with pytest.raises(SendFailedError) as raised:
+                await _guard_bridge(app)({"type": "http"}, None, send)
+            return str(raised.value)
+
+        assert {asyncio.run(scenario()) for _ in range(20)} == {"0"}
+
+    def test_send_started_after_the_guard_finished_never_reaches_a2wsgi(self):
+        """A send the app scheduled but that had not started when the app
+        failed must not slip out to a2wsgi after the guard has let go: it
+        fails in the app's own task instead."""
+        delivered = []
+        leaked = []
+
+        async def send(message):
+            delivered.append(message.get("body", message["type"]))
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            message = {"type": "http.response.body", "body": b"late", "more_body": True}
+            leaked.append(asyncio.ensure_future(send(message)))
+            msg = "boom"
+            raise RuntimeError(msg)  # before the scheduled send ever runs
+
+        async def scenario():
+            with pytest.raises(RuntimeError, match="boom"):
+                await _guard_bridge(app)({"type": "http"}, None, send)
+            with pytest.raises(RuntimeError, match="after the MCP bridge exchange"):
+                await leaked[0]
+
+        asyncio.run(scenario())
+        assert b"late" not in delivered
+
+    def test_endless_stream_is_closed_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.3)
+
+        async def endless(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"x", "more_body": True})
+            await asyncio.sleep(3600)
+
+        response = _invoke_bounded(_guarded(endless), _bridge_request())
+        assert response.status_code == HTTPStatus.OK
+        assert response.content == b"x"
+
+    def test_complete_response_passes_through_untouched(self):
+        async def ok(scope, receive, send):
+            await send({"type": "http.response.start", "status": 201, "headers": []})
+            await send({"type": "http.response.body", "body": b"done"})
+
+        response = _invoke_bounded(_guarded(ok), _bridge_request())
+        assert response.status_code == HTTPStatus.CREATED
+        assert response.content == b"done"
+
+
+class TestRealSdkThroughTheBridge:
+    """The real FastMCP app through `_bridge`, the composition the view uses.
+
+    GET never reaches the bridge any more (`TestOnlyPostReachesTheTransport`);
+    these drive it there directly to pin that the guard alone would have
+    stopped both shapes of the original hang.
+    """
+
+    def _server(self):
+        return _build_mcp_server(
+            user=MagicMock(),
+            profile=_DEFAULT_PROFILE,
+            token_id="",
+            client_ip=None,
+        )
+
+    def test_post_ping_round_trips(self):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode()
+        response = _invoke_bounded(_bridge(self._server()), _bridge_request(body=body))
+        assert response.status_code == HTTPStatus.OK
+        assert json.loads(response.content) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    def test_get_with_last_event_id_no_longer_hangs(self, monkeypatch):
+        # The SDK returns without sending anything (no event store), so the
+        # guard answers at once; the deadline is set out of reach to prove it.
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 3600.0)
+        response = _invoke_bounded(
+            _bridge(self._server()),
+            _bridge_request(method="GET", HTTP_LAST_EVENT_ID="0"),
+        )
+        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+    def test_get_sse_stream_is_closed_at_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(mcp_endpoint_module, "_BRIDGE_DEADLINE_SECONDS", 0.5)
+        response = _invoke_bounded(
+            _bridge(self._server()), _bridge_request(method="GET")
+        )
+        assert response.status_code == HTTPStatus.OK
+        assert response["Content-Type"].startswith("text/event-stream")
 
 
 @pytest.mark.django_db

@@ -13,7 +13,6 @@ import secrets
 from datetime import timedelta
 from http import HTTPStatus
 from urllib.parse import parse_qs
-from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 import pytest
@@ -56,7 +55,8 @@ def _s256_pair() -> tuple[str, str]:
 
 
 def _consent_and_exchange(client, user) -> dict:
-    """Authorize the canonical (skip-consent) client and exchange the code."""
+    """Authorize the canonical client (consent POST: it requires consent since
+    migration 0016) and exchange the code."""
     client.force_login(user)
     verifier, challenge = _s256_pair()
     params = {
@@ -68,7 +68,9 @@ def _consent_and_exchange(client, user) -> dict:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    location = client.get(reverse("authorize") + "?" + urlencode(params))["Location"]
+    location = client.post(reverse("authorize"), {**params, "allow": "Authorize"})[
+        "Location"
+    ]
     code = parse_qs(urlparse(location).query)["code"][0]
     response = client.post(
         reverse("token"),
@@ -523,7 +525,7 @@ class TestPasswordChangeEdgeCases:
             "code_challenge": challenge,
             "code_challenge_method": "S256",
         }
-        location = client.get(reverse("authorize") + "?" + urlencode(params))[
+        location = client.post(reverse("authorize"), {**params, "allow": "Authorize"})[
             "Location"
         ]
         code = parse_qs(urlparse(location).query)["code"][0]
