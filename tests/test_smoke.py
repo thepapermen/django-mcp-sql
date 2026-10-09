@@ -10,6 +10,7 @@ empty-`ALLOWED_MODELS` guard.
 """
 
 import io
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -307,3 +308,34 @@ class TestReadPathMissingTable:
         assert message.startswith("mcp_sql_smoke_no_such_table does not exist")
         assert "mcp_sql.E001" in message
         assert "check --database default" in message
+
+
+@pytest.mark.django_db
+class TestReadPathFirstRunErrors:
+    """The other first-run states (grants not applied, role not created)
+    escaped as a bare `ProgrammingError` too."""
+
+    @pytest.fixture
+    def cmd(self, monkeypatch):
+        monkeypatch.setattr(mcp_sql_smoke, "connections", _AliasedConnections())
+        monkeypatch.setattr(
+            mcp_sql_smoke,
+            "transaction",
+            SimpleNamespace(atomic=lambda using: transaction.atomic()),
+        )
+        return Command(stdout=io.StringIO())
+
+    def test_a_table_the_role_cannot_read_names_grants_apply(self, cmd):
+        with connection.cursor() as cur:
+            cur.execute("CREATE TABLE mcp_sql_smoke_ungranted (id int)")
+        profile = Command._smoke_profile(None)
+        with pytest.raises(CommandError) as exc:
+            cmd._verify_read_path(profile, "mcp_sql_smoke_ungranted")
+        assert "mcp_sql_grants --apply" in str(exc.value)
+
+    def test_a_missing_role_names_role_setup(self, cmd):
+        profile = replace(Command._smoke_profile(None), role="mcp_sql_no_such_role")
+        with pytest.raises(CommandError) as exc:
+            cmd._verify_read_path(profile, "auth_group")
+        assert "Cannot enter role mcp_sql_no_such_role" in str(exc.value)
+        assert "role_setup.sql" in str(exc.value)

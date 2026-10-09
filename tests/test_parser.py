@@ -900,6 +900,9 @@ _SQL_TEXT_CALLS = [
     ("crosstab2", "'SELECT 1'"),
     ("crosstab3", "'SELECT 1'"),
     ("crosstab4", "'SELECT 1'"),
+    # A wrapper named after the predefined ones.
+    ("crosstab5", "'SELECT 1'"),
+    ("crosstab12", "'SELECT 1'"),
     # The `crosstab_<suffix>(text)` wrappers tablefunc's docs suggest.
     ("crosstab_float_4", "'SELECT 1'"),
     ("connectby", "'auth_group', 'id', 'name', '1', 0"),
@@ -971,10 +974,10 @@ class TestFunctionsRunningSqlText:
             "SELECT ts_stat FROM (SELECT 1 AS ts_stat) AS s",
             "SELECT s.crosstab_total FROM (SELECT 1 AS crosstab_total) AS s",
             "SELECT 'ts_stat(1)' AS r",
-            # Only tablefunc's names and the `crosstab_<suffix>` wrappers:
-            # a consumer's own function that starts with the word is not one.
+            # Only tablefunc's names, `crosstab<N>` and the
+            # `crosstab_<suffix>` wrappers: a consumer's own function that
+            # starts with the word is not one.
             "SELECT crosstabulate(id) AS r FROM auth_group",
-            "SELECT crosstab5(id) AS r FROM auth_group",
         ],
     )
     def test_same_named_columns_and_strings_accepted(self, sql):

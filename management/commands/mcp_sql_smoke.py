@@ -21,6 +21,8 @@ from mcp_sql.session import session_drift
 PGCODE_READ_ONLY_SQL_TRANSACTION = "25006"
 PGCODE_INSUFFICIENT_PRIVILEGE = "42501"
 PGCODE_UNDEFINED_TABLE = "42P01"
+# `SET ROLE` to a role that does not exist.
+PGCODE_INVALID_PARAMETER_VALUE = "22023"
 EXPECTED_REJECTION_PGCODES = frozenset(
     {PGCODE_READ_ONLY_SQL_TRANSACTION, PGCODE_INSUFFICIENT_PRIVILEGE}
 )
@@ -225,7 +227,21 @@ class Command(BaseCommand):
             transaction.atomic(using=mcp_sql_settings.DB_ALIAS),
             connections[mcp_sql_settings.DB_ALIAS].cursor() as cur,
         ):
-            enter_readonly_session(cur, role=profile.role)
+            try:
+                enter_readonly_session(cur, role=profile.role)
+            except DatabaseError as exc:
+                if pgcode(exc) not in {
+                    PGCODE_INVALID_PARAMETER_VALUE,
+                    PGCODE_INSUFFICIENT_PRIVILEGE,
+                }:
+                    raise
+                msg = (
+                    f"Cannot enter role {profile.role} (profile "
+                    f"{profile.name!r}): {exc}. Create the role and grant it "
+                    "to the app login with sql/role_setup.sql (or "
+                    "`manage.py mcp_sql_role_setup --emit-sql`)."
+                )
+                raise CommandError(msg) from exc
             drift = session_drift(cur, profile.role)
             if drift:
                 msg = (
@@ -241,6 +257,14 @@ class Command(BaseCommand):
             try:
                 cur.execute(read)
             except DatabaseError as exc:
+                if pgcode(exc) == PGCODE_INSUFFICIENT_PRIVILEGE:
+                    msg = (
+                        f"Role {profile.role} cannot read "
+                        f"{grants.relation_display(relation_of(table))}: "
+                        "run `manage.py mcp_sql_grants --apply` (as the "
+                        "relation's owner) to grant the whitelist."
+                    )
+                    raise CommandError(msg) from exc
                 if pgcode(exc) != PGCODE_UNDEFINED_TABLE:
                     raise
                 msg = (

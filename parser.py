@@ -153,8 +153,10 @@ DENIED_BARE_KEYWORDS: frozenset[str] = frozenset(
 # legitimate use case appears. `crosstab_` covers the `crosstab_<suffix>(text)`
 # wrappers `tablefunc`'s documentation tells a DBA to create over the same C
 # function as `crosstab` (listed by name above), which run their text argument
-# as SQL. Only the underscore form: a consumer's own `crosstabulate()` is not
-# one of them.
+# as SQL. `_CROSSTAB_N_RE` adds `crosstab<N>` (a wrapper named after the
+# predefined `crosstab2..4`). Only those forms: a consumer's own
+# `crosstabulate()` is not one of them.
+_CROSSTAB_N_RE = re.compile(r"crosstab[0-9]+")
 DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = (
     "dblink_",
     "lo_",
@@ -2124,6 +2126,11 @@ def _denial(name: str) -> tuple[OutcomeReason, str] | None:
         if name.startswith(prefix):
             msg = f"Function '{name}' (prefix '{prefix}*') is on the deny list"
             return OutcomeReason.DISALLOWED_FUNCTION, msg
+    if _CROSSTAB_N_RE.fullmatch(name):
+        return (
+            OutcomeReason.DISALLOWED_FUNCTION,
+            f"Function '{name}' (crosstab<N>) is on the deny list",
+        )
     return None
 
 

@@ -27,6 +27,8 @@ from django.core.checks import register
 from django.db import DEFAULT_DB_ALIAS
 from django.db import connections
 from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.migrations.exceptions import InconsistentMigrationHistory
+from django.db.migrations.exceptions import NodeNotFoundError
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models import Model
 from mcp_sql.conf import mcp_sql_settings
@@ -128,9 +130,15 @@ def _apps_with_pending_migrations(connection: BaseDatabaseWrapper) -> set[str]:
     `connection` (to every app's latest migration, as a bare `migrate`
     does). Read as `migrate` reads it (`MigrationExecutor`): with no
     `django_migrations` table yet (a fresh database) every migration is
-    pending, and an app without migrations has none."""
-    executor = MigrationExecutor(connection)
-    plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+    pending, and an app without migrations has none. A graph Django cannot
+    build (a dependency on a migration that does not exist) skips nothing:
+    the check then reports as it would without this lookup, rather than
+    raising out of `check`."""
+    try:
+        executor = MigrationExecutor(connection)
+        plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+    except (NodeNotFoundError, InconsistentMigrationHistory):
+        return set()
     return {migration.app_label for migration, _backwards in plan}
 
 

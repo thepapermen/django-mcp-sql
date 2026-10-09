@@ -72,7 +72,7 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   answers from client-sent parameters).
 - **Functions that run SQL given as text are denied by name** (the
   `query_to_xml` / `schema_to_xml` / `database_to_xml` families, `ts_stat`,
-  `ts_rewrite`, `crosstab`/`crosstab2..4`/`crosstab_*`, `connectby`,
+  `ts_rewrite`, `crosstab`/`crosstab<N>`/`crosstab_*`, `connectby`,
   `xpath_table`): the inner query never enters the parser. Any new such
   built-in or common extension function goes on the deny list.
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over

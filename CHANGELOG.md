@@ -307,8 +307,8 @@ below precisely because they do **not** announce themselves.
 
 - **Security: built-ins that run SQL passed as text are refused.** `ts_stat`,
   `ts_rewrite` (every arity), `schema_to_xml*`, `database_to_xml*`, and the
-  extension functions `crosstab`, `crosstab2`..`crosstab4`, the `crosstab_*`
-  wrappers and `connectby` (tablefunc) and `xpath_table` (xml2) were refused
+  extension functions `crosstab`, `crosstab<N>`, the `crosstab_*` wrappers
+  and `connectby` (tablefunc) and `xpath_table` (xml2) were refused
   in `FROM` but accepted in the select list, `WHERE` and nested expressions.
   There the inner query skipped the table whitelist, schema scoping,
   `BAN_SELECT_STAR` and the deny list: for example a `pg_advisory_lock` that
@@ -376,8 +376,10 @@ below precisely because they do **not** announce themselves.
   stops first on `mcp_sql.E001`, and `mcp_sql_grants` and the `post_migrate`
   drift check name the schema and the remedy (before the role checks, so
   also before `role_setup.sql` has run). `mcp_sql_smoke` reports a
-  whitelisted table missing from `public` as a command error pointing at the
-  check, not a bare `ProgrammingError`.
+  whitelisted table missing from `public`, a table the role cannot read yet
+  and a role it cannot enter as a command error naming the remedy (the
+  check, `mcp_sql_grants --apply`, `role_setup.sql`), not a bare
+  `ProgrammingError`.
 - **`mcp_sql_grants --apply` counted every profile in its summary** ("across
   N profile(s)"), not the ones whose grants it changed.
 - **A declared client's redirects followed its `Application` row, not

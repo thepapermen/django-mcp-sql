@@ -22,7 +22,9 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.management.base import SystemCheckError
 from django.db import connection
+from django.db.migrations.exceptions import NodeNotFoundError
 from django.test.utils import override_system_checks
+from mcp_sql import checks
 from mcp_sql.checks import check_whitelist_schemas
 from mcp_sql.grants import quote_ident
 from mcp_sql.grants import relation_sql
@@ -321,6 +323,17 @@ class TestE001PendingMigrations:
         with connection.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS django_migrations")
         assert _e001(databases=["default"]) == []
+
+    def test_a_graph_django_cannot_build_skips_nothing(self, elsewhere, monkeypatch):
+        """A migration depending on one that does not exist: the lookup
+        raised out of `check`; it now reports as it would without it."""
+
+        def broken(connection):
+            msg = "a dependency is missing"
+            raise NodeNotFoundError(msg, ("app", "9999"))
+
+        monkeypatch.setattr(checks, "MigrationExecutor", broken)
+        assert len(_e001(databases=["default"])) == 1
 
 
 class TestW001:
