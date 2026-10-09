@@ -61,8 +61,11 @@ DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
         #   SELECT, whitelisted or not;
         # - `tablefunc`'s `connectby(relname text, ...)` and `xml2`'s
         #   `xpath_table(..., relname text, ..., criteria text)` build a
-        #   query from their text arguments and run it (`tablefunc`'s
-        #   `crosstab*` family: the `crosstab` prefix below).
+        #   query from their text arguments and run it;
+        # - `tablefunc`'s `crosstab(source_sql text [, category_sql text |
+        #   N int])` / `crosstab2..4(source_sql text)` run their text
+        #   argument (the `crosstab_<suffix>(text)` wrappers: the
+        #   `crosstab_` prefix below).
         # The inner query skips the whitelist, schema scoping,
         # `BAN_SELECT_STAR` and this deny list:
         # `ts_stat('SELECT to_tsvector(pg_advisory_lock(1)::text)')` takes
@@ -84,6 +87,10 @@ DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
         "database_to_xml_and_xmlschema",
         "connectby",
         "xpath_table",
+        "crosstab",
+        "crosstab2",
+        "crosstab3",
+        "crosstab4",
         # Server-state / identity leaks. PG returns version banners, role
         # names, and network topology via these built-ins — useful for an
         # attacker doing reconnaissance about what role the executor runs
@@ -143,17 +150,17 @@ DENIED_BARE_KEYWORDS: frozenset[str] = frozenset(
 # bits and are introspection tools, not query helpers. Both prefixes are
 # opt-out: there is no allowlist today, since an agent doing exploration of
 # whitelisted business tables does not need any of them. Revisit if a
-# legitimate use case appears. `crosstab*` covers `tablefunc`'s
-# `crosstab(source_sql text [, category_sql text | N int])` /
-# `crosstab2..4(source_sql text)`, which run their text argument as SQL (see
-# the `ts_stat` comment above), plus the `crosstab_<suffix>(text)` wrappers
-# its documentation tells a DBA to create over the same C function.
+# legitimate use case appears. `crosstab_` covers the `crosstab_<suffix>(text)`
+# wrappers `tablefunc`'s documentation tells a DBA to create over the same C
+# function as `crosstab` (listed by name above), which run their text argument
+# as SQL. Only the underscore form: a consumer's own `crosstabulate()` is not
+# one of them.
 DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = (
     "dblink_",
     "lo_",
     "pg_",
     "has_",
-    "crosstab",
+    "crosstab_",
 )
 # Set-returning functions (SRFs). In a FROM clause these are caught by the
 # empty-name `exp.Table` guard in `_check_tables`; in the PROJECTION they are

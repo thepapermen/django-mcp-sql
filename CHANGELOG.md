@@ -280,11 +280,11 @@ they do **not** announce themselves.
 
 - **Security: built-ins that run SQL passed as text are refused.** `ts_stat`,
   `ts_rewrite` (every arity), `schema_to_xml*`, `database_to_xml*`, and the
-  extension functions `crosstab*` (tablefunc, by prefix), `connectby`
-  (tablefunc) and `xpath_table` (xml2) were refused in `FROM` but accepted in
-  the select list, `WHERE` and nested expressions. There the inner query
-  skipped the table whitelist, schema scoping, `BAN_SELECT_STAR` and the deny
-  list: for example a `pg_advisory_lock` that outlives the rollback on a pooled
+  extension functions `crosstab`, `crosstab2`..`crosstab4`, the `crosstab_*`
+  wrappers and `connectby` (tablefunc) and `xpath_table` (xml2) were refused
+  in `FROM` but accepted in the select list, `WHERE` and nested expressions.
+  There the inner query skipped the table whitelist, schema scoping,
+  `BAN_SELECT_STAR` and the deny list: for example a `pg_advisory_lock` that outlives the rollback on a pooled
   connection, `dblink` where it is installed, or a whole schema serialised
   into one value. Now refused as `disallowed_function` in every position and
   spelling (schema-qualified, quoted, attribute notation), like the

@@ -929,10 +929,10 @@ _SQL_TEXT_POSITIONS = [
 
 class TestFunctionsRunningSqlText:
     """`ts_stat`, `ts_rewrite`, `schema_to_xml*`, `database_to_xml*`,
-    `crosstab*`, `connectby`, `xpath_table` run SQL given (or built from
-    names given) as text: the inner query never meets the whitelist, schema
-    scoping, `BAN_SELECT_STAR` or the deny list. Refused by name in every
-    position and spelling, like `query_to_xml`."""
+    `crosstab`/`crosstab2..4`/`crosstab_*`, `connectby`, `xpath_table` run
+    SQL given (or built from names given) as text: the inner query never
+    meets the whitelist, schema scoping, `BAN_SELECT_STAR` or the deny list.
+    Refused by name in every position and spelling, like `query_to_xml`."""
 
     @pytest.mark.parametrize("position", _SQL_TEXT_POSITIONS)
     @pytest.mark.parametrize("spelling", _SQL_TEXT_SPELLINGS)
@@ -971,6 +971,10 @@ class TestFunctionsRunningSqlText:
             "SELECT ts_stat FROM (SELECT 1 AS ts_stat) AS s",
             "SELECT s.crosstab_total FROM (SELECT 1 AS crosstab_total) AS s",
             "SELECT 'ts_stat(1)' AS r",
+            # Only tablefunc's names and the `crosstab_<suffix>` wrappers:
+            # a consumer's own function that starts with the word is not one.
+            "SELECT crosstabulate(id) AS r FROM auth_group",
+            "SELECT crosstab5(id) AS r FROM auth_group",
         ],
     )
     def test_same_named_columns_and_strings_accepted(self, sql):

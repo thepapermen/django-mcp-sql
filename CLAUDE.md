@@ -65,9 +65,9 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   path or revocation (`tests/test_revocation_race.py`).
 - **Functions that run SQL given as text are denied by name** (the
   `query_to_xml` / `schema_to_xml` / `database_to_xml` families, `ts_stat`,
-  `ts_rewrite`, `crosstab*`, `connectby`, `xpath_table`): the inner query never
-  enters the parser. Any new such built-in or common extension function goes
-  on the deny list.
+  `ts_rewrite`, `crosstab`/`crosstab2..4`/`crosstab_*`, `connectby`,
+  `xpath_table`): the inner query never enters the parser. Any new such
+  built-in or common extension function goes on the deny list.
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over
   the authenticated user). Tools are `async def`, dispatch ORM work via
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is
