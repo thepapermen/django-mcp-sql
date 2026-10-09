@@ -425,21 +425,21 @@ can create the `"$user"` schema, and another session on the same backend
 a DBA's database- or login-level `search_path` does the same by
 accident. The drift check (`mcp_sql_grants`) does **not** see such a
 shadow: its inventory lists only direct grants to the profile role, not
-grants to `PUBLIC`, through role membership, on materialized views or
-on temporary relations. `manage.py check --deploy` warns
-(`mcp_sql.W001`) while the pin is off. See `docs/architecture.md` →
-"`search_path` is pinned only on request" for what each mode guarantees. In both modes a
-direct SELECT grant to the profile role on a relation in another schema
-(a `GRANT SELECT ON ALL TABLES IN SCHEMA …`, a same-named copy of a
-whitelisted table) is drift:
+grants to `PUBLIC`, through role membership, or on temporary relations.
+`manage.py check --deploy` warns (`mcp_sql.W001`) while the pin is off.
+See `docs/architecture.md` → "`search_path` is pinned only on request"
+for what each mode guarantees. In both modes a direct SELECT grant to
+the profile role on a relation in another schema (a `GRANT SELECT ON ALL
+TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
 the check reports it as "granted but not declared" (shown quoted,
 `"schema"."name"`) and `--apply` revokes it. The names come from whoever
 owns the relations, so the command quotes each identifier (an embedded
 `"` doubled) in what it prints and runs.
 
-Not in this view, so not checked by `mcp_sql_grants` either: SELECT on a
-materialized view, grants to `PUBLIC`, and grants the profile role holds
-only through membership in another role. Check those by hand
+Not in this view: SELECT on a materialized view (`mcp_sql_grants` reads
+the catalog's ACLs and does check those), grants to `PUBLIC`, and grants
+the profile role holds only through membership in another role (not
+checked by `mcp_sql_grants` either). Check those by hand
 (`has_table_privilege('mcp_readonly_role', 'schema.relation', 'SELECT')`)
 if the database has them.
 

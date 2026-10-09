@@ -163,22 +163,103 @@ class TestApplyAsTheOwner:
         assert "Grants in sync" in check.getvalue()
 
 
-class TestAMaterializedViewIsNamedAsSuch:
-    """The inventory (`information_schema.role_table_grants`) lists no
-    grants on a materialized view, so a whitelisted one is drift on every
-    run (check mode included); `--apply` says why rather than blaming the
-    owner."""
+_MV = "mcp_sql_fu6_mv"
 
-    def test_named(self, monkeypatch):
-        monkeypatch.setattr(
-            "mcp_sql.grants.declared_tables",
-            lambda _profile: {"mcp_sql_testapp.Widget": "mcp_sql_fu6_mv"},
-        )
+
+@pytest.fixture
+def matview(monkeypatch):
+    """A materialized view, whitelisted (as a managed model's table, so no
+    view-parity probe) and not yet granted."""
+    monkeypatch.setattr(
+        "mcp_sql.grants.declared_tables",
+        lambda _profile: {"mcp_sql_testapp.Widget": _MV},
+    )
+    with connection.cursor() as cur:
+        cur.execute(f"CREATE MATERIALIZED VIEW public.{_MV} AS SELECT 1 AS id")
+
+
+class TestMaterializedViews:
+    """`information_schema.role_table_grants` lists no materialized views,
+    so with it as the inventory a whitelisted one was drift on every run;
+    once `--apply` re-read its grants, `--apply` failed on it too although
+    its GRANT had applied. The inventory reads the catalog's ACLs now."""
+
+    def test_apply_grants_and_verifies_it(self, matview):
+        out = _apply()
+        assert "Applied: +1 grant(s), -0 revoke(s)" in out
+        assert grants.granted_tables(_ROLE) == {("public", _MV)}
+        check = StringIO()
+        call_command("mcp_sql_grants", stdout=check)
+        assert "Grants in sync" in check.getvalue()
+
+    def test_a_silent_no_op_still_fails_naming_it(self, unowned, matview, notices):
         with connection.cursor() as cur:
-            cur.execute(
-                "CREATE MATERIALIZED VIEW public.mcp_sql_fu6_mv AS SELECT 1 AS id"
-            )
-        with pytest.raises(
-            CommandError, match="a materialized view: information_schema"
-        ):
+            revoke = f"REVOKE SELECT ON public.{_STALE} FROM {_ROLE}"  # noqa: S608
+            cur.execute(revoke)
+            cur.execute(f"ALTER MATERIALIZED VIEW public.{_MV} OWNER TO {_OWNER}")
+            cur.execute(f"GRANT SELECT ON public.{_MV} TO {_LOGIN}")
+        _as_login()
+        with pytest.raises(CommandError) as exc:
             _apply()
+        _reset_role()
+        assert any("no privileges were granted" in n for n in notices), notices
+        assert f'still not granted: {_MV} (owner "{_OWNER}")' in str(exc.value)
+        assert ("public", _MV) not in grants.granted_tables(_ROLE)
+
+    def test_an_undeclared_grant_on_one_is_drift(self, matview):
+        """The other half of what the view hid: check mode reports, and
+        `--apply` revokes, a grant on a materialized view nothing declares."""
+        with connection.cursor() as cur:
+            cur.execute("CREATE MATERIALIZED VIEW public.mcp_sql_fu6_mv2 AS SELECT 1")
+            cur.execute(f"GRANT SELECT ON public.mcp_sql_fu6_mv2 TO {_ROLE}")
+        with pytest.raises(
+            CommandError, match="granted but not declared: mcp_sql_fu6_mv2"
+        ):
+            call_command("mcp_sql_grants", stdout=StringIO())
+        _apply()
+        assert grants.granted_tables(_ROLE) == {("public", _MV)}
+
+
+class TestTheInventoryIsTheViewsForOtherKinds:
+    """For tables, views and partitioned tables the catalog inventory lists
+    exactly what `information_schema.role_table_grants` lists: check mode's
+    output is unchanged by the switch."""
+
+    def test_same_rows(self, unowned):
+        with connection.cursor() as cur:
+            cur.execute("CREATE SCHEMA mcp_sql_fu6_s")
+            cur.execute("CREATE TABLE mcp_sql_fu6_s.t (id int)")
+            cur.execute("CREATE VIEW public.mcp_sql_fu6_v AS SELECT 1 AS id")
+            cur.execute(
+                "CREATE TABLE public.mcp_sql_fu6_p (id int) PARTITION BY RANGE (id)"
+            )
+            cur.execute(
+                "CREATE TABLE public.mcp_sql_fu6_p1 PARTITION OF public.mcp_sql_fu6_p"
+                " FOR VALUES FROM (0) TO (10)"
+            )
+            cur.execute("CREATE TABLE public.mcp_sql_fu6_ins (id int)")
+            for relation in (
+                "mcp_sql_fu6_s.t",
+                "public.mcp_sql_fu6_v",
+                "public.mcp_sql_fu6_p",
+            ):
+                cur.execute(f"GRANT SELECT ON {relation} TO {_ROLE}")
+            # Not SELECT: in neither.
+            cur.execute(f"GRANT INSERT ON public.mcp_sql_fu6_ins TO {_ROLE}")
+            # Owned by the role: its implicit privileges, in both.
+            cur.execute("CREATE TABLE public.mcp_sql_fu6_owned (id int)")
+            cur.execute(f"ALTER TABLE public.mcp_sql_fu6_owned OWNER TO {_ROLE}")
+            cur.execute(
+                r"""
+                SELECT table_schema, table_name
+                FROM information_schema.role_table_grants
+                WHERE grantee = %s AND privilege_type = 'SELECT'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND table_schema NOT LIKE 'pg\_%%'
+                """,
+                [_ROLE],
+            )
+            view = {(str(a), str(b)) for a, b in cur.fetchall()}
+        assert ("public", "mcp_sql_fu6_owned") in view
+        assert ("mcp_sql_fu6_s", "t") in view
+        assert grants.granted_tables(_ROLE) == view

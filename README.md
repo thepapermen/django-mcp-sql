@@ -434,7 +434,7 @@ the package (importable consumers find them under `mcp_sql/docs/`):
 ## Compatibility
 
 - **Python**: 3.11–3.14 (which ones depends on the Django line — see the table below)
-- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
+- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `aclexplode` over `pg_class.relacl`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
 
 ### Supported combinations
 

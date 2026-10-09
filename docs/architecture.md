@@ -543,9 +543,9 @@ The load-bearing invariants and footguns, grouped by layer:
     refused, so the agent reads only columns it names, but column names
     are not checked against the model: a column only the shadow has is
     read when a query names it. **`mcp_sql_grants` does not detect it:**
-    its inventory (`information_schema.role_table_grants WHERE grantee =
-    <profile role>`) does not see a grant to `PUBLIC`, one held through
-    role membership, a materialized view, or a temporary relation
+    its inventory (direct grants to the profile role, read from
+    `pg_class.relacl`) does not see a grant to `PUBLIC`, one held through
+    role membership, or a temporary relation
     (temporary schemas are skipped), nor the schema-level `USAGE` grant —
     so the check stays clean while the shadow is served. It reports (and
     `--apply` revokes) only a direct SELECT grant to the profile role on
@@ -726,12 +726,15 @@ The load-bearing invariants and footguns, grouped by layer:
   On the grants side `granted_tables` lists SELECT grants in every
   non-system schema (not `pg_catalog`, `information_schema`, `pg_*` —
   temporary schemas included), so the drift check reports, and `--apply`
-  revokes, a grant on a relation nothing declares wherever it is. Limits:
-  it reads `information_schema.role_table_grants`, which lists neither
-  materialized views, nor grants to `PUBLIC`, nor grants the profile role
-  holds only through membership in another role (ledger F42 / F64) — so a
-  whitelisted materialized view is drift on every run, and `--apply`, which
-  re-reads the inventory after its statements, fails naming it as one. A
+  revokes, a grant on a relation nothing declares wherever it is. It
+  reads the catalog's ACLs (`aclexplode(pg_class.relacl)`, grantee = the
+  profile role) for tables, views, foreign and partitioned tables and
+  materialized views — the rows `information_schema.role_table_grants`
+  lists, plus materialized views, which that view leaves out (before
+  0.2.0b1 the inventory was that view, so a whitelisted materialized view
+  was drift on every run). Limits: grants to `PUBLIC`, grants the profile
+  role holds only through membership in another role (ledger F42 / F64),
+  sequences and column-level grants are not listed. A
   whitelisted `db_table` whose schema or table name is longer than 63
   bytes (UTF-8; `grants.MAX_IDENTIFIER_BYTES`, PostgreSQL's `NAMEDATALEN -
   1`) is refused by the reconciler in every mode (`overlong_entries`, like

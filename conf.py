@@ -342,8 +342,8 @@ DEFAULTS: dict[str, Any] = {
     # the same backend, e.g. under transaction-mode pooling (a temporary
     # relation); the agent then reads its rows under the whitelisted name,
     # and the grants drift check does not see it (it lists direct grants to
-    # the profile role only: not `PUBLIC`, membership, materialized views or
-    # temporary relations). Leave it off only if an extension the agent
+    # the profile role only: not `PUBLIC`, membership or temporary
+    # relations). Leave it off only if an extension the agent
     # needs lives outside `public` (or `pg_catalog`): with it on, such an
     # extension loses its unqualified functions and operators (`ext.f(...)`,
     # `OPERATOR(ext.op)`). The schema-qualified whitelist check and the

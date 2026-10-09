@@ -216,24 +216,41 @@ def granted_tables(role: str) -> set[Relation]:
     whatever the relations' owners chose; they are compared as tuples and
     rendered for SQL only through `relation_sql`.
 
-    Limits of the inventory (`information_schema.role_table_grants`):
-    materialized views are not listed, nor are grants to `PUBLIC` or grants
-    the role holds only through membership in another role (ledger F42 /
-    F64); relations in temporary schemas are skipped. With
-    `PIN_SEARCH_PATH` off, a relation shadowing a whitelisted name and
-    readable through any of these is served to the agent and never
-    reported (docs/architecture.md "`search_path` is pinned only on
-    request")."""
+    Read from the catalog (`pg_class.relacl`, through `aclexplode`, the
+    owner's implicit privileges where it is NULL), as
+    `information_schema.role_table_grants` reads it, with materialized
+    views included: the view lists tables, views, foreign and partitioned
+    tables only, so a SELECT grant on a materialized view was never seen —
+    a whitelisted one was drift on every run, and once `--apply` re-read
+    its grants (`_apply_and_verify`), `--apply` failed on it too (ledger
+    F42, materialized-view half). For the other kinds the rows are the
+    view's: a direct grant whose grantee is `role` (the view also filters
+    to grants that involve a role the login has enabled; the login is a
+    member of every profile role — `has_role_membership` — so that filter
+    drops nothing here).
+
+    Limits of the inventory: grants to `PUBLIC` and grants the role holds
+    only through membership in another role are not listed (ledger F42 /
+    F64), nor are sequences or column-level grants; relations in
+    temporary schemas are skipped. With `PIN_SEARCH_PATH` off, a relation
+    shadowing a whitelisted name and readable through any of these is
+    served to the agent and never reported (docs/architecture.md
+    "`search_path` is pinned only on request")."""
     _verify_default_alias()
     with connection.cursor() as cur:
         cur.execute(
             r"""
-            SELECT table_schema, table_name
-            FROM information_schema.role_table_grants
-            WHERE grantee = %s
-              AND privilege_type = 'SELECT'
-              AND table_schema NOT IN ('pg_catalog', 'information_schema')
-              AND table_schema NOT LIKE 'pg\_%%'
+            SELECT n.nspname, c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(
+                coalesce(c.relacl, acldefault('r', c.relowner))
+            ) AS a
+            WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s)
+              AND a.privilege_type = 'SELECT'
+              AND c.relkind IN ('r', 'v', 'f', 'p', 'm')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname NOT LIKE 'pg\_%%'
             """,
             [role],
         )
@@ -569,10 +586,9 @@ def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
     changes (with no privilege at all it raises "permission denied"); a
     REVOKE also removes only grants its role made itself. Before,
     `--apply` reported such statements as applied and exited 0 while check
-    mode kept reporting the same drift. A whitelisted materialized view
-    fails here too: the inventory (`information_schema`) never lists its
-    grants, so its GRANT never shows (check mode reports it on every run
-    as well — `granted_tables`)."""
+    mode kept reporting the same drift. The re-read is `granted_tables`,
+    check mode's own inventory, so what passes here is what check mode
+    then reports in sync."""
     with transaction.atomic():
         for profile, drift in drifts:
             _apply_drift(profile.role, drift)
@@ -588,23 +604,15 @@ def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
 def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
     """Name each profile's drift `--apply` left, with each relation's owner
     and the login that ran the statements."""
-    info = _catalog_info({r for d in left.values() for r in d.granted + d.revoked})
+    owners = _owners({r for d in left.values() for r in d.granted + d.revoked})
 
     def shown(relations: list[Relation]) -> str:
-        out = []
-        for relation in relations:
-            text = relation_display(relation)
-            if relation in info:
-                owner, relkind = info[relation]
-                text += f" (owner {quote_ident(owner)}"
-                if relkind == "m":
-                    text += (
-                        "; a materialized view: information_schema lists no "
-                        "grants on one, so the drift check never sees them"
-                    )
-                text += ")"
-            out.append(text)
-        return ", ".join(out)
+        return ", ".join(
+            f"{relation_display(r)} (owner {quote_ident(owners[r])})"
+            if r in owners
+            else relation_display(r)
+            for r in relations
+        )
 
     lines = []
     for name, drift in left.items():
@@ -616,39 +624,35 @@ def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
         cur.execute("SELECT current_user")
         login = cur.fetchone()[0]
     return (
-        "After the GRANT / REVOKE statements the grants still drift, so "
-        "nothing was applied (rolled back):\n"
+        "GRANT / REVOKE ran but PostgreSQL left these privileges unchanged "
+        "(it only warns when a role may not change a privilege), so nothing "
+        "was applied:\n"
         + "\n".join(lines)
-        + "\nPostgreSQL only warns, changing nothing, when the role running "
-        f"a GRANT / REVOKE (the login running mcp_sql_grants, {login!r}) "
-        "may not change the privilege: it can grant or revoke only on a "
-        "relation it owns (or whose owning role it is a member of) or holds "
-        "WITH GRANT OPTION on, and REVOKE removes only the grants it made "
-        "itself. Run `mcp_sql_grants --apply` as the relations' owner, or "
-        "have the owner run the statements `mcp_sql_grants` prints without "
-        "--apply."
+        + f"\nThe login running mcp_sql_grants ({login!r}) can grant or "
+        "revoke a privilege only on a relation it owns (or whose owning role "
+        "it is a member of) or holds WITH GRANT OPTION on, and REVOKE "
+        "removes only the grants it made itself. Run `mcp_sql_grants "
+        "--apply` as the relations' owner, or have the owner run the "
+        "statements `mcp_sql_grants` prints without --apply."
     )
 
 
-def _catalog_info(relations: set[Relation]) -> dict[Relation, tuple[str, str]]:
-    """`(owning role, relkind)` of each of `relations` that exists."""
+def _owners(relations: set[Relation]) -> dict[Relation, str]:
+    """The owning role of each of `relations` that exists, by relation."""
     if not relations:
         return {}
     schemas, names = zip(*sorted(relations), strict=True)
     with connection.cursor() as cur:
         cur.execute(
             """
-            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), c.relkind
+            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner)
             FROM unnest(%s::text[], %s::text[]) AS r(nspname, relname)
             JOIN pg_namespace n ON n.nspname = r.nspname
             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = r.relname
             """,
             [list(schemas), list(names)],
         )
-        return {
-            (str(s), str(n)): (str(owner), str(kind))
-            for s, n, owner, kind in cur.fetchall()
-        }
+        return {(str(s), str(n)): str(owner) for s, n, owner in cur.fetchall()}
 
 
 def _apply_drift(role: str, drift: ProfileDrift) -> None:
