@@ -426,8 +426,9 @@ a DBA's database- or login-level `search_path` does the same by
 accident. The drift check (`mcp_sql_grants`) does **not** see such a
 shadow: its inventory lists only direct grants to the profile role, not
 grants to `PUBLIC`, through role membership, on materialized views or
-on temporary relations. See `docs/architecture.md` → "`search_path` is
-pinned only on request" for what each mode guarantees. In both modes a
+on temporary relations. `manage.py check --deploy` warns
+(`mcp_sql.W001`) while the pin is off. See `docs/architecture.md` →
+"`search_path` is pinned only on request" for what each mode guarantees. In both modes a
 direct SELECT grant to the profile role on a relation in another schema
 (a `GRANT SELECT ON ALL TABLES IN SCHEMA …`, a same-named copy of a
 whitelisted table) is drift:

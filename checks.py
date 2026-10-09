@@ -7,8 +7,9 @@ IDs are `mcp_sql.<level><nnn>`, Django's `<app label>.<E|W><number>` shape:
   `runserver`): a whitelisted model's unqualified `db_table` names no
   relation in `public` while the login's `search_path` finds it in another
   schema (`grants.relations_off_default_schema`).
-- `mcp_sql.W001` (deploy-only, `check --deploy`): `MCP_SQL["PIN_SEARCH_PATH"]`
-  is off.
+- `mcp_sql.W001` (`Tags.security`, deploy-only: `check --deploy`):
+  `MCP_SQL["PIN_SEARCH_PATH"]` is off, so a relation earlier on the
+  `search_path` can shadow a whitelisted name unreported.
 """
 
 from collections.abc import Iterable
@@ -20,6 +21,7 @@ from django.apps import apps
 from django.core.checks import CheckMessage
 from django.core.checks import Error
 from django.core.checks import Tags
+from django.core.checks import Warning as CheckWarning
 from django.core.checks import register
 from django.db import DEFAULT_DB_ALIAS
 from django.db import connections
@@ -82,3 +84,36 @@ def check_whitelist_schemas(
                 Error(message, hint=remedy, obj=models[entry], id="mcp_sql.E001")
             )
     return errors
+
+
+@register(Tags.security, deploy=True)
+def check_search_path_pinned(
+    app_configs: Sequence[AppConfig] | None = None, **kwargs: Any
+) -> list[CheckMessage]:
+    """`mcp_sql.W001` (`check --deploy` only): `PIN_SEARCH_PATH` is off.
+
+    The default stays off (an extension outside `public` keeps its
+    unqualified functions and operators); the deploy check is where an
+    install that never chose says so. docs/architecture.md "`search_path`
+    is pinned only on request" has what each mode guarantees."""
+    if mcp_sql_settings.PIN_SEARCH_PATH:
+        return []
+    return [
+        CheckWarning(
+            'MCP_SQL["PIN_SEARCH_PATH"] is False: an unqualified table name '
+            "in an agent's query resolves through the database's own "
+            "search_path, so a same-named relation in a schema searched "
+            'before public (a "$user" schema named after the profile role, '
+            "a temporary relation on a backend shared under transaction-mode "
+            "pooling) is served under the whitelisted name, and "
+            "mcp_sql_grants does not see it.",
+            hint=(
+                'Turn it on: MCP_SQL["PIN_SEARCH_PATH"] = True. Functions and '
+                "operators of an extension installed outside public then "
+                "need qualifying (ext.f(...), OPERATOR(ext.op)). See "
+                'docs/architecture.md "`search_path` is pinned only on '
+                'request".'
+            ),
+            id="mcp_sql.W001",
+        )
+    ]

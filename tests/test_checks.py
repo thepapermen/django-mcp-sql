@@ -110,3 +110,37 @@ class TestE001:
                 sender=apps.get_app_config("mcp_sql"), using="default"
             )
         assert f"finds it in schema {_SCHEMA!r}" in caplog.text
+
+
+class TestW001:
+    """`check --deploy` warns while `PIN_SEARCH_PATH` is off (the default,
+    kept: an extension outside `public` keeps its unqualified functions)."""
+
+    @staticmethod
+    def _w001(**kwargs) -> list:
+        return [m for m in run_checks(**kwargs) if m.id == "mcp_sql.W001"]
+
+    def test_warns_when_off(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": False}
+        [warning] = self._w001(include_deployment_checks=True)
+        assert not warning.is_serious()
+        assert '"$user"' in warning.msg
+        assert "mcp_sql_grants does not see it" in warning.msg
+        assert 'PIN_SEARCH_PATH"] = True' in warning.hint
+
+    def test_warns_on_the_shipped_default(self, settings):
+        assert "PIN_SEARCH_PATH" not in settings.MCP_SQL
+        assert len(self._w001(include_deployment_checks=True)) == 1
+
+    def test_silent_when_on(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": True}
+        assert self._w001(include_deployment_checks=True) == []
+
+    def test_deploy_only(self, settings):
+        settings.MCP_SQL = {**settings.MCP_SQL, "PIN_SEARCH_PATH": False}
+        assert self._w001() == []
+        out = StringIO()
+        # `--tag security`: other test modules register throwaway models a
+        # full `check` would report.
+        call_command("check", "--deploy", "--tag", "security", stdout=out, stderr=out)
+        assert "mcp_sql.W001" in out.getvalue()

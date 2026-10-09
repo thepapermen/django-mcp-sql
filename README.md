@@ -153,7 +153,8 @@ the package itself never imports `sentry_sdk`.
 >   database, or another session on the same pooled backend — can plant a
 >   same-named relation readable by `PUBLIC` and have the agent read *its*
 >   rows under a whitelisted name (curated view included), which
->   `mcp_sql_grants` does not report. See
+>   `mcp_sql_grants` does not report; `manage.py check --deploy` warns
+>   (`mcp_sql.W001`) while it is off. See
 >   [docs/architecture.md](docs/architecture.md) "`search_path` is pinned
 >   only on request".
 > - **Revoke `CREATE` on schema `public` from `PUBLIC`** (PostgreSQL 14 and
@@ -354,7 +355,8 @@ MCP_SQL = {
     # agent reads its rows under the whitelisted name; mcp_sql_grants does
     # not detect it. Leave it off only if an extension the agent uses lives
     # outside `public` — and even then, with it on, the agent can write
-    # `ext.f(x)` / `OPERATOR(ext.op)`.
+    # `ext.f(x)` / `OPERATOR(ext.op)`. Left off, `check --deploy` warns
+    # (mcp_sql.W001).
     # See docs/architecture.md "`search_path` is pinned only on request".
     "PIN_SEARCH_PATH": True,
 }

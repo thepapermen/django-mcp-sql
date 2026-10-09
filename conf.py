@@ -349,7 +349,9 @@ DEFAULTS: dict[str, Any] = {
     # `OPERATOR(ext.op)`). The schema-qualified whitelist check and the
     # every-schema grants inventory apply either way. Neither mode stops a
     # function / operator overload planted in `public` (`public` stays on
-    # the path): revoke `PUBLIC`'s CREATE there (docs/role-setup.md). See
+    # the path): revoke `PUBLIC`'s CREATE there (docs/role-setup.md). While
+    # it is off, `manage.py check --deploy` warns (`mcp_sql.W001`,
+    # `checks.py`). See
     # docs/architecture.md "`search_path`".
     "PIN_SEARCH_PATH": False,
 }
