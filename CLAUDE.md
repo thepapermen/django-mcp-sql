@@ -62,7 +62,14 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   revocation deletes codes and families BEFORE the tokens (refresh tokens
   locked first) — so a request in flight is waited for and deleted, and a
   later one finds nothing to mint from. Keep both orders for any new token
-  path or revocation (`tests/test_revocation_race.py`).
+  path or revocation (`tests/test_revocation_race.py`). The refresh-token
+  lock stays `select_for_update(of=("self",))` (a bare one locks the
+  `Application` row for every user), the consent-record prune stays
+  `skip_locked`, and only a deadlock (40P01) is retried. A code exchange
+  deletes its `Grant` inside that locked save, and
+  `invalidate_authorization_code` accepts only the code this request's save
+  consumed, read with `vars(request)` (oauthlib's `Request.__getattr__`
+  answers from client-sent parameters).
 - **Functions that run SQL given as text are denied by name** (the
   `query_to_xml` / `schema_to_xml` / `database_to_xml` families, `ts_stat`,
   `ts_rewrite`, `crosstab`/`crosstab2..4`/`crosstab_*`, `connectby`,

@@ -325,7 +325,23 @@ below precisely because they do **not** announce themselves.
   first and refresh tokens are locked before deletion; every token request
   locks the code or consent record it mints from in its saving transaction. A
   request in flight is waited for and its tokens deleted with the rest; a
-  later one gets `invalid_grant` with nothing minted.
+  later one gets `invalid_grant` with nothing minted. A revocation that
+  PostgreSQL aborts to break a deadlock (DOT's `cleartokens` locks tokens in
+  the reverse order of DOT's own revocation) is run again, up to 3 times,
+  logged at WARNING.
+- **Security: two concurrent exchanges of one authorization code could both
+  mint tokens.** oauthlib deletes the code only after the tokens are saved,
+  so a second exchange validated in between minted a second, live pair (its
+  response was `invalid_grant`, its tokens stayed). The code is now consumed
+  in the transaction that saves the tokens: the other exchange is refused
+  with nothing minted. Tokens already issued from a code presented again are
+  still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **Docs: the operator's token-revocation snippet missed refresh tokens.**
+  `docs/oauth.md` (linked from `docs/role-setup.md`) now deletes codes,
+  consent records, refresh tokens and access tokens in one transaction, in
+  the order the package revokes them, and explains how to keep the
+  refresh-token table bounded (DOT's `REFRESH_TOKEN_EXPIRE_SECONDS` at least
+  the cap, and `cleartokens` on a schedule).
 - **`invalid_grant` raised after validation is answered as JSON** with
   `Cache-Control: no-store`, not DOT's `text/html` 400.
 - **Docs: `pg_catalog` first on the search path does not stop overloads
