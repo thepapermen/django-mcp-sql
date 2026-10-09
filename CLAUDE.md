@@ -54,6 +54,20 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   grant / refresh token stored before that in another accepted spelling
   (`audience.use_granted_spelling`). The rewrite touches accepted values
   only: a foreign one stays foreign.
+- **Refresh on requires reuse detection; token requests lock their source.**
+  With `REFRESH_TOKEN_MAX_AGE_SECONDS > 0`, boot refuses unless DOT's
+  `REFRESH_TOKEN_REUSE_PROTECTION` is True. `save_bearer_token` locks the
+  `Grant` (code exchange) or `MCPRefreshTokenFamily` (rotation) it mints from
+  `FOR UPDATE` in its saving transaction, and the logout / password-change
+  revocation deletes codes and families BEFORE the tokens (refresh tokens
+  locked first) — so a request in flight is waited for and deleted, and a
+  later one finds nothing to mint from. Keep both orders for any new token
+  path or revocation (`tests/test_revocation_race.py`).
+- **Functions that run SQL given as text are denied by name** (the
+  `query_to_xml` / `schema_to_xml` / `database_to_xml` families, `ts_stat`,
+  `ts_rewrite`, `crosstab*`, `connectby`, `xpath_table`): the inner query never
+  enters the parser. Any new such built-in or common extension function goes
+  on the deny list.
 - **Per-request `FastMCP` instantiation is deliberate** (tool closures over
   the authenticated user). Tools are `async def`, dispatch ORM work via
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is
