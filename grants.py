@@ -10,7 +10,8 @@ that profile's whitelist independently (per-role drift — never global).
 - `strict=False`: env-level preflight failures (role missing,
   no membership) log a WARNING and return an empty `DriftDiff` with
   `skipped_reason` set. Code-level misconfigs (self-referential
-  whitelist, overlong `db_table`) raise regardless. Used by the
+  whitelist, overlong `db_table`, an unqualified `db_table` found only
+  outside `public`) raise regardless. Used by the
   `post_migrate` signal so a fresh environment without `role_setup.sql`
   does not crash `migrate`.
 - `apply=True`: also execute the GRANT / REVOKE statements implied by the
@@ -327,9 +328,16 @@ def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
     with `relation "public.<name>" does not exist`, and an unmanaged one's
     view-parity probe fails the same way. Resolved as Postgres resolves an
     unqualified name on this connection (`current_schemas(true)`: the
-    schemas on the `search_path` that exist and the login may use, with
-    `pg_catalog` and the session's temporary schema where Postgres implies
-    them), from the catalog, so no name is parsed as SQL. A `db_table`
+    schemas on the `search_path` that exist and the login may use), from
+    the catalog, so no name is parsed as SQL. Both sides count only the
+    relation kinds the inventory does (`granted_tables`: tables, views,
+    materialized views, foreign and partitioned tables), so a same-named
+    index, sequence or composite type neither stands for the relation in
+    `public` nor is reported as found elsewhere. The system schemas
+    `current_schemas(true)` adds are not searched: `pg_catalog`, and the
+    session's temporary schema (a temporary relation is the shadowing case
+    `PIN_SEARCH_PATH` is for, docs/architecture.md "`search_path` is pinned
+    only on request" — not a place a `db_table` could name). A `db_table`
     that is nowhere yet (a migration still to run) is not reported."""
     _verify_default_alias()
     names = {
@@ -341,13 +349,16 @@ def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
         return {}
     with connection.cursor() as cur:
         cur.execute(
-            """
+            r"""
             SELECT w.name, (
                 SELECT s.nspname
                 FROM unnest(current_schemas(true)) WITH ORDINALITY
                     AS s(nspname, pos)
                 JOIN pg_namespace n ON n.nspname = s.nspname
                 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = w.name
+                WHERE c.relkind IN ('r', 'v', 'f', 'p', 'm')
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND n.nspname NOT LIKE 'pg\_%%'
                 ORDER BY s.pos
                 LIMIT 1
             )
@@ -357,6 +368,7 @@ def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname = %s AND c.relname = w.name
+                  AND c.relkind IN ('r', 'v', 'f', 'p', 'm')
             )
             """,
             [sorted(set(names.values())), DEFAULT_SCHEMA],
@@ -365,23 +377,52 @@ def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
     return {entry: found[name] for entry, name in names.items() if name in found}
 
 
+def qualified_db_table(relation: Relation) -> str | None:
+    """The `db_table` that names `relation` (`schema"."name`), or None when
+    no `db_table` can: Django quotes a `db_table` by wrapping it in `"`
+    without doubling any inside it, so a name holding `"` breaks out of its
+    identifier, and the package reads `"."` as the schema separator
+    (`parser.relation_of`). A name with a character that does not print is
+    refused too, so a printed remedy shows what it names."""
+    if any('"' in part or not part.isprintable() for part in relation):
+        return None
+    return '{}"."{}'.format(*relation)
+
+
 def off_default_schema_message(
     profile_name: str, entry: str, db_table: str, schema: str
 ) -> tuple[str, str]:
     """`(message, remedy)` for an entry `relations_off_default_schema`
     reported: shared by the system check (`mcp_sql.E001`) and the
-    reconciler, so `check`, `migrate` and `mcp_sql_grants` say the same."""
+    reconciler, so `check`, `migrate` and `mcp_sql_grants` say the same.
+
+    `schema` is a catalog name (untrusted: whoever may create a schema
+    chooses it), shown only as `quote_ident` renders it, and offered as a
+    `db_table` only when one can name it (`qualified_db_table`), as a
+    Python literal (`repr`)."""
+    relation = (schema, relation_of(db_table)[1])
     message = (
         f"MCP_SQL profile {profile_name!r} whitelists {entry}, whose db_table "
         f"{db_table!r} names no schema, so it is the relation in schema "
         f"{DEFAULT_SCHEMA!r} to the parser, mcp_sql_grants and the read path; "
         f"there is none there — the login's search_path finds it in schema "
-        f"{schema!r}."
+        f"{quote_ident(schema)}."
     )
-    qualified = f'{schema}"."{relation_of(db_table)[1]}'
+    qualified = qualified_db_table(relation)
+    if qualified is None:
+        name_it = (
+            f"No db_table can name {relation_sql(relation)} (Django does not "
+            "escape a double quote in one, and a name that does not print is "
+            "not offered): rename the schema or the relation, then name the "
+            "schema in db_table (and grant the profile role USAGE on it)."
+        )
+    else:
+        name_it = (
+            f"Name the schema: db_table = {qualified!r} (and grant the "
+            "profile role USAGE on the schema)."
+        )
     remedy = (
-        f"Name the schema: db_table = {qualified!r} (and grant the profile "
-        "role USAGE on the schema). For a model you cannot edit (a "
+        f"{name_it} For a model you cannot edit (a "
         "third-party app), whitelist instead an unmanaged model of your own "
         "(Meta.managed = False) with that db_table, declaring exactly the "
         "relation's columns, or a curated view in public over the relation "
@@ -525,6 +566,12 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
         )
         raise GrantsReconcileError(msg)
 
+    # Before the role checks: it reads the login's `search_path`, not the
+    # role, and the system check (`mcp_sql.E001`) leaves an entry whose app
+    # had migrations to apply to this, the `post_migrate` receiver's run —
+    # on a fresh database, where the role is likeliest still to be created.
+    _verify_off_default_schema(profile)
+
     if not role_exists(profile.role):
         msg = (
             f"Role {profile.role} (profile {profile.name!r}) does not exist. "
@@ -546,8 +593,6 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
             raise GrantsReconcileError(msg)
         logger.warning("MCP grants reconcile skipped: %s", msg)
         return ProfileDrift(skipped_reason="no_membership")
-
-    _verify_off_default_schema(profile)
 
     # Curated MCPxxx view ↔ unmanaged-model column parity. Runs here
     # rather than as a separate helper because the parity contract is

@@ -20,6 +20,7 @@ from mcp_sql.session import session_drift
 # PG SQLSTATEs we expect when the readonly guard or grants reject a write.
 PGCODE_READ_ONLY_SQL_TRANSACTION = "25006"
 PGCODE_INSUFFICIENT_PRIVILEGE = "42501"
+PGCODE_UNDEFINED_TABLE = "42P01"
 EXPECTED_REJECTION_PGCODES = frozenset(
     {PGCODE_READ_ONLY_SQL_TRANSACTION, PGCODE_INSUFFICIENT_PRIVILEGE}
 )
@@ -237,7 +238,19 @@ class Command(BaseCommand):
             assert cur.fetchone() == (1,)
             # `table` is a `db_table` (`schema"."name` names another schema).
             read = f"SELECT 1 FROM {grants.relation_sql(relation_of(table))} LIMIT 1"  # noqa: S608
-            cur.execute(read)
+            try:
+                cur.execute(read)
+            except DatabaseError as exc:
+                if pgcode(exc) != PGCODE_UNDEFINED_TABLE:
+                    raise
+                msg = (
+                    f"{grants.relation_display(relation_of(table))} does not "
+                    f"exist: db_table {table!r} names it. An unqualified "
+                    "db_table is the relation in schema public; if the table "
+                    "lives in another schema, `manage.py check --database "
+                    "default` reports it (mcp_sql.E001) with the remedy."
+                )
+                raise CommandError(msg) from exc
             cur.fetchall()
         self.stdout.write(
             self.style.SUCCESS(

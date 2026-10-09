@@ -157,6 +157,13 @@ def test_public_create_revoke_is_recommended_commented_out_in_both(pin):
     assert "NOT applied by this script" in _public_schema_block(static)
 
 
+def test_public_create_revoke_block_is_last_in_both(pin):
+    """The docs call it the last statement of both: the static file had it
+    before its membership `BEGIN … COMMIT` block, the command after."""
+    for sql in (_emit_sql(), _static_sql()):
+        assert sql.rstrip("\n").endswith(_public_schema_block(sql))
+
+
 @pytest.mark.django_db
 def test_the_commented_revoke_closes_public_create():
     with connection.cursor() as cur:
