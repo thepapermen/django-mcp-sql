@@ -401,7 +401,13 @@ Expected (with `auth.Permission` whitelisted):
 A whitelisted `db_table` is the relation in `public`, unless the
 `db_table` names a schema (`schema"."name`, Django's spelling of a
 schema-qualified table; the role then also needs `USAGE` on that schema,
-which the package does not grant). The parser refuses a qualified
+which the package does not grant). An unqualified `db_table` whose table
+lives only in another schema on the app login's `search_path` is an
+error — system check `mcp_sql.E001` on `migrate` / `check --database
+default`, and a refusal from `mcp_sql_grants` naming the schema: qualify
+the `db_table`, or for a third-party model whitelist your own unmanaged
+model with a qualified `db_table`, or a curated view in `public`
+(`docs/architecture.md` → "Whitelist contract"). The parser refuses a qualified
 reference to a relation in any other schema. An unqualified name is the
 relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
 read path then pins `search_path` to `public, pg_temp`) — **set it**,

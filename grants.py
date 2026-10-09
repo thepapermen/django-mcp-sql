@@ -36,6 +36,7 @@ from django.db import transaction
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.parser import DEFAULT_SCHEMA
+from mcp_sql.parser import names_schema
 from mcp_sql.parser import relation_of
 
 logger = logging.getLogger(__name__)
@@ -298,6 +299,96 @@ def overlong_entries(profile: Profile) -> list[str]:
     ]
 
 
+def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
+    """`{entry: schema}` for each unqualified `db_table` in `tables`
+    (`{dotted_path: db_table}`) that names no relation in `DEFAULT_SCHEMA`
+    while the login's `search_path` finds one of that name in `schema`.
+
+    An unqualified `db_table` is the relation in `public` to the parser,
+    the grants and the read path (round 16; until 0.1.0b5 GRANT resolved it
+    through the login's `search_path`). For such an entry `--apply` fails
+    with `relation "public.<name>" does not exist`, and an unmanaged one's
+    view-parity probe fails the same way. Resolved as Postgres resolves an
+    unqualified name on this connection (`current_schemas(true)`: the
+    schemas on the `search_path` that exist and the login may use, with
+    `pg_catalog` and the session's temporary schema where Postgres implies
+    them), from the catalog, so no name is parsed as SQL. A `db_table`
+    that is nowhere yet (a migration still to run) is not reported."""
+    _verify_default_alias()
+    names = {
+        entry: relation_of(table)[1]
+        for entry, table in tables.items()
+        if not names_schema(table)
+    }
+    if not names:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT w.name, (
+                SELECT s.nspname
+                FROM unnest(current_schemas(true)) WITH ORDINALITY
+                    AS s(nspname, pos)
+                JOIN pg_namespace n ON n.nspname = s.nspname
+                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = w.name
+                ORDER BY s.pos
+                LIMIT 1
+            )
+            FROM unnest(%s::text[]) AS w(name)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = w.name
+            )
+            """,
+            [sorted(set(names.values())), DEFAULT_SCHEMA],
+        )
+        found = {str(name): str(schema) for name, schema in cur.fetchall() if schema}
+    return {entry: found[name] for entry, name in names.items() if name in found}
+
+
+def off_default_schema_message(
+    profile_name: str, entry: str, db_table: str, schema: str
+) -> tuple[str, str]:
+    """`(message, remedy)` for an entry `relations_off_default_schema`
+    reported: shared by the system check (`mcp_sql.E001`) and the
+    reconciler, so `check`, `migrate` and `mcp_sql_grants` say the same."""
+    message = (
+        f"MCP_SQL profile {profile_name!r} whitelists {entry}, whose db_table "
+        f"{db_table!r} names no schema, so it is the relation in schema "
+        f"{DEFAULT_SCHEMA!r} to the parser, mcp_sql_grants and the read path; "
+        f"there is none there — the login's search_path finds it in schema "
+        f"{schema!r}."
+    )
+    qualified = f'{schema}"."{relation_of(db_table)[1]}'
+    remedy = (
+        f"Name the schema: db_table = {qualified!r} (and grant the profile "
+        "role USAGE on the schema). For a model you cannot edit (a "
+        "third-party app), whitelist instead an unmanaged model of your own "
+        "(Meta.managed = False) with that db_table, declaring exactly the "
+        "relation's columns, or a curated view in public over the relation "
+        '(docs/architecture.md "Curated-view pattern").'
+    )
+    return message, remedy
+
+
+def _verify_off_default_schema(profile: Profile) -> None:
+    """Raise `GrantsReconcileError` for an entry that names a relation
+    `public` does not have but the `search_path` does
+    (`relations_off_default_schema`) — before the view-parity probe and
+    GRANT would fail on it with a bare `ProgrammingError` (which the
+    `post_migrate` receiver let through, failing `migrate`)."""
+    tables = declared_tables(profile)
+    off = relations_off_default_schema(tables)
+    if off:
+        msg = "\n".join(
+            " ".join(off_default_schema_message(profile.name, e, tables[e], schema))
+            for e, schema in sorted(off.items())
+        )
+        raise GrantsReconcileError(msg)
+
+
 def _verify_view_parity(profile: Profile) -> None:
     """Raise on column-list drift between unmanaged whitelist models and their views.
 
@@ -438,6 +529,8 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
             raise GrantsReconcileError(msg)
         logger.warning("MCP grants reconcile skipped: %s", msg)
         return ProfileDrift(skipped_reason="no_membership")
+
+    _verify_off_default_schema(profile)
 
     # Curated MCPxxx view ↔ unmanaged-model column parity. Runs here
     # rather than as a separate helper because the parity contract is

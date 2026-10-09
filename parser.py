@@ -2818,12 +2818,24 @@ def relation_of(db_table: str) -> tuple[str, str]:
     `widget` in the schema `analytics`; any other `db_table` (`'"t"'`
     included) names a relation in `DEFAULT_SCHEMA`.
     """
+    schema, name = _split_db_table(db_table)
+    return (DEFAULT_SCHEMA if schema is None else schema), name
+
+
+def names_schema(db_table: str) -> bool:
+    """Whether a `db_table` names its schema (`schema"."name`); an
+    unqualified one is the relation in `DEFAULT_SCHEMA` (`relation_of`)."""
+    return _split_db_table(db_table)[0] is not None
+
+
+def _split_db_table(db_table: str) -> tuple[str | None, str]:
+    """A `db_table` as `(schema, name)` — `schema` None when it names none."""
     quoted = len(db_table) > 1 and db_table[0] == db_table[-1] == '"'
     inner = db_table[1:-1] if quoted else db_table
     schema, dot, name = inner.partition('"."')
     if dot:
         return schema, name
-    return DEFAULT_SCHEMA, inner
+    return None, inner
 
 
 def _table_relation(table: exp.Table) -> tuple[str, str]:
