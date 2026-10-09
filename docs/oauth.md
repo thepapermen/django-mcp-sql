@@ -300,11 +300,38 @@ refresh on, the same hard cap applies as on the package's endpoints); and a
 Off by default: `ACCESS_TOKEN_EXPIRE_SECONDS` (6 h in the documented
 settings) is then the re-consent interval. Set
 `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` to a positive number of seconds
-to turn them on:
+to turn them on, together with DOT's
+`OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"] = True` — the app refuses
+to boot (`ImproperlyConfigured`) with refresh on and that setting anything
+but `True`:
 
 - The authorization-code exchange returns a `refresh_token`; every refresh
   rotates it (the presented token is spent, a new one is issued in the same
   chain), whatever DOT's `ROTATE_REFRESH_TOKEN` says.
+- **Replay revokes the chain.** Presenting a rotated-out refresh token
+  makes DOT revoke every refresh token of its chain and delete their access
+  tokens (`REFRESH_TOKEN_REUSE_PROTECTION`, by `token_family`). Whoever
+  rotated first — the legitimate client or someone who stole the token —
+  the other party's replay ends the chain for both, and the user
+  re-authorizes. Rotation alone would only refuse the replay: a thief who
+  used a stolen token first kept a working chain until the cap, and the
+  legitimate client merely got `invalid_grant`. OAuth 2.1 §4.3.1 and
+  RFC 9700 §4.14.2 require rotation with this detection for public clients,
+  which every MCP client is. The setting is install-global: it applies to
+  every OAuth application on the install, not only MCP's.
+- Keep DOT's `REFRESH_TOKEN_GRACE_PERIOD_SECONDS` at its default `0`, or a
+  few seconds at most. Within it, presenting the token rotated out last
+  returns the chain's current tokens instead of revoking the chain (so a
+  client retrying a refresh whose response it lost is not cut off) — to
+  whoever presents it, so a stolen token replayed within the window shares
+  the chain undetected. Truly concurrent refreshes of one token do not need
+  it: they serialize, and the later one gets the earlier one's tokens. The
+  package does not bound it.
+- Reuse detection matches a replay against the rotated-out rows, so they
+  must outlive the replay: DOT's `cleartokens` keeps them, with reuse
+  protection on, until `REFRESH_TOKEN_EXPIRE_SECONDS` has passed (never at
+  the documented `0`). Rows of a chain past the cap below can go — the
+  package refuses every token of such a chain anyway.
 - **Hard cap from the consent.** The package records when each chain
   started (the authorization-code exchange; `MCPRefreshTokenFamily`) and
   refuses a refresh once `REFRESH_TOKEN_MAX_AGE_SECONDS` has passed since
@@ -328,9 +355,6 @@ to turn them on:
 - Logout and a password change delete the user's MCP refresh tokens with
   the access tokens (see "Revoking access").
 
-Consider DOT's `REFRESH_TOKEN_REUSE_PROTECTION = True` as well: replaying a
-rotated-out refresh token then revokes the whole chain.
-
 ## Security posture: what each optional layer adds
 
 The OAuth and SQL boundaries hold on their own; three layers are optional and
@@ -342,7 +366,7 @@ test-minimal`) to prove the first column.
 |---|---|---|---|---|
 | Who can get a token | Active user holding exactly one MCP profile, through `/o/authorize/` (consent screen for every client) | A verified second factor, at issuance and on every request | — | — |
 | How long a token works | 6 h access token; no refresh | — | Only while the user has a live web session (`SESSION_COOKIE_AGE`) | Opt-in: refresh for at most the cap after consent (access then ends ≤ 6 h later) |
-| What ends access early | Losing active / the profile (checked every request); logout; password change; deleting the tokens | Removing the MFA device | Expiry or deletion of every web session | — |
+| What ends access early | Losing active / the profile (checked every request); logout; password change; deleting the tokens | Removing the MFA device | Expiry or deletion of every web session | A replay of a rotated-out refresh token ends its chain (reuse protection, required with refresh on) |
 | What the token can do | Read-only `SELECT` on the profile's whitelisted tables, in a read-only, rolled-back transaction, through the checked SQL only | — | — | — |
 
 ## Dynamic Client Registration (RFC 7591)

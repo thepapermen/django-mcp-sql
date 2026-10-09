@@ -790,6 +790,34 @@ def _validate_raw_types(cfg: Mapping[str, Any]) -> None:
         raise ImproperlyConfigured(msg)
 
 
+def _validate_refresh_reuse_protection(refresh_cap: int) -> None:
+    """Refresh tokens on → DOT's `REFRESH_TOKEN_REUSE_PROTECTION` must be on.
+
+    Every refresh rotates (`MCPOAuth2Validator.rotate_refresh_token`), but
+    rotation alone only spends the presented token: whoever presents a
+    stolen one first keeps a valid chain until the cap, and the other party
+    just gets `invalid_grant`. With reuse protection, presenting a
+    rotated-out token revokes the whole chain (DOT's
+    `RefreshToken.revoke_family`, by `token_family`) — attacker and
+    legitimate client alike, so the user re-authorizes. OAuth 2.1 §4.3.1 and
+    RFC 9700 §4.14.2 require rotation WITH that detection for public
+    clients, which every MCP client is. A simple strict rule: any positive
+    cap requires the literal `True` (read through DOT's own accessor, so it
+    is the value DOT enforces); refresh off requires nothing.
+    """
+    from oauth2_provider.settings import oauth2_settings
+
+    if refresh_cap > 0 and oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION is not True:
+        msg = (
+            "MCP_SQL.REFRESH_TOKEN_MAX_AGE_SECONDS enables refresh tokens, which "
+            "requires OAUTH2_PROVIDER['REFRESH_TOKEN_REUSE_PROTECTION'] = True "
+            f"(got {oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION!r}): without "
+            "it, a stolen refresh token used first keeps a working chain until "
+            "the cap. See docs/oauth.md → 'Refresh tokens (opt-in)'."
+        )
+        raise ImproperlyConfigured(msg)
+
+
 def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
     """Validate the consumer's `MCP_SQL` dict on startup.
 
@@ -812,6 +840,8 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
       installed `Application` model's `client_id` and `name` columns.
     - Each entry in `CLIENTS` normalises through the same builder the
       runtime accessor uses, and the redirect schemes it needs are allowed.
+    - Refresh tokens on (`REFRESH_TOKEN_MAX_AGE_SECONDS > 0`) require DOT's
+      `REFRESH_TOKEN_REUSE_PROTECTION = True`.
 
     Raises `ImproperlyConfigured` on any violation so Django startup
     halts with a single, focused error rather than a cascade of
@@ -857,6 +887,7 @@ def validate_mcp_sql_settings(declared: Mapping[str, Any]) -> None:
         raise ImproperlyConfigured(msg)
 
     _validate_raw_types(cfg)
+    _validate_refresh_reuse_protection(cfg["REFRESH_TOKEN_MAX_AGE_SECONDS"])
     _validate_profiles(cfg["PROFILES"])
     _validate_application_name_lengths(
         cfg["APPLICATION_NAME"], cfg["APPLICATION_NAME_PREFIX"]

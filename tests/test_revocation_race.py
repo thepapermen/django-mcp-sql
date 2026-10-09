@@ -339,3 +339,30 @@ def test_an_exchange_in_flight_when_a_revocation_starts_loses_its_tokens(
     # it either answered with tokens since deleted, or was refused.
     assert _no_token_left(mcp_user)
     assert response.status_code == HTTPStatus.OK or _refused(response)
+
+
+def test_concurrent_refreshes_of_one_token_share_the_rotation(
+    client, mcp_user, monkeypatch
+):
+    """Two refreshes of the same token, both validated before either saves
+    (a client firing two at once), serialize on the chain's consent record:
+    the later gets the earlier's tokens, and reuse protection does not see
+    a replay (docs/oauth.md → "Refresh tokens (opt-in)")."""
+    first = consent_and_exchange(client, mcp_user)
+    with _gates(monkeypatch) as gates:
+        gates["rotate-a"] = gate_a = _Gate()
+        gates["rotate-b"] = gate_b = _Gate(at="save")
+        rotate_a = _Worker("rotate-a", _rotate(first["refresh_token"]))
+        rotate_b = _Worker("rotate-b", _rotate(first["refresh_token"]))
+        rotate_a.start()
+        assert gate_a.arrived.wait(_WAIT)
+        rotate_b.start()
+        assert gate_b.arrived.wait(_WAIT)  # B validated; A has not committed
+        gate_b.release.set()
+        _until(_someone_waits_on_a_lock, "B to block behind A")
+        gate_a.release.set()
+        a, b = rotate_a.finish(), rotate_b.finish()
+    assert a.status_code == b.status_code == HTTPStatus.OK, (a.content, b.content)
+    assert a.json()["refresh_token"] == b.json()["refresh_token"]
+    assert a.json()["access_token"] == b.json()["access_token"]
+    assert refresh(client, a.json()["refresh_token"]).status_code == HTTPStatus.OK

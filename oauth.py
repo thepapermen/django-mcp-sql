@@ -485,7 +485,10 @@ class MCPOAuth2Validator(OAuth2Validator):
     def rotate_refresh_token(self, request):
         """Always rotate: each refresh revokes the presented refresh token
         and issues a new one (in the same family), whatever DOT's
-        `ROTATE_REFRESH_TOKEN` says."""
+        `ROTATE_REFRESH_TOKEN` says. Presenting a rotated-out one revokes
+        the whole family: refresh on requires DOT's
+        `REFRESH_TOKEN_REUSE_PROTECTION = True` at boot
+        (`validation._validate_refresh_reuse_protection`)."""
         return True
 
     def validate_user(self, username, password, client, request, *args, **kwargs):

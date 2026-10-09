@@ -158,6 +158,9 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
+    # Required with refresh tokens on, which tests turn on per case
+    # (`validation._validate_refresh_reuse_protection`); inert while off.
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
     # ALLOWED_REDIRECT_URI_SCHEMES deliberately unset, so the suite runs on
     # DOT's default (["http", "https"]) — the path a real consumer is on. The
     # tests that care narrow it per-case.

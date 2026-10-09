@@ -339,8 +339,9 @@ MCP_SQL = {
                                             # does NOT qualify — its absence of a `user`
                                             # column is why the default is `None`)
     # Opt-in refresh tokens (default 0 = OFF): rotating, and refused once this
-    # many seconds have passed since the user's consent. See docs/oauth.md
-    # "Refresh tokens (opt-in)".
+    # many seconds have passed since the user's consent. Requires
+    # OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"] = True (below). See
+    # docs/oauth.md "Refresh tokens (opt-in)".
     # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
     # search_path pin — RECOMMENDED, but off by default (False). On, every
     # read transaction runs SET LOCAL search_path = public, pg_temp, so an
@@ -372,6 +373,11 @@ OAUTH2_PROVIDER = {
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Required once MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] turns refresh
+    # tokens on (the app refuses to boot otherwise); inert while they are
+    # off. Replaying a rotated-out refresh token then revokes its whole
+    # chain. Install-global: every OAuth application on the install.
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
     # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
     # in the URL query string outright, without DOT's per-request warning.
     # The package never accepts such a token either way.

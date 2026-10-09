@@ -264,8 +264,10 @@ class MCPRefreshTokenFamily(models.Model):
     the exchange stores the first refresh token
     (`MCPOAuth2Validator.save_bearer_token`). The hard cap is measured from
     it, across rotations. DOT's own rows cannot carry it: `cleartokens`
-    deletes revoked (rotated) refresh tokens, so the chain's first row does
-    not survive. A family with no row here — refresh tokens from 0.1.0b5 or
+    can delete revoked (rotated) refresh tokens (with
+    `REFRESH_TOKEN_REUSE_PROTECTION`, which refresh requires, once
+    `REFRESH_TOKEN_EXPIRE_SECONDS` has passed), so the chain's first row
+    need not survive. A family with no row here — refresh tokens from 0.1.0b5 or
     earlier, or any written outside `save_bearer_token` — is refused.
 
     Rows past the cap are pruned at each new exchange. Rows whose refresh
