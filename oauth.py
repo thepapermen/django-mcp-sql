@@ -9,6 +9,7 @@ import hashlib
 import re
 from datetime import timedelta
 from typing import TYPE_CHECKING
+from typing import Any
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
@@ -22,12 +23,16 @@ from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import is_mcp_application
 from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.views.registration import _is_loopback_redirect
+from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Application
+from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauth2_provider.models import redirect_to_uri_allowed
 from oauth2_provider.oauth2_validators import OAuth2Validator
+from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
 
 if TYPE_CHECKING:
+    from django.db.models import QuerySet
     from django.http import QueryDict
     from mcp_sql.clients import DeclaredClient
 
@@ -56,6 +61,46 @@ def _record_refresh_family(raw_refresh_token: str) -> None:
         consented_at__lte=now
         - timedelta(seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS)
     ).delete()
+
+
+def _lock_token_source(request: Any, using: str) -> None:
+    """Lock what a token request mints its tokens from, on `using` (the
+    database DOT saves them to), or refuse it (`invalid_grant`) when that is
+    gone: the authorization code of an exchange, the consent record
+    (`MCPRefreshTokenFamily`, within the cap) of a rotated chain.
+
+    Taken first in the saving transaction, before DOT locks anything. The
+    checks that let the request this far (`validate_code`,
+    `validate_refresh_token`) run before that transaction; a logout or
+    password change can delete the code or the record in between
+    (`signals._revoke_and_audit`, which deletes both before the tokens).
+    Such a request then waits here for the revocation to commit and is
+    refused, instead of minting tokens the revocation's deletes, already
+    past, would miss. A request already holding the lock makes the
+    revocation wait until its tokens are committed, and so deleted too.
+    Other grant types (none reaches the package's own server) lock nothing.
+    """
+    source: QuerySet[Any]
+    if request.grant_type == "authorization_code":
+        source = Grant.objects.using(using).filter(
+            code=request.code, application=request.client
+        )
+    elif request.grant_type == "refresh_token":
+        family = getattr(
+            getattr(request, "refresh_token_instance", None), "token_family", None
+        )
+        if family is None:
+            raise InvalidGrantError(request=request)
+        cutoff = timezone.now() - timedelta(
+            seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS
+        )
+        source = MCPRefreshTokenFamily.objects.using(
+            router.db_for_write(MCPRefreshTokenFamily)
+        ).filter(token_family=family, consented_at__gt=cutoff)
+    else:
+        return
+    if not list(source.select_for_update().values_list("pk", flat=True)):
+        raise InvalidGrantError(request=request)
 
 
 def has_control_character(*params: "QueryDict") -> bool:
@@ -366,6 +411,16 @@ class MCPOAuth2Validator(OAuth2Validator):
         for `validate_refresh_token`'s hard cap. Rotations inherit the family
         and record nothing. Expired family rows are pruned here too.
 
+        Either way, the tokens are saved only while what they are minted from
+        still exists, checked under a row lock taken first in the saving
+        transaction (`_lock_token_source`): the authorization code of an
+        exchange, the chain's consent record of a rotation. A logout or
+        password change deletes both before the user's tokens
+        (`signals._revoke_and_audit`), so a token request running alongside
+        it either commits before those deletes read — and its tokens are
+        deleted with the rest — or is refused (`invalid_grant`) with nothing
+        minted.
+
         First, the token request's RFC 8707 `resource` is put in the grant's
         (or refresh token's) own spelling when it is another spelling of it
         (`audience.use_granted_spelling`): `MCPTokenView` sends DOT one
@@ -375,13 +430,21 @@ class MCPOAuth2Validator(OAuth2Validator):
         `_check_and_set_request_resource`, which `super()` runs first.
         """
         use_granted_spelling(request)
-        if not refresh_tokens_enabled():
+        refresh = refresh_tokens_enabled()
+        if not refresh:
             token.pop("refresh_token", None)
-            return super().save_bearer_token(token, request, *args, **kwargs)
-        with transaction.atomic(using=router.db_for_write(RefreshToken)):
+        # DOT saves on `db_for_write(AccessToken)`; the lock must be taken in
+        # that same transaction. The consent records' transaction is opened
+        # first, so it commits last (it is the same one on one database).
+        tokens = router.db_for_write(AccessToken)
+        with (
+            transaction.atomic(using=router.db_for_write(MCPRefreshTokenFamily)),
+            transaction.atomic(using=tokens),
+        ):
+            _lock_token_source(request, tokens)
             result = super().save_bearer_token(token, request, *args, **kwargs)
             raw = token.get("refresh_token")
-            if raw and request.grant_type == "authorization_code":
+            if refresh and raw and request.grant_type == "authorization_code":
                 _record_refresh_family(raw)
         return result
 

@@ -322,6 +322,54 @@ class TestLogoutWithTokensOnAnotherDatabase:
         assert _audited(user, SECOND, AuthRejectionReason.SESSION_LOGOUT)
 
 
+class TokensOnlyOnSecond:
+    """DOT's models on the second database; mcp_sql's own (the consent
+    records, the audit table) left on the default one."""
+
+    def _route(self, model):
+        return SECOND if model._meta.app_label == "oauth2_provider" else None
+
+    def db_for_read(self, model, **hints):
+        return self._route(model)
+
+    def db_for_write(self, model, **hints):
+        return self._route(model)
+
+
+class TestConsentRecordsOnAnotherDatabase:
+    def test_the_chains_consent_records_go_where_they_live(self, settings):
+        """The revocation deletes the consent records of the user's
+        refresh-token chains (so no rotation of them can mint again) on the
+        database a router keeps them on, next to the token deletes on
+        DOT's."""
+        import uuid
+
+        from mcp_sql.models import MCPRefreshTokenFamily
+
+        user = UserFactory()
+        _credentials(_copy_user(user, SECOND), SECOND)
+        family = uuid.uuid4()
+        RefreshToken.objects.using(SECOND).filter(user_id=user.pk).update(
+            token_family=family
+        )
+        MCPRefreshTokenFamily.objects.using("default").create(
+            token_family=family, consented_at=timezone.now()
+        )
+        other = MCPRefreshTokenFamily.objects.using("default").create(
+            token_family=uuid.uuid4(), consented_at=timezone.now()
+        )
+        settings.DATABASE_ROUTERS = _routers(TokensOnlyOnSecond)
+        user.set_password(_NEW_PASSWORD)
+        user.save()
+        assert _remaining(user, SECOND) == _NONE
+        assert list(
+            MCPRefreshTokenFamily.objects.using("default").values_list(
+                "token_family", flat=True
+            )
+        ) == [other.token_family]
+        assert _audited(user, "default", AuthRejectionReason.PASSWORD_CHANGE)
+
+
 class TestTokenModelsSplitByARouter:
     def test_every_delete_runs_where_the_access_tokens_are(self, settings):
         """DOT keeps its token models in one database (foreign keys) and

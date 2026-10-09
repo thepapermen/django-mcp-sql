@@ -505,12 +505,15 @@ class TestValidatorBackstopsOnStockViews:
         assert response.status_code == HTTPStatus.BAD_REQUEST, response.content
         assert b'"invalid_grant"' in response.content
         assert list(AccessToken.objects.all()) == [mcp_access_token]
-        # Control: DOT's own hook would have renewed access.
+        # Control: DOT's own hook would have renewed access (with the
+        # save-time check of the chain's consent record, which this legacy
+        # token has none of either, out of the way).
         monkeypatch.setattr(
             MCPOAuth2Validator,
             "validate_refresh_token",
             OAuth2Validator.validate_refresh_token,
         )
+        monkeypatch.setattr("mcp_sql.oauth._lock_token_source", lambda *_a: None)
         assert stock_token(data).status_code == HTTPStatus.OK
 
     def test_code_exchange_mints_no_refresh_token(self, mcp_app, mcp_user, stock_token):

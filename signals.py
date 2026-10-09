@@ -39,6 +39,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.models import audit_client_ip
 from mcp_sql.schemas import AuthRejectionReason
 
@@ -179,18 +180,29 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
     exist only when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables them;
     one left behind would mint new access tokens) and pending authorization
     codes (`Grant` rows: a code issued just before would otherwise still
-    exchange for a fresh token) in one transaction, and in that same
-    transaction writes one `MCPAuthRejectionLog` row with `reason` — only
-    when something was deleted: the table records access that ended, and a
-    logout or password change of a user who held no MCP token or code ended
-    none.
+    exchange for a fresh token) in one transaction, together with the
+    consent records (`MCPRefreshTokenFamily`) of the user's refresh-token
+    chains, and in that same transaction writes one `MCPAuthRejectionLog`
+    row with `reason` — only when something was deleted: the table records
+    access that ended, and a logout or password change of a user who held
+    no MCP token or code ended none.
+
+    Complete against token requests running concurrently: the statements
+    run in an order (commented inline) that makes a rotation in flight
+    commit before the token deletes read, and refuses any rotation or code
+    exchange that would otherwise mint a token after them
+    (`tests/test_revocation_race.py`). Without deleting the consent
+    records, a rotation committing during the refresh-token delete and a
+    second one straddling the access-token delete left a live pair behind.
 
     Runs after the triggering transaction (logout, password change) on the
     alias `committed` has committed. What is guaranteed from then on:
     - the deletes and the audit row commit in a transaction of their own,
-      never inside another transaction this thread has open on the token
-      or audit database (`_outside_open_transaction`), so a later rollback
-      there cannot undo them;
+      never inside another transaction this thread has open on the token,
+      consent-record or audit database (`_outside_open_transaction`), so a
+      later rollback there cannot undo them. The consent records commit
+      with the token deletes when both live on one database; on two, just
+      before them;
     - the audit row commits only with the deletes (when both live on one
       database; on two, it commits just before them); it is written in a
       savepoint, so a failure to write it — a database error or any other
@@ -199,8 +211,8 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
       that savepoint cannot be rolled back either (the connection failed),
       the deletes cannot commit: that is a failed deletion;
     - a failed deletion (a database error, a row lock held past the
-      bounded wait, the connection lost before the commit) rolls back all
-      three deletes and writes no audit row: the access did not end. It is
+      bounded wait, the connection lost before the commit) rolls back the
+      token deletes and writes no audit row: the access did not end. It is
       logged with `logger.exception` only and nothing is retried: the
       tokens then live until they expire, and an operator must delete
       them. "Revoked ..." is logged (INFO) only after the deletes
@@ -232,25 +244,56 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
         # run there, explicitly, so they are one transaction whatever a
         # router says per model.
         tokens = router.db_for_write(AccessToken)
+        families = router.db_for_write(MCPRefreshTokenFamily)
         audit = router.db_for_write(MCPAuthRejectionLog)
         with ExitStack() as stack:
             own = {
                 alias: stack.enter_context(_outside_open_transaction(alias, committed))
-                for alias in dict.fromkeys((tokens, audit))
+                for alias in dict.fromkeys((tokens, families, audit))
             }
             with _transaction(tokens, own_connection=own[tokens]):
-                refresh_deleted, _ = (
-                    RefreshToken.objects.using(tokens)
-                    .filter(mcp_apps, user=user)
-                    .delete()
+                # The order is what makes the revocation complete against
+                # token requests running at the same time (each statement
+                # here sees only rows committed before it starts):
+                # 1. Pending codes first. An exchange locks its code first
+                #    thing in its saving transaction
+                #    (`MCPOAuth2Validator.save_bearer_token`), so this waits
+                #    for one in flight to commit (its tokens are then
+                #    visible below), and a later one finds its code gone
+                #    and is refused (`invalid_grant`), minting nothing.
+                grants_deleted, _ = (
+                    Grant.objects.using(tokens).filter(mcp_apps, user=user).delete()
                 )
+                # 2. The consent records of the user's refresh-token chains.
+                #    A rotation locks its chain's record first thing in its
+                #    transaction (`MCPOAuth2Validator.save_bearer_token`),
+                #    so this waits for a rotation in flight to commit (its
+                #    new tokens are then visible below), and a later one
+                #    finds no record and is refused, as
+                #    `validate_refresh_token` refuses every token of the
+                #    chain from now on.
+                with _transaction(families, own_connection=own[families]):
+                    chains = list(
+                        RefreshToken.objects.using(tokens)
+                        .filter(mcp_apps, user=user, token_family__isnull=False)
+                        .values_list("token_family", flat=True)
+                        .distinct()
+                    )
+                    if chains:
+                        MCPRefreshTokenFamily.objects.using(families).filter(
+                            token_family__in=chains
+                        ).delete()
+                # 3. Refresh tokens, locked before their access tokens, the
+                #    order DOT's own revocations take (`RefreshToken.revoke`,
+                #    `revoke_family`), so a concurrent one cannot deadlock
+                #    with this.
+                refresh = RefreshToken.objects.using(tokens).filter(mcp_apps, user=user)
+                list(refresh.select_for_update(of=("self",)).values_list("pk"))
+                refresh_deleted, _ = refresh.delete()
                 access_deleted, _ = (
                     AccessToken.objects.using(tokens)
                     .filter(mcp_apps, user=user)
                     .delete()
-                )
-                grants_deleted, _ = (
-                    Grant.objects.using(tokens).filter(mcp_apps, user=user).delete()
                 )
                 deleted = access_deleted + refresh_deleted
                 if not (deleted or grants_deleted):

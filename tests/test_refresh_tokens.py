@@ -7,7 +7,6 @@ measured from the consent, across rotations — has passed, and logout or a
 password change revokes refresh tokens along with access tokens.
 """
 
-import base64
 import hashlib
 import secrets
 from datetime import timedelta
@@ -31,6 +30,11 @@ from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.oauth_server import MCPServer
 from mcp_sql.schemas import AuthRejectionReason
+from mcp_sql.tests.refresh_flow import CAP as _CAP
+from mcp_sql.tests.refresh_flow import LOOPBACK as _LOOPBACK
+from mcp_sql.tests.refresh_flow import consent_and_exchange as _consent_and_exchange
+from mcp_sql.tests.refresh_flow import refresh as _refresh
+from mcp_sql.tests.refresh_flow import s256_pair as _s256_pair
 from mcp_sql.tests.settings import MCP_SQL as BASE_MCP_SQL
 from mcp_sql.validation import validate_mcp_sql_settings
 from mcp_sql.views.oauth_token import MCPTokenView
@@ -39,62 +43,10 @@ from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauthlib.oauth2.rfc6749.grant_types import RefreshTokenGrant
 
-_LOOPBACK = "http://127.0.0.1:9999"
-_CAP = 3600
-
 
 @pytest.fixture
 def refresh_on(settings):
     settings.MCP_SQL = {**settings.MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
-
-
-def _s256_pair() -> tuple[str, str]:
-    verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
-def _consent_and_exchange(client, user) -> dict:
-    """Authorize the canonical client (consent POST: it requires consent since
-    migration 0016) and exchange the code."""
-    client.force_login(user)
-    verifier, challenge = _s256_pair()
-    params = {
-        "client_id": "mcp-sql",
-        "response_type": "code",
-        "redirect_uri": _LOOPBACK,
-        "scope": "mcp:sql",
-        "state": "st4te",
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    location = client.post(reverse("authorize"), {**params, "allow": "Authorize"})[
-        "Location"
-    ]
-    code = parse_qs(urlparse(location).query)["code"][0]
-    response = client.post(
-        reverse("token"),
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": _LOOPBACK,
-            "client_id": "mcp-sql",
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == HTTPStatus.OK, response.content
-    return response.json()
-
-
-def _refresh(client, refresh_token: str):
-    return client.post(
-        reverse("token"),
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": "mcp-sql",
-        },
-    )
 
 
 def _family(refresh_token: str) -> MCPRefreshTokenFamily:

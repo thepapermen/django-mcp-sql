@@ -194,6 +194,7 @@ class TestMCPOAuth2ValidatorGrantBackstops:
             is False
         )
 
+    @pytest.mark.django_db  # the save's transaction (`_lock_token_source`)
     def test_refresh_token_is_dropped_before_dot_stores_the_token(self, monkeypatch):
         stored: dict = {}
         monkeypatch.setattr(
