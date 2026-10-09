@@ -28,11 +28,14 @@ still gets caught; `make lint` / `make typecheck` run them on demand.
 
 The suite needs a reachable PostgreSQL with `mcp_readonly_role` bootstrapped
 (`sql/role_setup.sql`); connection env vars and their defaults are at the
-top of `tests/settings.py`. Run against a superuser connection so the
+top of `tests/settings.py`. Use PostgreSQL 15+ unless you pin Django ≤ 6.0:
+`make test` / `make cov` don't pin Django, so on Python ≥ 3.12 they resolve
+Django 6.1, which refuses PostgreSQL 14. Run against a superuser connection so the
 role-isolation tests execute instead of skipping. CI runs the same suite
-across the Django 4.2/5.2/6.0 lines on their supported interpreters
-(Python 3.11–3.13) × PostgreSQL 14 (see the matrix in
-`.github/workflows/ci.yml`).
+across the Django 4.2/5.2/6.0/6.1 lines on Python 3.11–3.14 (a ragged
+per-line subset of each line's interpreters) against PostgreSQL 14 — 15 for
+Django 6.1, which refuses 14, and for one 6.0 leg; 16 for another 6.0 leg
+(see the matrix in `.github/workflows/ci.yml`).
 
 ## Expectations
 
