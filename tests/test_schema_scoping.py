@@ -633,6 +633,18 @@ class TestARefusedProfileChangesNoGrant:
         call_command("mcp_sql_grants", "--apply", stdout=StringIO())
         assert ("public", self._TABLE) in grants.granted_tables(_ROLE)
 
+    def test_the_summary_counts_the_profiles_that_changed(self, two_profiles):
+        """`b` is in sync (nothing declared, nothing granted): the summary
+        names one profile, not every configured one."""
+        two_profiles([], {})
+        with connection.cursor() as cur:
+            cur.execute("CREATE ROLE mcp_sql_a19_b NOLOGIN")
+        out = StringIO()
+        call_command("mcp_sql_grants", "--apply", stdout=out)
+        assert "Applied: +1 grant(s), -0 revoke(s) across 1 profile(s)." in (
+            out.getvalue()
+        )
+
     _STALE = "mcp_sql_a20_stale"
 
     def _with_a_stale_grant(self):
