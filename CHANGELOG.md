@@ -15,13 +15,14 @@ made the request.
 
 ### Breaking
 
-All but the last four fail loudly — at startup, or for the Python API renames
-at import or call time — and none require any client to reconnect (client_ids
-are unchanged, provisioning never deletes rows, and tokens are 6-hour anyway).
-The default-ON flip, the dropped `is_staff` requirement, the curated client's
-new consent page and the consent page no longer skippable by
-`REQUEST_APPROVAL_PROMPT` are called out separately below precisely because
-they do **not** announce themselves.
+All but the last five fail loudly — at startup, at `migrate`, from
+`mcp_sql_grants --apply`, or for the Python API renames at import or call
+time — and none require any client to reconnect (client_ids are unchanged,
+provisioning never deletes rows, and tokens are 6-hour anyway). The default-ON
+flip, the dropped `is_staff` requirement, the curated client's new consent
+page, the consent page no longer skippable by `REQUEST_APPROVAL_PROMPT` and
+`--apply` revoking grants on materialized views are called out separately
+below precisely because they do **not** announce themselves.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -111,6 +112,20 @@ they do **not** announce themselves.
   install). Refresh off (the default): nothing to change. Keep DOT's
   `REFRESH_TOKEN_GRACE_PERIOD_SECONDS` at 0 or a few seconds: within it a
   replay is answered with the chain's current pair instead of revoking it.
+- **`migrate` can stop on `mcp_sql.E001`.** A whitelisted model whose
+  `db_table` names no schema is the relation in `public`; when there is none
+  there and the login's `search_path` finds one of that name in another
+  schema, the new database system check fails `migrate` (and `check
+  --database default`) before anything is applied. It used to fail later,
+  inside `migrate`, with a bare `ProgrammingError`. Name the schema in
+  `db_table` (`'schema"."name'`), or run `migrate --skip-checks` to get past
+  it while fixing the model.
+- **`mcp_sql_grants --apply` can now exit 1.** When PostgreSQL silently skips
+  a `GRANT` / `REVOKE` (the login does not own the relation; see "Fixed"),
+  the whole apply is rolled back and the command fails naming each relation,
+  its owner and the login. A deploy script that ran `--apply` as a non-owner
+  used to pass while changing nothing; run it as the relations' owner or a
+  member of the owning role.
 - **Declared clients now ship ON.** `CLOUD_CLIENTS` defaulted to `[]`; `CLIENTS`
   defaults to `claude`, `chatgpt` and `cursor`. A consumer who declared the old
   key hits the `ImproperlyConfigured` above and makes a deliberate choice — but
@@ -171,6 +186,15 @@ they do **not** announce themselves.
   before the token expires skipped the page will now see it every time; there
   is no setting to bring the skip back. Other OAuth applications served by
   DOT's own views in the same project keep the setting.
+
+- **`mcp_sql_grants --apply` now revokes undeclared grants on materialized
+  views.** The inventory now reads the catalog's ACLs, which include
+  materialized views (see "Fixed"): a grant to the read role on a
+  materialized view that no profile whitelists is now drift, and `--apply`
+  revokes it, printing the `REVOKE` and exiting 0. Before, materialized views
+  were invisible to the command, so such a grant was never reported. Run
+  `mcp_sql_grants` (check mode) before upgrading to see what `--apply` will
+  revoke, and whitelist any materialized view the read role should keep.
 
 ### Added
 
@@ -284,9 +308,9 @@ they do **not** announce themselves.
   wrappers and `connectby` (tablefunc) and `xpath_table` (xml2) were refused
   in `FROM` but accepted in the select list, `WHERE` and nested expressions.
   There the inner query skipped the table whitelist, schema scoping,
-  `BAN_SELECT_STAR` and the deny list: for example a `pg_advisory_lock` that outlives the rollback on a pooled
-  connection, `dblink` where it is installed, or a whole schema serialised
-  into one value. Now refused as `disallowed_function` in every position and
+  `BAN_SELECT_STAR` and the deny list: for example a `pg_advisory_lock` that
+  outlives the rollback on a pooled connection, `dblink` where it is
+  installed, or a whole schema serialised into one value. Now refused as `disallowed_function` in every position and
   spelling (schema-qualified, quoted, attribute notation), like the
   `query_to_xml` family already was. Present in 0.1.0b5.
 - **Security: a logout or password change could miss tokens minted by a
