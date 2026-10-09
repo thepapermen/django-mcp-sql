@@ -601,13 +601,21 @@ def test_a_failed_save_does_not_burn_the_code(client, mcp_user, monkeypatch):
 
 def test_invalidating_a_code_this_request_did_not_consume_is_refused(mcp_user, mcp_app):
     """`invalidate_authorization_code` accepts only the code the request's
-    own save consumed; a missing code is otherwise DOT's `invalid_grant`."""
+    own save consumed; a missing code is otherwise DOT's `invalid_grant` —
+    also when the client sends the mark's name as a parameter (oauthlib's
+    `Request` answers unknown attributes from its parameters)."""
     from oauthlib.common import Request
     from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
 
     validator = MCPOAuth2Validator()
-    request = Request("https://testserver/o/token/")
+    request = Request(
+        "https://testserver/o/token/?_mcp_sql_consumed_code=gone",
+        http_method="POST",
+        body="_mcp_sql_consumed_code=gone",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
     request.client = mcp_app
+    assert request._mcp_sql_consumed_code == "gone"  # the parameter
     with pytest.raises(InvalidGrantError):
         validator.invalidate_authorization_code("mcp-sql", "gone", request)
     request._mcp_sql_consumed_code = "another"

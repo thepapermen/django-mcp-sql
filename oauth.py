@@ -500,9 +500,12 @@ class MCPOAuth2Validator(OAuth2Validator):
         refuse the exchange that just succeeded. The mark is set on this
         request object only once that transaction has completed (a failed
         save raises past it, and oauthlib never gets here): a missing code
-        is never accepted for another request, nor for another code.
+        is never accepted for another request, nor for another code. Read
+        from the object's own attributes only: oauthlib's `Request` answers
+        any other attribute name from the request's query and body
+        parameters, which the client chooses.
         """
-        consumed = getattr(request, _CONSUMED_CODE_ATTR, None)
+        consumed = vars(request).get(_CONSUMED_CODE_ATTR)
         if consumed is not None and consumed == code:
             return
         super().invalidate_authorization_code(client_id, code, request, *args, **kwargs)
