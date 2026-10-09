@@ -729,7 +729,9 @@ The load-bearing invariants and footguns, grouped by layer:
   revokes, a grant on a relation nothing declares wherever it is. Limits:
   it reads `information_schema.role_table_grants`, which lists neither
   materialized views, nor grants to `PUBLIC`, nor grants the profile role
-  holds only through membership in another role (ledger F42 / F64). A
+  holds only through membership in another role (ledger F42 / F64) — so a
+  whitelisted materialized view is drift on every run, and `--apply`, which
+  re-reads the inventory after its statements, fails naming it as one. A
   whitelisted `db_table` whose schema or table name is longer than 63
   bytes (UTF-8; `grants.MAX_IDENTIFIER_BYTES`, PostgreSQL's `NAMEDATALEN -
   1`) is refused by the reconciler in every mode (`overlong_entries`, like

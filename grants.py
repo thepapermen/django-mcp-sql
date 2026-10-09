@@ -561,13 +561,18 @@ def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
     then re-read each role's grants in it; if any drift is left, roll the
     transaction back and raise `GrantsReconcileError` naming it.
 
-    PostgreSQL does not fail a GRANT or REVOKE the executing role may not
-    make: on a relation the app login neither owns (nor is a member of the
-    owning role of) nor holds `WITH GRANT OPTION` on, GRANT warns "no
-    privileges were granted" and REVOKE "no privileges could be revoked",
-    and nothing changes; a REVOKE also removes only grants its role made
-    itself. Before, `--apply` reported such statements as applied and
-    exited 0 while check mode kept reporting the same drift."""
+    PostgreSQL does not always fail a GRANT or REVOKE the executing role
+    may not make: on a relation the app login neither owns (nor is a
+    member of the owning role of) nor holds `WITH GRANT OPTION` on, but
+    holds some other privilege on, GRANT warns "no privileges were
+    granted" and REVOKE "no privileges could be revoked", and nothing
+    changes (with no privilege at all it raises "permission denied"); a
+    REVOKE also removes only grants its role made itself. Before,
+    `--apply` reported such statements as applied and exited 0 while check
+    mode kept reporting the same drift. A whitelisted materialized view
+    fails here too: the inventory (`information_schema`) never lists its
+    grants, so its GRANT never shows (check mode reports it on every run
+    as well — `granted_tables`)."""
     with transaction.atomic():
         for profile, drift in drifts:
             _apply_drift(profile.role, drift)
@@ -583,15 +588,23 @@ def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
 def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
     """Name each profile's drift `--apply` left, with each relation's owner
     and the login that ran the statements."""
-    owners = _owners({r for d in left.values() for r in d.granted + d.revoked})
+    info = _catalog_info({r for d in left.values() for r in d.granted + d.revoked})
 
     def shown(relations: list[Relation]) -> str:
-        return ", ".join(
-            f"{relation_display(r)} (owner {quote_ident(owners[r])})"
-            if r in owners
-            else relation_display(r)
-            for r in relations
-        )
+        out = []
+        for relation in relations:
+            text = relation_display(relation)
+            if relation in info:
+                owner, relkind = info[relation]
+                text += f" (owner {quote_ident(owner)}"
+                if relkind == "m":
+                    text += (
+                        "; a materialized view: information_schema lists no "
+                        "grants on one, so the drift check never sees them"
+                    )
+                text += ")"
+            out.append(text)
+        return ", ".join(out)
 
     lines = []
     for name, drift in left.items():
@@ -603,35 +616,39 @@ def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
         cur.execute("SELECT current_user")
         login = cur.fetchone()[0]
     return (
-        "GRANT / REVOKE ran but PostgreSQL left these privileges unchanged "
-        "(it only warns when a role may not change a privilege), so nothing "
-        "was applied:\n"
+        "After the GRANT / REVOKE statements the grants still drift, so "
+        "nothing was applied (rolled back):\n"
         + "\n".join(lines)
-        + f"\nThe login running mcp_sql_grants ({login!r}) can grant or "
-        "revoke a privilege only on a relation it owns (or whose owning role "
-        "it is a member of) or holds WITH GRANT OPTION on, and REVOKE "
-        "removes only the grants it made itself. Run `mcp_sql_grants "
-        "--apply` as the relations' owner, or have the owner run the "
-        "statements `mcp_sql_grants` prints without --apply."
+        + "\nPostgreSQL only warns, changing nothing, when the role running "
+        f"a GRANT / REVOKE (the login running mcp_sql_grants, {login!r}) "
+        "may not change the privilege: it can grant or revoke only on a "
+        "relation it owns (or whose owning role it is a member of) or holds "
+        "WITH GRANT OPTION on, and REVOKE removes only the grants it made "
+        "itself. Run `mcp_sql_grants --apply` as the relations' owner, or "
+        "have the owner run the statements `mcp_sql_grants` prints without "
+        "--apply."
     )
 
 
-def _owners(relations: set[Relation]) -> dict[Relation, str]:
-    """The owning role of each of `relations` that exists, by relation."""
+def _catalog_info(relations: set[Relation]) -> dict[Relation, tuple[str, str]]:
+    """`(owning role, relkind)` of each of `relations` that exists."""
     if not relations:
         return {}
     schemas, names = zip(*sorted(relations), strict=True)
     with connection.cursor() as cur:
         cur.execute(
             """
-            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner)
+            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), c.relkind
             FROM unnest(%s::text[], %s::text[]) AS r(nspname, relname)
             JOIN pg_namespace n ON n.nspname = r.nspname
             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = r.relname
             """,
             [list(schemas), list(names)],
         )
-        return {(str(s), str(n)): str(owner) for s, n, owner in cur.fetchall()}
+        return {
+            (str(s), str(n)): (str(owner), str(kind))
+            for s, n, owner, kind in cur.fetchall()
+        }
 
 
 def _apply_drift(role: str, drift: ProfileDrift) -> None:

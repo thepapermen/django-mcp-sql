@@ -161,3 +161,24 @@ class TestApplyAsTheOwner:
         check = StringIO()
         call_command("mcp_sql_grants", stdout=check)
         assert "Grants in sync" in check.getvalue()
+
+
+class TestAMaterializedViewIsNamedAsSuch:
+    """The inventory (`information_schema.role_table_grants`) lists no
+    grants on a materialized view, so a whitelisted one is drift on every
+    run (check mode included); `--apply` says why rather than blaming the
+    owner."""
+
+    def test_named(self, monkeypatch):
+        monkeypatch.setattr(
+            "mcp_sql.grants.declared_tables",
+            lambda _profile: {"mcp_sql_testapp.Widget": "mcp_sql_fu6_mv"},
+        )
+        with connection.cursor() as cur:
+            cur.execute(
+                "CREATE MATERIALIZED VIEW public.mcp_sql_fu6_mv AS SELECT 1 AS id"
+            )
+        with pytest.raises(
+            CommandError, match="a materialized view: information_schema"
+        ):
+            _apply()
