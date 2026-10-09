@@ -369,6 +369,43 @@ class TestConsentRecordsOnAnotherDatabase:
         ) == [other.token_family]
         assert _audited(user, "default", AuthRejectionReason.PASSWORD_CHANGE)
 
+    def test_a_record_lock_the_open_transaction_holds_is_waited_for_briefly(
+        self, settings, monkeypatch, caplog
+    ):
+        """The records' database has a transaction of this thread's open,
+        holding a lock on a record the revocation deletes: its own
+        connection there waits for it boundedly too (the records are
+        deleted in a transaction of their own, under the same
+        `lock_timeout`), then the revocation fails, is logged, and the
+        token deletes roll back."""
+        import uuid
+
+        from mcp_sql import signals
+        from mcp_sql.models import MCPRefreshTokenFamily
+
+        monkeypatch.setattr(signals, "_OWN_CONNECTION_LOCK_TIMEOUT", "200ms")
+        user = _copy_user(UserFactory(), SECOND)
+        _credentials(user, SECOND)
+        family = uuid.uuid4()
+        RefreshToken.objects.using(SECOND).filter(user_id=user.pk).update(
+            token_family=family
+        )
+        records = MCPRefreshTokenFamily.objects.using("default")
+        records.create(token_family=family, consented_at=timezone.now())
+        settings.DATABASE_ROUTERS = _routers(TokensOnlyOnSecond)
+        started = time.monotonic()
+        with (
+            caplog.at_level(logging.ERROR, logger="mcp_sql.signals"),
+            transaction.atomic(using="default"),
+        ):
+            records.filter(token_family=family).update(consented_at=timezone.now())
+            user.set_password(_NEW_PASSWORD)
+            user.save()  # to SECOND, where the tokens are
+        assert time.monotonic() - started < 5
+        assert "Failed to revoke MCP tokens on password change" in caplog.text
+        assert _remaining(user, SECOND) == _ALL
+        assert records.filter(token_family=family).exists()
+
 
 class TestTokenModelsSplitByARouter:
     def test_every_delete_runs_where_the_access_tokens_are(self, settings):

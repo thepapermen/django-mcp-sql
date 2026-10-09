@@ -54,12 +54,14 @@ class SaveErrorsAnsweredMixin:
     oauthlib's token grants catch `OAuth2Error` only around
     `validate_token_request`. One raised later — by `save_token`
     (`MCPOAuth2Validator.save_bearer_token` refusing a token request whose
-    code or chain a concurrent logout / password change deleted:
-    `oauth._lock_token_source`) or by `invalidate_authorization_code` (DOT,
-    a code already gone) — reached DOT's backend, which answers its body
-    without the `Content-Type: application/json` and `no-store` headers.
-    Here it gets the grant's default headers, as a validation error does.
-    (A save refused this way has rolled back: nothing was minted.)
+    code or chain a concurrent logout / password change deleted, or whose
+    code a concurrent exchange consumed: `oauth._lock_token_source`) or by
+    `invalidate_authorization_code` (DOT's, a code already gone, on a server
+    whose validator did not consume it in the save as `MCPOAuth2Validator`
+    does) — reached DOT's backend, which answers its body without the
+    `Content-Type: application/json` and `no-store` headers. Here it gets
+    the grant's default headers, as a validation error does. (A save
+    refused this way has rolled back: nothing was minted.)
     """
 
     def create_token_response(self, request, token_handler):
