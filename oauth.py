@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 # raises an uncaught 500 (DataError).
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+# Set on an oauthlib request by `save_bearer_token` once its transaction,
+# which deleted the exchanged code, has completed: the code it consumed.
+_CONSUMED_CODE_ATTR = "_mcp_sql_consumed_code"
+
 
 def _record_refresh_family(raw_refresh_token: str) -> None:
     """Record the consent time of the chain `raw_refresh_token` starts, and
@@ -57,10 +61,26 @@ def _record_refresh_family(raw_refresh_token: str) -> None:
     MCPRefreshTokenFamily.objects.get_or_create(
         token_family=family, defaults={"consented_at": now}
     )
-    MCPRefreshTokenFamily.objects.filter(
-        consented_at__lte=now
-        - timedelta(seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS)
-    ).delete()
+    # Only rows no other transaction holds. A revocation deleting the
+    # records of a user's chains (`signals._revoke_and_audit`) locks them in
+    # `token_family` order, a plain delete here in `consented_at` order: over
+    # two of that user's expired records the two deadlocked, and PostgreSQL
+    # could abort the revocation (logged only; the user's tokens lived on).
+    # Skipping waits on nothing, so it can never close a cycle; a row
+    # skipped now is deleted by its holder or at a later exchange.
+    families = MCPRefreshTokenFamily.objects.using(
+        router.db_for_write(MCPRefreshTokenFamily)
+    )
+    expired = list(
+        families.filter(
+            consented_at__lte=now
+            - timedelta(seconds=mcp_sql_settings.REFRESH_TOKEN_MAX_AGE_SECONDS)
+        )
+        .select_for_update(skip_locked=True)
+        .values_list("pk", flat=True)
+    )
+    if expired:
+        families.filter(pk__in=expired).delete()
 
 
 def _lock_token_source(request: Any, using: str) -> None:
@@ -421,6 +441,18 @@ class MCPOAuth2Validator(OAuth2Validator):
         deleted with the rest — or is refused (`invalid_grant`) with nothing
         minted.
 
+        An exchange also consumes its code there: the `Grant` row it locked
+        is deleted in the same transaction, after DOT has read it (the
+        `resource` the tokens inherit). oauthlib deletes the code only after
+        `save_token` returns (`invalidate_authorization_code`), so a second
+        exchange of the same code, validated before the first committed and
+        waiting on the lock, took it in between and minted a second, live
+        token pair (its response was the `invalid_grant` of the code's
+        delete, the tokens stayed). It now finds no code and is refused with
+        nothing minted, and `invalidate_authorization_code` accepts the code
+        this request consumed. A save that fails rolls the delete back with
+        the tokens: a server error does not burn the code.
+
         First, the token request's RFC 8707 `resource` is put in the grant's
         (or refresh token's) own spelling when it is another spelling of it
         (`audience.use_granted_spelling`): `MCPTokenView` sends DOT one
@@ -435,18 +467,48 @@ class MCPOAuth2Validator(OAuth2Validator):
             token.pop("refresh_token", None)
         # DOT saves on `db_for_write(AccessToken)`; the lock must be taken in
         # that same transaction. The consent records' transaction is opened
-        # first, so it commits last (it is the same one on one database).
+        # first, so it commits last (it is the same one on one database): a
+        # rotation holds its chain's record until its tokens are committed,
+        # so a revocation's delete of the record waits until it can see them.
         tokens = router.db_for_write(AccessToken)
+        exchange = request.grant_type == "authorization_code"
         with (
             transaction.atomic(using=router.db_for_write(MCPRefreshTokenFamily)),
             transaction.atomic(using=tokens),
         ):
             _lock_token_source(request, tokens)
             result = super().save_bearer_token(token, request, *args, **kwargs)
+            if exchange:
+                Grant.objects.using(tokens).filter(
+                    code=request.code, application=request.client
+                ).delete()
             raw = token.get("refresh_token")
-            if refresh and raw and request.grant_type == "authorization_code":
+            if refresh and raw and exchange:
                 _record_refresh_family(raw)
+        if exchange:
+            setattr(request, _CONSUMED_CODE_ATTR, request.code)
         return result
+
+    def invalidate_authorization_code(self, client_id, code, request, *args, **kwargs):
+        """Accept the code this request's `save_bearer_token` consumed;
+        any other goes through DOT, which refuses one that is gone
+        (`invalid_grant`).
+
+        oauthlib calls this right after `save_token`. The code is deleted
+        there, in the transaction that saved the tokens (see
+        `save_bearer_token`), so DOT's delete here would find nothing and
+        refuse the exchange that just succeeded. The mark is set on this
+        request object only once that transaction has completed (a failed
+        save raises past it, and oauthlib never gets here): a missing code
+        is never accepted for another request, nor for another code. Read
+        from the object's own attributes only: oauthlib's `Request` answers
+        any other attribute name from the request's query and body
+        parameters, which the client chooses.
+        """
+        consumed = vars(request).get(_CONSUMED_CODE_ATTR)
+        if consumed is not None and consumed == code:
+            return
+        super().invalidate_authorization_code(client_id, code, request, *args, **kwargs)
 
     def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
         """Refresh only when enabled, and only within the chain's hard cap.

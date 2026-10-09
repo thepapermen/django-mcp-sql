@@ -332,6 +332,43 @@ but `True`:
   protection on, until `REFRESH_TOKEN_EXPIRE_SECONDS` has passed (never at
   the documented `0`). Rows of a chain past the cap below can go — the
   package refuses every token of such a chain anyway.
+- **Keeping the refresh-token table bounded.** Every refresh adds a row
+  (the presented token stays, revoked, for reuse detection). With
+  `REFRESH_TOKEN_REUSE_PROTECTION = True`, DOT 3.4's `cleartokens`
+  (`oauth2_provider.models.clear_expired`) deletes:
+  - revoked refresh tokens — rotated out, or revoked — once
+    `REFRESH_TOKEN_EXPIRE_SECONDS` has passed since they were revoked
+    (`REFRESH_TOKEN_GRACE_PERIOD_SECONDS` plays no part then), and none
+    while it is `0` or unset;
+  - live refresh tokens whose access token expired more than
+    `REFRESH_TOKEN_EXPIRE_SECONDS` ago (none while it is `0`), which DOT
+    already refuses at refresh, and live ones whose access token is gone,
+    always;
+  - expired access tokens no live refresh token holds, and expired codes.
+
+  At the documented `REFRESH_TOKEN_EXPIRE_SECONDS: 0`, no revoked refresh
+  token is ever deleted (`cleartokens` warns about it): the table, and the
+  expired access tokens the last live token of each chain holds, grow
+  without bound. To keep it bounded with refresh on, set DOT's
+  `REFRESH_TOKEN_EXPIRE_SECONDS` to **at least**
+  `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` (equal is simplest) and run
+  `python manage.py cleartokens` on a schedule (daily, say). The table then
+  holds about the refreshes of the last `REFRESH_TOKEN_EXPIRE_SECONDS`, plus
+  one live row per chain until its last access token has been expired that
+  long.
+
+  Not shorter than the cap: a rotated-out token is deleted
+  `REFRESH_TOKEN_EXPIRE_SECONDS` after it was rotated out, while its chain
+  is refreshable until the cap has passed since the consent. With the value
+  at least the cap, every rotated-out token outlives its chain, so a replay
+  within the cap always finds its row and revokes the chain. Shorter, and
+  `cleartokens` can delete rotated-out tokens of a chain still within the
+  cap: a replay of one is then refused as an unknown token and revokes
+  nothing — whoever rotated the stolen token first keeps the chain until
+  the cap. (A shorter value also makes DOT refuse a chain idle for longer
+  than its access token's lifetime plus that value: an idle timeout tighter
+  than the cap, harmless on its own.) The package does not check the
+  value.
 - **Hard cap from the consent.** The package records when each chain
   started (the authorization-code exchange; `MCPRefreshTokenFamily`) and
   refuses a refresh once `REFRESH_TOKEN_MAX_AGE_SECONDS` has passed since
@@ -343,7 +380,8 @@ but `True`:
 - A refresh token with no recorded consent — minted by 0.1.0b5 or earlier,
   or written by any path that bypassed `MCPOAuth2Validator.save_bearer_token`
   — is refused.
-- `MCPRefreshTokenFamily` rows past the cap are pruned at each new exchange.
+- `MCPRefreshTokenFamily` rows past the cap are pruned at each new exchange
+  (skipping any another transaction holds, e.g. a revocation deleting them).
   Rows whose refresh tokens are gone (revoked, removed by `cleartokens`, or
   refresh switched off again) are inert and safe to delete, e.g. next to
   `cleartokens`:
@@ -1027,8 +1065,44 @@ Paths by urgency:
 |---|---|---|
 | User-driven | The user logs out of the web app | `user_logged_out` signal deletes the user's MCP-purpose access **and refresh** tokens and pending authorization codes — the canonical `mcp-sql` Application, every DCR-minted `mcp-sql-<token>` client, **and** every settings-declared `mcp-sql-{cloud,local}.<slug>` client (all covered by `Q(application__name="mcp-sql") \| Q(application__name__startswith="mcp-sql-")`) |
 | User- or admin-driven | The password changes (the user's own change, an admin reset, `set_unusable_password`; proxies of the user model included) | Same deletion, from a `pre_save`/`post_save` pair on the user model (after the change commits, on the database the user was saved to); an `MCPAuthRejectionLog` row with reason `password_change` when it deleted anything (as for logout: a user with no MCP token or pending code gets no row, so the table records only changes that ended MCP access). Needs no session table. The stored hash is compared through the model's base manager on that database, so a default manager that filters rows (active users only, soft delete) cannot hide the user — reactivating a user with a new password revokes like any other change. Django's login-time hash upgrade is not a change: the package wraps `AbstractBaseUser.check_password` / `acheck_password` (in `ready()`) to mark the save they make while they run, and only that save is exempt — when the hash checked is the one stored (a legacy hash for a new password assigned in memory and then checked is a change). Any other new hash revokes, even one saved the same way (`set_password(...)` + `save(update_fields=["password"])`, as an SSO / LDAP sync does). A user model that overrides `check_password` without calling `super()` loses the exemption (its hash upgrades revoke too). **Multi-database installs:** the deletes and the audit row commit together in a transaction of their own on the database DOT keeps its tokens on; a transaction the request has open there (`ATOMIC_REQUESTS`) does not undo them when it rolls back — they run on a separate connection, which does not see tokens that transaction has written and not committed, and gives up after 5 s waiting for a row lock it holds (logged, no audit row; delete those tokens by hand). A failure to write the audit row is logged and never undoes the deletes (a connection lost while writing it ends the deletes' transaction too: logged as a failed revocation, not as "Revoked"), and nothing the revocation raises reaches the logout or the save. Logout's revocation waits for the default database's commit. **Not seen:** bulk `User.objects.filter(...).update(password=...)` and `User.objects.bulk_update(users, ["password"])` send no model signals — delete the tokens explicitly (row below) when changing passwords that way. |
-| Operator, keep cohort | `python manage.py shell -c "from oauth2_provider.models import get_access_token_model, get_grant_model, get_refresh_token_model; from mcp_sql.models import MCPRefreshTokenFamily; u='alice@example.com'; get_grant_model().objects.filter(user__email=u).delete(); MCPRefreshTokenFamily.objects.filter(token_family__in=get_refresh_token_model().objects.filter(user__email=u).values('token_family')).delete(); get_refresh_token_model().objects.filter(user__email=u).delete(); get_access_token_model().objects.filter(user__email=u).delete()"` | Pending codes, refresh-token chains (they exist only with the opt-in refresh grant) and outstanding tokens dropped in < 1 s (codes and the chains' consent records first, so neither a just-approved code nor a refresh in flight can mint a token afterwards — see "Token requests racing a revocation" below; this snippet covers every OAuth Application the user holds, not only MCP's); user can re-OAuth |
+| Operator, keep cohort | The token-delete shell snippet below | Pending codes, refresh-token chains (they exist only with the opt-in refresh grant) and outstanding tokens dropped in < 1 s, in the order the package's own revocation takes (codes and the chains' consent records first, so neither a just-approved code nor a refresh in flight can mint a token afterwards — see "Token requests racing a revocation" below; this snippet covers every OAuth Application the user holds, not only MCP's); user can re-OAuth |
 | Operator, kick out | Remove from `mcp_sql_users` group (admin) | Outstanding tokens still exist in DB but `MCPOAuth2Authentication` re-checks the perm on every request and rejects. Combine with the token-delete shell snippet for a clean state. |
+
+The token-delete shell snippet (`python manage.py shell`), in one
+transaction and in the order `signals._revoke_and_audit` takes:
+
+```python
+from django.db import transaction
+from mcp_sql.models import MCPRefreshTokenFamily
+from oauth2_provider.models import get_access_token_model
+from oauth2_provider.models import get_grant_model
+from oauth2_provider.models import get_refresh_token_model
+
+u = "alice@example.com"
+refresh = get_refresh_token_model().objects.filter(user__email=u)
+# One database. With DOT's models or the consent records routed elsewhere,
+# open `transaction.atomic(using=...)` on DOT's database and delete the
+# records with `.using(...)` on theirs.
+with transaction.atomic():
+    # 1. Pending codes, 2. the consent records of the user's refresh-token
+    # chains: an exchange or rotation in flight is waited for, a later one
+    # refused.
+    get_grant_model().objects.filter(user__email=u).delete()
+    MCPRefreshTokenFamily.objects.filter(
+        token_family__in=refresh.filter(token_family__isnull=False).values(
+            "token_family"
+        )
+    ).delete()
+    # 3. Refresh tokens, locked before any access token (DOT's own order),
+    # 4. access tokens.
+    list(refresh.select_for_update(of=("self",)).values_list("pk"))
+    refresh.delete()
+    get_access_token_model().objects.filter(user__email=u).delete()
+```
+
+It is idempotent: if it raises (a deadlock with a concurrent DOT
+`cleartokens`, for instance), run it again. It writes no
+`MCPAuthRejectionLog` row.
 
 **Token requests racing a revocation.** A logout or password change can
 land while the user's MCP client is exchanging a code or rotating a refresh
@@ -1046,6 +1120,26 @@ rotation committing during the refresh-token delete and a second one
 straddling the access-token delete left a working refresh / access pair
 behind a revocation logged as complete.) Pinned on real PostgreSQL
 connections by `tests/test_revocation_race.py`.
+
+**Lock cycles.** The revocation does not deadlock with a token request (an
+exchange prunes expired consent records, but skips any a revocation holds)
+or with DOT's `/o/revoke_token/` (both lock a refresh token before its
+access token). DOT's `cleartokens` takes the reverse order when it deletes
+rotated-out refresh tokens, so a revocation and a `cleartokens` run over
+the same user's rows can deadlock; PostgreSQL then aborts one of them. An
+aborted revocation is run again (up to three attempts, each retry logged
+as a WARNING); an aborted `cleartokens` fails with an error and is safe to
+rerun.
+
+**One code, two exchanges.** A code is consumed in the transaction that
+saves its tokens: of two exchanges of one code sent at once, one gets the
+tokens and the other `invalid_grant`, with nothing minted for it. (Before,
+oauthlib deleted the code only after that transaction, so both could mint:
+one was answered `invalid_grant` while its tokens stayed in the database.)
+Not done: RFC 6749 §4.1.2 says a server SHOULD also revoke the tokens
+already issued from a code presented a second time; the package refuses
+the reuse but leaves the first exchange's tokens alone (a code lives 60 s,
+and redeeming it takes its PKCE verifier).
 
 The 6 h hard cap on `access_token` lifetime is the worst-case fallback:
 even with no other action, a leaked or no-longer-needed token expires

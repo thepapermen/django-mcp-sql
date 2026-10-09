@@ -270,7 +270,8 @@ class MCPRefreshTokenFamily(models.Model):
     need not survive. A family with no row here — refresh tokens from 0.1.0b5 or
     earlier, or any written outside `save_bearer_token` — is refused.
 
-    Rows past the cap are pruned at each new exchange. Rows whose refresh
+    Rows past the cap are pruned at each new exchange (those no other
+    transaction holds locked). Rows whose refresh
     tokens are gone (revoked, deleted by `cleartokens`, or refresh switched
     off again) are inert — a family is only consulted for a live refresh
     token — and can be deleted at will, e.g. alongside `cleartokens`:
