@@ -271,10 +271,10 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
       token deletes and writes no audit row: the access did not end. It is
       logged with `logger.exception` only and not retried — except a
       deadlock PostgreSQL broke by aborting the revocation, which is run
-      again, up to `_DEADLOCK_ATTEMPTS` times (`_deadlock_attempts`): the
-      tokens then live until they expire, and an operator must delete
-      them. "Revoked ..." is logged (INFO) only after the deletes
-      committed;
+      again, up to `_DEADLOCK_ATTEMPTS` attempts in all
+      (`_deadlock_attempts`): the tokens then live until they expire, and
+      an operator must delete them. "Revoked ..." is logged (INFO) only
+      after the deletes committed;
     - no exception leaves this function. When no transaction is open the
       callback runs inside `logout()` (before the session is flushed) or
       inside the user's `save()`; an error escaping would turn the

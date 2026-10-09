@@ -251,7 +251,7 @@ def granted_tables(role: str) -> set[Relation]:
               AND a.privilege_type = 'SELECT'
               AND c.relkind IN ('r', 'v', 'f', 'p', 'm')
               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-              AND n.nspname NOT LIKE 'pg\_%%'
+              AND left(n.nspname, 3) <> 'pg_'
             """,
             [role],
         )
@@ -358,7 +358,7 @@ def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
                 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = w.name
                 WHERE c.relkind IN ('r', 'v', 'f', 'p', 'm')
                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-                  AND n.nspname NOT LIKE 'pg\_%%'
+                  AND left(n.nspname, 3) <> 'pg_'
                 ORDER BY s.pos
                 LIMIT 1
             )

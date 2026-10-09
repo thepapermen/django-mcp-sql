@@ -576,6 +576,16 @@ def test_two_exchanges_of_one_code_mint_one_token_pair(
     assert not Grant.objects.filter(user=mcp_user).exists()
 
 
+def test_a_code_exchanges_once(client, mcp_user):
+    """The plain replay: the code the first exchange consumed is gone for
+    the second, which `invalidate_authorization_code` never accepts as this
+    request's own."""
+    code, verifier = consent(client, mcp_user)
+    assert exchange(client, code, verifier).status_code == HTTPStatus.OK
+    assert _refused(exchange(client, code, verifier))
+    assert AccessToken.objects.filter(user=mcp_user).count() == 1
+
+
 def test_a_failed_save_does_not_burn_the_code(client, mcp_user, monkeypatch):
     """The code is deleted in the transaction that saves the tokens: a save
     that fails afterwards rolls the delete back with them, and the code

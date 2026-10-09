@@ -327,8 +327,8 @@ below precisely because they do **not** announce themselves.
   request in flight is waited for and its tokens deleted with the rest; a
   later one gets `invalid_grant` with nothing minted. A revocation that
   PostgreSQL aborts to break a deadlock (DOT's `cleartokens` locks tokens in
-  the reverse order of DOT's own revocation) is run again, up to 3 times,
-  logged at WARNING.
+  the reverse order of DOT's own revocation) is run again, up to three
+  attempts in all, logged at WARNING.
 - **Security: two concurrent exchanges of one authorization code could both
   mint tokens.** oauthlib deletes the code only after the tokens are saved,
   so a second exchange validated in between minted a second, live pair (its

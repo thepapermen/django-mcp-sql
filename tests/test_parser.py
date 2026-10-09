@@ -1431,6 +1431,19 @@ class TestOperatorSigns:
         parse_and_validate(sql, allowed_tables=ALLOWED)
 
     @pytest.mark.parametrize(
+        "sql",
+        [
+            # `^@` after an operator Postgres binds more loosely: sqlglot
+            # 30.22's comparison-level `StartsWith` rendered these as
+            # `STARTS_WITH(...)` (errors in Postgres too: `boolean ^@ unknown`).
+            "SELECT 'a' IS NULL ^@ 'a' AS v",
+            "SELECT 'a' IN ('a') ^@ 'a' AS v",
+        ],
+    )
+    def test_starts_with_after_a_looser_operator_is_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
         ("sql", "rendered"),
         [
             # Review round 10: `^@` (starts with) was read as `^ (@ b)`; `!!`
