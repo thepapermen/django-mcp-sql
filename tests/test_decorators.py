@@ -70,17 +70,30 @@ class TestCapRequestBody:
         request.META["CONTENT_LENGTH"] = "101"
         assert wrapped(request).status_code == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
-    def test_csrf_exempt_preserved_on_dot_cbv_as_view(self):
-        # Production wraps CBV `.as_view()` results (DOT's TokenView /
-        # RevokeTokenView), not plain functions. DOT exempts via
-        # `@method_decorator(csrf_exempt, name="dispatch")`, which
-        # `View.as_view()` copies onto the view fn's __dict__; `functools.wraps`
-        # must propagate it through the cap wrapper, or wrapping would re-arm
-        # CSRF and break the token POST. Assert against the real shape.
-        from oauth2_provider import views as oauth2_views
+    @pytest.mark.parametrize("url_name", ["token", "revoke-token"])
+    def test_csrf_exempt_preserved_on_the_mounted_oauth_views(self, url_name):
+        # Production wraps CBV `.as_view()` results (`MCPTokenView` /
+        # `MCPRevokeTokenView`, subclasses of DOT's views), not plain
+        # functions. DOT exempts via `@method_decorator(csrf_exempt,
+        # name="dispatch")`, which `View.as_view()` copies onto the view fn's
+        # __dict__; `functools.wraps` must propagate it through the cap
+        # wrapper, or wrapping would re-arm CSRF and break the token POST.
+        # Assert against what `urls.py` actually mounts.
+        from django.urls import resolve
 
-        wrapped = cap_request_body()(oauth2_views.TokenView.as_view())
-        assert getattr(wrapped, "csrf_exempt", False) is True
+        mounted = resolve(reverse(url_name)).func
+        assert getattr(mounted, "csrf_exempt", False) is True
+
+    def test_mounted_token_endpoint_accepts_a_post_without_csrf(self):
+        # End to end with CSRF checks on: the POST reaches the view (an OAuth
+        # error from it), not Django's 403 CSRF failure page.
+        from django.test import Client
+
+        response = Client(enforce_csrf_checks=True).post(
+            reverse("token"), {"grant_type": "client_credentials"}
+        )
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert response.json()["error"] == "unsupported_grant_type"
 
     def test_non_exempt_view_stays_non_exempt(self):
         wrapped = cap_request_body()(_stub_view)

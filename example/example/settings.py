@@ -221,9 +221,19 @@ OAUTH2_PROVIDER = {
     "SCOPES": {"mcp:sql": "Read-only SQL surface for MCP agents"},
     "DEFAULT_SCOPES": ["mcp:sql"],
     "ACCESS_TOKEN_EXPIRE_SECONDS": 6 * 3600,
+    # Moot for MCP: the package's OAuth endpoints mint no refresh tokens and
+    # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
+    # opts in (with its own hard cap from the consent), so
+    # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
+    # DOT reads 0 as "no age limit".)
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
+    # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
+    # in the URL query string outright, without DOT's per-request warning.
+    # The package never accepts such a token either way.
+    "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
     # "http" for loopback DCR clients (Claude Code); "https" is required
     # whenever CLOUD_CLIENTS is non-empty (the app refuses to boot otherwise).
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
