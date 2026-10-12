@@ -252,6 +252,11 @@ below precisely because they do **not** announce themselves.
     `public`.
   - `mcp_sql.W001` (`check --deploy`): `MCP_SQL["PIN_SEARCH_PATH"]` is off.
     The default is unchanged (`False`).
+  - `mcp_sql.W002` (`check --deploy`): refresh tokens are on while DOT's
+    `REFRESH_TOKEN_EXPIRE_SECONDS` is `0` or unset, so DOT never expires a
+    refresh token and `cleartokens` never deletes a rotated-out one. Only a
+    warning: the value, like `REFRESH_TOKEN_GRACE_PERIOD_SECONDS`, is the
+    operator's.
 - **`mcp_sql_smoke` warns (exit 0) while `PUBLIC` holds `CREATE` on schema
   `public`** (the PostgreSQL 14 default; 15+ revokes it). See the overload
   entry under Fixed.

@@ -347,7 +347,8 @@ but `True`:
   - expired access tokens no live refresh token holds, and expired codes.
 
   At the documented `REFRESH_TOKEN_EXPIRE_SECONDS: 0`, no revoked refresh
-  token is ever deleted (`cleartokens` warns about it): the table, and the
+  token is ever deleted (`cleartokens` warns about it, and so does
+  `check --deploy` while refresh is on: `mcp_sql.W002`): the table, and the
   expired access tokens the last live token of each chain holds, grow
   without bound. To keep it bounded with refresh on, set DOT's
   `REFRESH_TOKEN_EXPIRE_SECONDS` to **at least**

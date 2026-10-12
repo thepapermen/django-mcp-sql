@@ -372,7 +372,8 @@ OAUTH2_PROVIDER = {
     # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
     # DOT reads 0 as "no age limit".) With refresh on, set it to at least
     # that cap and schedule `cleartokens`, or rotated-out refresh tokens
-    # are never deleted (docs/oauth.md -> "Refresh tokens (opt-in)").
+    # are never deleted (docs/oauth.md -> "Refresh tokens (opt-in)";
+    # `check --deploy` warns: mcp_sql.W002).
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.

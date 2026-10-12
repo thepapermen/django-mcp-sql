@@ -11,6 +11,10 @@ IDs are `mcp_sql.<level><nnn>`, Django's `<app label>.<E|W><number>` shape:
 - `mcp_sql.W001` (`Tags.security`, deploy-only: `check --deploy`):
   `MCP_SQL["PIN_SEARCH_PATH"]` is off, so a relation earlier on the
   `search_path` can shadow a whitelisted name unreported.
+- `mcp_sql.W002` (`Tags.security`, deploy-only): refresh tokens are on
+  (`MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] > 0`) while DOT's
+  `REFRESH_TOKEN_EXPIRE_SECONDS` is `0` or unset, so DOT never expires a
+  refresh token and `cleartokens` never deletes a rotated-out one.
 """
 
 from collections.abc import Iterable
@@ -32,6 +36,8 @@ from django.db.migrations.exceptions import NodeNotFoundError
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models import Model
 from mcp_sql.conf import mcp_sql_settings
+from mcp_sql.conf import refresh_tokens_enabled
+from oauth2_provider.settings import oauth2_settings
 
 
 @register(Tags.database)
@@ -171,5 +177,38 @@ def check_search_path_pinned(
                 'request".'
             ),
             id="mcp_sql.W001",
+        )
+    ]
+
+
+@register(Tags.security, deploy=True)
+def check_refresh_tokens_expire(
+    app_configs: Sequence[AppConfig] | None = None, **kwargs: Any
+) -> list[CheckMessage]:
+    """`mcp_sql.W002` (`check --deploy` only): refresh on, DOT's refresh
+    tokens unexpirable.
+
+    The package's own cap still ends every chain; what DOT's value decides
+    is how long `cleartokens` keeps the rows. A warning, not a boot error:
+    the value is the operator's (docs/oauth.md "Keeping the refresh-token
+    table bounded")."""
+    if not refresh_tokens_enabled() or oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS:
+        return []
+    return [
+        CheckWarning(
+            'MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] turns refresh tokens on '
+            "while OAUTH2_PROVIDER['REFRESH_TOKEN_EXPIRE_SECONDS'] is "
+            f"{oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS!r}: DOT never "
+            "expires a refresh token, and cleartokens never deletes a "
+            "rotated-out one, so the refresh-token table grows without bound.",
+            hint=(
+                "Give OAUTH2_PROVIDER['REFRESH_TOKEN_EXPIRE_SECONDS'] a value "
+                'of at least MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] (shorter lets '
+                "cleartokens delete the rotated-out tokens reuse detection "
+                "matches a replay against) and run `manage.py cleartokens` on "
+                'a schedule. See docs/oauth.md "Keeping the refresh-token '
+                'table bounded".'
+            ),
+            id="mcp_sql.W002",
         )
     ]

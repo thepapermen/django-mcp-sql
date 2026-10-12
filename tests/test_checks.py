@@ -368,3 +368,57 @@ class TestW001:
         # full `check` would report.
         call_command("check", "--deploy", "--tag", "security", stdout=out, stderr=out)
         assert "mcp_sql.W001" in out.getvalue()
+
+
+class TestW002:
+    """`check --deploy` warns while refresh tokens are on and DOT's
+    `REFRESH_TOKEN_EXPIRE_SECONDS` leaves them unexpirable (`0` or unset).
+    A positive value is the operator's call, shorter than the cap included."""
+
+    _CAP = 30 * 24 * 3600
+
+    @staticmethod
+    def _w002(**kwargs) -> list:
+        return [m for m in run_checks(**kwargs) if m.id == "mcp_sql.W002"]
+
+    def _refresh_on(self, settings, **dot) -> None:
+        settings.MCP_SQL = {
+            **settings.MCP_SQL,
+            "REFRESH_TOKEN_MAX_AGE_SECONDS": self._CAP,
+        }
+        settings.OAUTH2_PROVIDER = {**settings.OAUTH2_PROVIDER, **dot}
+
+    def test_warns_at_the_documented_zero(self, settings):
+        self._refresh_on(settings, REFRESH_TOKEN_EXPIRE_SECONDS=0)
+        [warning] = self._w002(include_deployment_checks=True)
+        assert not warning.is_serious()
+        assert "is 0: DOT never expires a refresh token" in warning.msg
+        assert "grows without bound" in warning.msg
+        assert "cleartokens" in warning.hint
+
+    def test_warns_when_unset(self, settings):
+        self._refresh_on(settings)
+        settings.OAUTH2_PROVIDER = {
+            k: v
+            for k, v in settings.OAUTH2_PROVIDER.items()
+            if k != "REFRESH_TOKEN_EXPIRE_SECONDS"
+        }
+        [warning] = self._w002(include_deployment_checks=True)
+        assert "is None" in warning.msg
+
+    def test_silent_with_refresh_off(self, settings):
+        assert settings.MCP_SQL.get("REFRESH_TOKEN_MAX_AGE_SECONDS", 0) == 0
+        assert settings.OAUTH2_PROVIDER["REFRESH_TOKEN_EXPIRE_SECONDS"] == 0
+        assert self._w002(include_deployment_checks=True) == []
+
+    @pytest.mark.parametrize("expire", [_CAP, _CAP + 1, 60])
+    def test_silent_with_any_positive_value(self, settings, expire):
+        self._refresh_on(settings, REFRESH_TOKEN_EXPIRE_SECONDS=expire)
+        assert self._w002(include_deployment_checks=True) == []
+
+    def test_deploy_only(self, settings):
+        self._refresh_on(settings, REFRESH_TOKEN_EXPIRE_SECONDS=0)
+        assert self._w002() == []
+        out = StringIO()
+        call_command("check", "--deploy", "--tag", "security", stdout=out, stderr=out)
+        assert "mcp_sql.W002" in out.getvalue()
