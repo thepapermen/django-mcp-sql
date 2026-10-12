@@ -201,11 +201,18 @@ OAUTH2_PROVIDER = {
     # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
     # opts in (with its own hard cap from the consent), so
     # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
-    # DOT reads 0 as "no age limit".)
+    # DOT reads 0 as "no age limit".) With refresh on, set it to at least
+    # that cap and schedule `cleartokens`, or rotated-out refresh tokens
+    # are never deleted (docs/oauth.md -> "Refresh tokens (opt-in)").
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Required once MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] turns refresh
+    # tokens on (the app refuses to boot otherwise); inert while they are
+    # off. Replaying a rotated-out refresh token then revokes its whole
+    # chain. Install-global: every OAuth application on the install.
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
     # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
     # in the URL query string outright, without DOT's per-request warning.
     # The package never accepts such a token either way.

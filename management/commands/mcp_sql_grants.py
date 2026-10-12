@@ -25,9 +25,11 @@ class Command(BaseCommand):
             "--apply",
             action="store_true",
             help=(
-                "Execute GRANT / REVOKE for any drift. Without this flag the "
-                "command is read-only and exits 1 on drift (intended as a "
-                "CI / pre-deploy gate)."
+                "Execute GRANT / REVOKE for any drift, then re-check the "
+                "grants: if PostgreSQL left any unchanged (the login does not "
+                "own the relation), roll back and exit 1. Without this flag "
+                "the command is read-only and exits 1 on drift (intended as "
+                "a CI / pre-deploy gate)."
             ),
         )
 
@@ -54,11 +56,13 @@ class Command(BaseCommand):
             return
 
         if apply:
+            # The profiles whose grants changed, not every configured one.
+            changed = sum(1 for drift in result.per_profile.values() if drift.changed)
             self.stdout.write(
                 self.style.SUCCESS(
                     f"Applied: +{result.granted_count} grant(s), "
                     f"-{result.revoked_count} revoke(s) across "
-                    f"{len(result.per_profile)} profile(s)."
+                    f"{changed} profile(s)."
                 )
             )
             return

@@ -48,6 +48,49 @@ DENIED_FUNCTIONS_EXACT: frozenset[str] = frozenset(
         "table_to_xml_and_xmlschema",
         "cursor_to_xml",
         "cursor_to_xmlschema",
+        # The same hole through the other built-ins and stock extensions
+        # that run SQL given as text (or a query built from a relation /
+        # schema name given as text) under `mcp_readonly_role`, outside
+        # this parser:
+        # - `ts_stat(sqlquery text [, weights text])` runs `sqlquery`;
+        # - `ts_rewrite(query tsquery, select text)` runs `select` (the
+        #   3-arg `ts_rewrite(query, target, substitute)` runs nothing but
+        #   is refused by name too — owner decision: one rule per name);
+        # - `schema_to_xml*(schema name, ...)` / `database_to_xml*(...)`
+        #   dump every table of a schema / of the database the role can
+        #   SELECT, whitelisted or not;
+        # - `tablefunc`'s `connectby(relname text, ...)` and `xml2`'s
+        #   `xpath_table(..., relname text, ..., criteria text)` build a
+        #   query from their text arguments and run it;
+        # - `tablefunc`'s `crosstab(source_sql text [, category_sql text |
+        #   N int])` / `crosstab2..4(source_sql text)` run their text
+        #   argument (the `crosstab_<suffix>(text)` wrappers: the
+        #   `crosstab_` prefix below).
+        # The inner query skips the whitelist, schema scoping,
+        # `BAN_SELECT_STAR` and this deny list:
+        # `ts_stat('SELECT to_tsvector(pg_advisory_lock(1)::text)')` takes
+        # a session-level lock that outlives the read transaction's
+        # rollback on a pooled connection (verified on PostgreSQL 15), a
+        # `dblink` call reaches the network, and the `*_to_xml` dumps are
+        # one unbounded scalar. In FROM they are already refused by the
+        # empty-name `exp.Table` guard (`_check_tables`); this covers every
+        # other position — projection, WHERE, nested, schema-qualified,
+        # quoted, attribute notation (`('…'::text).ts_stat` is
+        # `ts_stat('…')` to Postgres).
+        "ts_stat",
+        "ts_rewrite",
+        "schema_to_xml",
+        "schema_to_xmlschema",
+        "schema_to_xml_and_xmlschema",
+        "database_to_xml",
+        "database_to_xmlschema",
+        "database_to_xml_and_xmlschema",
+        "connectby",
+        "xpath_table",
+        "crosstab",
+        "crosstab2",
+        "crosstab3",
+        "crosstab4",
         # Server-state / identity leaks. PG returns version banners, role
         # names, and network topology via these built-ins — useful for an
         # attacker doing reconnaissance about what role the executor runs
@@ -107,8 +150,20 @@ DENIED_BARE_KEYWORDS: frozenset[str] = frozenset(
 # bits and are introspection tools, not query helpers. Both prefixes are
 # opt-out: there is no allowlist today, since an agent doing exploration of
 # whitelisted business tables does not need any of them. Revisit if a
-# legitimate use case appears.
-DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = ("dblink_", "lo_", "pg_", "has_")
+# legitimate use case appears. `crosstab_` covers the `crosstab_<suffix>(text)`
+# wrappers `tablefunc`'s documentation tells a DBA to create over the same C
+# function as `crosstab` (listed by name above), which run their text argument
+# as SQL. `_CROSSTAB_N_RE` adds `crosstab<N>` (a wrapper named after the
+# predefined `crosstab2..4`). Only those forms: a consumer's own
+# `crosstabulate()` is not one of them.
+_CROSSTAB_N_RE = re.compile(r"crosstab[0-9]+")
+DENIED_FUNCTIONS_PREFIX: tuple[str, ...] = (
+    "dblink_",
+    "lo_",
+    "pg_",
+    "has_",
+    "crosstab_",
+)
 # Set-returning functions (SRFs). In a FROM clause these are caught by the
 # empty-name `exp.Table` guard in `_check_tables`; in the PROJECTION they are
 # not, and they fan one input row out to many — `generate_series` is the
@@ -477,8 +532,9 @@ class FaithfulPostgres(Postgres):
     - `x IS NOT NULL` / `x NOTNULL` stay as written on sqlglot versions that
       build `NOT x IS NULL` (different for a row value).
     - The operators `@ x`, `@-@ x`, `a ^@ b`, `!! q` and `! x` stay as
-      written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` and `!` as
-      `NOT`. A parameter `$1` stays a parameter.
+      written: sqlglot read `@` as a parameter, `^@` as `^ (@ b)` (30.22:
+      `STARTS_WITH(a, b)`, at the comparison level) and `!` as `NOT`. A
+      parameter `$1` stays a parameter.
     - `current_timestamp` / `current_time` keep the precision written.
     - `OPERATOR(schema.op)` keeps its name as written (sqlglot rebuilt it
       from its tokens' texts: a quoted schema came back unquoted, `< =`
@@ -496,6 +552,16 @@ class FaithfulPostgres(Postgres):
     JSONPathTokenizer = Postgres.jsonpath_tokenizer_class
 
     class Parser(_PostgresParser):
+        # sqlglot 30.22 lexes `^@` as one token and parses it at the
+        # comparison level as `exp.StartsWith`, rendered `STARTS_WITH(a,
+        # b)`: not as written, and grouped below operators Postgres binds
+        # more loosely (`a ^@ b = c`). `_parse_exponent` reads it instead,
+        # on every version.
+        RANGE_PARSERS = {
+            token: parse
+            for token, parse in _PostgresParser.RANGE_PARSERS.items()
+            if token.name != "CARET_AT"
+        }
         FUNCTIONS = {
             name: build
             for name, build in Postgres.Parser.FUNCTIONS.items()
@@ -1190,18 +1256,30 @@ class FaithfulPostgres(Postgres):
                 and token.start == before.end + 1
             )
 
-        def _starts_with_operator(self) -> bool:
-            """`^@` (starts with) at the current token: `^` and `@` written
-            together, which sqlglot reads as `^ (@ x)`."""
+        def _starts_with_operator(self) -> int:
+            """How many tokens `^@` (starts with) at the current token takes:
+            one where sqlglot lexes it as one (30.22), two for `^` and `@`
+            written together, which older versions read as `^ (@ x)`; 0 if
+            it is not there."""
             token = self._curr
-            return (
-                token is not None
-                and token.token_type == TokenType.CARET
-                and self._index + 1 < len(self._tokens)
-                and self._tokens[self._index + 1].token_type == TokenType.PARAMETER
-                and self._tokens[self._index + 1].text == "@"
-                and self._tokens[self._index + 1].start == token.end + 1
+            if token is None:
+                return 0
+            if token.token_type.name == "CARET_AT":
+                return 1
+            following = (
+                self._tokens[self._index + 1]
+                if self._index + 1 < len(self._tokens)
+                else None
             )
+            if (
+                token.token_type == TokenType.CARET
+                and following is not None
+                and following.token_type == TokenType.PARAMETER
+                and following.text == "@"
+                and following.start == token.end + 1
+            ):
+                return 2
+            return 0
 
         def _parse_exponent(self) -> exp.Expression | None:
             # sqlglot's own loop, plus `a ^@ b` (starts with), which it read
@@ -1210,8 +1288,8 @@ class FaithfulPostgres(Postgres):
             # Postgres groups it as written.
             this: exp.Expression | None = self._parse_unary()
             while True:
-                if self._starts_with_operator():
-                    self._advance(2)
+                if taken := self._starts_with_operator():
+                    self._advance(taken)
                     this = self.expression(
                         _InfixOperator(
                             this=this, expression=self._parse_unary(), op="^@"
@@ -1693,6 +1771,11 @@ def _checked(
 ) -> ParsedQuery:
     """`_parse_and_validate`, with any non-rejection exception mapped to
     `PARSE_ERROR` (see `parse_and_validate`)."""
+    if "\x00" in raw_sql:
+        # PostgreSQL takes no NUL in query text: psycopg 3 cut the query
+        # there, psycopg 2 raised a `ValueError` no handler audits.
+        msg = "SQL contains a NUL character, which PostgreSQL does not accept"
+        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
     try:
         return _parse_and_validate(
             raw_sql,
@@ -2048,6 +2131,11 @@ def _denial(name: str) -> tuple[OutcomeReason, str] | None:
         if name.startswith(prefix):
             msg = f"Function '{name}' (prefix '{prefix}*') is on the deny list"
             return OutcomeReason.DISALLOWED_FUNCTION, msg
+    if _CROSSTAB_N_RE.fullmatch(name):
+        return (
+            OutcomeReason.DISALLOWED_FUNCTION,
+            f"Function '{name}' (crosstab<N>) is on the deny list",
+        )
     return None
 
 
@@ -2772,12 +2860,24 @@ def relation_of(db_table: str) -> tuple[str, str]:
     `widget` in the schema `analytics`; any other `db_table` (`'"t"'`
     included) names a relation in `DEFAULT_SCHEMA`.
     """
+    schema, name = _split_db_table(db_table)
+    return (DEFAULT_SCHEMA if schema is None else schema), name
+
+
+def names_schema(db_table: str) -> bool:
+    """Whether a `db_table` names its schema (`schema"."name`); an
+    unqualified one is the relation in `DEFAULT_SCHEMA` (`relation_of`)."""
+    return _split_db_table(db_table)[0] is not None
+
+
+def _split_db_table(db_table: str) -> tuple[str | None, str]:
+    """A `db_table` as `(schema, name)` — `schema` None when it names none."""
     quoted = len(db_table) > 1 and db_table[0] == db_table[-1] == '"'
     inner = db_table[1:-1] if quoted else db_table
     schema, dot, name = inner.partition('"."')
     if dot:
         return schema, name
-    return DEFAULT_SCHEMA, inner
+    return None, inner
 
 
 def _table_relation(table: exp.Table) -> tuple[str, str]:

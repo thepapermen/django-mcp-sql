@@ -153,9 +153,19 @@ the package itself never imports `sentry_sdk`.
 >   database, or another session on the same pooled backend — can plant a
 >   same-named relation readable by `PUBLIC` and have the agent read *its*
 >   rows under a whitelisted name (curated view included), which
->   `mcp_sql_grants` does not report. See
+>   `mcp_sql_grants` does not report; `manage.py check --deploy` warns
+>   (`mcp_sql.W001`) while it is off. See
 >   [docs/architecture.md](docs/architecture.md) "`search_path` is pinned
 >   only on request".
+> - **Revoke `CREATE` on schema `public` from `PUBLIC`** (PostgreSQL 14 and
+>   earlier grant it; 15+ does not). Any role that can create there can
+>   plant a function or operator overload — `public.lower(varchar)` — that
+>   Postgres prefers to the built-in for a better-matching argument type,
+>   with the pin on too, and that runs on the values the agent's query
+>   passes it; the parser's deny list matches names and cannot see it.
+>   `mcp_sql_smoke` warns while `PUBLIC` holds it. See
+>   [docs/role-setup.md](docs/role-setup.md) "Revoke `CREATE` on schema
+>   `public` from `PUBLIC`".
 > - **Don't expose this surface to a privileged agent.** Keep the read-only
 >   SQL context separate from any agent that also holds act/exfiltrate tools,
 >   so a malicious row has nothing to pivot into.
@@ -330,8 +340,9 @@ MCP_SQL = {
                                             # does NOT qualify — its absence of a `user`
                                             # column is why the default is `None`)
     # Opt-in refresh tokens (default 0 = OFF): rotating, and refused once this
-    # many seconds have passed since the user's consent. See docs/oauth.md
-    # "Refresh tokens (opt-in)".
+    # many seconds have passed since the user's consent. Requires
+    # OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"] = True (below). See
+    # docs/oauth.md "Refresh tokens (opt-in)".
     # "REFRESH_TOKEN_MAX_AGE_SECONDS": 7 * 24 * 3600,
     # search_path pin — RECOMMENDED, but off by default (False). On, every
     # read transaction runs SET LOCAL search_path = public, pg_temp, so an
@@ -344,7 +355,8 @@ MCP_SQL = {
     # agent reads its rows under the whitelisted name; mcp_sql_grants does
     # not detect it. Leave it off only if an extension the agent uses lives
     # outside `public` — and even then, with it on, the agent can write
-    # `ext.f(x)` / `OPERATOR(ext.op)`.
+    # `ext.f(x)` / `OPERATOR(ext.op)`. Left off, `check --deploy` warns
+    # (mcp_sql.W001).
     # See docs/architecture.md "`search_path` is pinned only on request".
     "PIN_SEARCH_PATH": True,
 }
@@ -358,11 +370,19 @@ OAUTH2_PROVIDER = {
     # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
     # opts in (with its own hard cap from the consent), so
     # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
-    # DOT reads 0 as "no age limit".)
+    # DOT reads 0 as "no age limit".) With refresh on, set it to at least
+    # that cap and schedule `cleartokens`, or rotated-out refresh tokens
+    # are never deleted (docs/oauth.md -> "Refresh tokens (opt-in)";
+    # `check --deploy` warns: mcp_sql.W002).
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
+    # Required once MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] turns refresh
+    # tokens on (the app refuses to boot otherwise); inert while they are
+    # off. Replaying a rotated-out refresh token then revokes its whole
+    # chain. Install-global: every OAuth application on the install.
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
     # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
     # in the URL query string outright, without DOT's per-request warning.
     # The package never accepts such a token either way.
@@ -417,7 +437,7 @@ the package (importable consumers find them under `mcp_sql/docs/`):
 ## Compatibility
 
 - **Python**: 3.11–3.14 (which ones depends on the Django line — see the table below)
-- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `information_schema.role_table_grants`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
+- **Postgres**: 14+ on Django 4.2–6.0, **15+ on Django 6.1** (Django 6.1 itself refuses to connect to 14). The package's own SQL (`pg_has_role`, `aclexplode` over `pg_class.relacl`, `SET LOCAL ROLE`, `CREATE OR REPLACE VIEW`) works on earlier versions too, but CI only tests PostgreSQL 14, 15 and 16.
 
 ### Supported combinations
 

@@ -10,12 +10,15 @@ that profile's whitelist independently (per-role drift — never global).
 - `strict=False`: env-level preflight failures (role missing,
   no membership) log a WARNING and return an empty `DriftDiff` with
   `skipped_reason` set. Code-level misconfigs (self-referential
-  whitelist, overlong `db_table`) raise regardless. Used by the
+  whitelist, overlong `db_table`, an unqualified `db_table` found only
+  outside `public`) raise regardless. Used by the
   `post_migrate` signal so a fresh environment without `role_setup.sql`
   does not crash `migrate`.
 - `apply=True`: also execute the GRANT / REVOKE statements implied by the
-  diff. `apply=False` is read-only; the returned `DriftDiff` describes
-  what WOULD have been done.
+  diff, then re-read the grants in the same transaction and roll back with
+  `GrantsReconcileError` if any drift is left (PostgreSQL only warns on a
+  GRANT / REVOKE the app login may not make). `apply=False` is read-only;
+  the returned `DriftDiff` describes what WOULD have been done.
 
 The signal observes (`apply=False`); the deploy command applies
 (`apply=True`). Keeping detection and execution behind one flag means
@@ -34,6 +37,7 @@ from django.db import transaction
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.parser import DEFAULT_SCHEMA
+from mcp_sql.parser import names_schema
 from mcp_sql.parser import relation_of
 
 logger = logging.getLogger(__name__)
@@ -48,9 +52,10 @@ MAX_IDENTIFIER_BYTES = 63
 
 
 class GrantsReconcileError(Exception):
-    """Strict-mode preflight failure (role missing, no membership) or
+    """Strict-mode preflight failure (role missing, no membership),
     code-level misconfiguration (self-referential whitelist, a `db_table`
-    longer than PostgreSQL keeps)."""
+    longer than PostgreSQL keeps), or an `--apply` whose statements left
+    drift (rolled back)."""
 
 
 def _verify_default_alias() -> None:
@@ -212,24 +217,41 @@ def granted_tables(role: str) -> set[Relation]:
     whatever the relations' owners chose; they are compared as tuples and
     rendered for SQL only through `relation_sql`.
 
-    Limits of the inventory (`information_schema.role_table_grants`):
-    materialized views are not listed, nor are grants to `PUBLIC` or grants
-    the role holds only through membership in another role (ledger F42 /
-    F64); relations in temporary schemas are skipped. With
-    `PIN_SEARCH_PATH` off, a relation shadowing a whitelisted name and
-    readable through any of these is served to the agent and never
-    reported (docs/architecture.md "`search_path` is pinned only on
-    request")."""
+    Read from the catalog (`pg_class.relacl`, through `aclexplode`, the
+    owner's implicit privileges where it is NULL), as
+    `information_schema.role_table_grants` reads it, with materialized
+    views included: the view lists tables, views, foreign and partitioned
+    tables only, so a SELECT grant on a materialized view was never seen —
+    a whitelisted one was drift on every run, and once `--apply` re-read
+    its grants (`_apply_and_verify`), `--apply` failed on it too (ledger
+    F42, materialized-view half). For the other kinds the rows are the
+    view's: a direct grant whose grantee is `role` (the view also filters
+    to grants that involve a role the login has enabled; the login is a
+    member of every profile role — `has_role_membership` — so that filter
+    drops nothing here).
+
+    Limits of the inventory: grants to `PUBLIC` and grants the role holds
+    only through membership in another role are not listed (ledger F42 /
+    F64), nor are sequences or column-level grants; relations in
+    temporary schemas are skipped. With `PIN_SEARCH_PATH` off, a relation
+    shadowing a whitelisted name and readable through any of these is
+    served to the agent and never reported (docs/architecture.md
+    "`search_path` is pinned only on request")."""
     _verify_default_alias()
     with connection.cursor() as cur:
         cur.execute(
             r"""
-            SELECT table_schema, table_name
-            FROM information_schema.role_table_grants
-            WHERE grantee = %s
-              AND privilege_type = 'SELECT'
-              AND table_schema NOT IN ('pg_catalog', 'information_schema')
-              AND table_schema NOT LIKE 'pg\_%%'
+            SELECT n.nspname, c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(
+                coalesce(c.relacl, acldefault('r', c.relowner))
+            ) AS a
+            WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = %s)
+              AND a.privilege_type = 'SELECT'
+              AND c.relkind IN ('r', 'v', 'f', 'p', 'm')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND left(n.nspname, 3) <> 'pg_'
             """,
             [role],
         )
@@ -293,6 +315,136 @@ def overlong_entries(profile: Profile) -> list[str]:
             for part in relation_of(table)
         )
     ]
+
+
+def relations_off_default_schema(tables: dict[str, str]) -> dict[str, str]:
+    """`{entry: schema}` for each unqualified `db_table` in `tables`
+    (`{dotted_path: db_table}`) that names no relation in `DEFAULT_SCHEMA`
+    while the login's `search_path` finds one of that name in `schema`.
+
+    An unqualified `db_table` is the relation in `public` to the parser,
+    the grants and the read path (round 16; until 0.1.0b5 GRANT resolved it
+    through the login's `search_path`). For such an entry `--apply` fails
+    with `relation "public.<name>" does not exist`, and an unmanaged one's
+    view-parity probe fails the same way. Resolved as Postgres resolves an
+    unqualified name on this connection (`current_schemas(true)`: the
+    schemas on the `search_path` that exist and the login may use), from
+    the catalog, so no name is parsed as SQL. Both sides count only the
+    relation kinds the inventory does (`granted_tables`: tables, views,
+    materialized views, foreign and partitioned tables), so a same-named
+    index, sequence or composite type neither stands for the relation in
+    `public` nor is reported as found elsewhere. The system schemas
+    `current_schemas(true)` adds are not searched: `pg_catalog`, and the
+    session's temporary schema (a temporary relation is the shadowing case
+    `PIN_SEARCH_PATH` is for, docs/architecture.md "`search_path` is pinned
+    only on request" — not a place a `db_table` could name). A `db_table`
+    that is nowhere yet (a migration still to run) is not reported."""
+    _verify_default_alias()
+    names = {
+        entry: relation_of(table)[1]
+        for entry, table in tables.items()
+        if not names_schema(table)
+    }
+    if not names:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            r"""
+            SELECT w.name, (
+                SELECT s.nspname
+                FROM unnest(current_schemas(true)) WITH ORDINALITY
+                    AS s(nspname, pos)
+                JOIN pg_namespace n ON n.nspname = s.nspname
+                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = w.name
+                WHERE c.relkind IN ('r', 'v', 'f', 'p', 'm')
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND left(n.nspname, 3) <> 'pg_'
+                ORDER BY s.pos
+                LIMIT 1
+            )
+            FROM unnest(%s::text[]) AS w(name)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = w.name
+                  AND c.relkind IN ('r', 'v', 'f', 'p', 'm')
+            )
+            """,
+            [sorted(set(names.values())), DEFAULT_SCHEMA],
+        )
+        found = {str(name): str(schema) for name, schema in cur.fetchall() if schema}
+    return {entry: found[name] for entry, name in names.items() if name in found}
+
+
+def qualified_db_table(relation: Relation) -> str | None:
+    """The `db_table` that names `relation` (`schema"."name`), or None when
+    no `db_table` can: Django quotes a `db_table` by wrapping it in `"`
+    without doubling any inside it, so a name holding `"` breaks out of its
+    identifier, and the package reads `"."` as the schema separator
+    (`parser.relation_of`). A name with a character that does not print is
+    refused too, so a printed remedy shows what it names."""
+    if any('"' in part or not part.isprintable() for part in relation):
+        return None
+    return '{}"."{}'.format(*relation)
+
+
+def off_default_schema_message(
+    profile_name: str, entry: str, db_table: str, schema: str
+) -> tuple[str, str]:
+    """`(message, remedy)` for an entry `relations_off_default_schema`
+    reported: shared by the system check (`mcp_sql.E001`) and the
+    reconciler, so `check`, `migrate` and `mcp_sql_grants` say the same.
+
+    `schema` is a catalog name (untrusted: whoever may create a schema
+    chooses it), shown only as `quote_ident` renders it, and offered as a
+    `db_table` only when one can name it (`qualified_db_table`), as a
+    Python literal (`repr`)."""
+    relation = (schema, relation_of(db_table)[1])
+    message = (
+        f"MCP_SQL profile {profile_name!r} whitelists {entry}, whose db_table "
+        f"{db_table!r} names no schema, so it is the relation in schema "
+        f"{DEFAULT_SCHEMA!r} to the parser, mcp_sql_grants and the read path; "
+        f"there is none there — the login's search_path finds it in schema "
+        f"{quote_ident(schema)}."
+    )
+    qualified = qualified_db_table(relation)
+    if qualified is None:
+        name_it = (
+            f"No db_table can name {relation_sql(relation)} (Django does not "
+            "escape a double quote in one, and a name that does not print is "
+            "not offered): rename the schema or the relation, then name the "
+            "schema in db_table (and grant the profile role USAGE on it)."
+        )
+    else:
+        name_it = (
+            f"Name the schema: db_table = {qualified!r} (and grant the "
+            "profile role USAGE on the schema)."
+        )
+    remedy = (
+        f"{name_it} For a model you cannot edit (a "
+        "third-party app), whitelist instead an unmanaged model of your own "
+        "(Meta.managed = False) with that db_table, declaring exactly the "
+        "relation's columns, or a curated view in public over the relation "
+        '(docs/architecture.md "Curated-view pattern").'
+    )
+    return message, remedy
+
+
+def _verify_off_default_schema(profile: Profile) -> None:
+    """Raise `GrantsReconcileError` for an entry that names a relation
+    `public` does not have but the `search_path` does
+    (`relations_off_default_schema`) — before the view-parity probe and
+    GRANT would fail on it with a bare `ProgrammingError` (which the
+    `post_migrate` receiver let through, failing `migrate`)."""
+    tables = declared_tables(profile)
+    off = relations_off_default_schema(tables)
+    if off:
+        msg = "\n".join(
+            " ".join(off_default_schema_message(profile.name, e, tables[e], schema))
+            for e, schema in sorted(off.items())
+        )
+        raise GrantsReconcileError(msg)
 
 
 def _verify_view_parity(profile: Profile) -> None:
@@ -361,6 +513,9 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
     applied, and all profiles' GRANT / REVOKE statements run in one
     transaction: a refusal of any profile changes no grant (review round
     19: the profiles before the refused one had been applied already).
+    The grants are re-read in that transaction before it commits, and any
+    drift left — a statement PostgreSQL only warned about — rolls it back
+    with `GrantsReconcileError` (`_apply_and_verify`).
     Roles are unique per profile (boot-validated), so one profile's
     changes never alter another's drift.
     """
@@ -370,19 +525,18 @@ def reconcile_grants(*, strict: bool, apply: bool) -> DriftDiff:
     for profile in profiles:
         result.per_profile[profile.name] = _profile_drift(profile, strict=strict)
     if apply and result.changed:
-        with transaction.atomic():
-            for profile in profiles:
-                _apply_drift(profile.role, result.per_profile[profile.name])
+        _apply_and_verify(
+            [(profile, result.per_profile[profile.name]) for profile in profiles]
+        )
     return result
 
 
 def _reconcile_profile(profile: Profile, *, strict: bool, apply: bool) -> ProfileDrift:
     """Reconcile one profile's role against its declared whitelist (the
-    checks and the drift of `_profile_drift`, then `_apply_drift`)."""
+    checks and the drift of `_profile_drift`, then `_apply_and_verify`)."""
     drift = _profile_drift(profile, strict=strict)
     if apply and drift.changed:
-        with transaction.atomic():
-            _apply_drift(profile.role, drift)
+        _apply_and_verify([(profile, drift)])
     return drift
 
 
@@ -411,6 +565,12 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
             "truncates: shorten Meta.db_table."
         )
         raise GrantsReconcileError(msg)
+
+    # Before the role checks: it reads the login's `search_path`, not the
+    # role, and the system check (`mcp_sql.E001`) leaves an entry whose app
+    # had migrations to apply to this, the `post_migrate` receiver's run —
+    # on a fresh database, where the role is likeliest still to be created.
+    _verify_off_default_schema(profile)
 
     if not role_exists(profile.role):
         msg = (
@@ -442,6 +602,12 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
     # statements against an out-of-sync view.
     _verify_view_parity(profile)
 
+    return _role_drift(profile)
+
+
+def _role_drift(profile: Profile) -> ProfileDrift:
+    """The profile role's drift from its whitelist as the catalog stands
+    now: declared minus granted, granted minus declared."""
     # Relations, `(schema, name)`, on both sides (`"t"` and `t` are the same
     # table; `s"."t` is not `t`).
     declared = {relation_of(table) for table in declared_tables(profile).values()}
@@ -450,6 +616,88 @@ def _profile_drift(profile: Profile, *, strict: bool) -> ProfileDrift:
         granted=sorted(declared - current),
         revoked=sorted(current - declared),
     )
+
+
+def _apply_and_verify(drifts: list[tuple[Profile, ProfileDrift]]) -> None:
+    """Run every profile's GRANT / REVOKE statements in one transaction,
+    then re-read each role's grants in it; if any drift is left, roll the
+    transaction back and raise `GrantsReconcileError` naming it.
+
+    PostgreSQL does not always fail a GRANT or REVOKE the executing role
+    may not make: on a relation the app login neither owns (nor is a
+    member of the owning role of) nor holds `WITH GRANT OPTION` on, but
+    holds some other privilege on, GRANT warns "no privileges were
+    granted" and REVOKE "no privileges could be revoked", and nothing
+    changes (with no privilege at all it raises "permission denied"); a
+    REVOKE also removes only grants its role made itself. Before,
+    `--apply` reported such statements as applied and exited 0 while check
+    mode kept reporting the same drift. The re-read is `granted_tables`,
+    check mode's own inventory, so what passes here is what check mode
+    then reports in sync."""
+    with transaction.atomic():
+        for profile, drift in drifts:
+            _apply_drift(profile.role, drift)
+        left = {
+            profile.name: remaining
+            for profile, drift in drifts
+            if drift.changed and (remaining := _role_drift(profile)).changed
+        }
+        if left:
+            raise GrantsReconcileError(_unapplied_message(left))
+
+
+def _unapplied_message(left: dict[str, ProfileDrift]) -> str:
+    """Name each profile's drift `--apply` left, with each relation's owner
+    and the login that ran the statements."""
+    owners = _owners({r for d in left.values() for r in d.granted + d.revoked})
+
+    def shown(relations: list[Relation]) -> str:
+        return ", ".join(
+            f"{relation_display(r)} (owner {quote_ident(owners[r])})"
+            if r in owners
+            else relation_display(r)
+            for r in relations
+        )
+
+    lines = []
+    for name, drift in left.items():
+        if drift.granted:
+            lines.append(f"  [{name}] still not granted: {shown(drift.granted)}")
+        if drift.revoked:
+            lines.append(f"  [{name}] still granted: {shown(drift.revoked)}")
+    with connection.cursor() as cur:
+        cur.execute("SELECT current_user")
+        login = cur.fetchone()[0]
+    return (
+        "GRANT / REVOKE ran but PostgreSQL left these privileges unchanged "
+        "(it only warns when a role may not change a privilege), so nothing "
+        "was applied:\n"
+        + "\n".join(lines)
+        + f"\nThe login running mcp_sql_grants ({login!r}) can grant or "
+        "revoke a privilege only on a relation it owns (or whose owning role "
+        "it is a member of) or holds WITH GRANT OPTION on, and REVOKE "
+        "removes only the grants it made itself. Run `mcp_sql_grants "
+        "--apply` as the relations' owner, or have the owner run the "
+        "statements `mcp_sql_grants` prints without --apply."
+    )
+
+
+def _owners(relations: set[Relation]) -> dict[Relation, str]:
+    """The owning role of each of `relations` that exists, by relation."""
+    if not relations:
+        return {}
+    schemas, names = zip(*sorted(relations), strict=True)
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner)
+            FROM unnest(%s::text[], %s::text[]) AS r(nspname, relname)
+            JOIN pg_namespace n ON n.nspname = r.nspname
+            JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = r.relname
+            """,
+            [list(schemas), list(names)],
+        )
+        return {(str(s), str(n)): str(owner) for s, n, owner in cur.fetchall()}
 
 
 def _apply_drift(role: str, drift: ProfileDrift) -> None:

@@ -15,13 +15,14 @@ made the request.
 
 ### Breaking
 
-All but the last four fail loudly — at startup, or for the Python API renames
-at import or call time — and none require any client to reconnect (client_ids
-are unchanged, provisioning never deletes rows, and tokens are 6-hour anyway).
-The default-ON flip, the dropped `is_staff` requirement, the curated client's
-new consent page and the consent page no longer skippable by
-`REQUEST_APPROVAL_PROMPT` are called out separately below precisely because
-they do **not** announce themselves.
+All but the last five fail loudly — at startup, at `migrate`, from
+`mcp_sql_grants --apply`, or for the Python API renames at import or call
+time — and none require any client to reconnect (client_ids are unchanged,
+provisioning never deletes rows, and tokens are 6-hour anyway). The default-ON
+flip, the dropped `is_staff` requirement, the curated client's new consent
+page, the consent page no longer skippable by `REQUEST_APPROVAL_PROMPT` and
+`--apply` revoking grants on materialized views are called out separately
+below precisely because they do **not** announce themselves.
 
 - **`MCP_SQL["CLOUD_CLIENTS"]` → `MCP_SQL["CLIENTS"]`**, reshaped from a list
   of entries carrying `NAME` to a **dict keyed by slug**, and from the singular
@@ -99,6 +100,35 @@ they do **not** announce themselves.
     (see "Changed"). `consts.classify_application_name(name)` remains as the
     name-shape half; it is not a recognition check on its own.
 
+- **Refresh tokens now require DOT's `REFRESH_TOKEN_REUSE_PROTECTION = True`.**
+  With `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"] > 0` the app refuses to boot
+  (`ImproperlyConfigured`) unless `OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"]`
+  is `True`. Rotation was already forced, but without reuse detection whoever
+  presented a stolen refresh token first kept a working rotated chain until
+  the cap, and the legitimate client only got `invalid_grant` (OAuth 2.1
+  §4.3.1 and RFC 9700 §4.14.2 require rotation with reuse detection for public
+  clients). Replaying a rotated-out token now revokes the whole chain. The
+  setting is install-global (it applies to every OAuth application on the
+  install). Refresh off (the default): nothing to change. Keep DOT's
+  `REFRESH_TOKEN_GRACE_PERIOD_SECONDS` at 0 or a few seconds: within it a
+  replay is answered with the chain's current pair instead of revoking it.
+- **`migrate` can stop on `mcp_sql.E001`.** A whitelisted model whose
+  `db_table` names no schema is the relation in `public`; when there is none
+  there and the login's `search_path` finds one of that name in another
+  schema, the new database system check fails `migrate` (and `check
+  --database default`) before anything is applied. It used to fail later,
+  inside `migrate`, with a bare `ProgrammingError`. An entry whose app still
+  has migrations to apply is not checked (one of them may create the table
+  in `public`); the `post_migrate` grants check logs it if it is still wrong
+  afterwards. Name the schema in `db_table` (`'schema"."name'`), or run
+  `migrate --skip-checks` when another app's migration creates the
+  relation.
+- **`mcp_sql_grants --apply` can now exit 1.** When PostgreSQL silently skips
+  a `GRANT` / `REVOKE` (the login does not own the relation; see "Fixed"),
+  the whole apply is rolled back and the command fails naming each relation,
+  its owner and the login. A deploy script that ran `--apply` as a non-owner
+  used to pass while changing nothing; run it as the relations' owner or a
+  member of the owning role.
 - **Declared clients now ship ON.** `CLOUD_CLIENTS` defaulted to `[]`; `CLIENTS`
   defaults to `claude`, `chatgpt` and `cursor`. A consumer who declared the old
   key hits the `ImproperlyConfigured` above and makes a deliberate choice — but
@@ -160,6 +190,15 @@ they do **not** announce themselves.
   is no setting to bring the skip back. Other OAuth applications served by
   DOT's own views in the same project keep the setting.
 
+- **`mcp_sql_grants --apply` now revokes undeclared grants on materialized
+  views.** The inventory now reads the catalog's ACLs, which include
+  materialized views (see "Fixed"): a grant to the read role on a
+  materialized view that no profile whitelists is now drift, and `--apply`
+  revokes it, printing the `REVOKE` and exiting 0. Before, materialized views
+  were invisible to the command, so such a grant was never reported. Run
+  `mcp_sql_grants` (check mode) before upgrading to see what `--apply` will
+  revoke, and whitelist any materialized view the read role should keep.
+
 ### Added
 
 - **Every `MCP_SQL` key now has an in-package default** — declare only what you
@@ -200,6 +239,27 @@ they do **not** announce themselves.
 - **`manage.py mcp_sql_clients`** prints each declared client's client_id and
   callbacks — the values to paste into a provider connector, without scrolling
   through `migrate` output.
+
+- **Django system checks** (`mcp_sql.checks`, IDs `mcp_sql.<E|W><nnn>`):
+  - `mcp_sql.E001` (a database check: `manage.py migrate` runs it before
+    applying anything, and `check --database default`): a whitelisted model
+    whose unqualified `db_table` names no relation in `public` while the
+    login's `search_path` finds it in another schema. Until 0.1.0b5 such an
+    entry resolved through `search_path`; it now means `public`. The error
+    names the profile, the model and the schema; the remedy is
+    `db_table = 'schema"."name'`, or for a third-party model your own
+    unmanaged model with a qualified `db_table`, or a curated view in
+    `public`.
+  - `mcp_sql.W001` (`check --deploy`): `MCP_SQL["PIN_SEARCH_PATH"]` is off.
+    The default is unchanged (`False`).
+  - `mcp_sql.W002` (`check --deploy`): refresh tokens are on while DOT's
+    `REFRESH_TOKEN_EXPIRE_SECONDS` is `0` or unset, so DOT never expires a
+    refresh token and `cleartokens` never deletes a rotated-out one. Only a
+    warning: the value, like `REFRESH_TOKEN_GRACE_PERIOD_SECONDS`, is the
+    operator's.
+- **`mcp_sql_smoke` warns (exit 0) while `PUBLIC` holds `CREATE` on schema
+  `public`** (the PostgreSQL 14 default; 15+ revokes it). See the overload
+  entry under Fixed.
 
 ### Changed
 
@@ -250,6 +310,90 @@ they do **not** announce themselves.
 
 ### Fixed
 
+- **Security: built-ins that run SQL passed as text are refused.** `ts_stat`,
+  `ts_rewrite` (every arity), `schema_to_xml*`, `database_to_xml*`, and the
+  extension functions `crosstab`, `crosstab<N>`, the `crosstab_*` wrappers
+  and `connectby` (tablefunc) and `xpath_table` (xml2) were refused
+  in `FROM` but accepted in the select list, `WHERE` and nested expressions.
+  There the inner query skipped the table whitelist, schema scoping,
+  `BAN_SELECT_STAR` and the deny list: for example a `pg_advisory_lock` that
+  outlives the rollback on a pooled connection, `dblink` where it is
+  installed, or a whole schema serialised into one value. Now refused as `disallowed_function` in every position and
+  spelling (schema-qualified, quoted, attribute notation), like the
+  `query_to_xml` family already was. Present in 0.1.0b5.
+- **Security: a logout or password change could miss tokens minted by a
+  concurrent rotation or code exchange.** The revocation's deletes were
+  separate statements, each seeing only rows committed before it started, so
+  two rotations interleaved with it left a working refresh / access pair while
+  the audit row reported the revocation. Reproduced on PostgreSQL. Now pending
+  codes and the chains' consent records (`MCPRefreshTokenFamily`) are deleted
+  first and refresh tokens are locked before deletion; every token request
+  locks the code or consent record it mints from in its saving transaction. A
+  request in flight is waited for and its tokens deleted with the rest; a
+  later one gets `invalid_grant` with nothing minted. A revocation that
+  PostgreSQL aborts to break a deadlock (DOT's `cleartokens` locks tokens in
+  the reverse order of DOT's own revocation) is run again, up to three
+  attempts in all, logged at WARNING.
+- **Security: two concurrent exchanges of one authorization code could both
+  mint tokens.** oauthlib deletes the code only after the tokens are saved,
+  so a second exchange validated in between minted a second, live pair (its
+  response was `invalid_grant`, its tokens stayed). The code is now consumed
+  in the transaction that saves the tokens: the other exchange is refused
+  with nothing minted. Tokens already issued from a code presented again are
+  still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **Security: a NUL character in the SQL suppressed its audit row.** Postgres
+  refuses NUL in a `text` column, so the `MCPQueryLog` insert failed (logged
+  only) and a query carrying one in a comment, which the executed rendering
+  drops, returned rows with no audit row. SQL containing a NUL is now
+  refused as `unsafe_literal` (Postgres takes no NUL in query text: psycopg 3
+  cut the query there, psycopg 2 raised a `ValueError` that escaped the
+  audit), and the audit writer stores any NUL as U+2400 (␀).
+- **Docs: the operator's token-revocation snippet missed refresh tokens.**
+  `docs/oauth.md` (linked from `docs/role-setup.md`) now deletes codes,
+  consent records, refresh tokens and access tokens in one transaction, in
+  the order the package revokes them, and explains how to keep the
+  refresh-token table bounded (DOT's `REFRESH_TOKEN_EXPIRE_SECONDS` at least
+  the cap, and `cleartokens` on a schedule).
+- **`invalid_grant` raised after validation is answered as JSON** with
+  `Cache-Control: no-store`, not DOT's `text/html` 400.
+- **Docs: `pg_catalog` first on the search path does not stop overloads
+  planted in `public`.** `docs/architecture.md` claimed it protected function
+  resolution; a better-matching overload in `public` (`public.lower(varchar)`
+  for a `varchar` column, or an `=(varchar, varchar)` operator) wins wherever
+  `public` sits on the path, with `PIN_SEARCH_PATH` on too, and the
+  name-based deny list cannot see it. Recommended: `REVOKE CREATE ON SCHEMA
+  public FROM PUBLIC` (the PostgreSQL 15+ default), documented in
+  `docs/role-setup.md` and shipped commented out in `sql/role_setup.sql` and
+  `mcp_sql_role_setup --emit-sql` (applying it automatically would break a
+  PostgreSQL 14 app login that creates its tables through that grant).
+- **`mcp_sql_grants --apply` reported changes it had not made.** PostgreSQL
+  only warns ("no privileges were granted" / "no privileges could be
+  revoked") and changes nothing when the login does not own a relation and
+  lacks the grant option but holds some other privilege on it (an app login
+  with DML grants on tables a migration role owns). `--apply` printed
+  `Applied: …` and exited 0 while check mode reported the same drift forever.
+  It now re-reads the grants in the same transaction and, if any drift is
+  left, rolls everything back and fails (exit 1) naming each relation, its
+  owner and the login. Run `--apply` as the relations' owner or a member of
+  the owning role.
+- **The grants inventory reads the catalog's ACLs** (`pg_class.relacl`)
+  instead of `information_schema.role_table_grants`, so it now includes
+  materialized views: a whitelisted one is no longer drift on every run, and
+  an undeclared grant on one is drift that `--apply` revokes. Tables and views
+  report exactly as before. Grants to `PUBLIC` and through role membership
+  are still not listed.
+- **An unqualified `db_table` living outside `public` failed inside
+  `migrate`** (`relation "public.<name>" does not exist`, or a bare
+  `ProgrammingError` from `post_migrate` for an unmanaged entry). `migrate` now
+  stops first on `mcp_sql.E001`, and `mcp_sql_grants` and the `post_migrate`
+  drift check name the schema and the remedy (before the role checks, so
+  also before `role_setup.sql` has run). `mcp_sql_smoke` reports a
+  whitelisted table missing from `public`, a table the role cannot read yet
+  and a role it cannot enter as a command error naming the remedy (the
+  check, `mcp_sql_grants --apply`, `role_setup.sql`), not a bare
+  `ProgrammingError`.
+- **`mcp_sql_grants --apply` counted every profile in its summary** ("across
+  N profile(s)"), not the ones whose grants it changed.
 - **A declared client's redirects followed its `Application` row, not
   settings.** Its exact callbacks were matched by DOT against the row's
   `redirect_uris`, which provisioning refreshes only in `post_migrate`. So

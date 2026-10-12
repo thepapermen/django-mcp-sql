@@ -322,6 +322,91 @@ class TestLogoutWithTokensOnAnotherDatabase:
         assert _audited(user, SECOND, AuthRejectionReason.SESSION_LOGOUT)
 
 
+class TokensOnlyOnSecond:
+    """DOT's models on the second database; mcp_sql's own (the consent
+    records, the audit table) left on the default one."""
+
+    def _route(self, model):
+        return SECOND if model._meta.app_label == "oauth2_provider" else None
+
+    def db_for_read(self, model, **hints):
+        return self._route(model)
+
+    def db_for_write(self, model, **hints):
+        return self._route(model)
+
+
+class TestConsentRecordsOnAnotherDatabase:
+    def test_the_chains_consent_records_go_where_they_live(self, settings):
+        """The revocation deletes the consent records of the user's
+        refresh-token chains (so no rotation of them can mint again) on the
+        database a router keeps them on, next to the token deletes on
+        DOT's."""
+        import uuid
+
+        from mcp_sql.models import MCPRefreshTokenFamily
+
+        user = UserFactory()
+        _credentials(_copy_user(user, SECOND), SECOND)
+        family = uuid.uuid4()
+        RefreshToken.objects.using(SECOND).filter(user_id=user.pk).update(
+            token_family=family
+        )
+        MCPRefreshTokenFamily.objects.using("default").create(
+            token_family=family, consented_at=timezone.now()
+        )
+        other = MCPRefreshTokenFamily.objects.using("default").create(
+            token_family=uuid.uuid4(), consented_at=timezone.now()
+        )
+        settings.DATABASE_ROUTERS = _routers(TokensOnlyOnSecond)
+        user.set_password(_NEW_PASSWORD)
+        user.save()
+        assert _remaining(user, SECOND) == _NONE
+        assert list(
+            MCPRefreshTokenFamily.objects.using("default").values_list(
+                "token_family", flat=True
+            )
+        ) == [other.token_family]
+        assert _audited(user, "default", AuthRejectionReason.PASSWORD_CHANGE)
+
+    def test_a_record_lock_the_open_transaction_holds_is_waited_for_briefly(
+        self, settings, monkeypatch, caplog
+    ):
+        """The records' database has a transaction of this thread's open,
+        holding a lock on a record the revocation deletes: its own
+        connection there waits for it boundedly too (the records are
+        deleted in a transaction of their own, under the same
+        `lock_timeout`), then the revocation fails, is logged, and the
+        token deletes roll back."""
+        import uuid
+
+        from mcp_sql import signals
+        from mcp_sql.models import MCPRefreshTokenFamily
+
+        monkeypatch.setattr(signals, "_OWN_CONNECTION_LOCK_TIMEOUT", "200ms")
+        user = _copy_user(UserFactory(), SECOND)
+        _credentials(user, SECOND)
+        family = uuid.uuid4()
+        RefreshToken.objects.using(SECOND).filter(user_id=user.pk).update(
+            token_family=family
+        )
+        records = MCPRefreshTokenFamily.objects.using("default")
+        records.create(token_family=family, consented_at=timezone.now())
+        settings.DATABASE_ROUTERS = _routers(TokensOnlyOnSecond)
+        started = time.monotonic()
+        with (
+            caplog.at_level(logging.ERROR, logger="mcp_sql.signals"),
+            transaction.atomic(using="default"),
+        ):
+            records.filter(token_family=family).update(consented_at=timezone.now())
+            user.set_password(_NEW_PASSWORD)
+            user.save()  # to SECOND, where the tokens are
+        assert time.monotonic() - started < 5
+        assert "Failed to revoke MCP tokens on password change" in caplog.text
+        assert _remaining(user, SECOND) == _ALL
+        assert records.filter(token_family=family).exists()
+
+
 class TestTokenModelsSplitByARouter:
     def test_every_delete_runs_where_the_access_tokens_are(self, settings):
         """DOT keeps its token models in one database (foreign keys) and

@@ -7,8 +7,8 @@ measured from the consent, across rotations — has passed, and logout or a
 password change revokes refresh tokens along with access tokens.
 """
 
-import base64
 import hashlib
+import re
 import secrets
 from datetime import timedelta
 from http import HTTPStatus
@@ -31,6 +31,12 @@ from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.oauth_server import MCPServer
 from mcp_sql.schemas import AuthRejectionReason
+from mcp_sql.tests.refresh_flow import CAP as _CAP
+from mcp_sql.tests.refresh_flow import LOOPBACK as _LOOPBACK
+from mcp_sql.tests.refresh_flow import consent as _consent
+from mcp_sql.tests.refresh_flow import consent_and_exchange as _consent_and_exchange
+from mcp_sql.tests.refresh_flow import refresh as _refresh
+from mcp_sql.tests.refresh_flow import s256_pair as _s256_pair
 from mcp_sql.tests.settings import MCP_SQL as BASE_MCP_SQL
 from mcp_sql.validation import validate_mcp_sql_settings
 from mcp_sql.views.oauth_token import MCPTokenView
@@ -39,62 +45,10 @@ from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauthlib.oauth2.rfc6749.grant_types import RefreshTokenGrant
 
-_LOOPBACK = "http://127.0.0.1:9999"
-_CAP = 3600
-
 
 @pytest.fixture
 def refresh_on(settings):
     settings.MCP_SQL = {**settings.MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
-
-
-def _s256_pair() -> tuple[str, str]:
-    verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
-def _consent_and_exchange(client, user) -> dict:
-    """Authorize the canonical client (consent POST: it requires consent since
-    migration 0016) and exchange the code."""
-    client.force_login(user)
-    verifier, challenge = _s256_pair()
-    params = {
-        "client_id": "mcp-sql",
-        "response_type": "code",
-        "redirect_uri": _LOOPBACK,
-        "scope": "mcp:sql",
-        "state": "st4te",
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    location = client.post(reverse("authorize"), {**params, "allow": "Authorize"})[
-        "Location"
-    ]
-    code = parse_qs(urlparse(location).query)["code"][0]
-    response = client.post(
-        reverse("token"),
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": _LOOPBACK,
-            "client_id": "mcp-sql",
-            "code_verifier": verifier,
-        },
-    )
-    assert response.status_code == HTTPStatus.OK, response.content
-    return response.json()
-
-
-def _refresh(client, refresh_token: str):
-    return client.post(
-        reverse("token"),
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": "mcp-sql",
-        },
-    )
 
 
 def _family(refresh_token: str) -> MCPRefreshTokenFamily:
@@ -124,6 +78,60 @@ class TestSetting:
         validate_mcp_sql_settings(
             {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": value}
         )
+
+
+_ABSENT = object()
+
+
+def _with_reuse_protection(settings, *, value) -> None:
+    provider = {
+        k: v
+        for k, v in settings.OAUTH2_PROVIDER.items()
+        if k != "REFRESH_TOKEN_REUSE_PROTECTION"
+    }
+    if value is not _ABSENT:
+        provider["REFRESH_TOKEN_REUSE_PROTECTION"] = value
+    settings.OAUTH2_PROVIDER = provider
+
+
+class TestReuseProtectionRequired:
+    """Refresh on requires DOT's `REFRESH_TOKEN_REUSE_PROTECTION = True`
+    (OAuth 2.1 §4.3.1, RFC 9700 §4.14.2: rotation with reuse detection for
+    public clients); refresh off requires nothing."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [_ABSENT, False, None, 1, "true"],
+        ids=["unset-dot-default-false", "false", "none", "one", "str"],
+    )
+    def test_refresh_on_without_it_refuses_to_boot(self, settings, value):
+        _with_reuse_protection(settings, value=value)
+        with pytest.raises(ImproperlyConfigured, match="REUSE_PROTECTION"):
+            validate_mcp_sql_settings(
+                {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
+            )
+
+    def test_the_boot_path_runs_it(self, settings):
+        from mcp_sql.apps import McpSqlConfig
+
+        _with_reuse_protection(settings, value=False)
+        settings.MCP_SQL = {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
+        with pytest.raises(ImproperlyConfigured, match="REUSE_PROTECTION"):
+            McpSqlConfig.validate_settings()
+
+    def test_refresh_on_with_it_boots(self, settings):
+        _with_reuse_protection(settings, value=True)
+        validate_mcp_sql_settings(
+            {**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": _CAP}
+        )
+
+    @pytest.mark.parametrize("value", [_ABSENT, False], ids=["unset", "false"])
+    def test_refresh_off_requires_nothing(self, settings, value):
+        _with_reuse_protection(settings, value=value)
+        validate_mcp_sql_settings({**BASE_MCP_SQL, "REFRESH_TOKEN_MAX_AGE_SECONDS": 0})
+        cfg = dict(BASE_MCP_SQL)
+        cfg.pop("REFRESH_TOKEN_MAX_AGE_SECONDS", None)
+        validate_mcp_sql_settings(cfg)
 
 
 @pytest.mark.django_db
@@ -218,6 +226,68 @@ class TestRefreshEnabled:
         )
         response = _refresh(client, legacy.token)
         assert response.json()["error"] == "invalid_grant"
+
+    def test_replaying_a_rotated_out_token_revokes_the_whole_chain(
+        self, client, mcp_app, mcp_user
+    ):
+        """One party rotates R1 into R2, the other then presents R1. Read
+        either way — the legitimate client rotated and a thief replays R1,
+        or the thief rotated first and the legitimate client comes back
+        with R1 — the replay is refused and DOT's reuse protection revokes
+        the chain: R2 no longer refreshes and every access token minted in
+        it is gone, so the user re-authorizes and the thief holds nothing."""
+        first = _consent_and_exchange(client, mcp_user)
+        second = _refresh(client, first["refresh_token"])
+        assert second.status_code == HTTPStatus.OK, second.content
+        replay = _refresh(client, first["refresh_token"])
+        assert replay.status_code == HTTPStatus.BAD_REQUEST
+        assert replay.json()["error"] == "invalid_grant"
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
+        assert not RefreshToken.objects.filter(
+            user=mcp_user, revoked__isnull=True
+        ).exists()
+        assert _refresh(client, second.json()["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+
+    def test_a_replay_generations_down_the_chain_revokes_it(
+        self, client, mcp_app, mcp_user
+    ):
+        tokens = [_consent_and_exchange(client, mcp_user)]
+        for _ in range(3):
+            response = _refresh(client, tokens[-1]["refresh_token"])
+            assert response.status_code == HTTPStatus.OK, response.content
+            tokens.append(response.json())
+        assert _refresh(client, tokens[0]["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+        assert not AccessToken.objects.filter(user=mcp_user).exists()
+        assert _refresh(client, tokens[-1]["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+
+    def test_a_replay_leaves_other_chains_alone(self, client, mcp_app, mcp_user):
+        """Revocation is per chain (`token_family`): another consent of the
+        same user (another MCP client) keeps working."""
+        other = _consent_and_exchange(client, mcp_user)
+        first = _consent_and_exchange(client, mcp_user)
+        assert _refresh(client, first["refresh_token"]).status_code == HTTPStatus.OK
+        _refresh(client, first["refresh_token"])  # the replay
+        assert _refresh(client, other["refresh_token"]).status_code == HTTPStatus.OK
+
+    def test_control_without_reuse_protection_the_first_presenter_keeps_the_chain(
+        self, client, mcp_app, mcp_user, settings
+    ):
+        """What the boot check prevents (`TestReuseProtectionRequired`): with
+        DOT's reuse protection off, the replay is refused but the chain the
+        first presenter rotated into keeps working."""
+        _with_reuse_protection(settings, value=False)
+        first = _consent_and_exchange(client, mcp_user)
+        second = _refresh(client, first["refresh_token"]).json()
+        assert _refresh(client, first["refresh_token"]).json()["error"] == (
+            "invalid_grant"
+        )
+        assert _refresh(client, second["refresh_token"]).status_code == HTTPStatus.OK
 
     def test_logout_revokes_refresh_tokens(
         self, client, mcp_app, mcp_user, django_capture_on_commit_callbacks
@@ -790,3 +860,46 @@ def test_documented_family_prune_deletes_only_orphaned_families(mcp_user, mcp_ap
     assert list(
         MCPRefreshTokenFamily.objects.values_list("token_family", flat=True)
     ) == [live]
+
+
+def _documented_token_delete_snippet() -> str:
+    """The token-delete shell snippet of docs/oauth.md → "Revoking access"."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "docs" / "oauth.md").read_text()
+    (snippet,) = [
+        block
+        for block in re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+        if "get_grant_model().objects.filter(user__email=u)" in block
+    ]
+    return snippet
+
+
+@pytest.mark.usefixtures("refresh_on", "mcp_mfa_on")
+def test_documented_token_delete_snippet_revokes_the_user_only(
+    client, mcp_app, mcp_user, mcp_user_factory, use_mcp_perm
+):
+    """The operator snippet deletes the user's pending codes, chains'
+    consent records, refresh and access tokens, and nobody else's."""
+    from django.test import Client
+
+    other = mcp_user_factory(is_active=True, is_staff=True)
+    other.user_permissions.add(use_mcp_perm)
+    for user, email in ((mcp_user, "alice@example.com"), (other, "bob@example.com")):
+        user.email = email
+        user.save(update_fields=["email"])
+    _consent_and_exchange(client, mcp_user)
+    _consent_and_exchange(Client(), other)
+    families = dict(
+        RefreshToken.objects.values_list("user_id", "token_family").distinct()
+    )
+    _consent(client, mcp_user)  # a pending code of the user's
+
+    exec(_documented_token_delete_snippet(), {})  # noqa: S102
+
+    for model in (Grant, RefreshToken, AccessToken):
+        assert not model.objects.filter(user=mcp_user).exists(), model
+        assert model is Grant or model.objects.filter(user=other).exists(), model
+    assert set(
+        MCPRefreshTokenFamily.objects.values_list("token_family", flat=True)
+    ) == {families[other.pk]}

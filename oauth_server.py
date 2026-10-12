@@ -34,6 +34,7 @@ from mcp_sql.conf import refresh_tokens_enabled
 from oauth2_provider.oauth2_backends import OAuthLibCore
 from oauth2_provider.settings import oauth2_settings
 from oauth2_provider.views.mixins import OAuthLibMixin
+from oauthlib.oauth2.rfc6749 import errors
 from oauthlib.oauth2.rfc6749.endpoints import AuthorizationEndpoint
 from oauthlib.oauth2.rfc6749.endpoints import ResourceEndpoint
 from oauthlib.oauth2.rfc6749.endpoints import RevocationEndpoint
@@ -47,7 +48,36 @@ from oauthlib.oauth2.rfc6749.tokens import BearerToken
 from oauthlib.oauth2.rfc6749.tokens import get_token_from_header
 
 
-class MCPAuthorizationCodeGrant(AuthorizationCodeGrant):
+class SaveErrorsAnsweredMixin:
+    """Answer an OAuth error raised after validation as one raised during it.
+
+    oauthlib's token grants catch `OAuth2Error` only around
+    `validate_token_request`. One raised later — by `save_token`
+    (`MCPOAuth2Validator.save_bearer_token` refusing a token request whose
+    code or chain a concurrent logout / password change deleted, or whose
+    code a concurrent exchange consumed: `oauth._lock_token_source`) or by
+    `invalidate_authorization_code` (DOT's, a code already gone, on a server
+    whose validator did not consume it in the save as `MCPOAuth2Validator`
+    does) — reached DOT's backend, which answers its body without the
+    `Content-Type: application/json` and `no-store` headers. Here it gets
+    the grant's default headers, as a validation error does. (A save
+    refused this way has rolled back: nothing was minted.)
+    """
+
+    def create_token_response(self, request, token_handler):
+        try:
+            return super().create_token_response(request, token_handler)  # type: ignore[misc]
+        except errors.OAuth2Error as e:
+            headers = self._get_default_headers()  # type: ignore[attr-defined]
+            headers.update(e.headers)
+            return headers, e.json, e.status_code
+
+
+class MCPRefreshTokenGrant(SaveErrorsAnsweredMixin, RefreshTokenGrant):
+    """oauthlib's refresh grant (`SaveErrorsAnsweredMixin`)."""
+
+
+class MCPAuthorizationCodeGrant(SaveErrorsAnsweredMixin, AuthorizationCodeGrant):
     """The authorization-code grant: `S256` PKCE only; no refresh token
     unless refresh is enabled.
 
@@ -144,7 +174,7 @@ class MCPServer(
         )
         grant_types: dict[str, Any] = {"authorization_code": self.auth_grant}
         if refresh:
-            grant_types["refresh_token"] = RefreshTokenGrant(request_validator)
+            grant_types["refresh_token"] = MCPRefreshTokenGrant(request_validator)
         self.bearer = HeaderOnlyBearer(
             request_validator,
             token_generator,

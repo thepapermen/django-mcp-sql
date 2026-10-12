@@ -152,7 +152,8 @@ HINTS: dict[str, str] = {
     ),
     OutcomeReason.DISALLOWED_FUNCTION: (
         "Query uses a denied function (e.g. pg_read_file, dblink_*, lo_*, "
-        "copy, current_setting). Those bypass the read-only contract."
+        "copy, current_setting, or one that runs SQL given as text: "
+        "query_to_xml, ts_stat, crosstab). Those bypass the read-only contract."
     ),
     OutcomeReason.SYSTEM_SCHEMA: (
         "Catalogs (pg_catalog, information_schema, pg_*) are off limits. "

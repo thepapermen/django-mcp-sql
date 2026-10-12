@@ -22,6 +22,7 @@ from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_out
 from django.db import DEFAULT_DB_ALIAS
 from django.db import DatabaseError
+from django.db import OperationalError
 from django.db import connections
 from django.db import router
 from django.db import transaction
@@ -39,6 +40,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
 from mcp_sql.models import MCPAuthRejectionLog
+from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.models import audit_client_ip
 from mcp_sql.schemas import AuthRejectionReason
 
@@ -158,6 +160,61 @@ def _outside_open_transaction(alias: str, committed: str) -> Iterator[bool]:
             connections[alias] = current
 
 
+# How many times `_revoke_and_audit` runs a revocation PostgreSQL keeps
+# aborting to break a deadlock.
+_DEADLOCK_ATTEMPTS = 3
+
+
+class _Attempt:
+    """One attempt of `_deadlock_attempts`: as a context manager (entered
+    around the attempt's outermost transaction), it swallows PostgreSQL's
+    `deadlock_detected` (40P01) unless it is the last attempt."""
+
+    def __init__(self, *, last: bool) -> None:
+        self.last = last
+        self.deadlocked = False
+
+    def __enter__(self) -> "_Attempt":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> bool:
+        cause = getattr(exc, "__cause__", None)
+        self.deadlocked = isinstance(exc, OperationalError) and "40P01" in (
+            getattr(cause, "sqlstate", None),  # psycopg 3
+            getattr(cause, "pgcode", None),  # psycopg 2
+        )
+        return self.deadlocked and not self.last
+
+
+def _deadlock_attempts(event: str, user_pk: Any) -> Iterator[_Attempt]:
+    """Attempts of a revocation, the next one only after a deadlock.
+
+    PostgreSQL breaks a lock cycle by aborting one of its transactions, and
+    not every cycle is the package's to avoid: DOT's `cleartokens` deletes a
+    rotated-out refresh token after locking its successor access token (it
+    nulls `source_refresh_token` first), the reverse of DOT's own
+    `RefreshToken.revoke`, whose order the revocation follows. An aborted
+    attempt has rolled back (its transaction is the outermost on its
+    connection; consent records committed on another database stay deleted,
+    and deleting them again is a no-op), so it is run again; the last one's
+    deadlock is a failed revocation like any other error."""
+    for number in range(1, _DEADLOCK_ATTEMPTS + 1):
+        attempt = _Attempt(last=number == _DEADLOCK_ATTEMPTS)
+        yield attempt
+        if not attempt.deadlocked:
+            return
+        logger.warning(
+            "Revoking MCP tokens on %s for user %s: deadlock, retrying",
+            event,
+            user_pk,
+        )
+
+
 @contextmanager
 def _transaction(alias: str, *, own_connection: bool) -> Iterator[None]:
     """`transaction.atomic(using=alias)`, with a bounded lock wait on a
@@ -179,18 +236,29 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
     exist only when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables them;
     one left behind would mint new access tokens) and pending authorization
     codes (`Grant` rows: a code issued just before would otherwise still
-    exchange for a fresh token) in one transaction, and in that same
-    transaction writes one `MCPAuthRejectionLog` row with `reason` — only
-    when something was deleted: the table records access that ended, and a
-    logout or password change of a user who held no MCP token or code ended
-    none.
+    exchange for a fresh token) in one transaction, together with the
+    consent records (`MCPRefreshTokenFamily`) of the user's refresh-token
+    chains, and in that same transaction writes one `MCPAuthRejectionLog`
+    row with `reason` — only when something was deleted: the table records
+    access that ended, and a logout or password change of a user who held
+    no MCP token or code ended none.
+
+    Complete against token requests running concurrently: the statements
+    run in an order (commented inline) that makes a rotation in flight
+    commit before the token deletes read, and refuses any rotation or code
+    exchange that would otherwise mint a token after them
+    (`tests/test_revocation_race.py`). Without deleting the consent
+    records, a rotation committing during the refresh-token delete and a
+    second one straddling the access-token delete left a live pair behind.
 
     Runs after the triggering transaction (logout, password change) on the
     alias `committed` has committed. What is guaranteed from then on:
     - the deletes and the audit row commit in a transaction of their own,
-      never inside another transaction this thread has open on the token
-      or audit database (`_outside_open_transaction`), so a later rollback
-      there cannot undo them;
+      never inside another transaction this thread has open on the token,
+      consent-record or audit database (`_outside_open_transaction`), so a
+      later rollback there cannot undo them. The consent records commit
+      with the token deletes when both live on one database; on two, just
+      before them;
     - the audit row commits only with the deletes (when both live on one
       database; on two, it commits just before them); it is written in a
       savepoint, so a failure to write it — a database error or any other
@@ -199,12 +267,14 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
       that savepoint cannot be rolled back either (the connection failed),
       the deletes cannot commit: that is a failed deletion;
     - a failed deletion (a database error, a row lock held past the
-      bounded wait, the connection lost before the commit) rolls back all
-      three deletes and writes no audit row: the access did not end. It is
-      logged with `logger.exception` only and nothing is retried: the
-      tokens then live until they expire, and an operator must delete
-      them. "Revoked ..." is logged (INFO) only after the deletes
-      committed;
+      bounded wait, the connection lost before the commit) rolls back the
+      token deletes and writes no audit row: the access did not end. It is
+      logged with `logger.exception` only and not retried — except a
+      deadlock PostgreSQL broke by aborting the revocation, which is run
+      again, up to `_DEADLOCK_ATTEMPTS` attempts in all
+      (`_deadlock_attempts`): the tokens then live until they expire, and
+      an operator must delete them. "Revoked ..." is logged (INFO) only
+      after the deletes committed;
     - no exception leaves this function. When no transaction is open the
       callback runs inside `logout()` (before the session is flushed) or
       inside the user's `save()`; an error escaping would turn the
@@ -232,70 +302,112 @@ def _revoke_and_audit(*, user, client_ip, at, reason, event, committed):  # noqa
         # run there, explicitly, so they are one transaction whatever a
         # router says per model.
         tokens = router.db_for_write(AccessToken)
+        families = router.db_for_write(MCPRefreshTokenFamily)
         audit = router.db_for_write(MCPAuthRejectionLog)
         with ExitStack() as stack:
             own = {
                 alias: stack.enter_context(_outside_open_transaction(alias, committed))
-                for alias in dict.fromkeys((tokens, audit))
+                for alias in dict.fromkeys((tokens, families, audit))
             }
-            with _transaction(tokens, own_connection=own[tokens]):
-                refresh_deleted, _ = (
-                    RefreshToken.objects.using(tokens)
-                    .filter(mcp_apps, user=user)
-                    .delete()
-                )
-                access_deleted, _ = (
-                    AccessToken.objects.using(tokens)
-                    .filter(mcp_apps, user=user)
-                    .delete()
-                )
-                grants_deleted, _ = (
-                    Grant.objects.using(tokens).filter(mcp_apps, user=user).delete()
-                )
-                deleted = access_deleted + refresh_deleted
-                if not (deleted or grants_deleted):
-                    return
-                # Record the revocation in the access-ending audit table
-                # alongside the per-request gate denials, so the timeline of
-                # why a user lost MCP access is complete.
-                try:
-                    # Nested in the deletes' transaction (one database), a
-                    # savepoint: anything raised in it rolls back to the
-                    # savepoint, never the deletes. On a separate audit
-                    # database, a transaction of its own.
-                    with _transaction(audit, own_connection=own[audit]):
-                        # By pk: the user instance may come from another
-                        # database than the audit table's (a router would
-                        # refuse the cross-database relation).
-                        MCPAuthRejectionLog.objects.using(audit).create(
-                            user_id=user.pk,
-                            token_pk="",
-                            application_name="",
-                            reason=reason,
-                            error=(
-                                f"Revoked {deleted} MCP token(s) and "
-                                f"{grants_deleted} pending authorization "
-                                f"code(s) on {event}"
-                            ),
-                            client_ip=client_ip,
-                            started_at=at,
-                        )
-                except Exception:
-                    if connections[tokens].needs_rollback:
-                        # The savepoint could not be rolled back (the
-                        # connection failed; Django also sets the flag when
-                        # it closes a connection inside `atomic`): the
-                        # deletes' transaction can only roll back now, which
-                        # Django would do without raising on leaving it. A
-                        # failed revocation, not a missing audit row.
-                        raise
-                    audit_failed = True
-                    logger.exception(
-                        "Revoking MCP tokens on %s for user %s: failed to write "
-                        "the audit row",
-                        event,
-                        user.pk,
+            # A deadlock is retried (`_deadlock_attempts`).
+            for attempt in _deadlock_attempts(event, user.pk):
+                with attempt, _transaction(tokens, own_connection=own[tokens]):
+                    # The order is what makes the revocation complete against
+                    # token requests running at the same time (each statement
+                    # here sees only rows committed before it starts):
+                    # 1. Pending codes first. An exchange locks its code first
+                    #    thing in its saving transaction
+                    #    (`MCPOAuth2Validator.save_bearer_token`), so this waits
+                    #    for one in flight to commit (its tokens are then
+                    #    visible below), and a later one finds its code gone
+                    #    and is refused (`invalid_grant`), minting nothing.
+                    grants_deleted, _ = (
+                        Grant.objects.using(tokens).filter(mcp_apps, user=user).delete()
                     )
+                    # 2. The consent records of the user's refresh-token chains.
+                    #    A rotation locks its chain's record first thing in its
+                    #    transaction (`MCPOAuth2Validator.save_bearer_token`),
+                    #    so this waits for a rotation in flight to commit (its
+                    #    new tokens are then visible below), and a later one
+                    #    finds no record and is refused, as
+                    #    `validate_refresh_token` refuses every token of the
+                    #    chain from now on.
+                    with _transaction(families, own_connection=own[families]):
+                        chains = list(
+                            RefreshToken.objects.using(tokens)
+                            .filter(mcp_apps, user=user, token_family__isnull=False)
+                            .values_list("token_family", flat=True)
+                            .distinct()
+                        )
+                        if chains:
+                            MCPRefreshTokenFamily.objects.using(families).filter(
+                                token_family__in=chains
+                            ).delete()
+                    # 3. Refresh tokens, locked before their access tokens, the
+                    #    order DOT's own revocations take (`RefreshToken.revoke`
+                    #    — `/o/revoke_token/`, a rotation — and `revoke_family`),
+                    #    so a concurrent one cannot deadlock with this: deleting
+                    #    them unlocked nulls their successors'
+                    #    `source_refresh_token` first, an access-token lock
+                    #    taken before the refresh token's. Only their own rows
+                    #    (`of`): the query joins the Application, and its row
+                    #    locked held up every token insert for that client (the
+                    #    foreign-key check). `cleartokens` takes the reverse
+                    #    order (`_deadlock_attempts`).
+                    refresh = RefreshToken.objects.using(tokens).filter(
+                        mcp_apps, user=user
+                    )
+                    list(refresh.select_for_update(of=("self",)).values_list("pk"))
+                    refresh_deleted, _ = refresh.delete()
+                    access_deleted, _ = (
+                        AccessToken.objects.using(tokens)
+                        .filter(mcp_apps, user=user)
+                        .delete()
+                    )
+                    deleted = access_deleted + refresh_deleted
+                    if not (deleted or grants_deleted):
+                        return
+                    # Record the revocation in the access-ending audit table
+                    # alongside the per-request gate denials, so the timeline of
+                    # why a user lost MCP access is complete.
+                    try:
+                        # Nested in the deletes' transaction (one database), a
+                        # savepoint: anything raised in it rolls back to the
+                        # savepoint, never the deletes. On a separate audit
+                        # database, a transaction of its own.
+                        with _transaction(audit, own_connection=own[audit]):
+                            # By pk: the user instance may come from another
+                            # database than the audit table's (a router would
+                            # refuse the cross-database relation).
+                            MCPAuthRejectionLog.objects.using(audit).create(
+                                user_id=user.pk,
+                                token_pk="",
+                                application_name="",
+                                reason=reason,
+                                error=(
+                                    f"Revoked {deleted} MCP token(s) and "
+                                    f"{grants_deleted} pending authorization "
+                                    f"code(s) on {event}"
+                                ),
+                                client_ip=client_ip,
+                                started_at=at,
+                            )
+                    except Exception:
+                        if connections[tokens].needs_rollback:
+                            # The savepoint could not be rolled back (the
+                            # connection failed; Django also sets the flag when
+                            # it closes a connection inside `atomic`): the
+                            # deletes' transaction can only roll back now, which
+                            # Django would do without raising on leaving it. A
+                            # failed revocation, not a missing audit row.
+                            raise
+                        audit_failed = True
+                        logger.exception(
+                            "Revoking MCP tokens on %s for user %s: failed to write "
+                            "the audit row",
+                            event,
+                            user.pk,
+                        )
     except Exception:
         logger.exception(
             "Failed to revoke MCP tokens on %s for user %s", event, user.pk

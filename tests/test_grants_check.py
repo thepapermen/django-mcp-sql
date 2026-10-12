@@ -75,6 +75,7 @@ def patched_grants():
         patch("mcp_sql.grants.has_role_membership") as has_membership,
         patch("mcp_sql.grants.declared_tables") as declared_tables,
         patch("mcp_sql.grants.granted_tables") as granted_tables,
+        patch("mcp_sql.grants.relations_off_default_schema", return_value={}),
     ):
         role_exists.return_value = True
         has_membership.return_value = True

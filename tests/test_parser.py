@@ -878,6 +878,112 @@ class TestDisallowedFunction:
         _expect_reject(f"SELECT {fn}", OutcomeReason.DISALLOWED_FUNCTION)
 
 
+# Built-ins / stock-extension functions that run SQL (or a query built from
+# a relation / schema name) given as text, outside the parser (PR #4 review):
+# `(name, arguments)`, one entry per overload shape.
+_INNER = "'SELECT to_tsvector(name) FROM auth_group'"
+_SQL_TEXT_CALLS = [
+    ("ts_stat", _INNER),
+    ("ts_stat", f"{_INNER}, 'ab'"),
+    ("ts_rewrite", "'a'::tsquery, 'SELECT ''a''::tsquery, ''b''::tsquery'"),
+    # Runs no SQL, refused by name all the same (owner decision).
+    ("ts_rewrite", "'a'::tsquery, 'a'::tsquery, 'b'::tsquery"),
+    ("schema_to_xml", "'public', true, true, ''"),
+    ("schema_to_xmlschema", "'public', true, true, ''"),
+    ("schema_to_xml_and_xmlschema", "'public', true, true, ''"),
+    ("database_to_xml", "true, true, ''"),
+    ("database_to_xmlschema", "true, true, ''"),
+    ("database_to_xml_and_xmlschema", "true, true, ''"),
+    ("crosstab", "'SELECT name, name, name FROM auth_group'"),
+    ("crosstab", "'SELECT 1', 'SELECT 2'"),
+    ("crosstab", "'SELECT 1', 2"),
+    ("crosstab2", "'SELECT 1'"),
+    ("crosstab3", "'SELECT 1'"),
+    ("crosstab4", "'SELECT 1'"),
+    # A wrapper named after the predefined ones.
+    ("crosstab5", "'SELECT 1'"),
+    ("crosstab12", "'SELECT 1'"),
+    # The `crosstab_<suffix>(text)` wrappers tablefunc's docs suggest.
+    ("crosstab_float_4", "'SELECT 1'"),
+    ("connectby", "'auth_group', 'id', 'name', '1', 0"),
+    ("connectby", "'auth_group', 'id', 'name', 'id', '1', 0, '~'"),
+    ("xpath_table", "'id', 'name', 'auth_group', '/a', 'true'"),
+]
+_SQL_TEXT_SPELLINGS = [
+    "{name}",
+    "pg_catalog.{name}",
+    "public.{name}",
+    '"pg_catalog"."{name}"',
+    '"{name}"',
+    "PG_CATALOG.{upper}",
+]
+_SQL_TEXT_POSITIONS = [
+    "SELECT {call} AS r FROM auth_group",
+    "SELECT {call} AS r",
+    "SELECT id FROM auth_group WHERE {call} IS NOT NULL",
+    "SELECT coalesce(({call})::text, '') AS r FROM auth_group",
+    "SELECT id FROM auth_group WHERE id IN "
+    "(SELECT length(({call})::text) FROM auth_group)",
+    "WITH c AS (SELECT {call} AS r FROM auth_group) SELECT count(*) FROM c",
+    "SELECT id FROM auth_group ORDER BY {call}",
+    "SELECT auth_group.id FROM auth_group JOIN django_content_type ON {call} IS NULL",
+]
+
+
+class TestFunctionsRunningSqlText:
+    """`ts_stat`, `ts_rewrite`, `schema_to_xml*`, `database_to_xml*`,
+    `crosstab`/`crosstab2..4`/`crosstab_*`, `connectby`, `xpath_table` run
+    SQL given (or built from names given) as text: the inner query never
+    meets the whitelist, schema scoping, `BAN_SELECT_STAR` or the deny list.
+    Refused by name in every position and spelling, like `query_to_xml`."""
+
+    @pytest.mark.parametrize("position", _SQL_TEXT_POSITIONS)
+    @pytest.mark.parametrize("spelling", _SQL_TEXT_SPELLINGS)
+    @pytest.mark.parametrize(("name", "args"), _SQL_TEXT_CALLS)
+    def test_refused_everywhere(self, name, args, spelling, position):
+        fn = spelling.format(name=name, upper=name.upper())
+        sql = position.format(call=f"{fn}({args})")
+        exc = _expect_reject(sql, OutcomeReason.DISALLOWED_FUNCTION)
+        assert f"'{name}'" in str(exc)
+
+    @pytest.mark.parametrize(
+        "name", ["ts_stat", "crosstab", "crosstab2", "crosstab_float_4"]
+    )
+    def test_refused_in_attribute_notation(self, name):
+        # One text argument: `('…'::text).ts_stat` is `ts_stat('…')` to
+        # Postgres (verified on PostgreSQL 15).
+        _expect_reject(
+            f"SELECT ({_INNER}::text).{name} AS r",
+            OutcomeReason.DISALLOWED_FUNCTION,
+        )
+
+    @pytest.mark.parametrize("spelling", ["{name}", "pg_catalog.{name}", '"{name}"'])
+    @pytest.mark.parametrize(("name", "args"), _SQL_TEXT_CALLS)
+    def test_from_form_stays_refused(self, name, args, spelling):
+        fn = spelling.format(name=name)
+        exc = _expect_reject(
+            f"SELECT 1 AS r FROM {fn}({args}) AS f",  # noqa: S608
+            OutcomeReason.DISALLOWED_CONSTRUCT,
+        )
+        assert "Table-valued functions in FROM" in str(exc)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # A column that only shares the name is no call.
+            "SELECT ts_stat FROM (SELECT 1 AS ts_stat) AS s",
+            "SELECT s.crosstab_total FROM (SELECT 1 AS crosstab_total) AS s",
+            "SELECT 'ts_stat(1)' AS r",
+            # Only tablefunc's names, `crosstab<N>` and the
+            # `crosstab_<suffix>` wrappers: a consumer's own function that
+            # starts with the word is not one.
+            "SELECT crosstabulate(id) AS r FROM auth_group",
+        ],
+    )
+    def test_same_named_columns_and_strings_accepted(self, sql):
+        parse_and_validate(sql, allowed_tables=ALLOWED, table_columns=COLUMNS)
+
+
 class TestInjectLimit:
     def test_appends_to_query_without_limit(self):
         ast = parse_and_validate(
@@ -1328,6 +1434,19 @@ class TestOperatorSigns:
         parse_and_validate(sql, allowed_tables=ALLOWED)
 
     @pytest.mark.parametrize(
+        "sql",
+        [
+            # `^@` after an operator Postgres binds more loosely: sqlglot
+            # 30.22's comparison-level `StartsWith` rendered these as
+            # `STARTS_WITH(...)` (errors in Postgres too: `boolean ^@ unknown`).
+            "SELECT 'a' IS NULL ^@ 'a' AS v",
+            "SELECT 'a' IN ('a') ^@ 'a' AS v",
+        ],
+    )
+    def test_starts_with_after_a_looser_operator_is_refused(self, sql):
+        _expect_reject(sql, OutcomeReason.PARSE_ERROR)
+
+    @pytest.mark.parametrize(
         ("sql", "rendered"),
         [
             # Review round 10: `^@` (starts with) was read as `^ (@ b)`; `!!`
@@ -1339,6 +1458,9 @@ class TestOperatorSigns:
             ),
             ("SELECT 'x' || 'abc' ^@ 'a' AS v", "'x' || 'abc' ^@ 'a' AS v"),
             ("SELECT NOT 'abc' ^@ 'b' AS v", "NOT 'abc' ^@ 'b' AS v"),
+            # sqlglot 30.22 lexes `^@` as one token and rendered
+            # `STARTS_WITH(...)`, below `=`.
+            ("SELECT 'abc' ^@ 'a' = true AS v", "'abc' ^@ 'a' = TRUE AS v"),
             ("SELECT 2 ^ @ -3 AS v", "2 ^ @ -3 AS v"),
             (
                 "SELECT !! to_tsquery('simple', 'a') AS v",
@@ -2637,6 +2759,19 @@ class TestCheckOrdering:
         ],
     )
     def test_unsafe_literal_before_parse_error(self, sql):
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'a\x00b' AS v",
+            "SELECT id /* \x00 */ FROM auth_group",
+            "SELECT id FROM pg_class\x00",
+        ],
+    )
+    def test_a_nul_character_is_refused_first(self, sql):
+        # Postgres takes no NUL in query text: psycopg 3 cut the query
+        # there, psycopg 2 raised a `ValueError` that escaped the audit.
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
 
     def test_system_schema_with_qualify_as_a_name(self):
