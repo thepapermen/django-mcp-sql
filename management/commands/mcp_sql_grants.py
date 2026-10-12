@@ -3,8 +3,6 @@ from django.core.management.base import CommandError
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
-from mcp_sql.grants import relation_display
-from mcp_sql.grants import relation_sql
 
 
 class Command(BaseCommand):
@@ -42,12 +40,10 @@ class Command(BaseCommand):
         profiles = mcp_sql_settings.profiles()
         for name, drift in result.per_profile.items():
             role = profiles[name].role
-            for relation in drift.granted:
-                grant = f"GRANT SELECT ON {relation_sql(relation)} TO {role};"
-                self.stdout.write(grant)
-            for relation in drift.revoked:
-                revoke = f"REVOKE SELECT ON {relation_sql(relation)} FROM {role};"  # noqa: S608
-                self.stdout.write(revoke)
+            for table in drift.granted:
+                self.stdout.write(f'GRANT SELECT ON "{table}" TO {role};')
+            for table in drift.revoked:
+                self.stdout.write(f'REVOKE SELECT ON "{table}" FROM {role};')  # noqa: S608
 
         if not result.changed:
             self.stdout.write(self.style.SUCCESS("Grants in sync; no action."))
@@ -67,11 +63,13 @@ class Command(BaseCommand):
         parts = []
         for name, drift in result.per_profile.items():
             if drift.granted:
-                shown = ", ".join(map(relation_display, drift.granted))
-                parts.append(f"[{name}] declared but not granted: {shown}")
+                parts.append(
+                    f"[{name}] declared but not granted: {', '.join(drift.granted)}"
+                )
             if drift.revoked:
-                shown = ", ".join(map(relation_display, drift.revoked))
-                parts.append(f"[{name}] granted but not declared: {shown}")
+                parts.append(
+                    f"[{name}] granted but not declared: {', '.join(drift.revoked)}"
+                )
         raise CommandError(
             "Grants drift detected — "
             + "; ".join(parts)

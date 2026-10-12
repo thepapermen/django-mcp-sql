@@ -37,12 +37,12 @@ _DOC_FILES = [
 _PY_FENCE_RE = re.compile(r"```python\n(.*?)```", re.DOTALL)
 
 
-def _extract_dict_literal(text: str, name: str) -> str | None:
-    """Return the `<name> = {...}` dict literal in `text`, brace-balanced.
+def _extract_mcp_sql_literal(text: str) -> str | None:
+    """Return the `MCP_SQL = {...}` dict literal in `text`, brace-balanced.
 
-    Returns None if `text` has no `<name> = {` assignment.
+    Returns None if `text` has no `MCP_SQL = {` assignment.
     """
-    marker = f"{name} = {{"
+    marker = "MCP_SQL = {"
     start = text.find(marker)
     if start == -1:
         return None
@@ -59,50 +59,43 @@ def _extract_dict_literal(text: str, name: str) -> str | None:
     raise AssertionError(msg)
 
 
-def _complete_mcp_sql_blocks(markdown: str) -> list[tuple[str, str | None]]:
-    """Return paste-ready `(MCP_SQL, OAUTH2_PROVIDER)` literal pairs from all
-    python fences.
+def _complete_mcp_sql_blocks(markdown: str) -> list[str]:
+    """Return paste-ready `MCP_SQL = {...}` literals from all python fences.
 
-    "Complete" = the `MCP_SQL` dict body has no `...` placeholder, so it can be
-    exec'd into a real dict and validated. The sibling `OAUTH2_PROVIDER` from
-    the SAME fence comes along when present (None otherwise): several
-    `MCP_SQL` invariants are cross-settings — declaring an https client while
-    `ALLOWED_REDIRECT_URI_SCHEMES` omits "https" refuses to boot — so
-    validating the pasted `MCP_SQL` against the ambient test settings would
-    miss exactly the drift an adopter would hit.
+    "Complete" = the dict body has no `...` placeholder, so it can be exec'd
+    into a real dict and validated.
     """
     blocks = []
     for body in _PY_FENCE_RE.findall(markdown):
-        literal = _extract_dict_literal(body, "MCP_SQL")
+        literal = _extract_mcp_sql_literal(body)
         if literal is not None and "..." not in literal:
-            blocks.append((literal, _extract_dict_literal(body, "OAUTH2_PROVIDER")))
+            blocks.append(literal)
     return blocks
 
 
-def _exec_literal(block: str, name: str) -> dict:
-    """Exec a dict literal in an isolated namespace and return the dict."""
+def _exec_mcp_sql(block: str) -> dict:
+    """Exec an MCP_SQL literal in an isolated namespace and return the dict."""
     ns: dict = {}
     exec(block, ns)  # noqa: S102 — trusted, repo-owned doc content
-    return ns[name]
+    return ns["MCP_SQL"]
 
 
 def _iter_doc_blocks():
     for path in _DOC_FILES:
         if not path.exists():  # installed-wheel test run without the docs tree
             continue
-        for i, pair in enumerate(_complete_mcp_sql_blocks(path.read_text())):
-            yield pytest.param(*pair, id=f"{path.name}#{i}")
+        for i, block in enumerate(_complete_mcp_sql_blocks(path.read_text())):
+            yield pytest.param(block, id=f"{path.name}#{i}")
 
 
 _DOC_BLOCKS = list(_iter_doc_blocks())
 
 
-@pytest.mark.parametrize(("block", "oauth_block"), _DOC_BLOCKS)
-def test_doc_config_block_passes_validator(block, oauth_block, settings):
-    """Every paste-ready MCP_SQL block in the docs validates cleanly — against
-    its own fence's OAUTH2_PROVIDER — and uses the current PROFILES shape (not
-    the pre-refactor flat ALLOWED_MODELS)."""
-    cfg = _exec_literal(block, "MCP_SQL")
+@pytest.mark.parametrize("block", _DOC_BLOCKS)
+def test_doc_config_block_passes_validator(block):
+    """Every paste-ready MCP_SQL block in the docs validates cleanly and uses
+    the current PROFILES shape (not the pre-refactor flat ALLOWED_MODELS)."""
+    cfg = _exec_mcp_sql(block)
     assert "PROFILES" in cfg, (
         "doc config uses the pre-PROFILES flat shape; it will not boot"
     )
@@ -110,8 +103,6 @@ def test_doc_config_block_passes_validator(block, oauth_block, settings):
         "top-level ALLOWED_MODELS is no longer a valid MCP_SQL key — it lives "
         "inside each PROFILES entry"
     )
-    if oauth_block is not None and "..." not in oauth_block:
-        settings.OAUTH2_PROVIDER = _exec_literal(oauth_block, "OAUTH2_PROVIDER")
     validate_mcp_sql_settings(cfg)
 
 
@@ -122,14 +113,7 @@ def test_readme_ships_a_complete_config_block():
     readme = _REPO_ROOT / "README.md"
     if not readme.exists():
         pytest.skip("README.md not present (installed-wheel test run)")
-    blocks = _complete_mcp_sql_blocks(readme.read_text())
-    assert blocks, (
+    assert _complete_mcp_sql_blocks(readme.read_text()), (
         "README.md no longer contains a complete, paste-ready MCP_SQL config "
         "block — the install-snippet regression guard is now inert"
-    )
-    # Same reasoning one level down: without the sibling OAUTH2_PROVIDER, the
-    # cross-settings half of the check above silently stops running.
-    assert any(oauth is not None for _, oauth in blocks), (
-        "README.md's install fence no longer carries an OAUTH2_PROVIDER block "
-        "next to MCP_SQL — the cross-settings validation is now inert"
     )

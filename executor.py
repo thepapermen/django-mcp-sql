@@ -12,24 +12,20 @@ from typing import NotRequired
 from typing import TypedDict
 from typing import Unpack
 
-from django.apps import apps as django_apps
 from django.db import DatabaseError
 from django.db import connections
 from django.db import transaction
 from django.utils import timezone
 from mcp_sql import observability
-from mcp_sql.clients import NO_CLIENT
-from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import declared_tables
 from mcp_sql.models import MCPQueryLog
-from mcp_sql.models import audit_client_ip
 from mcp_sql.parser import QueryRejectedError
 from mcp_sql.parser import extract_limit
+from mcp_sql.parser import inject_limit
 from mcp_sql.parser import parse_and_validate
-from mcp_sql.parser import render_for_execution
 from mcp_sql.schemas import HINTS
 from mcp_sql.schemas import Cell
 from mcp_sql.schemas import OutcomeReason
@@ -58,7 +54,7 @@ class ExecutorMisconfiguredError(RuntimeError):
     'execution_error'`, `error=<misconfig reason>`."""
 
 
-def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by design
+def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
     *,
     user: "AbstractBaseUser",
     profile: Profile,
@@ -66,7 +62,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     limit: int | None = None,
     token_id: str = "",
     client_ip: str | None = None,
-    client: ClientIdentity = NO_CLIENT,
+    client_redirect: str = "",
 ) -> QueryResult:
     """Validate, execute, and audit a single read-only SQL query.
 
@@ -74,10 +70,10 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     bound access tier (its `ALLOWED_MODELS` become the table whitelist, its
     `role` is entered via `SET LOCAL ROLE`, its optional `SESSION_CONTEXT`
     hook sets per-row GUCs, and its name is recorded on the audit row).
-    `token_id`, `client_ip`, and `client` (which OAuth client presented the
-    token — name, derived kind, and allowed callbacks (declared or
-    registered), recorded for attribution) are optional. `limit` is clamped to
-    `[DEFAULT_LIMIT, HARD_LIMIT]` from `MCP_SQL["LIMITS"]`.
+    `token_id`, `client_ip`, and `client_redirect` (the OAuth redirect_uri the
+    token was issued against, recorded for cloud-provider attribution) are
+    optional. `limit` is clamped to `[DEFAULT_LIMIT, HARD_LIMIT]` from
+    `MCP_SQL["LIMITS"]`.
     """
     started_at = timezone.now()
     db_alias = mcp_sql_settings.DB_ALIAS
@@ -90,7 +86,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -98,45 +94,31 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     cfg = mcp_sql_config()
     limits = cfg["LIMITS"]
     ban_select_star = cfg["BAN_SELECT_STAR"]
-    tables = declared_tables(profile)
-    allowed = set(tables.values())
-    table_columns = _table_columns(tables)
+    allowed = set(declared_tables(profile).values())
 
     try:
         parsed = parse_and_validate(
             raw_sql,
             allowed_tables=allowed,
             ban_select_star=ban_select_star,
-            table_columns=table_columns,
         )
-    except Exception as exc:  # noqa: BLE001 — every outcome is audited
-        # `parse_and_validate` raises only `QueryRejectedError`; anything else
-        # is a parser bug, still audited (as PARSE_ERROR) rather than escaping
-        # `run_query` with no row.
-        rejection = (
-            exc
-            if isinstance(exc, QueryRejectedError)
-            else QueryRejectedError(
-                OutcomeReason.PARSE_ERROR,
-                f"SQL could not be parsed ({type(exc).__name__}): {exc}",
-            )
-        )
+    except QueryRejectedError as exc:
         _audit_safely(
             user=user,
             profile=profile.name,
             token_id=token_id,
             decision=MCPQueryLog.DECISION_REJECTED,
-            rejection_reason=rejection.reason,
+            rejection_reason=exc.reason,
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client=client,
-            error=rejection.detail,
+            client_redirect=client_redirect,
+            error=exc.detail,
         )
         return QueryResult(
-            rejection_reason=rejection.reason,
-            hint=HINTS.get(rejection.reason, ""),
-            error=rejection.detail,
+            rejection_reason=exc.reason,
+            hint=HINTS.get(exc.reason, ""),
+            error=exc.detail,
         )
 
     # Effective row cap = min(kwarg, SQL LIMIT, HARD_LIMIT), defaulting
@@ -165,7 +147,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             truncated=False,
             result_bytes=0,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
         )
         return QueryResult(row_count=0, duration_ms=0)
     # LIMIT-injection re-serializes (and may copy) the AST. `parse_and_validate`
@@ -174,17 +156,9 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     # cleared the parser). Audit it as a parse-class reject anyway so the
     # "every code path writes exactly one audit row" invariant holds with no
     # `RecursionError` escaping to the agent as an unaudited 500.
-    #
-    # `render_for_execution` also re-validates the rendered text itself and
-    # requires it to be a stable rendering (ledger F32: sqlglot's re-emission
-    # is not always faithful); a failure is refused and audited, never run.
     try:
-        wrapped_sql = render_for_execution(
-            parsed.ast,
-            effective_limit + 1,
-            allowed_tables=allowed,
-            ban_select_star=ban_select_star,
-            table_columns=table_columns,
+        wrapped_sql = inject_limit(parsed.ast, effective_limit + 1).sql(
+            dialect="postgres"
         )
     except RecursionError:
         msg = "SQL nesting is too deep to serialize"
@@ -198,42 +172,13 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             normalized_sql=parsed.normalized_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
             error=msg,
         )
         return QueryResult(
             rejection_reason=OutcomeReason.PARSE_ERROR,
             hint=HINTS.get(OutcomeReason.PARSE_ERROR, ""),
             error=msg,
-        )
-    except Exception as exc:  # noqa: BLE001 — every outcome is audited
-        # `QueryRejectedError` (ROUNDTRIP_MISMATCH) as designed; anything
-        # else is a rendering bug, refused the same way rather than escaping.
-        rejection = (
-            exc
-            if isinstance(exc, QueryRejectedError)
-            else QueryRejectedError(
-                OutcomeReason.ROUNDTRIP_MISMATCH,
-                f"SQL could not be rendered ({type(exc).__name__}): {exc}",
-            )
-        )
-        _audit_safely(
-            user=user,
-            profile=profile.name,
-            token_id=token_id,
-            decision=MCPQueryLog.DECISION_REJECTED,
-            rejection_reason=rejection.reason,
-            raw_sql=raw_sql,
-            normalized_sql=parsed.normalized_sql,
-            started_at=started_at,
-            client_ip=client_ip,
-            client=client,
-            error=rejection.detail,
-        )
-        return QueryResult(
-            rejection_reason=rejection.reason,
-            hint=HINTS.get(rejection.reason, ""),
-            error=rejection.detail,
         )
 
     # Defense-in-depth alias assertion: the router pins audit writes back to
@@ -251,7 +196,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             raw_sql=raw_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
             error=msg,
         )
         raise ExecutorMisconfiguredError(msg)
@@ -283,7 +228,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             wrapped_sql=wrapped_sql,
             started_at=started_at,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
             exc=exc,
         )
     t0 = perf_counter_ns()
@@ -296,13 +241,6 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             cur.execute(wrapped_sql)
             raw_rows = cur.fetchall()
             columns = [c.name for c in cur.description] if cur.description else []
-            # Never commit the read transaction. `transaction_read_only`
-            # already refuses writes to tables and sequences (`nextval` fails
-            # with 25006); rolling back additionally discards the
-            # transactional effects the read-only rule permits (e.g. writes
-            # to temporary tables). It cannot undo non-transactional effects
-            # (sequence advances, anything outside the database).
-            transaction.set_rollback(True, using=db_alias)
     except DatabaseError as exc:
         duration_ms = (perf_counter_ns() - t0) // 1_000_000
         reason = _classify_db_error(exc)
@@ -318,7 +256,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
             started_at=started_at,
             duration_ms=duration_ms,
             client_ip=client_ip,
-            client=client,
+            client_redirect=client_redirect,
             error=str(exc),
         )
         return QueryResult(
@@ -358,7 +296,7 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
         truncated=truncated,
         result_bytes=result_bytes,
         client_ip=client_ip,
-        client=client,
+        client_redirect=client_redirect,
     )
     return QueryResult(
         columns=columns,
@@ -377,7 +315,7 @@ def audit_tool_call(  # noqa: PLR0913
     tool: str,
     token_id: str = "",
     client_ip: str | None = None,
-    client: ClientIdentity = NO_CLIENT,
+    client_redirect: str = "",
     detail: str = "",
 ) -> None:
     """Write one `MCPQueryLog` row for a metadata tool call.
@@ -400,7 +338,7 @@ def audit_tool_call(  # noqa: PLR0913
         raw_sql=detail,
         started_at=timezone.now(),
         client_ip=client_ip,
-        client=client,
+        client_redirect=client_redirect,
     )
 
 
@@ -414,7 +352,7 @@ def _hook_failure(  # noqa: PLR0913
     wrapped_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
-    client: ClientIdentity,
+    client_redirect: str,
     exc: Exception,
 ) -> QueryResult:
     """Audit + structure a SESSION_CONTEXT-hook failure.
@@ -443,7 +381,7 @@ def _hook_failure(  # noqa: PLR0913
         wrapped_sql=wrapped_sql,
         started_at=started_at,
         client_ip=client_ip,
-        client=client,
+        client_redirect=client_redirect,
         error=error,
     )
     return QueryResult(
@@ -461,7 +399,7 @@ def _audit_misconfig(  # noqa: PLR0913
     raw_sql: str,
     started_at: "datetime.datetime",
     client_ip: str | None,
-    client: ClientIdentity,
+    client_redirect: str,
     error: str,
 ) -> None:
     """Write a `decision='rejected'` audit row for an operator-error path.
@@ -482,23 +420,19 @@ def _audit_misconfig(  # noqa: PLR0913
         raw_sql=raw_sql,
         started_at=started_at,
         client_ip=client_ip,
-        client=client,
+        client_redirect=client_redirect,
         error=error,
     )
 
 
 class AuditFields(TypedDict):
-    """Keyword payload for `_audit_safely` — the per-query half of one
+    """Keyword payload for `_audit_safely` — the shape of one
     `MCPQueryLog.objects.create`. The eight required keys are written on
     every code path (allowed or rejected); the rest are filled in as the
     pipeline progresses (parse → execute → cap). Typing `**fields` against
     this `TypedDict` (PEP 692) makes a typo'd field name or wrong value
     type at any call site a static error instead of a runtime
-    `create()` failure.
-
-    The client-attribution columns are NOT here: they arrive as one
-    `ClientIdentity` and `_audit_safely` expands it, so adding a future
-    attribution field touches that one function instead of every call site."""
+    `create()` failure."""
 
     user: "AbstractBaseUser"
     profile: str
@@ -508,6 +442,7 @@ class AuditFields(TypedDict):
     raw_sql: str
     started_at: "datetime.datetime"
     client_ip: str | None
+    client_redirect: NotRequired[str]
     error: NotRequired[str]
     normalized_sql: NotRequired[str]
     wrapped_sql: NotRequired[str]
@@ -518,16 +453,8 @@ class AuditFields(TypedDict):
     tool: NotRequired[str]
 
 
-def _audit_safely(
-    *, client: ClientIdentity = NO_CLIENT, **fields: Unpack[AuditFields]
-) -> None:
+def _audit_safely(**fields: Unpack[AuditFields]) -> None:
     """Best-effort wrapper for every `MCPQueryLog.objects.create` call site.
-
-    `client` is expanded into the three attribution columns here — the single
-    place they are written, and (via `ClientIdentity.build`) the single place
-    the registered-redirect string is bounded to the column width. An
-    over-long value would otherwise raise `DataError`, get swallowed by the
-    handler below, and lose the audit row entirely.
 
     Audit-row writes happen on the `default` alias after the readonly tx
     (or the parser-reject path) has already produced its side effects.
@@ -544,22 +471,9 @@ def _audit_safely(
 
     No retry: a `default`-DB outage usually lasts longer than any
     reasonable retry budget. The Sentry signal is the actionable channel.
-
-    `client_ip` is stored only when it is one IP address
-    (`models.audit_client_ip`), whoever passed it: a consumer calling
-    `run_query` / `audit_tool_call` with `REMOTE_ADDR` as is (a forwarded
-    list `a, b`) made the insert raise `ValueError` on psycopg 3, which no
-    `DatabaseError` handler catches (review round 20). Every
-    `MCPQueryLog` row is written here.
     """
-    fields["client_ip"] = audit_client_ip(fields.get("client_ip"))
     try:
-        MCPQueryLog.objects.create(
-            application_name=client.name,
-            client_kind=client.kind,
-            client_redirect=client.redirect,
-            **fields,
-        )
+        MCPQueryLog.objects.create(**fields)
     except DatabaseError:
         # Pull out the reason so the log message stays grep-friendly even
         # if the full payload is dropped by the structured logging layer.
@@ -581,8 +495,6 @@ def _audit_safely(
             user_id=user.pk,
             decision=fields["decision"],
             user_label=user.get_username(),
-            client_name=client.name,
-            client_kind=client.kind,
         )
     except Exception:
         logger.exception("MCP volume tripwire failed; query response unaffected")
@@ -671,27 +583,3 @@ def _cap_cell(value: object) -> Cell:
     if len(text.encode("utf-8")) > PER_CELL_BYTE_CAP:
         return text[:PER_CELL_BYTE_CAP] + TRUNCATION_MARK
     return text
-
-
-def _table_columns(tables: dict[str, str]) -> dict[str, frozenset[str]]:
-    """Column names of each whitelisted table (`db_table` -> columns, both
-    as spelled), from its model: the parser needs them to tell `t.name` (a
-    column) from attribute notation (`t.name` as the call `name(t)`). A
-    table whose model cannot be loaded gets no entry (its qualified names
-    are then treated as calls when they name a denied function)."""
-    columns: dict[str, frozenset[str]] = {}
-    for label, db_table in tables.items():
-        try:
-            model = django_apps.get_model(label)
-        except (LookupError, ValueError):
-            continue
-        # Django quotes its column names, so this is their exact spelling
-        # (the parser compares quoted names case-sensitively).
-        # The columns of this model's own table: a multi-table-inheritance
-        # child's parent fields live in the parent's table (`c.to_jsonb` is
-        # then `to_jsonb(c)`), and a proxy reads its concrete model's table.
-        concrete = model._meta.concrete_model._meta
-        columns[db_table] = frozenset(
-            field.column for field in concrete.local_concrete_fields
-        )
-    return columns

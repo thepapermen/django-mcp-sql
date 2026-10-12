@@ -10,28 +10,14 @@ class McpSqlConfig(AppConfig):
         self.validate_settings()
         self.warn_if_mfa_unconfigured()
         # Importing the module wires its @receiver-decorated handlers.
-        from mcp_sql import signals
-
-        # Lets the password-change receiver tell Django's login-time hash
-        # upgrade apart from a real change (`signals._is_hash_upgrade`).
-        signals.install_password_check_marker()
+        from mcp_sql import signals  # noqa: F401
 
     @staticmethod
     def validate_settings():
-        """Validate whatever the consumer declared — including nothing.
-
-        Every `MCP_SQL` key carries an in-package default, so an absent
-        setting is a valid (if useless: no readable tables, no MFA checker)
-        configuration rather than a boot error. `validate_mcp_sql_settings`
-        merges over the defaults before checking, so the shipped defaults are
-        re-validated on every boot too.
-        """
         from django.conf import settings
         from mcp_sql.validation import validate_mcp_sql_settings
-        from mcp_sql.validation import validate_oauth2_validator_class
 
-        validate_mcp_sql_settings(getattr(settings, "MCP_SQL", {}))
-        validate_oauth2_validator_class()
+        validate_mcp_sql_settings(settings.MCP_SQL)
 
     @staticmethod
     def warn_if_mfa_unconfigured():

@@ -12,7 +12,6 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.executor import ExecutorMisconfiguredError
 from mcp_sql.executor import pgcode
 from mcp_sql.executor import run_query
-from mcp_sql.parser import relation_of
 from mcp_sql.session import enter_readonly_session
 from mcp_sql.session import session_drift
 
@@ -149,17 +148,7 @@ class Command(BaseCommand):
                 )
                 raise CommandError(msg)
         else:
-            # Prefer a staff user for attribution when the user model has the
-            # flag; MCP access no longer requires it, and a custom user model
-            # may not define it at all (filtering on it would raise FieldError).
-            has_staff_flag = any(
-                f.name == "is_staff" for f in user_model._meta.get_fields()
-            )
-            user = (
-                user_model.objects.filter(is_staff=True).first()
-                if has_staff_flag
-                else None
-            )
+            user = user_model.objects.filter(is_staff=True).first()
             if user is None:
                 user = user_model.objects.first()
             if user is None:
@@ -207,19 +196,16 @@ class Command(BaseCommand):
                 msg = (
                     "Session GUC drift after enter_readonly_session: "
                     f"{drift}. The role / SET LOCAL contract is not in sync "
-                    "with sql/role_setup.sql; review session.session_gucs()."
+                    "with sql/role_setup.sql; review session.EXPECTED_SESSION_GUCS."
                 )
                 raise CommandError(msg)
             cur.execute("SELECT 1")
             assert cur.fetchone() == (1,)
-            # `table` is a `db_table` (`schema"."name` names another schema).
-            read = f"SELECT 1 FROM {grants.relation_sql(relation_of(table))} LIMIT 1"  # noqa: S608
-            cur.execute(read)
+            cur.execute(f'SELECT 1 FROM "{table}" LIMIT 1')  # noqa: S608
             cur.fetchall()
         self.stdout.write(
             self.style.SUCCESS(
-                "Read path ok: SET LOCAL ROLE + session GUCs (incl. the live "
-                f"transaction_read_only) verified, "
+                f"Read path ok: SET LOCAL ROLE + 4 GUCs verified, "
                 f"SELECT FROM {table} ok"
             )
         )
@@ -266,8 +252,7 @@ class Command(BaseCommand):
                 connections[mcp_sql_settings.DB_ALIAS].cursor() as cur,
             ):
                 enter_readonly_session(cur, role=profile.role)
-                relation = grants.relation_sql(relation_of(table))
-                cur.execute(f"INSERT INTO {relation} DEFAULT VALUES")
+                cur.execute(f'INSERT INTO "{table}" DEFAULT VALUES')
                 # INSERT did not raise. Force rollback so any side effect (in
                 # case the readonly guard is bypassed AND grants are
                 # misconfigured AND no NOT NULL columns block the row) is

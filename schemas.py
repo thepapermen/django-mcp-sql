@@ -35,8 +35,7 @@ class AuthRejectionReason(StrEnum):
     `AXES_COOLOFF_TIME=1h`, `AXES_CACHE='default'`). This table records
     **resolved-user access-ending events** — every row names a real user
     and is one of: a per-request gate denial (revoked perm, removed MFA,
-    dead session, rogue-Application token, scope drift, or a gate that
-    raised: `GATE_ERROR`) or a logout-driven
+    dead session, rogue-Application token, scope drift) or a logout-driven
     token revocation (`SESSION_LOGOUT`). Both answer "when/why did this
     user lose MCP access?"; both are keyed to a real user, so anonymous
     probing stays out of the enum and the table.
@@ -44,9 +43,6 @@ class AuthRejectionReason(StrEnum):
 
     BAD_APPLICATION = "bad_application"
     BAD_SCOPE = "bad_scope"
-    INACTIVE = "inactive"
-    # Legacy: written up to 0.1.x, when the gate also required `is_staff`.
-    # Never written now; kept so those rows still validate and display.
     INACTIVE_OR_NON_STAFF = "inactive_or_non_staff"
     NO_MFA = "no_mfa"
     NO_PERM = "no_perm"
@@ -56,26 +52,11 @@ class AuthRejectionReason(StrEnum):
     # once at ASSIGNMENT time (`signals.py`), not per request.
     AMBIGUOUS_PROFILE = "ambiguous_profile"
     NO_SESSION = "no_session"
-    # A per-request gate RAISED instead of deciding (a consumer MFA checker
-    # failing, a DB blip in profile resolution, a bad SESSION_MODEL). Denied
-    # fail-closed; the row records that access could not be verified, the
-    # traceback goes to the log (`auth.MCPOAuth2Authentication.authenticate`).
-    GATE_ERROR = "gate_error"
-    # Not a denial: the `user_logged_out` signal's revocation of the user's
-    # MCP access and refresh tokens and pending authorization codes. One
-    # transaction deletes all three and writes the row with them, and only
-    # when something was deleted (a codes-only revocation included); its
-    # `error` text carries the counts revoked. A failed deletion rolls all
-    # of it back and writes no row (the access did not end; it is logged
-    # with `logger.exception`). Kept alongside the gate denials so the audit
-    # table carries a complete access-ending timeline — see
-    # `signals.revoke_mcp_tokens_on_logout` and `signals._revoke_and_audit`.
+    # Not a denial: the `user_logged_out` signal revoked the user's MCP
+    # tokens. Recorded here alongside the gate denials so the audit table
+    # carries a complete access-ending timeline — see
+    # `signals.revoke_mcp_tokens_on_logout`.
     SESSION_LOGOUT = "session_logout"
-    # Not a denial either: the user's password changed, so their MCP access
-    # and refresh tokens and pending authorization codes were revoked —
-    # written under the same rules as SESSION_LOGOUT
-    # (`signals.revoke_mcp_tokens_on_password_change`).
-    PASSWORD_CHANGE = "password_change"  # noqa: S105 — an audit reason code, not a credential.
 
 
 class OutcomeReason(StrEnum):
@@ -98,17 +79,6 @@ class OutcomeReason(StrEnum):
     SYSTEM_SCHEMA = "system_schema"
     WRITEABLE_CTE = "writeable_cte"
     SELECT_INTO = "select_into"
-    # The SQL uses a source form sqlglot and Postgres read differently (an
-    # `E'…'` escape string with a backslash, a `U&` escape, an identifier
-    # written as a string constant, a double-quoted function name), so the
-    # SQL sent to Postgres could differ from the SQL that was checked.
-    # Parser-side (`parser._check_lexical_fidelity`).
-    UNSAFE_LITERAL = "unsafe_literal"
-    # Executor-side backstop for the same class: the SQL rendered for
-    # execution (after LIMIT wrapping) did not itself pass validation, or did
-    # not settle into a stable rendering (`parser.render_for_execution`), so
-    # it was not executed.
-    ROUNDTRIP_MISMATCH = "roundtrip_mismatch"
     EXECUTION_ERROR = "execution_error"
     TIMEOUT = "timeout"
     MISCONFIGURED = "misconfigured"
@@ -163,19 +133,6 @@ HINTS: dict[str, str] = {
         "rejected even when the outer statement is a SELECT."
     ),
     OutcomeReason.SELECT_INTO: "SELECT INTO writes a new table. Use SELECT only.",
-    OutcomeReason.UNSAFE_LITERAL: (
-        "The SQL uses a form that is read differently by the checker and by "
-        "Postgres, so it is refused: an E'...' string with a backslash (write "
-        "'line1' || chr(10) || 'line2' for a newline, chr(9) for a tab, '' "
-        "for a quote), a U&'...' or U&\"...\" escape (write the characters "
-        "directly), an alias written as a string ('x', $$x$$; use x or \"x\"), "
-        "or a double-quoted function name (write it unquoted)."
-    ),
-    OutcomeReason.ROUNDTRIP_MISMATCH: (
-        "The query was not run: the SQL generated from it did not pass the "
-        "same checks (see `error` for the generated SQL and the reason). "
-        "Rewrite the construct it names in a plainer form and retry."
-    ),
     OutcomeReason.DISALLOWED_CONSTRUCT: (
         "The SQL uses a construct that is not supported on the MCP surface. "
         "See `error` for the specific construct and the recommended "

@@ -173,16 +173,40 @@ MCP_SQL = {
             ],
         },
     },
+    "BAN_SELECT_STAR": True,
+    "LIMITS": {
+        "DEFAULT_LIMIT": 10,
+        "HARD_LIMIT": 100,
+        "BYTES_LIMIT": 256 * 1024,
+    },
+    "VOLUME_ALERT_THRESHOLDS": {
+        "allowed": {3600: 50, 86400: 150},
+        "rejected": {3600: 50, 86400: 150},
+    },
+    "BAD_TOKEN_IP_THRESHOLD": 100,
+    "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     "RESOURCE_NAME": "MCP SQL Example",
-    # BAN_SELECT_STAR, LIMITS, VOLUME_ALERT_THRESHOLDS and the BAD_TOKEN_IP_*
-    # knobs are deliberately NOT declared here — the in-package defaults
-    # (`mcp_sql/conf.py` DEFAULTS) already carry the values this example wants,
-    # and leaving them out is the point: a consumer declares only what they
-    # change. Same for CLIENTS: Claude.ai, ChatGPT, and Cursor's hosted agents
-    # ship ON. Run `manage.py mcp_sql_clients` for the client_id to paste into
-    # a provider connector (no secret). They need a public HTTPS origin
-    # (EXAMPLE_PUBLIC_ORIGIN) to be reachable at all — see docs/oauth.md
-    # "Clients". `"CLIENTS": {}` would turn them off.
+    # Opt-in cloud MCP clients (Claude.ai, ChatGPT). Empty by default = off /
+    # loopback-only. Each entry provisions a curated public/PKCE Application
+    # (consent required) whose derived client_id the operator pastes into the
+    # provider's custom-connector "client_id" field (no secret). Requires
+    # "https" in OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] below and a
+    # public HTTPS origin (EXAMPLE_PUBLIC_ORIGIN). See docs/oauth.md
+    # "Cloud clients".
+    "CLOUD_CLIENTS": [
+        # Claude.ai / Claude Desktop — OAuth client ID is: mcp-sql-cloud.claude
+        {
+            "NAME": "claude",
+            "REDIRECT_MATCH": "exact",
+            "REDIRECT_URI": "https://claude.ai/api/mcp/auth_callback",
+        },
+        # ChatGPT / Codex — OAuth client ID is: mcp-sql-cloud.chatgpt
+        {
+            "NAME": "chatgpt",
+            "REDIRECT_MATCH": "prefix",
+            "REDIRECT_URI": "https://chatgpt.com/connector/oauth/",
+        },
+    ],
     # Stock Django has no MFA. The package default (`deny_unconfigured_mfa`)
     # is fail-closed and would reject every user at the OAuth issuance gate,
     # so the demo wires a permissive checker. Production consumers point this
@@ -197,23 +221,12 @@ OAUTH2_PROVIDER = {
     "SCOPES": {"mcp:sql": "Read-only SQL surface for MCP agents"},
     "DEFAULT_SCOPES": ["mcp:sql"],
     "ACCESS_TOKEN_EXPIRE_SECONDS": 6 * 3600,
-    # Moot for MCP: the package's OAuth endpoints mint no refresh tokens and
-    # refuse every refresh grant unless MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]
-    # opts in (with its own hard cap from the consent), so
-    # ACCESS_TOKEN_EXPIRE_SECONDS is the re-consent interval. (On its own,
-    # DOT reads 0 as "no age limit".)
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
-    # The package requires PKCE (S256 only) whatever this says.
     "PKCE_REQUIRED": True,
-    # Recommended (DOT 3.4.1+): refuse any request carrying an `access_token`
-    # in the URL query string outright, without DOT's per-request warning.
-    # The package never accepts such a token either way.
-    "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
-    # ALLOWED_REDIRECT_URI_SCHEMES deliberately unset — DOT's default
-    # ["http", "https"] already covers loopback DCR clients (Claude Code) and
-    # the declared https ones. Narrowing it is install-global; dropping "https"
-    # while any https client is declared refuses to boot.
+    # "http" for loopback DCR clients (Claude Code); "https" is required
+    # whenever CLOUD_CLIENTS is non-empty (the app refuses to boot otherwise).
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
 }
 
 # Cache backend — Redis if reachable, fall back to LocMem otherwise. The

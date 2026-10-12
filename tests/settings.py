@@ -1,12 +1,11 @@
 """Standalone Django settings for the package's own test suite.
 
 Self-contained: stock Django + DRF + django-oauth-toolkit + the package and
-its in-package test app, against a plain PostgreSQL (15+ under Django 6.1,
-which refuses 14) reachable via the `MCP_SQL_TEST_PG_*` environment variables
-(defaults match the GitHub Actions `postgres` service containers). This is
-what `pytest` runs against in the extracted repo; an in-tree consumer instead
-runs the suite under its own settings (this project:
-`--ds=config.settings.test`).
+its in-package test app, against a plain PostgreSQL reachable via the
+`MCP_SQL_TEST_PG_*` environment variables (defaults match the GitHub Actions
+`postgres:14` service container). This is what `pytest` runs against in the
+extracted repo; an in-tree consumer instead runs the suite under its own
+settings (this project: `--ds=config.settings.test`).
 
 Deliberate omissions:
 
@@ -27,7 +26,6 @@ Deliberate omissions:
   override it per-test.
 """
 
-import copy
 import os
 
 SECRET_KEY = "mcp-sql-test-suite-not-a-secret"
@@ -85,14 +83,6 @@ DATABASES = {
     },
 }
 
-# A second database (same server, its own name) for the multi-database tests
-# (`test_multi_db_revocation.py`): a user saved to one database while the
-# tokens live in another. pytest-django creates its test database only when
-# a collected test asks for the alias.
-SECOND_DB_ALIAS = "second"
-DATABASES[SECOND_DB_ALIAS] = copy.deepcopy(DATABASES["default"])
-DATABASES[SECOND_DB_ALIAS]["NAME"] = f"{DATABASES['default']['NAME']}_second"
-
 DATABASE_ROUTERS = ["mcp_sql.db_router.McpSqlRouter"]
 
 LANGUAGE_CODE = "en-us"
@@ -109,6 +99,7 @@ PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 # into the type-check build (the `[tool.mypy]` `/tests/` exclude does not drop
 # the configured settings module), so a bare `[]` trips `var-annotated`.
 AUTH_PASSWORD_VALIDATORS: list[dict[str, object]] = []
+EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
@@ -129,26 +120,22 @@ MCP_SQL = {
             "ALLOWED_MODELS": [],
         },
     },
-    # LIMITS / BAN_SELECT_STAR / VOLUME_ALERT_THRESHOLDS / BAD_TOKEN_IP_* are
-    # deliberately NOT declared: the in-package defaults carry exactly these
-    # values, so omitting them means the suite exercises the defaulting path
-    # the way a real consumer does. Tests needing different values override
-    # per-case. CLIENTS is likewise left to the shipped default (claude,
-    # chatgpt, cursor) — `test_clients.py` pins both the default set and the
-    # empty-dict off-switch.
+    "BAN_SELECT_STAR": True,
+    "LIMITS": {
+        "DEFAULT_LIMIT": 10,
+        "HARD_LIMIT": 100,
+        "BYTES_LIMIT": 256 * 1024,
+    },
+    "VOLUME_ALERT_THRESHOLDS": {
+        "allowed": {3600: 50, 86400: 150},
+        "rejected": {3600: 50, 86400: 150},
+    },
+    "BAD_TOKEN_IP_THRESHOLD": 100,
+    "BAD_TOKEN_IP_WINDOW_SECONDS": 21600,
     # The runtime session-existence gate needs a session model with a `user`
     # FK; the in-package test app ships a minimal stand-in.
     "SESSION_MODEL": "mcp_sql_testapp.TestSession",
 }
-
-# Minimal security posture (`MCP_SQL_TEST_POSTURE=minimal`; CI runs the suite
-# under it as a separate job): an allow-all MFA checker and no session gate,
-# as an install without MFA or a session-with-user model runs. Tests that
-# exercise a gate configure it themselves (`mcp_mfa_on` / `mcp_mfa_off`, an
-# explicit `SESSION_MODEL`), so the same suite proves what holds without them.
-if os.environ.get("MCP_SQL_TEST_POSTURE") == "minimal":
-    MCP_SQL["MFA_CHECKER"] = "mcp_sql.tests.conftest.allow_all_mfa"
-    del MCP_SQL["SESSION_MODEL"]  # the in-package default: None, gate off
 
 OAUTH2_PROVIDER = {
     "OAUTH2_VALIDATOR_CLASS": "mcp_sql.oauth.MCPOAuth2Validator",
@@ -158,7 +145,5 @@ OAUTH2_PROVIDER = {
     "REFRESH_TOKEN_EXPIRE_SECONDS": 0,
     "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "PKCE_REQUIRED": True,
-    # ALLOWED_REDIRECT_URI_SCHEMES deliberately unset, so the suite runs on
-    # DOT's default (["http", "https"]) — the path a real consumer is on. The
-    # tests that care narrow it per-case.
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"],
 }
