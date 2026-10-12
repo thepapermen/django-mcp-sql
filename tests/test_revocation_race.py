@@ -600,6 +600,26 @@ def test_an_openid_spelled_exchange_locks_its_code(mcp_user):
         oauth._lock_token_source(request, "default")
 
 
+def test_an_openid_spelled_save_consumes_its_code(client, mcp_user, monkeypatch):
+    """The save treats `openid` as the code exchange it is: it deletes the
+    code in its own transaction and records the refresh chain's consent."""
+    code, verifier = consent(client, mcp_user)
+    real = MCPOAuth2Validator.save_bearer_token
+    seen = {}
+
+    def as_openid(self, token, request, *args, **kwargs):
+        request.grant_type = "openid"
+        result = real(self, token, request, *args, **kwargs)
+        seen["code_left"] = Grant.objects.filter(code=code).exists()
+        return result
+
+    monkeypatch.setattr(MCPOAuth2Validator, "save_bearer_token", as_openid)
+    assert exchange(client, code, verifier).status_code == HTTPStatus.OK
+    assert seen == {"code_left": False}
+    family = RefreshToken.objects.get(user=mcp_user).token_family
+    assert MCPRefreshTokenFamily.objects.filter(token_family=family).exists()
+
+
 def test_a_failed_save_does_not_burn_the_code(client, mcp_user, monkeypatch):
     """The code is deleted in the transaction that saves the tokens: a save
     that fails afterwards rolls the delete back with them, and the code

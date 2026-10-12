@@ -39,6 +39,7 @@ from typing import Any
 
 from django.http import HttpRequest
 from django.urls import reverse
+from mcp_sql.consts import CODE_EXCHANGE_GRANT_TYPES
 from mcp_sql.consts import absolute_url
 from mcp_sql.consts import canonical_authority
 from oauth2_provider.models import get_grant_model
@@ -230,7 +231,7 @@ def _stored_resources(request: Any) -> list[str]:
     authorization code's grant's (looked up as DOT does), or the refresh
     token's. Empty when it carries none."""
     stored: Any = None
-    if request.grant_type == "authorization_code":
+    if request.grant_type in CODE_EXCHANGE_GRANT_TYPES:
         stored = (
             get_grant_model()
             .objects.filter(code=request.code, application=request.client)

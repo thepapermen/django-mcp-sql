@@ -20,6 +20,7 @@ from mcp_sql.audience import use_granted_spelling
 from mcp_sql.clients import ClientKind
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.conf import refresh_tokens_enabled
+from mcp_sql.consts import CODE_EXCHANGE_GRANT_TYPES
 from mcp_sql.consts import is_mcp_application
 from mcp_sql.models import MCPRefreshTokenFamily
 from mcp_sql.views.registration import _is_loopback_redirect
@@ -44,12 +45,6 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Set on an oauthlib request by `save_bearer_token` once its transaction,
 # which deleted the exchanged code, has completed: the code it consumed.
 _CONSUMED_CODE_ATTR = "_mcp_sql_consumed_code"
-
-# The grant types oauthlib's authorization-code grant answers: `openid` is
-# its spelling for the same exchange. DOT 3.4 refuses it before the save
-# (`validate_grant_type`), and `MCPTokenView` before DOT; an exchange that
-# got here in it would still lock and consume its code.
-_CODE_EXCHANGE_GRANT_TYPES = frozenset({"authorization_code", "openid"})
 
 
 def _record_refresh_family(raw_refresh_token: str) -> None:
@@ -107,7 +102,7 @@ def _lock_token_source(request: Any, using: str) -> None:
     Other grant types (none reaches the package's own server) lock nothing.
     """
     source: QuerySet[Any]
-    if request.grant_type in _CODE_EXCHANGE_GRANT_TYPES:
+    if request.grant_type in CODE_EXCHANGE_GRANT_TYPES:
         source = Grant.objects.using(using).filter(
             code=request.code, application=request.client
         )
@@ -477,7 +472,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         # rotation holds its chain's record until its tokens are committed,
         # so a revocation's delete of the record waits until it can see them.
         tokens = router.db_for_write(AccessToken)
-        exchange = request.grant_type in _CODE_EXCHANGE_GRANT_TYPES
+        exchange = request.grant_type in CODE_EXCHANGE_GRANT_TYPES
         with (
             transaction.atomic(using=router.db_for_write(MCPRefreshTokenFamily)),
             transaction.atomic(using=tokens),

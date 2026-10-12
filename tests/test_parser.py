@@ -2770,9 +2770,36 @@ class TestCheckOrdering:
         ],
     )
     def test_a_nul_character_is_refused_first(self, sql):
-        # Postgres takes no NUL in query text: psycopg 3 cut the query
-        # there, psycopg 2 raised a `ValueError` that escaped the audit.
+        # Postgres takes no NUL in query text: psycopg 3 and 2 both cut the
+        # query there, and the audit insert of the raw text raised.
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'a\ud800b' AS v",
+            "SELECT id /* \udfff */ FROM auth_group",
+            "SELECT id FROM pg_class /* \ud800 */",
+        ],
+    )
+    def test_an_unpaired_surrogate_is_refused_first(self, sql):
+        # Stdlib `json.loads` hands the MCP tool an unpaired `\ud800`, which
+        # UTF-8 cannot encode: the driver's `UnicodeEncodeError` escaped the
+        # executor's handlers, so neither the query nor its audit row went
+        # through.
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
+    def test_a_character_outside_the_bmp_is_not_a_surrogate(self):
+        # A surrogate pair decodes to one code point: nothing to refuse.
+        parse_and_validate(
+            "SELECT id FROM auth_group WHERE name = '\U0001f600'",
+            allowed_tables={"auth_group"},
+        )
+
+    @pytest.mark.parametrize("raw", [None, b"SELECT 1"])
+    def test_a_value_that_is_not_text_is_a_parse_error(self, raw):
+        # `parse_and_validate` raises only `QueryRejectedError`.
+        _expect_reject(raw, OutcomeReason.PARSE_ERROR)
 
     def test_system_schema_with_qualify_as_a_name(self):
         # Review round 7: `qualify` is an ordinary name, so the tree is

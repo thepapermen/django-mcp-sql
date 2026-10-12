@@ -965,3 +965,38 @@ class TestNulInTheAuditRow:
         log = MCPQueryLog.objects.get()
         assert log.raw_sql == "SELECT id /* \u2400 */ FROM auth_permission"
         assert log.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value
+
+    def test_an_unpaired_surrogate_is_refused_and_audited(self):
+        # UTF-8 cannot encode it: the insert raised `UnicodeEncodeError`, a
+        # `ValueError` the audit's `DatabaseError` handler never caught.
+        user = UserFactory()
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            result = run_query(
+                user=user,
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT id /* \ud800 */ FROM auth_permission",
+            )
+        assert result.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value
+        log = MCPQueryLog.objects.get()
+        assert log.raw_sql == "SELECT id /* \ufffd */ FROM auth_permission"
+
+    def test_a_value_the_driver_cannot_adapt_is_logged_not_raised(self, caplog):
+        user = UserFactory()
+        with (
+            patch("mcp_sql.executor.connections") as mock_conns,
+            patch(
+                "mcp_sql.executor.MCPQueryLog.objects.create",
+                side_effect=ValueError("cannot adapt"),
+            ),
+        ):
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            result = run_query(
+                user=user,
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT id /* \x00 */ FROM auth_permission",
+            )
+        assert result.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value
+        assert "MCP audit row write failed" in caplog.text

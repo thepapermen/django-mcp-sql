@@ -65,6 +65,13 @@ def absolute_url(request: HttpRequest, path: str) -> str:
 
 DEFAULT_PORTS = {"http": "80", "https": "443"}
 
+# The grant types oauthlib's authorization-code grant answers: `openid` is
+# its spelling for the same exchange. Neither of the package's token paths
+# lets it through (`MCPTokenView`'s grant-type guard refuses it, and DOT
+# 3.4.1 asserts it away in `validate_grant_type` — a 500 on a stock
+# `TokenView`); code that keys on the code exchange checks both anyway.
+CODE_EXCHANGE_GRANT_TYPES = frozenset({"authorization_code", "openid"})
+
 
 def canonical_authority(scheme: str, authority: str) -> str:
     """`authority` (`host[:port]`) as URL parsers serialise it for `scheme`.
