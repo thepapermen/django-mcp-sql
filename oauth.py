@@ -45,6 +45,12 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # which deleted the exchanged code, has completed: the code it consumed.
 _CONSUMED_CODE_ATTR = "_mcp_sql_consumed_code"
 
+# The grant types oauthlib's authorization-code grant answers: `openid` is
+# its spelling for the same exchange. DOT 3.4 refuses it before the save
+# (`validate_grant_type`), and `MCPTokenView` before DOT; an exchange that
+# got here in it would still lock and consume its code.
+_CODE_EXCHANGE_GRANT_TYPES = frozenset({"authorization_code", "openid"})
+
 
 def _record_refresh_family(raw_refresh_token: str) -> None:
     """Record the consent time of the chain `raw_refresh_token` starts, and
@@ -101,7 +107,7 @@ def _lock_token_source(request: Any, using: str) -> None:
     Other grant types (none reaches the package's own server) lock nothing.
     """
     source: QuerySet[Any]
-    if request.grant_type == "authorization_code":
+    if request.grant_type in _CODE_EXCHANGE_GRANT_TYPES:
         source = Grant.objects.using(using).filter(
             code=request.code, application=request.client
         )
@@ -471,7 +477,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         # rotation holds its chain's record until its tokens are committed,
         # so a revocation's delete of the record waits until it can see them.
         tokens = router.db_for_write(AccessToken)
-        exchange = request.grant_type == "authorization_code"
+        exchange = request.grant_type in _CODE_EXCHANGE_GRANT_TYPES
         with (
             transaction.atomic(using=router.db_for_write(MCPRefreshTokenFamily)),
             transaction.atomic(using=tokens),

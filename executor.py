@@ -549,10 +549,16 @@ def _audit_safely(
     (`models.audit_client_ip`), whoever passed it: a consumer calling
     `run_query` / `audit_tool_call` with `REMOTE_ADDR` as is (a forwarded
     list `a, b`) made the insert raise `ValueError` on psycopg 3, which no
-    `DatabaseError` handler catches (review round 20). Every
-    `MCPQueryLog` row is written here.
+    `DatabaseError` handler catches (review round 20). A NUL in a text
+    field (the agent's `raw_sql`, an error echoing it) is stored as U+2400
+    (␀): Postgres refuses NUL in text, and the failed insert lost the row
+    of a query that had returned rows. Every `MCPQueryLog` row is written
+    here.
     """
     fields["client_ip"] = audit_client_ip(fields.get("client_ip"))
+    for name, value in list(fields.items()):
+        if isinstance(value, str) and "\x00" in value:
+            fields[name] = value.replace("\x00", "\u2400")  # type: ignore[literal-required]
     try:
         MCPQueryLog.objects.create(
             application_name=client.name,

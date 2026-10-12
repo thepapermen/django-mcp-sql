@@ -943,3 +943,25 @@ def test_table_columns_are_the_tables_own():
     )
     assert columns[child] == frozenset({"gauge_ptr_id", "reading"})
     assert columns[parent] == frozenset({"id", "current_setting"})
+
+
+@pytest.mark.django_db
+class TestNulInTheAuditRow:
+    """Postgres refuses a NUL in a `text` column: the audit insert failed
+    and was swallowed, so a query carrying one (in a comment the rendering
+    drops) left no `MCPQueryLog` row, even when it returned rows."""
+
+    def test_refused_and_audited_with_the_nul_shown(self):
+        user = UserFactory()
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            result = run_query(
+                user=user,
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT id /* \x00 */ FROM auth_permission",
+            )
+        assert result.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value
+        log = MCPQueryLog.objects.get()
+        assert log.raw_sql == "SELECT id /* \u2400 */ FROM auth_permission"
+        assert log.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value

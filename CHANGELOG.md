@@ -336,6 +336,13 @@ below precisely because they do **not** announce themselves.
   in the transaction that saves the tokens: the other exchange is refused
   with nothing minted. Tokens already issued from a code presented again are
   still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **Security: a NUL character in the SQL suppressed its audit row.** Postgres
+  refuses NUL in a `text` column, so the `MCPQueryLog` insert failed (logged
+  only) and a query carrying one in a comment, which the executed rendering
+  drops, returned rows with no audit row. SQL containing a NUL is now
+  refused as `unsafe_literal` (Postgres takes no NUL in query text: psycopg 3
+  cut the query there, psycopg 2 raised a `ValueError` that escaped the
+  audit), and the audit writer stores any NUL as U+2400 (␀).
 - **Docs: the operator's token-revocation snippet missed refresh tokens.**
   `docs/oauth.md` (linked from `docs/role-setup.md`) now deletes codes,
   consent records, refresh tokens and access tokens in one transaction, in

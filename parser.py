@@ -1771,6 +1771,11 @@ def _checked(
 ) -> ParsedQuery:
     """`_parse_and_validate`, with any non-rejection exception mapped to
     `PARSE_ERROR` (see `parse_and_validate`)."""
+    if "\x00" in raw_sql:
+        # PostgreSQL takes no NUL in query text: psycopg 3 cut the query
+        # there, psycopg 2 raised a `ValueError` no handler audits.
+        msg = "SQL contains a NUL character, which PostgreSQL does not accept"
+        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
     try:
         return _parse_and_validate(
             raw_sql,

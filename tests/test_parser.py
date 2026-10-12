@@ -2761,6 +2761,19 @@ class TestCheckOrdering:
     def test_unsafe_literal_before_parse_error(self, sql):
         _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'a\x00b' AS v",
+            "SELECT id /* \x00 */ FROM auth_group",
+            "SELECT id FROM pg_class\x00",
+        ],
+    )
+    def test_a_nul_character_is_refused_first(self, sql):
+        # Postgres takes no NUL in query text: psycopg 3 cut the query
+        # there, psycopg 2 raised a `ValueError` that escaped the audit.
+        _expect_reject(sql, OutcomeReason.UNSAFE_LITERAL)
+
     def test_system_schema_with_qualify_as_a_name(self):
         # Review round 7: `qualify` is an ordinary name, so the tree is
         # built and the catalog reference is what the audit row names.

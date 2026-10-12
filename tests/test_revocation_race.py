@@ -57,6 +57,8 @@ from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Grant
 from oauth2_provider.models import RefreshToken
 from oauth2_provider.models import clear_expired
+from oauthlib.common import Request as OAuthlibRequest
+from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
 
 pytestmark = [
     pytest.mark.django_db(transaction=True),
@@ -584,6 +586,18 @@ def test_a_code_exchanges_once(client, mcp_user):
     assert exchange(client, code, verifier).status_code == HTTPStatus.OK
     assert _refused(exchange(client, code, verifier))
     assert AccessToken.objects.filter(user=mcp_user).count() == 1
+
+
+def test_an_openid_spelled_exchange_locks_its_code(mcp_user):
+    """oauthlib's authorization-code grant also answers `grant_type=openid`;
+    an exchange in that spelling locks and consumes its code like any
+    other (DOT 3.4 refuses the spelling earlier, in `validate_grant_type`)."""
+    request = OAuthlibRequest("https://testserver/o/token/")
+    request.grant_type = "openid"
+    request.code = "no-such-code"
+    request.client = None
+    with transaction.atomic(), pytest.raises(InvalidGrantError):
+        oauth._lock_token_source(request, "default")
 
 
 def test_a_failed_save_does_not_burn_the_code(client, mcp_user, monkeypatch):
