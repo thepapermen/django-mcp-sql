@@ -709,6 +709,26 @@ class TestGrantsStoredBeforeTheRewrite:
         for transport in ("/mcp/sql", "/mcp/sql/"):
             assert _ping(client, access_token, transport).status_code == HTTPStatus.OK
 
+    def test_an_openid_spelled_exchange_matches_the_stored_spelling(  # noqa: PLR0913
+        self, client, mcp_app, mcp_user, mcp_active_session, gate_posture, monkeypatch
+    ):
+        # `openid` is the code exchange too: its grant's spelling is looked up.
+        from mcp_sql.oauth import MCPOAuth2Validator
+        from oauth2_provider.models import AccessToken
+
+        real = MCPOAuth2Validator.save_bearer_token
+
+        def as_openid(self, token, request, *args, **kwargs):
+            request.grant_type = "openid"
+            return real(self, token, request, *args, **kwargs)
+
+        monkeypatch.setattr(MCPOAuth2Validator, "save_bearer_token", as_openid)
+        code, verifier = _legacy_grant(mcp_app, mcp_user, [SLASHED])
+        response = _exchange(client, code, verifier, [SLASHLESS])
+        assert response.status_code == HTTPStatus.OK, response.content
+        token = AccessToken.objects.get(token=response.json()["access_token"])
+        assert token.resource == [SLASHED]
+
     def test_without_resource_the_token_inherits_the_stored_spelling(
         self, client, mcp_app, mcp_user, mcp_active_session, gate_posture
     ):

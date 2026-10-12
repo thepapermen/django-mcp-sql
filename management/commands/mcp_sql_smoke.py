@@ -261,8 +261,12 @@ class Command(BaseCommand):
                     msg = (
                         f"Role {profile.role} cannot read "
                         f"{grants.relation_display(relation_of(table))}: "
-                        "run `manage.py mcp_sql_grants --apply` (as the "
-                        "relation's owner) to grant the whitelist."
+                        f"{exc}. A missing table grant: run `manage.py "
+                        "mcp_sql_grants --apply` (as the relation's owner). "
+                        "A table in another schema also needs USAGE on that "
+                        "schema for the role, which the package does not "
+                        "grant; a view also needs its owner's rights on the "
+                        "tables it reads (docs/role-setup.md)."
                     )
                     raise CommandError(msg) from exc
                 if pgcode(exc) != PGCODE_UNDEFINED_TABLE:

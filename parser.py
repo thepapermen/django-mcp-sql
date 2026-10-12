@@ -1761,6 +1761,31 @@ def parse_and_validate(
     )
 
 
+# A UTF-16 surrogate code point: in a Python `str` (stdlib `json.loads`
+# accepts `"\\ud800"`) it is unpaired, and UTF-8 cannot encode it.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _refuse_unsendable_text(raw_sql: str) -> None:
+    """Refuse text no driver can send to PostgreSQL as written.
+
+    A NUL: PostgreSQL takes none in query text, and both psycopg 3 and 2 cut
+    the query at it. A lone surrogate: the UTF-8 encode raises
+    `UnicodeEncodeError`, a `ValueError` the executor's `DatabaseError`
+    handlers never saw, so neither the query nor its audit row went through
+    (a query run with the surrogate in a comment returned no rows and left
+    no audit row)."""
+    if "\x00" in raw_sql:
+        msg = "SQL contains a NUL character, which PostgreSQL does not accept"
+        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+    if _SURROGATE_RE.search(raw_sql):
+        msg = (
+            "SQL contains an unpaired UTF-16 surrogate (U+D800..U+DFFF), "
+            "which cannot be encoded to send to PostgreSQL"
+        )
+        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
+
+
 def _checked(
     raw_sql: str,
     *,
@@ -1771,12 +1796,8 @@ def _checked(
 ) -> ParsedQuery:
     """`_parse_and_validate`, with any non-rejection exception mapped to
     `PARSE_ERROR` (see `parse_and_validate`)."""
-    if "\x00" in raw_sql:
-        # PostgreSQL takes no NUL in query text: psycopg 3 cut the query
-        # there, psycopg 2 raised a `ValueError` no handler audits.
-        msg = "SQL contains a NUL character, which PostgreSQL does not accept"
-        raise QueryRejectedError(OutcomeReason.UNSAFE_LITERAL, msg)
     try:
+        _refuse_unsendable_text(raw_sql)
         return _parse_and_validate(
             raw_sql,
             allowed_tables=allowed_tables,
@@ -2517,9 +2538,15 @@ def extract_limit(ast: exp.Query) -> int | None:
         if written.is_string
         else written.name
     )
-    if _PLAIN_INTEGER_RE.fullmatch(text) and int(text) <= _BIGINT_MAX:
-        return int(text)
-    return None  # beyond bigint, negative, ...: Postgres's own error
+    if not _PLAIN_INTEGER_RE.fullmatch(text):
+        return None  # negative, a fraction, ...: Postgres's own error
+    # Leading zeros are Postgres's too (`LIMIT 007`). Bound the length
+    # before `int()`: Python 3.11+ refuses a string of over 4300 digits with
+    # a `ValueError` that escaped `run_query` before any audit row.
+    digits = text.lstrip("0") or "0"
+    if len(digits) <= len(str(_BIGINT_MAX)) and int(digits) <= _BIGINT_MAX:
+        return int(digits)
+    return None  # beyond bigint: Postgres's own error
 
 
 def _check_no_select_into(ast: exp.Query) -> None:

@@ -5,6 +5,7 @@ limit-clamp / truncation contract, and the raw-PG-error policy."""
 
 import json
 import logging
+import re
 from collections.abc import Sequence
 from time import perf_counter_ns
 from typing import TYPE_CHECKING
@@ -518,6 +519,17 @@ class AuditFields(TypedDict):
     tool: NotRequired[str]
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _storable_text(value: str) -> str:
+    """`value` as a text column can store it: NUL as U+2400 (␀), an
+    unpaired surrogate as U+FFFD."""
+    if "\x00" in value:
+        value = value.replace("\x00", "\u2400")
+    return _SURROGATE_RE.sub("\ufffd", value)
+
+
 def _audit_safely(
     *, client: ClientIdentity = NO_CLIENT, **fields: Unpack[AuditFields]
 ) -> None:
@@ -552,21 +564,24 @@ def _audit_safely(
     `DatabaseError` handler catches (review round 20). A NUL in a text
     field (the agent's `raw_sql`, an error echoing it) is stored as U+2400
     (␀): Postgres refuses NUL in text, and the failed insert lost the row
-    of a query that had returned rows. Every `MCPQueryLog` row is written
-    here.
+    of a query that had returned rows; an unpaired UTF-16 surrogate, which
+    UTF-8 cannot encode, is stored as U+FFFD. Every `MCPQueryLog` row is
+    written here.
     """
     fields["client_ip"] = audit_client_ip(fields.get("client_ip"))
     for name, value in list(fields.items()):
-        if isinstance(value, str) and "\x00" in value:
-            fields[name] = value.replace("\x00", "\u2400")  # type: ignore[literal-required]
+        if isinstance(value, str):
+            fields[name] = _storable_text(value)  # type: ignore[literal-required]
     try:
         MCPQueryLog.objects.create(
-            application_name=client.name,
+            application_name=_storable_text(client.name),
             client_kind=client.kind,
-            client_redirect=client.redirect,
+            client_redirect=_storable_text(client.redirect),
             **fields,
         )
-    except DatabaseError:
+    except (DatabaseError, ValueError):
+        # `ValueError`: a value the driver cannot adapt raises before the
+        # database sees it (psycopg's `UnicodeEncodeError` among them).
         # Pull out the reason so the log message stays grep-friendly even
         # if the full payload is dropped by the structured logging layer.
         reason = fields.get("rejection_reason") or "<allowed>"

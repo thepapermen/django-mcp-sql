@@ -120,9 +120,11 @@ below precisely because they do **not** announce themselves.
   inside `migrate`, with a bare `ProgrammingError`. An entry whose app still
   has migrations to apply is not checked (one of them may create the table
   in `public`); the `post_migrate` grants check logs it if it is still wrong
-  afterwards. Name the schema in `db_table` (`'schema"."name'`), or run
-  `migrate --skip-checks` when another app's migration creates the
-  relation.
+  afterwards. A migration graph Django cannot build (a missing or circular
+  dependency, a migration file that does not import) skips nothing, and
+  `migrate` reports its real error. Name the schema in `db_table`
+  (`'schema"."name'`), or run `migrate --skip-checks` when another app's
+  migration creates the relation.
 - **`mcp_sql_grants --apply` can now exit 1.** When PostgreSQL silently skips
   a `GRANT` / `REVOKE` (the login does not own the relation; see "Fixed"),
   the whole apply is rolled back and the command fails naming each relation,
@@ -341,13 +343,23 @@ below precisely because they do **not** announce themselves.
   in the transaction that saves the tokens: the other exchange is refused
   with nothing minted. Tokens already issued from a code presented again are
   still not revoked (RFC 6749 §4.1.2's SHOULD).
-- **Security: a NUL character in the SQL suppressed its audit row.** Postgres
-  refuses NUL in a `text` column, so the `MCPQueryLog` insert failed (logged
-  only) and a query carrying one in a comment, which the executed rendering
-  drops, returned rows with no audit row. SQL containing a NUL is now
-  refused as `unsafe_literal` (Postgres takes no NUL in query text: psycopg 3
-  cut the query there, psycopg 2 raised a `ValueError` that escaped the
-  audit), and the audit writer stores any NUL as U+2400 (␀).
+- **Security: a NUL character or an unpaired UTF-16 surrogate in the SQL
+  suppressed its audit row.** Postgres refuses NUL in a `text` column, so the
+  `MCPQueryLog` insert failed (logged only) and a query carrying one in a
+  comment, which the executed rendering drops, returned rows with no audit
+  row. An unpaired surrogate (`"\ud800"`, which the MCP transport's JSON
+  decoding accepts) cannot be encoded to UTF-8 at all: the driver's
+  `UnicodeEncodeError` escaped the executor's database-error handlers, and
+  neither the query's result nor its audit row came back. Both are now
+  refused as `unsafe_literal`, before any other check (Postgres takes no NUL
+  in query text, and no driver can send the surrogate). The audit writer
+  stores any NUL as U+2400 (␀) and any unpaired surrogate as U+FFFD, and a
+  value the driver cannot adapt is logged like a database error instead of
+  escaping.
+- **A `LIMIT` of over 4300 digits escaped `run_query` with no audit row.**
+  Python 3.11+ refuses `int()` of so long a digit string with a
+  `ValueError`, raised before any handler. Such a `LIMIT` now runs capped
+  like any other beyond bigint, and Postgres's own error is audited.
 - **Docs: the operator's token-revocation snippet missed refresh tokens.**
   `docs/oauth.md` (linked from `docs/role-setup.md`) now deletes codes,
   consent records, refresh tokens and access tokens in one transaction, in
@@ -390,8 +402,10 @@ below precisely because they do **not** announce themselves.
   also before `role_setup.sql` has run). `mcp_sql_smoke` reports a
   whitelisted table missing from `public`, a table the role cannot read yet
   and a role it cannot enter as a command error naming the remedy (the
-  check, `mcp_sql_grants --apply`, `role_setup.sql`), not a bare
-  `ProgrammingError`.
+  check, `mcp_sql_grants --apply`, `role_setup.sql`) next to Postgres's own
+  message, not a bare `ProgrammingError`. A table the role cannot read also
+  names the grants the package does not make: `USAGE` on a schema other
+  than `public`, and a view owner's rights on its tables.
 - **`mcp_sql_grants --apply` counted every profile in its summary** ("across
   N profile(s)"), not the ones whose grants it changed.
 - **A declared client's redirects followed its `Application` row, not

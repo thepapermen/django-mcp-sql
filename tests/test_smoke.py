@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import DatabaseError
 from django.db import connection
 from django.db import transaction
 from mcp_sql.conf import mcp_sql_settings
@@ -332,6 +333,25 @@ class TestReadPathFirstRunErrors:
         with pytest.raises(CommandError) as exc:
             cmd._verify_read_path(profile, "mcp_sql_smoke_ungranted")
         assert "mcp_sql_grants --apply" in str(exc.value)
+        # Postgres's own message names the object it refused, and the
+        # remedy names the grants the package does not make.
+        assert "permission denied for table mcp_sql_smoke_ungranted" in str(exc.value)
+        assert "USAGE on that schema" in str(exc.value)
+
+    def test_a_role_the_login_cannot_set_names_role_setup(self, cmd, monkeypatch):
+        # A role that exists but is not granted to the app login: 42501 at
+        # SET ROLE (the suite's superuser login can set any role).
+        refused = DatabaseError('permission denied to set role "mcp_readonly_role"')
+        refused.pgcode = "42501"
+
+        def enter(cur, *, role):
+            raise refused
+
+        monkeypatch.setattr(mcp_sql_smoke, "enter_readonly_session", enter)
+        with pytest.raises(CommandError) as exc:
+            cmd._verify_read_path(Command._smoke_profile(None), "auth_group")
+        assert "Cannot enter role" in str(exc.value)
+        assert "permission denied to set role" in str(exc.value)
 
     def test_a_missing_role_names_role_setup(self, cmd):
         profile = replace(Command._smoke_profile(None), role="mcp_sql_no_such_role")
