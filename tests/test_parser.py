@@ -1121,6 +1121,27 @@ class TestExtractLimit:
         ).ast
         assert extract_limit(ast) == 7
 
+    @pytest.mark.parametrize(
+        ("limit", "expected"),
+        [
+            ("007", 7),
+            ("'0000000000000000000000005'", 5),
+            ("9223372036854775807", 9223372036854775807),
+            ("9223372036854775808", None),
+            ("1" * 5000, None),
+            ("'" + "9" * 5000 + "'", None),
+        ],
+    )
+    def test_long_digit_strings(self, limit, expected):
+        # Python 3.11+ refuses `int()` of over 4300 digits with a
+        # `ValueError` that escaped `run_query` unaudited; leading zeros
+        # are still read as Postgres reads them.
+        ast = parse_and_validate(
+            f"SELECT id FROM auth_permission LIMIT {limit}",  # noqa: S608
+            allowed_tables=ALLOWED,
+        ).ast
+        assert extract_limit(ast) == expected
+
     def test_with_cte_limit_returned(self):
         ast = parse_and_validate(
             "WITH p AS (SELECT id FROM auth_permission) SELECT id FROM p LIMIT 4",

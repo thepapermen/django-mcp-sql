@@ -22,6 +22,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.core.management.base import SystemCheckError
 from django.db import connection
+from django.db.migrations.exceptions import CircularDependencyError
 from django.db.migrations.exceptions import NodeNotFoundError
 from django.test.utils import override_system_checks
 from mcp_sql import checks
@@ -324,13 +325,26 @@ class TestE001PendingMigrations:
             cur.execute("DROP TABLE IF EXISTS django_migrations")
         assert _e001(databases=["default"]) == []
 
-    def test_a_graph_django_cannot_build_skips_nothing(self, elsewhere, monkeypatch):
-        """A migration depending on one that does not exist: the lookup
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            NodeNotFoundError("a dependency is missing", ("app", "9999")),
+            CircularDependencyError("app.0001_a, app.0002_b"),
+            ValueError("Dependency on unknown app: gone"),
+            SyntaxError("invalid syntax (0001_x.py, line 4)"),
+            ImportError("No module named 'gone'"),
+        ],
+        ids=type,
+    )
+    def test_a_graph_django_cannot_build_skips_nothing(
+        self, elsewhere, monkeypatch, failure
+    ):
+        """A graph Django cannot build (a missing or circular dependency, an
+        unknown app, a migration file that does not import): the lookup
         raised out of `check`; it now reports as it would without it."""
 
         def broken(connection):
-            msg = "a dependency is missing"
-            raise NodeNotFoundError(msg, ("app", "9999"))
+            raise failure
 
         monkeypatch.setattr(checks, "MigrationExecutor", broken)
         assert len(_e001(databases=["default"])) == 1

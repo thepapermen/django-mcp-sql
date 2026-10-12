@@ -588,14 +588,20 @@ def test_a_code_exchanges_once(client, mcp_user):
     assert AccessToken.objects.filter(user=mcp_user).count() == 1
 
 
-def test_an_openid_spelled_exchange_locks_its_code(mcp_user):
+def test_an_openid_spelled_exchange_locks_its_code(client, mcp_user):
     """oauthlib's authorization-code grant also answers `grant_type=openid`;
-    an exchange in that spelling locks and consumes its code like any
-    other (DOT 3.4 refuses the spelling earlier, in `validate_grant_type`)."""
+    an exchange in that spelling locks the code it names like any other
+    (DOT 3.4.1 asserts the spelling away earlier, in `validate_grant_type`),
+    and is refused once that code is gone."""
+    code, _verifier = consent(client, mcp_user)
+    grant = Grant.objects.get(code=code)
     request = OAuthlibRequest("https://testserver/o/token/")
     request.grant_type = "openid"
-    request.code = "no-such-code"
-    request.client = None
+    request.code = code
+    request.client = grant.application
+    with transaction.atomic():
+        oauth._lock_token_source(request, "default")
+    grant.delete()
     with transaction.atomic(), pytest.raises(InvalidGrantError):
         oauth._lock_token_source(request, "default")
 

@@ -43,6 +43,7 @@ from unittest.mock import patch
 
 import pytest
 from django.db import DatabaseError
+from mcp_sql.clients import ClientIdentity
 from mcp_sql.conf import Profile
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.executor import ExecutorMisconfiguredError
@@ -981,6 +982,24 @@ class TestNulInTheAuditRow:
         assert result.rejection_reason == OutcomeReason.UNSAFE_LITERAL.value
         log = MCPQueryLog.objects.get()
         assert log.raw_sql == "SELECT id /* \ufffd */ FROM auth_permission"
+
+    def test_the_client_columns_are_stored_too(self):
+        user = UserFactory()
+        client = ClientIdentity(
+            name="a\x00b\ud800", kind="cloud", redirect="https://x/\x00"
+        )
+        with patch("mcp_sql.executor.connections") as mock_conns:
+            mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+            mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+            run_query(
+                user=user,
+                profile=_DEFAULT_PROFILE,
+                raw_sql="SELECT id /* \x00 */ FROM auth_permission",
+                client=client,
+            )
+        log = MCPQueryLog.objects.get()
+        assert log.application_name == "a\u2400b\ufffd"
+        assert log.client_redirect == "https://x/\u2400"
 
     def test_a_value_the_driver_cannot_adapt_is_logged_not_raised(self, caplog):
         user = UserFactory()

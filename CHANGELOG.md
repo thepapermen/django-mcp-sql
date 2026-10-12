@@ -120,9 +120,11 @@ below precisely because they do **not** announce themselves.
   inside `migrate`, with a bare `ProgrammingError`. An entry whose app still
   has migrations to apply is not checked (one of them may create the table
   in `public`); the `post_migrate` grants check logs it if it is still wrong
-  afterwards. Name the schema in `db_table` (`'schema"."name'`), or run
-  `migrate --skip-checks` when another app's migration creates the
-  relation.
+  afterwards. A migration graph Django cannot build (a missing or circular
+  dependency, a migration file that does not import) skips nothing, and
+  `migrate` reports its real error. Name the schema in `db_table`
+  (`'schema"."name'`), or run `migrate --skip-checks` when another app's
+  migration creates the relation.
 - **`mcp_sql_grants --apply` can now exit 1.** When PostgreSQL silently skips
   a `GRANT` / `REVOKE` (the login does not own the relation; see "Fixed"),
   the whole apply is rolled back and the command fails naming each relation,
@@ -354,6 +356,10 @@ below precisely because they do **not** announce themselves.
   stores any NUL as U+2400 (␀) and any unpaired surrogate as U+FFFD, and a
   value the driver cannot adapt is logged like a database error instead of
   escaping.
+- **A `LIMIT` of over 4300 digits escaped `run_query` with no audit row.**
+  Python 3.11+ refuses `int()` of so long a digit string with a
+  `ValueError`, raised before any handler. Such a `LIMIT` now runs capped
+  like any other beyond bigint, and Postgres's own error is audited.
 - **Docs: the operator's token-revocation snippet missed refresh tokens.**
   `docs/oauth.md` (linked from `docs/role-setup.md`) now deletes codes,
   consent records, refresh tokens and access tokens in one transaction, in

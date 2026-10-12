@@ -574,9 +574,9 @@ def _audit_safely(
             fields[name] = _storable_text(value)  # type: ignore[literal-required]
     try:
         MCPQueryLog.objects.create(
-            application_name=client.name,
+            application_name=_storable_text(client.name),
             client_kind=client.kind,
-            client_redirect=client.redirect,
+            client_redirect=_storable_text(client.redirect),
             **fields,
         )
     except (DatabaseError, ValueError):
