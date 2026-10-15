@@ -8,6 +8,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly on main: the jobs that resolve the newest in-range dependencies
+  # (all but test-min-versions and test-legacy-drf, which pin) test a new
+  # sqlglot minor (the parser overrides its private internals; pinned by
+  # tests/test_sqlglot_internals.py and the functional corpus) before a
+  # consumer installs it, not at the next push. GitHub disables a scheduled
+  # workflow after 60 days without repository activity: re-enable it from
+  # the Actions tab. (release.yml runs on tag pushes only.)
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -218,6 +228,35 @@ jobs:
           MCP_SQL_TEST_POSTURE: minimal
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
 
+  # sqlglot recommends its compiled build (the `sqlglot[c]` extra, package
+  # `sqlglotc`), whose classes the parser cannot subclass. The app must refuse
+  # to start saying so (`McpSqlConfig.check_sql_dialect`), not refuse every
+  # query as parse_error. No database needed: the check runs in `ready()`.
+  test-compiled-sqlglot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install package with sqlglot's compiled build
+        run: pip install -e '.[allauth,test]' 'sqlglot[c]'
+      - name: Startup refuses the compiled build
+        env:
+          DJANGO_SETTINGS_MODULE: mcp_sql.tests.settings
+        run: |
+          python - <<'EOF'
+          import django
+          from django.core.exceptions import ImproperlyConfigured
+          try:
+              django.setup()
+          except ImproperlyConfigured as exc:
+              assert "sqlglotc" in str(exc), exc
+              print("refused as expected:", exc)
+          else:
+              raise SystemExit("django.setup() accepted sqlglot's compiled build")
+          EOF
+
   # Single representative run (newest-resolve on the current Python) that
   # measures coverage and uploads it to Codecov. One job, not the whole matrix
   # — coverage of the code is version-independent, so a per-leg upload would
@@ -283,6 +322,12 @@ jobs:
         run: mkdir -p .mypy-pkg && ln -sfn .. .mypy-pkg/mcp_sql
       - name: Run mypy
         run: mypy -p mcp_sql
+      - name: Run mypy against the sqlglot floor
+        # The parser's compat branches read sqlglot attributes one minor has
+        # and another lacks; type-check the oldest supported one too.
+        run: |
+          pip install 'sqlglot==30.7.*'
+          mypy -p mcp_sql
 
   build:
     runs-on: ubuntu-latest

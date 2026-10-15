@@ -5,6 +5,7 @@ import io
 import json
 import secrets
 import threading
+from dataclasses import replace
 from datetime import timedelta
 from http import HTTPStatus
 from unittest.mock import MagicMock
@@ -280,6 +281,31 @@ class TestBuildMcpServer:
         # A probe for a non-whitelisted table is still audited.
         assert audited[0]["tool"] == ToolName.DESCRIBE_TABLE
         assert audited[0]["detail"] == "describe_table('pg_class')"
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [("list_tables", ()), ("describe_table", ("auth_permission",))],
+    )
+    def test_an_unresolvable_allowed_model_is_audited_first(
+        self, mcp_user, monkeypatch, tool, args
+    ):
+        # The whitelist resolved before the audit row: an `ALLOWED_MODELS`
+        # entry Django cannot resolve raised with no row (GLM, round 4).
+        audited: list[dict] = []
+        monkeypatch.setattr(
+            "mcp_sql.views.mcp_endpoint.executor.audit_tool_call",
+            lambda **kw: audited.append(kw),
+        )
+        server = _build_mcp_server(
+            user=mcp_user,
+            profile=replace(_DEFAULT_PROFILE, allowed_models=("nosuchapp.Model",)),
+            token_id="t1",  # noqa: S106 — opaque DB id, not a credential
+            client_ip="127.0.0.1",
+        )
+        fn = server._tool_manager.get_tool(tool).fn
+        with pytest.raises(LookupError):
+            async_to_sync(fn)(*args)
+        assert len(audited) == 1
 
     def test_run_query_closure_passes_auth_principal(self, mcp_user, monkeypatch):
         """The `run_query` closure must forward the authenticated principal

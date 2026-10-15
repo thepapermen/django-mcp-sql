@@ -104,8 +104,11 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   fails loudly instead of reverting to a default.
 - **`clients.py` is settings-free** (takes the prefix as an argument), which
   is what lets `conf.py`, `validation.py`, and `consts.py` all import it
-  without a cycle. Redirect *safety* rules live in `validation.py`; `clients.py`
-  only classifies.
+  without a cycle. Redirect *safety* rules for the declared config live in
+  `validation.py`; the runtime predicates (`is_loopback_redirect`,
+  `redirect_under_prefix`) live in settings-free `redirects.py`, imported by
+  both `/o/register` and `oauth.MCPOAuth2Validator` — never a private helper
+  imported across layers; `clients.py` only classifies.
 - **The package's OAuth views use `MCPServerViewMixin`** (narrow
   `oauth_server.MCPServer`, `OAuthLibCore`, core built per call) and
   **`MCPOAuth2Authentication` verifies through

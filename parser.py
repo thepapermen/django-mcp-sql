@@ -2,12 +2,16 @@
 no Django imports). See `docs/architecture.md` for design /
 "Watch out" / parser-check ordering rules."""
 
+import contextlib
 import itertools
 import re
 import string
 from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
 import sqlglot
@@ -486,6 +490,13 @@ _STOCK_PARAMETER_PARSER = Postgres.Parser.PLACEHOLDER_PARSERS[TokenType.PARAMETE
 _STOCK_NOT_PARSER = Postgres.Parser.UNARY_PARSERS[TokenType.NOT]
 
 
+# sqlglot 30.21+ has a binary-operator table for `->` / `->>`; 30.7 does not
+# (read once here, so a type checker on either sqlglot sees one branch).
+_STOCK_JSON_OPERATORS: dict[Any, Any] | None = getattr(
+    Postgres.Parser, "JSON_OPERATORS", None
+)
+
+
 class FaithfulPostgres(Postgres):
     """sqlglot's postgres dialect, reading and rendering Postgres SQL as
     written. The executor runs sqlglot's rendering of the query, so any
@@ -664,8 +675,8 @@ class FaithfulPostgres(Postgres):
                 exp.JSONExtractScalar(this=this, expression=self._arrow_operand(path))
             ),
         }
-        if getattr(Postgres.Parser, "JSON_OPERATORS", None):
-            JSON_OPERATORS = {**Postgres.Parser.JSON_OPERATORS, **_ARROWS}
+        if _STOCK_JSON_OPERATORS:
+            JSON_OPERATORS = {**_STOCK_JSON_OPERATORS, **_ARROWS}
         else:
             # Every operator parsed this way (`#>`, `#>>`, `?`, ...) gets its
             # right operand's `::type` (see `_arrow_operand`).
@@ -1487,6 +1498,39 @@ class FaithfulPostgres(Postgres):
                 return False
             return word is None or _keyword(self._tokens[i].text) == word
 
+        def _parse_join(self, *args: Any, **kwargs: Any) -> exp.Join | None:
+            # sqlglot's own, parsed once per token position. A `JOIN` with no
+            # `ON`/`USING` after its table makes sqlglot try the joins that
+            # follow as a nested join (`a JOIN b JOIN c ON p ON q`), retreat
+            # when no `ON` closes them, and parse them again: twice the work
+            # per bare `JOIN`, so 24 of them (600 bytes) took minutes, all
+            # before Postgres is reached (GLM r4). The parse from a position
+            # depends on nothing but the tokens from there, so a repeat gets
+            # a copy of the first result and continues where it ended.
+            memo = self._joins_parsed
+            if memo is None or memo[0] is not self._tokens:
+                memo = self._joins_parsed = (self._tokens, {})
+            key = (
+                self._index,
+                self.error_level,
+                tuple(map(id, args)),
+                tuple((name, id(value)) for name, value in sorted(kwargs.items())),
+            )
+            if key in memo[1]:
+                end, join, _ = memo[1][key]
+                self._retreat(end)
+                return join.copy() if join is not None else None
+            parsed: exp.Join | None = super()._parse_join(*args, **kwargs)
+            # The arguments stay referenced, so their ids are not reused.
+            memo[1][key] = (
+                self._index,
+                parsed.copy() if parsed is not None else None,
+                (args, kwargs),
+            )
+            return parsed
+
+        _joins_parsed: tuple[list[Token], dict[Any, Any]] | None = None
+
         def _parse_json_object_or_call(self) -> exp.Expression | None:
             """`json_object(...)`: Postgres's function `json_object(text[]
             [, text[]])` when the arguments parse as plain expressions up to
@@ -1715,6 +1759,24 @@ class ParsedQuery:
     referenced_tables: set[str]
 
 
+def dialect_problem() -> str | None:
+    """Why `FaithfulPostgres` cannot parse and render here, or `None`.
+
+    sqlglot's compiled build (the `sqlglot[c]` extra, package `sqlglotc`)
+    replaces `sqlglot.parser`, `sqlglot.generator` and the postgres dialect
+    with mypyc-compiled modules, which a Python class cannot subclass
+    (`TypeError: interpreted classes cannot inherit from compiled`): every
+    query would be refused as `parse_error`, and the audit log would read as
+    agents writing bad SQL. `McpSqlConfig.ready` refuses to start instead."""
+    try:
+        sqlglot.parse_one("SELECT 1", dialect=FaithfulPostgres).sql(
+            dialect=FaithfulPostgres
+        )
+    except Exception as exc:  # noqa: BLE001 — any failure is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def parse_and_validate(
     raw_sql: str,
     *,
@@ -1798,13 +1860,14 @@ def _checked(
     `PARSE_ERROR` (see `parse_and_validate`)."""
     try:
         _refuse_unsendable_text(raw_sql)
-        return _parse_and_validate(
-            raw_sql,
-            allowed_tables=allowed_tables,
-            ban_select_star=ban_select_star,
-            normalize=normalize,
-            table_columns=table_columns,
-        )
+        with _scope_memo():
+            return _parse_and_validate(
+                raw_sql,
+                allowed_tables=allowed_tables,
+                ban_select_star=ban_select_star,
+                normalize=normalize,
+                table_columns=table_columns,
+            )
     except QueryRejectedError:
         raise
     except Exception as exc:
@@ -2821,7 +2884,18 @@ def _attribute_calls(ast: exp.Query, table_columns: RelationColumns) -> list[str
     - `(t.*).f` where `t` is such a FROM item with a column `f`.
     Everything else counts as a call: `(expr).f`, `t.c.f`. A name inside a
     type (`pg_catalog.pg_lsn`) is not a call. Quoted identifiers compare
-    case-sensitively, unquoted ones folded (`_name_key`)."""
+    case-sensitively, unquoted ones folded (`_name_key`).
+
+    Each SELECT's scope and each table's CTE are worked out once per
+    validation (`_scope_memo`): every qualified column asked about every
+    FROM item in scope, and each of those scanned every CTE, so a query of
+    n CTEs and as many references cost about n**3 in Python before any SQL
+    ran (`statement_timeout` does not bound it)."""
+    with _scope_memo():
+        return _attribute_calls_in(ast, table_columns)
+
+
+def _attribute_calls_in(ast: exp.Query, table_columns: RelationColumns) -> list[str]:
     names = []
     for col in ast.find_all(exp.Column):
         qualifier = col.args.get("table")
@@ -2835,7 +2909,7 @@ def _attribute_calls(ast: exp.Query, table_columns: RelationColumns) -> list[str
     for dot in ast.find_all(exp.Dot):
         if not isinstance(dot.expression, exp.Identifier):
             continue
-        if dot.find_ancestor(exp.DataType) is not None:
+        if _ancestors("types", dot.parent, lambda n: isinstance(n, exp.DataType)):
             continue
         if not _is_field_read(dot, table_columns):
             names.append(dot.expression.name.lower())
@@ -2932,14 +3006,45 @@ def _name_key(identifier: exp.Expression) -> str:
     return str(identifier.name).translate(_ASCII_LOWER)
 
 
-def _scopes(node: exp.Expression) -> list[exp.Select]:
-    selects = []
-    scope = node.parent
-    while scope is not None:
-        if isinstance(scope, exp.Select):
-            selects.append(scope)
-        scope = scope.parent
+def _scopes(node: exp.Expression) -> tuple[exp.Select, ...]:
+    """The SELECTs enclosing `node`, innermost first."""
+    selects: tuple[exp.Select, ...] = _ancestors(
+        "selects", node.parent, lambda n: isinstance(n, exp.Select)
+    )
     return selects
+
+
+def _ancestors(kind: str, node: Any, keep: Callable[[Any], bool]) -> tuple[Any, ...]:
+    """`node` and its ancestors that `keep` accepts, innermost first.
+
+    Within a validation each node's answer is built once from its parent's
+    (`_SCOPE_MEMO`), so asking for every node of a deep tree is linear:
+    sqlglot builds `a + b + ...`, `x AND y AND ...` and `UNION ALL` chains as
+    one long branch, tens of thousands of levels deep in 1 MiB, and walking
+    to the root from each of their nodes cost depth**2 (Opus, review round
+    4: about half an hour for one request, before any SQL ran)."""
+    memo = _SCOPE_MEMO.get()
+    if memo is None:
+        found = []
+        while node is not None:
+            if keep(node):
+                found.append(node)
+            node = node.parent
+        return tuple(found)
+    path = []
+    above: tuple[Any, ...] = ()
+    while node is not None:
+        hit = memo.get((kind, id(node)))
+        if hit is not None:
+            above = hit[1]
+            break
+        path.append(node)
+        node = node.parent
+    for walked in reversed(path):
+        if keep(walked):
+            above = (walked, *above)
+        memo[(kind, id(walked))] = (walked, above)
+    return above
 
 
 def _is_column_of(
@@ -2951,8 +3056,12 @@ def _is_column_of(
     """True if the FROM item `item`, in scope at `node` (the innermost
     match), provably has a column `name`."""
     for select in _scopes(node):
-        source = _from_item(select, item)
+        source = _scope_of(select, table_columns).items.get(item)
         if source is not None:
+            reference = _cte_reference(source)
+            if reference is not None:
+                shape, renamed, start = reference
+                return name in renamed or shape.last.get(name, -1) >= start
             certain, _possible = _item_columns(source, table_columns)
             return name in certain
     return False
@@ -2971,16 +3080,102 @@ def _is_column_name_in_scope(
     where Postgres reads the FROM item `t` anyway) only an item whose
     columns cannot be listed at all (a function in FROM) counts."""
     for select in _scopes(node):
-        for source in _from_items(select):
-            certain, possible = _item_columns(source, table_columns)
-            if strict:
-                if possible is None or name in possible:
-                    return True
-            elif name in certain or not isinstance(
-                source, (exp.Subquery, exp.Table, exp.Values)
-            ):
+        scope = _scope_of(select, table_columns)
+        if strict:
+            if scope.possible is None or name in scope.possible:
                 return True
+        elif name in scope.certain or scope.unlisted:
+            return True
     return False
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """One SELECT's FROM items, summed up once (`_scope_of`).
+
+    `items`: each FROM item by the name it is in scope under (the first, as
+    `_from_item` finds it). `certain` / `possible`: the union of the items'
+    certain / possible column names (`possible` is `None` when any item's
+    names are not all known). `unlisted`: some item's columns cannot be
+    listed at all (a function in FROM)."""
+
+    items: dict[str, exp.Expression]
+    certain: frozenset[str]
+    possible: frozenset[str] | None
+    unlisted: bool
+
+
+def _scope_of(select: exp.Select, table_columns: RelationColumns) -> _Scope:
+    scope: _Scope = _memoized(
+        "scope", select, lambda: _scope_summary(select, table_columns)
+    )
+    return scope
+
+
+def _scope_summary(select: exp.Select, table_columns: RelationColumns) -> _Scope:
+    """Every set grows in place, and a CTE referenced many times adds its
+    columns once (from the first position any reference leaves unrenamed):
+    the work is linear in the query, not references times columns."""
+    builder = _ScopeBuilder()
+    for source in _from_items(select):
+        key = _from_item_key(source)
+        if key is not None:
+            builder.items.setdefault(key, source)
+        reference = _cte_reference(source)
+        if reference is not None:
+            builder.add_cte_reference(*reference)
+        else:
+            builder.add_item(source, table_columns)
+    return builder.finish()
+
+
+@dataclass
+class _ScopeBuilder:
+    items: dict[str, exp.Expression] = field(default_factory=dict)
+    certain: set[str] = field(default_factory=set)
+    possible: set[str] | None = field(default_factory=set)
+    unlisted: bool = False
+    # Per CTE (by identity): its shape and the first position any of its
+    # references in this scope leaves unrenamed.
+    cte_suffixes: dict[int, tuple["_CteShape", int]] = field(default_factory=dict)
+
+    def add_cte_reference(
+        self, shape: "_CteShape", renamed: frozenset[str], start: int
+    ) -> None:
+        """`_renamed` over the CTE's columns, without copying them here."""
+        self.certain |= renamed
+        if shape.columns is None or shape.unknown_from >= start:
+            self.possible = None
+        elif self.possible is not None:
+            self.possible |= renamed
+        known = self.cte_suffixes.get(id(shape))
+        if known is None or start < known[1]:
+            self.cte_suffixes[id(shape)] = (shape, start)
+
+    def add_item(self, source: exp.Expression, table_columns: RelationColumns) -> None:
+        item_certain, item_possible = _item_columns(source, table_columns)
+        self.certain |= item_certain
+        if item_possible is None:
+            self.possible = None
+        elif self.possible is not None:
+            self.possible |= item_possible
+        if not isinstance(source, (exp.Subquery, exp.Table, exp.Values)):
+            self.unlisted = True
+
+    def finish(self) -> "_Scope":
+        for shape, start in self.cte_suffixes.values():
+            if shape.columns is None:
+                continue
+            suffix = {name for name in shape.columns[start:] if name is not None}
+            self.certain |= suffix
+            if self.possible is not None:
+                self.possible |= suffix
+        return _Scope(
+            items=self.items,
+            certain=frozenset(self.certain),
+            possible=None if self.possible is None else frozenset(self.possible),
+            unlisted=self.unlisted,
+        )
 
 
 def _from_items(select: exp.Select) -> list[exp.Expression]:
@@ -2990,17 +3185,16 @@ def _from_items(select: exp.Select) -> list[exp.Expression]:
     return sources
 
 
-def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
-    for source in _from_items(select):
-        alias = source.args.get("alias")
-        identifier = (
-            alias.this
-            if isinstance(alias, exp.TableAlias) and alias.this is not None
-            else source.this
-        )
-        if isinstance(identifier, exp.Identifier) and _name_key(identifier) == item:
-            found: exp.Expression = source
-            return found
+def _from_item_key(source: exp.Expression) -> str | None:
+    """The name a FROM item is in scope under: its alias, else its own."""
+    alias = source.args.get("alias")
+    identifier = (
+        alias.this
+        if isinstance(alias, exp.TableAlias) and alias.this is not None
+        else source.this
+    )
+    if isinstance(identifier, exp.Identifier):
+        return _name_key(identifier)
     return None
 
 
@@ -3009,7 +3203,48 @@ def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
 _ItemColumns = tuple[frozenset[str], frozenset[str] | None]
 
 
+# Scope answers computed once per validation (`_checked`), keyed by node
+# identity: a FROM item's columns, a SELECT's scope, a table's CTE. The
+# checks read the tree and change nothing (only parsing and rendering do),
+# so an answer cannot go stale; each entry keeps its node alive, so no id
+# is reused. Outside a validation nothing is cached.
+_SCOPE_MEMO: ContextVar[dict[tuple[str, int], tuple[object, Any]] | None] = ContextVar(
+    "_SCOPE_MEMO", default=None
+)
+
+
+@contextlib.contextmanager
+def _scope_memo() -> Iterator[None]:
+    if _SCOPE_MEMO.get() is not None:
+        yield  # already inside one: share it
+        return
+    token = _SCOPE_MEMO.set({})
+    try:
+        yield
+    finally:
+        _SCOPE_MEMO.reset(token)
+
+
+def _memoized(kind: str, node: object, compute: Callable[[], Any]) -> Any:
+    memo = _SCOPE_MEMO.get()
+    if memo is None:
+        return compute()
+    key = (kind, id(node))
+    if key not in memo:
+        memo[key] = (node, compute())
+    return memo[key][1]
+
+
 def _item_columns(
+    source: exp.Expression, table_columns: RelationColumns
+) -> _ItemColumns:
+    result: _ItemColumns = _memoized(
+        "item_columns", source, lambda: _item_columns_of(source, table_columns)
+    )
+    return result
+
+
+def _item_columns_of(
     source: exp.Expression, table_columns: RelationColumns
 ) -> _ItemColumns:
     alias = source.args.get("alias")
@@ -3068,6 +3303,65 @@ def _renamed(renamed: list[str], columns: list[str | None] | None) -> _ItemColum
     return certain, None if None in names else certain
 
 
+@dataclass(frozen=True)
+class _CteShape:
+    """A CTE's output columns (`_cte_columns`), indexed once per validation:
+    `last`, each name's last position; `unknown_from`, the last position of
+    a name not known (-1: none). A reference renaming the first k columns
+    (`c AS x(a, b)`) has the column `n` iff `n` is one of its new names or
+    `last[n] >= k`, and has a name not known iff `unknown_from >= k`."""
+
+    columns: list[str | None] | None
+    last: dict[str, int]
+    unknown_from: int
+
+
+def _cte_shape(cte: exp.CTE) -> _CteShape:
+    shape: _CteShape = _memoized("cte_shape", cte, lambda: _cte_shape_of(cte))
+    return shape
+
+
+def _cte_shape_of(cte: exp.CTE) -> _CteShape:
+    columns = _cte_columns(cte)
+    last: dict[str, int] = {}
+    unknown_from = -1
+    for position, name in enumerate(columns or ()):
+        if name is None:
+            unknown_from = position
+        else:
+            last[name] = position
+    return _CteShape(columns=columns, last=last, unknown_from=unknown_from)
+
+
+_CteReference = tuple["_CteShape", frozenset[str], int]
+
+
+def _cte_reference(source: exp.Expression) -> _CteReference | None:
+    """For a FROM item naming a CTE: the CTE's shape, the names the
+    item's alias list renames its first columns to, and how many columns
+    that list renames (its length: the CTE's own names count from there);
+    else `None`."""
+    reference: _CteReference | None = _memoized(
+        "cte_reference", source, lambda: _cte_reference_of(source)
+    )
+    return reference
+
+
+def _cte_reference_of(source: exp.Expression) -> _CteReference | None:
+    if not (isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier)):
+        return None
+    cte = _cte_named(source)
+    if cte is None:
+        return None
+    alias = source.args.get("alias")
+    renamed = (
+        [_name_key(column) for column in alias.columns]
+        if isinstance(alias, exp.TableAlias)
+        else []
+    )
+    return _cte_shape(cte), frozenset(renamed), len(renamed)
+
+
 def _cte_columns(cte: exp.CTE) -> list[str | None] | None:
     alias = cte.args.get("alias")
     renamed: list[str | None] = (
@@ -3099,26 +3393,55 @@ def _cte_key(cte: exp.CTE) -> str | None:
 def _cte_named(table: exp.Table) -> exp.CTE | None:
     """The CTE an unqualified `table` names, in scope for it (see
     `_resolves_to_cte`); names compare as Postgres compares them."""
+    found: exp.CTE | None = _memoized("cte_named", table, lambda: _cte_named_of(table))
+    return found
+
+
+def _cte_named_of(table: exp.Table) -> exp.CTE | None:
     if table.args.get("db") is not None or table.args.get("catalog") is not None:
         return None  # `public.t` is the table, whatever CTE `t` exists
     key = _name_key(table.this)
     inside: exp.Expression | None = None
-    node = table.parent
-    while node is not None:
-        ctes = list(getattr(node, "ctes", ()))
-        position = next((i for i, cte in enumerate(ctes) if cte is inside), None)
-        if position is not None:
+    # Only a CTE, or a node holding CTEs, does anything below: the ancestors
+    # in between are skipped (`_ancestors`, linear over a deep tree).
+    for node in _ancestors("cte_scopes", table.parent, _holds_or_is_cte):
+        ctes = getattr(node, "ctes", ())
+        if ctes:
+            first, positions = _cte_index(node, ctes)
+            index = first.get(key)
             # Inside a (non-recursive) CTE's body only the CTEs before it are
             # visible: `WITH t AS (SELECT ... FROM t)` reads the table `t`.
-            ctes = ctes[:position]
-        for cte in ctes:
-            if _cte_key(cte) == key:
-                found: exp.CTE = cte
+            position = positions.get(id(inside))
+            if index is not None and (position is None or index < position):
+                found: exp.CTE = ctes[index]
                 return found
         if isinstance(node, exp.CTE):
             inside = node
-        node = node.parent
     return None
+
+
+def _holds_or_is_cte(node: Any) -> bool:
+    return isinstance(node, exp.CTE) or bool(getattr(node, "ctes", ()))
+
+
+def _cte_index(
+    node: object, ctes: list[exp.CTE]
+) -> tuple[dict[str, int], dict[int, int]]:
+    """For a node's CTE list: the index of the first CTE of each name, and
+    each CTE's index by identity."""
+    index: tuple[dict[str, int], dict[int, int]] = _memoized(
+        "cte_index", node, lambda: _cte_index_of(ctes)
+    )
+    return index
+
+
+def _cte_index_of(ctes: list[exp.CTE]) -> tuple[dict[str, int], dict[int, int]]:
+    first: dict[str, int] = {}
+    for i, cte in enumerate(ctes):
+        key = _cte_key(cte)
+        if key is not None:
+            first.setdefault(key, i)
+    return first, {id(cte): i for i, cte in enumerate(ctes)}
 
 
 def _output_columns(query: exp.Expression) -> list[str | None] | None:

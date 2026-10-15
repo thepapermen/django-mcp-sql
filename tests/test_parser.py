@@ -8,6 +8,7 @@ over-reject normal SELECT shapes.
 """
 
 import re
+import time
 
 import pytest
 from mcp_sql.parser import QueryRejectedError
@@ -1102,6 +1103,192 @@ def _executed(limit: str) -> str:
     sql = f"SELECT id FROM auth_permission {limit}"  # noqa: S608
     parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
     return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+
+class TestValidationScales:
+    """Validation runs in Python before any SQL reaches Postgres, so
+    `statement_timeout` does not bound it. Scope resolution for qualified
+    columns cost about n**3 for n CTEs referenced n times each (20 KB: about
+    11 s to validate, as long again to render; kubedo8 on #5), and deep
+    chains cost depth**2. 8 times the query must cost far less than the 64
+    times a quadratic would; the best of three runs."""
+
+    _COLUMNS = {"auth_permission": frozenset({"id", "name"})}
+
+    @staticmethod
+    def _query(n: int) -> str:
+        ctes = ", ".join(
+            f"c{i} AS (SELECT id AS a FROM auth_permission)"  # noqa: S608
+            for i in range(n)
+        )
+        refs = ", ".join(f"c{j % n}.a AS r{j}" for j in range(4 * n))
+        items = ", ".join(f"c{i}" for i in range(n))
+        return f"WITH {ctes} SELECT {refs} FROM {items}"  # noqa: S608
+
+    @staticmethod
+    def _wide(n: int) -> str:
+        # One CTE of n columns referenced n/2 times (GLM, review round 4):
+        # each reference copied the CTE's columns, n * n/2 work.
+        projection = ", ".join(["1"] * n)
+        items = ", ".join(f"c x{i}" for i in range(n // 2))
+        return f"WITH c AS (SELECT {projection}) SELECT x0.column1 FROM {items}"  # noqa: S608
+
+    def _seconds(self, n: int, shape=None) -> float:
+        sql = (shape or self._query)(n)
+        runs = []
+        for _ in range(3):
+            start = time.perf_counter()
+            parse_and_validate(
+                sql, allowed_tables={"auth_permission"}, table_columns=self._COLUMNS
+            )
+            runs.append(time.perf_counter() - start)
+            if runs[-1] > self._CEILING:
+                break  # already failing: no need to wait for more runs
+        return min(runs)
+
+    _CEILING = 5.0
+
+    def test_ctes_referenced_by_qualified_columns(self):
+        small, large = self._seconds(30), self._seconds(240)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+    def test_one_wide_cte_referenced_many_times(self):
+        small, large = self._seconds(250, self._wide), self._seconds(2000, self._wide)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+    # sqlglot builds these as one long branch, a level per term: every
+    # column, table or `x.f` walked to the root (Opus, review round 4).
+    _CHAINS = {
+        "plus": lambda n: (
+            "SELECT " + " + ".join(["t.id"] * n) + " AS s FROM auth_permission t"  # noqa: S608
+        ),
+        "and": lambda n: (
+            "SELECT t.id FROM auth_permission t WHERE "  # noqa: S608
+            + " AND ".join(f"t.id > {i}" for i in range(n))
+        ),
+        "union": lambda n: " UNION ALL ".join(
+            ["SELECT t.id FROM auth_permission t"] * n
+        ),
+        "exists": lambda n: (
+            "SELECT t.id FROM auth_permission t WHERE "  # noqa: S608
+            + " AND ".join(
+                ["EXISTS (SELECT 1 FROM auth_permission u WHERE u.id = t.id)"] * n
+            )
+        ),
+    }
+
+    # Each needs one of the scope memos to stay linear: a wide derived table
+    # read by many qualified columns (a FROM item's columns), many CTEs read
+    # from many FROM items (a WITH's name index), one CTE reference with a
+    # long alias list read by many columns (the reference's renames).
+    _WIDE = {
+        "derived": lambda n: (
+            "SELECT "  # noqa: S608
+            + ", ".join(f"s.c{i}" for i in range(n))
+            + " FROM (SELECT "
+            + ", ".join(f"1 AS c{i}" for i in range(n))
+            + ") s"
+        ),
+        "ctes": lambda n: (
+            "WITH "  # noqa: S608
+            + ", ".join(f"c{i} AS (SELECT 1 AS a)" for i in range(n))
+            + " SELECT 1 AS one FROM "
+            + ", ".join(f"c{i}" for i in range(n))
+        ),
+        "renamed": lambda n: (
+            "WITH c AS (SELECT "  # noqa: S608
+            + ", ".join(["1"] * n)
+            + ") SELECT "
+            + ", ".join(f"x.a{i}" for i in range(n))
+            + " FROM c AS x("
+            + ", ".join(f"a{i}" for i in range(n))
+            + ")"
+        ),
+    }
+
+    @pytest.mark.parametrize(
+        ("shape", "n"), [("derived", 250), ("ctes", 250), ("renamed", 250)]
+    )
+    def test_wide_scopes(self, shape, n):
+        build = self._WIDE[shape]
+        small, large = self._seconds(n, build), self._seconds(8 * n, build)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+    # A `JOIN` with no `ON` after its table: sqlglot tries what follows as a
+    # nested join and parses it again when that fails, twice the work per
+    # `JOIN`: 21 of them took about 17 s, 24 over 2 minutes (GLM, review
+    # round 4). Postgres rejects the bare ones; the others are valid shapes
+    # the same code reads.
+    @staticmethod
+    def _joined(n: int, join: str, each: str = "", tail: str = "") -> str:
+        joins = "".join(f" {join} auth_permission t{i}{each}" for i in range(1, n))
+        return f"SELECT 1 AS x FROM auth_permission t0{joins}{tail}"  # noqa: S608
+
+    _JOINS = {
+        "bare": lambda n: TestValidationScales._joined(n, "JOIN"),
+        "one_on": lambda n: TestValidationScales._joined(n, "JOIN", tail=" ON true"),
+        "nested": lambda n: TestValidationScales._joined(
+            n, "JOIN", tail=" ON true" * (n - 1)
+        ),
+        "left_on_each": lambda n: TestValidationScales._joined(
+            n, "LEFT JOIN", each=" ON true"
+        ),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(_JOINS))
+    def test_joins(self, shape):
+        assert self._seconds(21, self._JOINS[shape]) < self._CEILING
+
+    def test_nested_joins_keep_their_shape(self):
+        parsed = parse_and_validate(
+            self._JOINS["nested"](3),
+            allowed_tables={"auth_permission"},
+            table_columns=self._COLUMNS,
+        )
+        assert parsed.normalized_sql == (
+            "SELECT 1 AS x FROM auth_permission AS t0 JOIN auth_permission AS t1 "
+            "JOIN auth_permission AS t2 ON TRUE ON TRUE"
+        )
+
+    @pytest.mark.parametrize(
+        ("shape", "n"), [("plus", 500), ("and", 400), ("union", 250), ("exists", 200)]
+    )
+    def test_deep_chains(self, shape, n):
+        build = self._CHAINS[shape]
+        small, large = self._seconds(n, build), self._seconds(8 * n, build)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+
+class TestScopeMemo:
+    """The scope memo lives for one validation only (it holds the tree's
+    nodes) and a nested one shares the outer."""
+
+    def test_gone_after_a_validation(self):
+        from mcp_sql.parser import _SCOPE_MEMO
+
+        parse_and_validate("SELECT t.id FROM auth_group t", allowed_tables=ALLOWED)
+        assert _SCOPE_MEMO.get() is None
+        with pytest.raises(QueryRejectedError):
+            parse_and_validate(
+                "SELECT t.to_jsonb FROM auth_group t", allowed_tables=ALLOWED
+            )
+        assert _SCOPE_MEMO.get() is None
+
+    def test_a_nested_memo_shares_the_outer(self):
+        from mcp_sql.parser import _SCOPE_MEMO
+        from mcp_sql.parser import _scope_memo
+
+        with _scope_memo():
+            outer = _SCOPE_MEMO.get()
+            assert outer is not None
+            with _scope_memo():
+                assert _SCOPE_MEMO.get() is outer
+            assert _SCOPE_MEMO.get() is outer
+        assert _SCOPE_MEMO.get() is None
 
 
 class TestExtractLimit:

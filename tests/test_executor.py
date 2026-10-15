@@ -37,6 +37,7 @@ NOT tested (acknowledged gaps)
 
 import datetime
 import decimal
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -258,6 +259,27 @@ class TestExecutorMisconfiguredError:
         assert log.decision == MCPQueryLog.DECISION_REJECTED
         assert log.rejection_reason == OutcomeReason.MISCONFIGURED.value
         assert "different alias" in log.error
+
+    @pytest.mark.parametrize("entry", ["nosuchapp.NosuchModel", "auth.NoSuchModel"])
+    def test_unresolvable_allowed_model_writes_audit_and_raises(
+        self, monkeypatch, entry
+    ):
+        # Boot defers model resolution to the query: an entry Django cannot
+        # resolve raised `LookupError` out of `run_query` with no row (GLM,
+        # review round 4).
+        user = UserFactory()
+        mock_conns = MagicMock()
+        mock_conns.databases = {"default": {}, "mcp_readonly": {}}
+        mock_conns.__getitem__.return_value.alias = "mcp_readonly"
+        monkeypatch.setattr("mcp_sql.executor.connections", mock_conns)
+        profile = replace(_DEFAULT_PROFILE, allowed_models=(entry,))
+        with pytest.raises(ExecutorMisconfiguredError):
+            run_query(
+                user=user, profile=profile, raw_sql="SELECT id FROM auth_permission"
+            )
+        log = MCPQueryLog.objects.get()
+        assert log.rejection_reason == OutcomeReason.MISCONFIGURED.value
+        assert "ALLOWED_MODELS entry not resolvable" in log.error
 
 
 @pytest.mark.django_db

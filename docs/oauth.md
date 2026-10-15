@@ -462,14 +462,14 @@ settings) are skipped — an `https` callback is expected there:
 python manage.py shell -c "
 from django.db.models import Q
 from mcp_sql.conf import mcp_sql_settings
-from mcp_sql.views.registration import _is_loopback_redirect
+from mcp_sql.redirects import is_loopback_redirect
 from oauth2_provider.models import Application
 prefix = mcp_sql_settings.APPLICATION_NAME_PREFIX
 qs = Application.objects.filter(
     Q(name=mcp_sql_settings.APPLICATION_NAME) | Q(name__startswith=prefix)
 ).exclude(name__startswith=prefix + 'cloud.')
 for a in qs:
-    if not all(_is_loopback_redirect(u) for u in a.redirect_uris.split()):
+    if not all(is_loopback_redirect(u) for u in a.redirect_uris.split()):
         print(a.created, a.client_id, '->', repr(a.redirect_uris))
 "
 ```
@@ -784,7 +784,7 @@ stops working until the two match again.
 - `"prefix"` (ChatGPT / Codex-cloud): the callback is
   **per-connector-instance** — `https://chatgpt.com/connector/oauth/{callback_id}`
   — so no single exact URI can be pre-registered. One override
-  (`MCPOAuth2Validator.validate_redirect_uri` → `_redirect_under_prefix`)
+  (`MCPOAuth2Validator.validate_redirect_uri` → `redirect_under_prefix`)
   accepts a redirect **iff** it is `https`, has no `@` anywhere in its
   authority (no userinfo, not even an empty one), carries no query, fragment
   or `;params` (not even a bare `?` / `#`), its host **exactly equals** the
@@ -799,7 +799,7 @@ stops working until the two match again.
   matching against their own rows. Every client that is not a declared cloud
   client (the canonical row, every DCR client, every declared local client)
   is checked only after the requested redirect passes the `/o/register`
-  loopback predicate (`_is_loopback_redirect`), and its default (used when a
+  loopback predicate (`is_loopback_redirect`), and its default (used when a
   request omits `redirect_uri`) is held to the same predicate. So for such a
   client, the validator refuses a non-loopback redirect whether it was
   requested or stored.
@@ -1035,7 +1035,7 @@ docstrings point back to):
 - Code: `mcp_sql/clients.py` (the taxonomy — kinds, `DeclaredClient`,
   namespace derivation, `ClientIdentity`), `mcp_sql/conf.py` (`clients()`),
   `mcp_sql/signals.py` (`provision_mcp_clients`), `mcp_sql/oauth.py`
-  (`MCPOAuth2Validator.validate_redirect_uri` / `_redirect_under_prefix`),
+  (`MCPOAuth2Validator.validate_redirect_uri` / `redirect_under_prefix`),
   `mcp_sql/consts.py` (settings-gated recognition + classification),
   `mcp_sql/validation.py` (`_validate_clients`).
 - Provider setup — paste the derived client_id (no secret): **Claude.ai** →

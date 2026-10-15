@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 
 # Redirect-matching strategies for one rule. "exact" is DOT's stock matcher
 # (`oauth2_provider.models.redirect_to_uri_allowed`) run against the declared
-# exact URIs; "prefix" is admitted by `oauth._redirect_under_prefix` for
+# exact URIs; "prefix" is admitted by `redirects.redirect_under_prefix` for
 # providers whose callback is per-instance (ChatGPT's `/connector/oauth/{id}`).
 # Both read SETTINGS, never the provisioned row (`oauth.MCPOAuth2Validator`).
 MATCH_EXACT = "exact"
@@ -147,7 +147,7 @@ class DeclaredClient:
     def prefixes(self) -> tuple[str, ...]:
         """Just the `MATCH_PREFIX` rules' URIs — what
         `oauth.MCPOAuth2Validator.validate_redirect_uri` admits through
-        `oauth._redirect_under_prefix`."""
+        `redirects.redirect_under_prefix`."""
         return tuple(r.uri for r in self.redirects if r.match == MATCH_PREFIX)
 
 

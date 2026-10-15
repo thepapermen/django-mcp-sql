@@ -51,7 +51,8 @@ TRUNCATION_MARK = "…[truncated]"
 
 
 class ExecutorMisconfiguredError(RuntimeError):
-    """The mcp_readonly alias is not configured / resolves to the wrong alias.
+    """The mcp_readonly alias is not configured / resolves to the wrong alias,
+    or the profile's `ALLOWED_MODELS` names a model Django cannot resolve.
 
     Operator error, not a query failure — but a `MCPQueryLog` row is written
     before raising so the daily-volume alert and incident triage have one
@@ -99,7 +100,15 @@ def run_query(  # noqa: PLR0911, PLR0913, PLR0915 — linear audited pipeline by
     cfg = mcp_sql_config()
     limits = cfg["LIMITS"]
     ban_select_star = cfg["BAN_SELECT_STAR"]
-    tables = declared_tables(profile)
+    tables = _declared_tables_or_audit(
+        user=user,
+        profile=profile,
+        token_id=token_id,
+        raw_sql=raw_sql,
+        started_at=started_at,
+        client_ip=client_ip,
+        client=client,
+    )
     allowed = set(tables.values())
     table_columns = _table_columns(tables)
 
@@ -452,6 +461,37 @@ def _hook_failure(  # noqa: PLR0913
         hint=HINTS.get(OutcomeReason.MISCONFIGURED, ""),
         error=error,
     )
+
+
+def _declared_tables_or_audit(  # noqa: PLR0913
+    *,
+    user: "AbstractBaseUser",
+    profile: Profile,
+    token_id: str,
+    raw_sql: str,
+    started_at: "datetime.datetime",
+    client_ip: str | None,
+    client: ClientIdentity,
+) -> dict[str, str]:
+    """`grants.declared_tables`, or, for an `ALLOWED_MODELS` entry Django
+    cannot resolve (boot defers model resolution to the query), a
+    misconfiguration audit row and `ExecutorMisconfiguredError` instead of
+    an exception escaping `run_query` with no row."""
+    try:
+        return declared_tables(profile)
+    except (LookupError, ValueError) as exc:
+        msg = f"profile {profile.name!r}: ALLOWED_MODELS entry not resolvable: {exc}"
+        _audit_misconfig(
+            user=user,
+            profile=profile,
+            token_id=token_id,
+            raw_sql=raw_sql,
+            started_at=started_at,
+            client_ip=client_ip,
+            client=client,
+            error=msg,
+        )
+        raise ExecutorMisconfiguredError(msg) from exc
 
 
 def _audit_misconfig(  # noqa: PLR0913

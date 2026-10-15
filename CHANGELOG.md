@@ -343,6 +343,39 @@ below precisely because they do **not** announce themselves.
   in the transaction that saves the tokens: the other exchange is refused
   with nothing minted. Tokens already issued from a code presented again are
   still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **sqlglot's compiled build refused every query, silently.** With the
+  `sqlglot[c]` extra (package `sqlglotc`), which sqlglot recommends, the
+  parser's dialect cannot subclass sqlglot's compiled classes: every query,
+  even `SELECT name FROM auth_permission`, was refused as `parse_error`, and
+  the audit log read as agents writing bad SQL. Startup now refuses with
+  `ImproperlyConfigured` naming the remedy (`pip uninstall sqlglotc`); a CI
+  job installs the compiled build and checks the refusal.
+- **CI: sqlglot internals pinned, weekly run.** The parser overrides private
+  sqlglot methods that move between minor releases; a test now fails when
+  one is renamed or gains a parameter the override does not take, and CI
+  runs weekly so a new 30.x is tested before consumers install it.
+- **Security: validating a query could take minutes of CPU.** Resolving
+  qualified columns (`c1.a`) asked every FROM item in scope, and each of
+  those scanned every CTE, for every reference: about n**3 for a query of n
+  CTEs referenced n times each (20 KB: 11 s to validate, and as long again
+  to render). It all ran in Python before any SQL reached Postgres, so
+  `statement_timeout` did not bound it, and any token holder could pin a
+  worker. Each SELECT's scope and each CTE lookup are now worked out once
+  per validation, and a CTE referenced many times contributes its columns
+  once (one wide CTE referenced from every FROM item cost references times
+  columns: 31 KB, 6.5 s, now 0.5 s): the same 20 KB query takes 0.2 s.
+  Deep chains (`a + b + ...`, `x AND y AND ...`, `UNION ALL`), which sqlglot
+  builds as one branch a level per term, made every column and table walk
+  to the root: depth squared, about half an hour for one 1 MiB request;
+  each node's enclosing scopes are now built once from its parent's. Parsing
+  itself doubled per `JOIN` with no `ON` after its table (sqlglot tries the
+  joins that follow as a nested join, then parses them again): 24 such
+  joins, 600 bytes, took over 2 minutes, though Postgres rejects the query;
+  each join is now parsed once per position, 24 taking under 0.01 s. Every
+  shape measured now grows about linearly; scaling tests guard them. A
+  1 MiB query still costs tens of seconds of CPU (about 15 to 80 s by
+  shape, validation and rendering together); the package sets no size
+  limit below the endpoint's 1 MiB request cap.
 - **Security: a NUL character or an unpaired UTF-16 surrogate in the SQL
   suppressed its audit row.** Postgres refuses NUL in a `text` column, so the
   `MCPQueryLog` insert failed (logged only) and a query carrying one in a
@@ -356,6 +389,12 @@ below precisely because they do **not** announce themselves.
   stores any NUL as U+2400 (␀) and any unpaired surrogate as U+FFFD, and a
   value the driver cannot adapt is logged like a database error instead of
   escaping.
+- **An `ALLOWED_MODELS` entry Django cannot resolve left no audit row.**
+  Boot defers model resolution to the query, and the whitelist was resolved
+  before the first audited step: `run_query`, `list_tables` and
+  `describe_table` raised `LookupError` with no `MCPQueryLog` row. `run_query`
+  now writes a `misconfigured` row and raises `ExecutorMisconfiguredError`,
+  like a missing read alias; the two metadata tools write their row first.
 - **A `LIMIT` of over 4300 digits escaped `run_query` with no audit row.**
   Python 3.11+ refuses `int()` of so long a digit string with a
   `ValueError`, raised before any handler. Such a `LIMIT` now runs capped

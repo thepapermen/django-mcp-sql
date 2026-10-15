@@ -127,7 +127,7 @@ class MCPAuthorizationView(MCPServerViewMixin, AuthorizationView):
         Rebuilt from the parsed parts rather than sliced out of the raw
         string, so a userinfo component can never reach the page: no
         registrable redirect URI may carry one (`validation` and
-        `registration._is_loopback_redirect` both refuse it), but
+        `redirects.is_loopback_redirect` both refuse it), but
         `https://claude.ai@evil.example/` rendering as "https://claude.ai…"
         is precisely the misreading this line exists to prevent.
 
