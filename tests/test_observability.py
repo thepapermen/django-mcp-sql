@@ -67,6 +67,34 @@ class TestRecordQueryVolume:
         assert cache.get("mcp_sql:vol:allowed:3600:5") == 1
         assert cache.get("mcp_sql:vol:rejected:3600:5") == 1
 
+    def test_one_counter_across_clients_alert_names_the_crossing_client(
+        self, settings, caplog
+    ):
+        # Counting is per (user, decision, window) ACROSS clients, so a burst
+        # spread over several clients still trips the threshold; the single
+        # alert names only the client whose query crossed it. It is not two
+        # per-client incidents.
+        _set_thresholds(settings, {"allowed": {3600: 2}})
+        dcr = "mcp-sql-" + "a" * 22
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.observability"):
+            observability.record_query_volume(
+                user_id=3,
+                decision="allowed",
+                client_name="mcp-sql-cloud.claude",
+                client_kind="cloud",
+            )
+            observability.record_query_volume(
+                user_id=3, decision="allowed", client_name=dcr, client_kind="dcr"
+            )
+        tripped = [
+            r for r in caplog.records if "query-volume tripwire" in r.getMessage()
+        ]
+        assert len(tripped) == 1
+        msg = tripped[0].getMessage()
+        assert f"client={dcr} (dcr)" in msg
+        assert "mcp-sql-cloud.claude" not in msg
+        assert cache.get("mcp_sql:vol:allowed:3600:3") == 2
+
     def test_users_have_independent_counters(self, settings):
         _set_thresholds(settings, {"allowed": {3600: 100}})
         observability.record_query_volume(user_id=1, decision="allowed")

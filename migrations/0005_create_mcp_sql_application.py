@@ -10,9 +10,13 @@
 #   compensates for the missing secret.
 # - `authorization_grant_type=authorization-code` only. No password / client
 #   credentials / implicit grants.
-# - `skip_authorization=True`: removes the "Allow Claude Code to access
-#   mcp:sql?" consent page. The issuance gate in `MCPAuthorizationView`
-#   already gated this; the consent page adds friction without security.
+# - `skip_authorization=False`: the consent page is shown, as for every
+#   other client kind. Up to 0.1.x this was True ("friction without
+#   security"), but DOT accepts any port on the registered loopback IP, so a
+#   phished authorize link delivered a code silently to any local port; see
+#   migration 0016, which flips existing rows. Changed here too (it only
+#   affects fresh installs, which also run 0016) so this file no longer
+#   creates the unsafe posture.
 # - `redirect_uris="http://127.0.0.1"`: per RFC 8252 §7.3, native-app OAuth
 #   uses loopback redirects, and DOT 3.x's `redirect_to_uri_allowed` accepts
 #   any PORT at request time on `http://127.0.0.1` (and `::1`) while still
@@ -47,7 +51,7 @@ def create_application(apps, schema_editor):
             "client_secret": "",
             "client_type": "public",
             "authorization_grant_type": "authorization-code",
-            "skip_authorization": True,
+            "skip_authorization": False,
             "redirect_uris": "http://127.0.0.1",
             "algorithm": "",
         },

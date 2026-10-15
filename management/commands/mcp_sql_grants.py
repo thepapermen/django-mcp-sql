@@ -3,6 +3,8 @@ from django.core.management.base import CommandError
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import GrantsReconcileError
 from mcp_sql.grants import reconcile_grants
+from mcp_sql.grants import relation_display
+from mcp_sql.grants import relation_sql
 
 
 class Command(BaseCommand):
@@ -23,9 +25,11 @@ class Command(BaseCommand):
             "--apply",
             action="store_true",
             help=(
-                "Execute GRANT / REVOKE for any drift. Without this flag the "
-                "command is read-only and exits 1 on drift (intended as a "
-                "CI / pre-deploy gate)."
+                "Execute GRANT / REVOKE for any drift, then re-check the "
+                "grants: if PostgreSQL left any unchanged (the login does not "
+                "own the relation), roll back and exit 1. Without this flag "
+                "the command is read-only and exits 1 on drift (intended as "
+                "a CI / pre-deploy gate)."
             ),
         )
 
@@ -40,21 +44,25 @@ class Command(BaseCommand):
         profiles = mcp_sql_settings.profiles()
         for name, drift in result.per_profile.items():
             role = profiles[name].role
-            for table in drift.granted:
-                self.stdout.write(f'GRANT SELECT ON "{table}" TO {role};')
-            for table in drift.revoked:
-                self.stdout.write(f'REVOKE SELECT ON "{table}" FROM {role};')  # noqa: S608
+            for relation in drift.granted:
+                grant = f"GRANT SELECT ON {relation_sql(relation)} TO {role};"
+                self.stdout.write(grant)
+            for relation in drift.revoked:
+                revoke = f"REVOKE SELECT ON {relation_sql(relation)} FROM {role};"  # noqa: S608
+                self.stdout.write(revoke)
 
         if not result.changed:
             self.stdout.write(self.style.SUCCESS("Grants in sync; no action."))
             return
 
         if apply:
+            # The profiles whose grants changed, not every configured one.
+            changed = sum(1 for drift in result.per_profile.values() if drift.changed)
             self.stdout.write(
                 self.style.SUCCESS(
                     f"Applied: +{result.granted_count} grant(s), "
                     f"-{result.revoked_count} revoke(s) across "
-                    f"{len(result.per_profile)} profile(s)."
+                    f"{changed} profile(s)."
                 )
             )
             return
@@ -63,13 +71,11 @@ class Command(BaseCommand):
         parts = []
         for name, drift in result.per_profile.items():
             if drift.granted:
-                parts.append(
-                    f"[{name}] declared but not granted: {', '.join(drift.granted)}"
-                )
+                shown = ", ".join(map(relation_display, drift.granted))
+                parts.append(f"[{name}] declared but not granted: {shown}")
             if drift.revoked:
-                parts.append(
-                    f"[{name}] granted but not declared: {', '.join(drift.revoked)}"
-                )
+                shown = ", ".join(map(relation_display, drift.revoked))
+                parts.append(f"[{name}] granted but not declared: {shown}")
         raise CommandError(
             "Grants drift detected — "
             + "; ".join(parts)

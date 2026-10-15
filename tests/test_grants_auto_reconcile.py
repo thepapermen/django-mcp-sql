@@ -93,7 +93,7 @@ class TestReconcileGrantsStrict:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"auth_permission"}
+        patched_grants["granted_tables"].return_value = {("public", "auth_permission")}
         result = reconcile_grants(strict=True, apply=True)
         assert result.granted == []
         assert result.revoked == []
@@ -103,11 +103,24 @@ class TestReconcileGrantsStrict:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = {"orphaned_table"}
+        # Before the statements, then as `--apply` re-reads them after.
+        patched_grants["granted_tables"].side_effect = [
+            {("public", "orphaned_table")},
+            {("public", "auth_permission")},
+        ]
         result = reconcile_grants(strict=True, apply=True)
-        assert result.granted == ["auth_permission"]
-        assert result.revoked == ["orphaned_table"]
+        assert result.granted == [("public", "auth_permission")]
+        assert result.revoked == [("public", "orphaned_table")]
         assert result.changed
+
+    def test_drift_left_after_the_statements_raises(self, patched_grants):
+        """PostgreSQL only warned (the login may not change the grant): the
+        re-read still shows the drift. Real-database version:
+        `test_grants_apply_verify.py`."""
+        patched_grants["declared_tables"].return_value = {}
+        patched_grants["granted_tables"].return_value = {("public", "orphaned_table")}
+        with pytest.raises(GrantsReconcileError, match="still granted: orphaned_table"):
+            reconcile_grants(strict=True, apply=True)
 
 
 class TestReconcileGrantsLenient:
@@ -156,9 +169,12 @@ class TestReconcileGrantsLenient:
         patched_grants["declared_tables"].return_value = {
             "auth.Permission": "auth_permission",
         }
-        patched_grants["granted_tables"].return_value = set()
+        patched_grants["granted_tables"].side_effect = [
+            set(),
+            {("public", "auth_permission")},
+        ]
         result = reconcile_grants(strict=False, apply=True)
-        assert result.granted == ["auth_permission"]
+        assert result.granted == [("public", "auth_permission")]
         assert not result.skipped_reason
 
 

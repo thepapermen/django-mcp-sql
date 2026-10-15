@@ -1,6 +1,30 @@
+import ipaddress
+
 from django.conf import settings
 from django.db import models
 from mcp_sql.schemas import AuthRejectionReason
+
+
+def audit_client_ip(remote_addr: object) -> str | None:
+    """`REMOTE_ADDR` as the audit tables' `client_ip` stores it: the value
+    when it is one IP address, else None.
+
+    `REMOTE_ADDR` is whatever the server or a real-IP middleware put there
+    (a forwarded list `"a, b"`, a hostname). Django adapts a
+    `GenericIPAddressField` value with `ipaddress.ip_address` on psycopg 3
+    (`ValueError`, not a `DatabaseError`); on psycopg2 PostgreSQL refuses
+    it (`DataError`): the audit insert failed. The row is kept, without the
+    address. A scoped IPv6 address (`fe80::1%eth0`) is None too: Django
+    would store it without its zone, another address."""
+    if not isinstance(remote_addr, str):
+        return None
+    try:
+        address = ipaddress.ip_address(remote_addr)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        return None
+    return remote_addr
 
 
 class MCPQueryLog(models.Model):
@@ -65,16 +89,32 @@ class MCPQueryLog(models.Model):
     truncated = models.BooleanField(default=False)
     result_bytes = models.PositiveIntegerField(null=True, blank=True)
     client_ip = models.GenericIPAddressField(null=True, blank=True)
-    # The OAuth redirect_uri the presenting token was issued against — i.e.
-    # WHERE the authorization code was delivered. For an "exact" cloud client
-    # this is the provider's true callback (the "auth url cannot lie" ground
-    # truth — validated + PKCE-bound at issuance, not an operator-set label);
-    # for a "prefix" cloud client it's the provider host+path prefix; for the
-    # canonical / loopback DCR clients it's the loopback URI. Blank on
-    # pre-existing rows (no data migration). Sourced from the token's
-    # `application.redirect_uris` in `views/mcp_endpoint.py`, where the token
-    # object is in hand, and threaded to the executor like `token_id`. How
-    # cloud logins produce this value: docs/oauth.md → "Cloud clients".
+    # Which OAuth client presented the token. All three are sourced from the
+    # token's `Application` by `consts.identify_application` (in
+    # `views/mcp_endpoint.py`, where the token object is in hand) and threaded
+    # to the executor as one `ClientIdentity`, like `token_id`. Blank on
+    # pre-existing rows — no data migration.
+    #
+    # `application_name` is the client_id / Application name: `mcp-sql` for the
+    # curated client, `mcp-sql-<token>` for a self-registered one, and
+    # `mcp-sql-<kind>.<slug>` for a settings-declared one.
+    application_name = models.CharField(max_length=255, blank=True, default="")
+    # `clients.ClientKind` — curated | dcr | cloud | local. DERIVED, never
+    # declared: for a declared client it comes from its redirect scheme, which
+    # is why "was this a provider-hosted client or one on someone's laptop?"
+    # has an answer here at all. Blank means the Application classified as
+    # nothing (a rejection path — DOT resolved the token but the client is no
+    # longer part of the MCP surface).
+    client_kind = models.CharField(max_length=16, blank=True, default="")
+    # The space-joined set of callbacks the presenting client may use,
+    # truncated to fit: for a recognised settings-declared client the URIs its
+    # `CLIENTS` entry declares (what its redirects are checked against), for
+    # any other Application its REGISTERED `redirect_uris`
+    # (`consts.identify_application`).
+    # NOT the single URI a given authorization actually delivered to: DOT does
+    # not persist that on `AccessToken`, so the allowed set is the closest
+    # available attribution. For a one-callback client the distinction is
+    # moot; for a multi-callback one, read it as "one of these".
     client_redirect = models.CharField(max_length=1024, blank=True, default="")
     error = models.TextField(blank=True, default="")
 
@@ -147,9 +187,10 @@ class MCPAuthRejectionLog(models.Model):
                 "Token not issued by an mcp-sql Application",
             ),
             (AuthRejectionReason.BAD_SCOPE, "Token does not carry mcp:sql scope"),
+            (AuthRejectionReason.INACTIVE, "User account is inactive"),
             (
                 AuthRejectionReason.INACTIVE_OR_NON_STAFF,
-                "User is not an active staff member",
+                "User is not an active staff member (up to 0.1.x)",
             ),
             (AuthRejectionReason.NO_MFA, "User does not have a verified TOTP device"),
             (
@@ -162,8 +203,16 @@ class MCPAuthRejectionLog(models.Model):
             ),
             (AuthRejectionReason.NO_SESSION, "User has no live Django session"),
             (
+                AuthRejectionReason.GATE_ERROR,
+                "A per-request gate failed; access could not be verified",
+            ),
+            (
                 AuthRejectionReason.SESSION_LOGOUT,
                 "MCP tokens revoked on user logout",
+            ),
+            (
+                AuthRejectionReason.PASSWORD_CHANGE,
+                "MCP tokens revoked on password change",
             ),
         )
     )
@@ -175,9 +224,14 @@ class MCPAuthRejectionLog(models.Model):
     )
     token_pk = models.CharField(max_length=64, blank=True, default="")
     application_name = models.CharField(max_length=255, blank=True, default="")
-    # The token's Application `redirect_uris` at rejection time — the same
-    # attribution as `MCPQueryLog.client_redirect`. Blank when there is no
-    # token in hand (e.g. the SESSION_LOGOUT revocation rows).
+    # `clients.ClientKind` — the same derived classification as
+    # `MCPQueryLog.client_kind`, so "which clients are generating rejections?"
+    # slices the same way on both tables.
+    client_kind = models.CharField(max_length=16, blank=True, default="")
+    # The token's client's callbacks at rejection time — the same
+    # attribution (and truncation) as `MCPQueryLog.client_redirect`.
+    # Blank when there is no token in hand (e.g. the SESSION_LOGOUT revocation
+    # rows).
     client_redirect = models.CharField(max_length=1024, blank=True, default="")
     reason = models.CharField(max_length=64, choices=REASON_CHOICES)
     error = models.TextField(blank=True, default="")
@@ -198,3 +252,41 @@ class MCPAuthRejectionLog(models.Model):
         return (
             f"#{self.pk} {self.reason} user={who} {self.started_at:%Y-%m-%d %H:%M:%S}"
         )
+
+
+class MCPRefreshTokenFamily(models.Model):
+    """When the consent behind a refresh-token chain was given.
+
+    Only used when `MCP_SQL["REFRESH_TOKEN_MAX_AGE_SECONDS"]` enables refresh
+    tokens. django-oauth-toolkit gives every refresh token a `token_family`
+    UUID, new at the authorization-code exchange and inherited on each
+    rotation; one row here records that family's consent time, written when
+    the exchange stores the first refresh token
+    (`MCPOAuth2Validator.save_bearer_token`). The hard cap is measured from
+    it, across rotations. DOT's own rows cannot carry it: `cleartokens`
+    can delete revoked (rotated) refresh tokens (with
+    `REFRESH_TOKEN_REUSE_PROTECTION`, which refresh requires, once
+    `REFRESH_TOKEN_EXPIRE_SECONDS` has passed), so the chain's first row
+    need not survive. A family with no row here — refresh tokens from 0.1.0b5 or
+    earlier, or any written outside `save_bearer_token` — is refused.
+
+    Rows past the cap are pruned at each new exchange (those no other
+    transaction holds locked). Rows whose refresh
+    tokens are gone (revoked, deleted by `cleartokens`, or refresh switched
+    off again) are inert — a family is only consulted for a live refresh
+    token — and can be deleted at will, e.g. alongside `cleartokens`:
+    `MCPRefreshTokenFamily.objects.exclude(token_family__in=RefreshToken.
+    objects.filter(token_family__isnull=False).values("token_family"))
+    .delete()` (the `isnull` filter is required: `NOT IN` over a list
+    holding a NULL matches nothing).
+    """
+
+    token_family = models.UUIDField(primary_key=True)
+    consented_at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        verbose_name = "MCP refresh-token family"
+        verbose_name_plural = "MCP refresh-token families"
+
+    def __str__(self) -> str:
+        return f"{self.token_family} (consented {self.consented_at:%Y-%m-%d %H:%M})"

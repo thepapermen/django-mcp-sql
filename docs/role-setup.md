@@ -22,10 +22,11 @@ deployments have just the in-package `default` profile and its
 | Reconcile grants in CI | Every PR | Wire `mcp_sql_grants --apply` against your CI's ephemeral test cluster | CI step exits 0 |
 | Detect grants drift (advisory) | Every `migrate` | `python manage.py migrate` — the `post_migrate` signal in `mcp_sql.signals` LOGs a WARNING when any profile's grants drift from its whitelist. Does NOT apply. | WARNING line absent from migrate output |
 | Audit grants drift | Pre-deploy verification on stage/prod | `python manage.py mcp_sql_grants` | exit 0 = in sync |
-| End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected" |
+| End-to-end smoke (role/grants contract) | After role + grants applied | `python manage.py mcp_sql_smoke` | "Write attempt rejected as expected", no `WARNING` line |
+| Stop overload planting in `public` (recommended) | Once per database, PostgreSQL 14 and earlier | `REVOKE CREATE ON SCHEMA public FROM PUBLIC` (after granting the app's login `CREATE`; see below) | `mcp_sql_smoke` prints "PUBLIC holds no CREATE" |
 | Executor smoke (full pipeline) | With a whitelisted table | `python manage.py mcp_sql_smoke --run-query "SELECT id FROM auth_permission LIMIT 5"` | `QueryResult` printed, audit row created |
 | Add user to MCP cohort | Onboarding / role change | Admin: add user to the profile's group (`default` profile's is `mcp_sql_users`) | user resolves to exactly one profile (`resolve_profile`) |
-| Revoke a user's MCP tokens | Incident / off-boarding | `AccessToken.objects.filter(user=user).delete()` (or user logs out) | `AccessToken.objects.filter(user=user).count() == 0` |
+| Revoke a user's MCP tokens | Incident / off-boarding | The token-delete shell snippet in [`oauth.md`](oauth.md) → "Revoking access": in one transaction, the user's pending codes, the consent records (`MCPRefreshTokenFamily`) of their refresh-token chains, their refresh tokens (locked first) and their access tokens — the order the package's own revocation takes — for every OAuth Application the user holds. Logging the user out, or changing their password, does the same for MCP Applications only | After the snippet: `get_grant_model().objects.filter(user=user).count() == 0`, and the same for `get_refresh_token_model()` and `get_access_token_model()`. After a logout: a `session_logout` row in `MCPAuthRejectionLog` naming what was revoked (rows of non-MCP Applications remain) |
 | Register Claude Code as MCP client | Once per developer per env | `claude mcp add --transport http <slug-of-RESOURCE_NAME> https://<host>/mcp/sql/` (e.g. `local-my-app`, `stage-my-app`, `my-app`) | First `claude` chat invokes a tool from this surface |
 
 OAuth-specific incident playbooks live in
@@ -134,6 +135,60 @@ indirection without value.
 
 ---
 
+## Revoke `CREATE` on schema `public` from `PUBLIC` (recommended)
+
+On PostgreSQL 14 and earlier every role (`PUBLIC`) may create objects in
+schema `public`; PostgreSQL 15 dropped that default. Any role that can
+create there can plant a function or operator **overload** the agent's
+queries then call instead of the built-in one (the CVE-2018-1058 class):
+Postgres picks the best-matching argument types across every schema on
+the `search_path` before `pg_catalog`'s place on it matters, so
+`public.lower(varchar)` beats `pg_catalog.lower(text)` for a `varchar`
+column, and an `=(varchar, varchar)` in `public` beats the built-in
+`=(text, text)` — with `MCP_SQL["PIN_SEARCH_PATH"] = True` too, since
+`public` stays on the path. The parser's deny list matches names and
+cannot see it. The planted function runs on the values the agent's query
+passes it (whitelisted columns its owner may have no right to read) and
+returns whatever it likes. See `docs/architecture.md` → "In both modes:
+overloads in `public`".
+
+As a superuser (or the schema's owner), connected to the **application's
+database** (schema privileges are per database):
+
+```sql
+-- PostgreSQL 14 and earlier: if the app's login does not own schema
+-- `public` (there it is owned by the bootstrap superuser), it creates its
+-- own tables through PUBLIC's CREATE — grant it explicitly first, or its
+-- next migration fails:
+GRANT CREATE ON SCHEMA public TO <app_role>;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+`sql/role_setup.sql` and `mcp_sql_role_setup --emit-sql` carry the
+`REVOKE` as their last statement (after the membership `BEGIN … COMMIT`
+block), **commented out**: the package does not change a database-wide
+privilege the consumer's app may depend on. Uncomment it once the app's
+login has its own `CREATE`, or run it by hand. `mcp_sql_smoke` prints a
+`WARNING` line while `PUBLIC` still holds `CREATE` on `public` (a
+warning, not a failure: the smoke command fails only when the package's
+own contract is broken). To check by hand:
+
+```sql
+SELECT EXISTS (
+    SELECT 1 FROM pg_namespace AS n,
+        aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) AS a
+    WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'CREATE'
+) AS public_may_create;
+-- Expected after the REVOKE: f
+```
+
+The roles that keep `CREATE` on `public` (its owner, the app's login) can
+still plant an overload; they can already change the app's tables, so the
+revoke narrows the planters to parties the app already trusts with its
+schema.
+
+---
+
 ## Sanity checks
 
 After installing the role on any environment, run these three checks. They
@@ -174,13 +229,23 @@ docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> 
     -c "SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'mcp_readonly_role';"
 ```
 
-Expected (one row, four GUCs):
+Expected (one row, five GUCs):
 
 ```
       rolname      |                              rolconfig
 -------------------+----------------------------------------------------------------------
- mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s}
+ mcp_readonly_role | {default_transaction_read_only=on,statement_timeout=5s,idle_in_transaction_session_timeout=10s,lock_timeout=1s,standard_conforming_strings=on}
 ```
+
+With `MCP_SQL["PIN_SEARCH_PATH"] = True`, a sixth,
+`"search_path=public, pg_temp"`, if you applied the role default for it
+(`mcp_sql_role_setup --emit-sql` prints it then; in `sql/role_setup.sql` it
+is the commented-out line — uncomment it). Optional either way: these
+defaults are inert under `SET ROLE` (the read path sets every guard with
+`SET LOCAL`, the pinned `search_path` included), and `mcp_sql_smoke`'s
+session check passes without it. An older role carrying the
+`search_path` default with the pin off is harmless for the same reason;
+`ALTER ROLE mcp_readonly_role RESET search_path` removes it.
 
 **3. App role is a member of `mcp_readonly_role`:**
 
@@ -231,24 +296,36 @@ profile's `ALLOWED_MODELS`. It is the only code path that issues
 `GRANT SELECT` / `REVOKE SELECT` statements; the `post_migrate` signal
 in `mcp_sql.signals` only DETECTS drift and logs a WARNING.
 
+**Run it as a login that may change those grants**: the owner of the
+whitelisted relations (or a member of the owning role) or a role holding
+SELECT `WITH GRANT OPTION` on them — a REVOKE also removes only grants the
+running role made itself. PostgreSQL does not fail a GRANT / REVOKE the
+role may not make when the role holds some other privilege on the relation
+(an app login with read/write grants on tables a separate migration role
+owns): it warns "no privileges were granted" / "no privileges could be
+revoked" and changes nothing. So `--apply` re-reads the grants in the same
+transaction before committing; if any drift is left it rolls everything
+back and fails, naming each relation still not granted / still granted,
+its owner, and the login that ran the statements.
+
 Sample output:
 
 ```
-Grants already in sync; no action.
+Grants in sync; no action.
 ```
 
 Or, after adding `auth.Permission` to the whitelist:
 
 ```
-GRANT SELECT ON "auth_permission" TO mcp_readonly_role;
-Applied: +1 grant(s), -0 revoke(s).
+GRANT SELECT ON "public"."auth_permission" TO mcp_readonly_role;
+Applied: +1 grant(s), -0 revoke(s) across 1 profile(s).
 ```
 
 ### Drift detection on every `migrate` (advisory)
 
 Every `python manage.py migrate` invocation fires the `post_migrate`
 receiver `audit_grants_drift_after_migrate` in `mcp_sql.signals`.
-The receiver runs `compute_drift(strict=False)` — pure read against PG.
+The receiver runs `reconcile_grants(strict=False, apply=False)` — pure read against PG.
 On drift it logs a single WARNING line that names the +N/-M to-grant /
 to-revoke counts and points at the apply command. It does **not** issue
 GRANT / REVOKE statements; reconciliation happens only via the deploy
@@ -257,6 +334,9 @@ step above.
 The receiver is **lenient** about environment state: if the role is
 missing (fresh env, DBA hasn't applied `role_setup.sql`) or membership
 is absent, it logs a WARNING and returns rather than crashing `migrate`.
+A whitelisted unqualified `db_table` found only outside `public` (below)
+is logged at ERROR before the role is looked at, so a fresh environment's
+first `migrate` names it too.
 
 ### Pre-deploy drift check
 
@@ -267,7 +347,8 @@ python manage.py mcp_sql_grants
 Read-only — never issues `GRANT` / `REVOKE`. Exits non-zero if there's
 any drift between declared whitelist and actual grants. Useful as a
 verification step in the deploy pipeline AFTER `mcp_sql_grants --apply`
-runs (to confirm the apply succeeded), and as a manual sanity check on
+runs (`--apply` already re-checks its own result before committing; this
+confirms nothing changed since), and as a manual sanity check on
 stage/prod. Not useful in CI test runs — the test settings have an
 empty whitelist, so `grants_check` would trivially pass and prove
 nothing.
@@ -283,7 +364,7 @@ answer if you ever suspect a routing bug.
 
 ```sh
 python manage.py mcp_sql_grants --apply
-# Expected: "Grants already in sync; no action."
+# Expected: "Grants in sync; no action."
 ```
 
 If the second run emits another GRANT / REVOKE, something is mutating the
@@ -295,31 +376,79 @@ before continuing.
 ```sh
 python manage.py mcp_sql_grants
 echo "exit: $?"
-# Expected: "Grants in sync." / exit: 0
+# Expected: "Grants in sync; no action." / exit: 0
 ```
 
 **3. DB-side ground truth** — `information_schema.role_table_grants`
 lists every grant on `mcp_readonly_role`, sourced directly from PG's
 catalog. The set of tables here must match the `default` profile's
-`ALLOWED_MODELS` `_meta.db_table` resolutions exactly (substitute the role
-name for another profile):
+`ALLOWED_MODELS` `_meta.db_table` resolutions exactly — in every schema,
+not only `public` (substitute the role name for another profile):
 
 ```sh
 docker exec -e PGPASSWORD=<password> <db_container> psql -h localhost -U <role> -d <db_name> -c "
-SELECT table_name, privilege_type
+SELECT table_schema, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'mcp_readonly_role'
-ORDER BY table_name;
+ORDER BY table_schema, table_name;
 "
 ```
 
 Expected (with `auth.Permission` whitelisted):
 
 ```
-   table_name    | privilege_type
------------------+----------------
- auth_permission | SELECT
+ table_schema |   table_name    | privilege_type
+--------------+-----------------+----------------
+ public       | auth_permission | SELECT
 ```
+
+A whitelisted `db_table` is the relation in `public`, unless the
+`db_table` names a schema (`schema"."name`, Django's spelling of a
+schema-qualified table; the role then also needs `USAGE` on that schema,
+which the package does not grant). An unqualified `db_table` whose table
+lives only in another schema on the app login's `search_path` is an
+error — system check `mcp_sql.E001` on `migrate` / `check --database
+default` (not while the model's app has migrations to apply: after them
+the `post_migrate` check logs it if it still holds; when another app's
+migration creates the relation, `migrate --skip-checks` gets past it), and
+a refusal from `mcp_sql_grants` naming the schema: qualify
+the `db_table`, or for a third-party model whitelist your own unmanaged
+model with a qualified `db_table`, or a curated view in `public`
+(`docs/architecture.md` → "Whitelist contract"). The parser refuses a qualified
+reference to a relation in any other schema. An unqualified name is the
+relation in `public` only with `MCP_SQL["PIN_SEARCH_PATH"] = True` (the
+read path then pins `search_path` to `public, pg_temp`) — **set it**,
+unless an extension the agents use lives outside `public` (with the pin
+on they can still call it as `ext.f(…)` / `OPERATOR(ext.op)`). With the
+default (`False`) Postgres resolves it through the database's own
+`search_path`, so a schema listed ahead of `public`, a `"$user"` schema
+named after the profile role, or a temporary relation (table or view) on
+the backend shadows a whitelisted table wherever the profile role may
+read the shadowing relation — and a grant to `PUBLIC` is enough for
+that. Without any right on the whitelisted tables, any role with
+`CREATE` on the database (by default its owner, often the app's login)
+can create the `"$user"` schema, and another session on the same backend
+(e.g. under transaction-mode pooling) can create the temporary relation;
+a DBA's database- or login-level `search_path` does the same by
+accident. The drift check (`mcp_sql_grants`) does **not** see such a
+shadow: its inventory lists only direct grants to the profile role, not
+grants to `PUBLIC`, through role membership, or on temporary relations.
+`manage.py check --deploy` warns (`mcp_sql.W001`) while the pin is off.
+See `docs/architecture.md` → "`search_path` is pinned only on request"
+for what each mode guarantees. In both modes a direct SELECT grant to
+the profile role on a relation in another schema (a `GRANT SELECT ON ALL
+TABLES IN SCHEMA …`, a same-named copy of a whitelisted table) is drift:
+the check reports it as "granted but not declared" (shown quoted,
+`"schema"."name"`) and `--apply` revokes it. The names come from whoever
+owns the relations, so the command quotes each identifier (an embedded
+`"` doubled) in what it prints and runs.
+
+Not in this view: SELECT on a materialized view (`mcp_sql_grants` reads
+the catalog's ACLs and does check those), grants to `PUBLIC`, and grants
+the profile role holds only through membership in another role (not
+checked by `mcp_sql_grants` either). Check those by hand
+(`has_table_privilege('mcp_readonly_role', 'schema.relation', 'SELECT')`)
+if the database has them.
 
 A divergence between this query and the profile's `ALLOWED_MODELS` means
 `grants_check` would report drift; the apply step has not run (or has not
@@ -345,18 +474,28 @@ python manage.py mcp_sql_smoke
 Expected output:
 
 ```
-Read path ok: SET LOCAL ROLE + 4 GUCs verified, SELECT FROM auth_permission ok
+Smoking profile 'default' (role mcp_readonly_role).
+Read path ok: SET LOCAL ROLE + session GUCs (incl. the live transaction_read_only) verified, SELECT FROM auth_permission ok
 Audit table mcp_sql_mcpquerylog unreadable (pgcode=42501) — 0002_revoke_audit_grants is in effect.
 Write attempt rejected as expected: ReadOnlySqlTransaction (pgcode=25006)
+Schema public: PUBLIC holds no CREATE (no role without a grant can plant an overload there).
 ```
 
-If the third line shows `pgcode=42501 (insufficient_privilege)`, that is
+The last line reads `WARNING: PUBLIC holds CREATE on schema public …`
+instead while every role may create objects in `public` (PostgreSQL 14's
+default) — see [Revoke `CREATE` on schema `public` from
+`PUBLIC`](#revoke-create-on-schema-public-from-public-recommended). The
+command still exits 0: it is a recommended hardening, not the package's
+contract.
+
+If the `Write attempt` line shows `pgcode=42501` (insufficient_privilege), that is
 also healthy — it means the readonly guard did not catch the write but the
 grants did. If it shows any other pgcode, the smoke command exits with a
 security alarm. See the command's source for the diagnostic message.
 
-If `MCP_READONLY_DATABASE_URL` is not set, the command writes a friendly
-"skipping smoke check" message and exits 0.
+If the read alias (`MCP_SQL["DB_ALIAS"]`, `mcp_readonly` by default) is
+not in `DATABASES` (`MCP_READONLY_DATABASE_URL` not set), the command
+prints a message ending `Skipping smoke check.` and exits 0.
 
 ### `--run-query` mode (full parser + executor)
 
@@ -375,6 +514,7 @@ python manage.py mcp_sql_smoke --as-user mcp-smoke@example.com \
 Expected output (abridged):
 
 ```
+Smoking profile 'default' (role mcp_readonly_role).
 run_query attributed to: <staff user>
   columns: ['id', 'codename']
   row_count: 5

@@ -25,10 +25,14 @@ executor-misconfig row counts as a `rejected` query too, consistent with
 counting every rejected row; it is independently escalated via its own
 `logger.error`, so the extra increment is accepted noise, not a second
 signal.) The alert names the user — pk plus `get_username()` (the email for
-an email-keyed user model) —
-so a responder can act without a DB lookup; this is appropriate because the
-MCP surface is staff-only (employees, not clients). It never includes the
-SQL text.
+an email-keyed user model) — and the client whose query crossed the
+threshold (its client_id plus derived `ClientKind`; counting itself is per
+user across clients), so the alert identifies who and which client without a
+query; this is appropriate because the MCP surface is staff-only (employees,
+not clients). Deciding whether the volume is legitimate still means reading
+the user's `MCPQueryLog` rows — a declared cloud client_id is shared by every
+account at its provider — and, when unsure, asking the user. It never
+includes the SQL text.
 """
 
 import logging
@@ -47,7 +51,12 @@ def _volume_key(decision: str, window: int, user_id: object) -> str:
 # model may key on an int, a UUID, or anything else, and this only ever `str()`s
 # it into a cache key — every type supports that, so `object` is the honest type.
 def record_query_volume(
-    *, user_id: object, decision: str, user_label: str = ""
+    *,
+    user_id: object,
+    decision: str,
+    user_label: str = "",
+    client_name: str = "",
+    client_kind: str = "",
 ) -> None:
     """Count one audited query toward this user's per-window volume counters.
 
@@ -62,8 +71,14 @@ def record_query_volume(
     break a query, so a Redis blip logs a sub-Sentry WARNING and returns.
 
     The counter keys on `user_id` (the stable pk); `user_label`
-    (`get_username()`) is carried only for the alert message so the Sentry
-    event names a person, not just a number.
+    (`get_username()`), `client_name`, and `client_kind` are carried only for
+    the alert message. Counting is per (user, decision, window) ACROSS
+    clients, so a burst spread over several clients still alerts — keying the
+    counters on the client too would let it slip under every threshold. The
+    one alert per crossing names the client whose query crossed the
+    threshold: a lead for the responder, not a statement that every counted
+    query came through that client (the per-row `MCPQueryLog` attribution
+    has the full breakdown).
     """
     windows = mcp_sql_config()["VOLUME_ALERT_THRESHOLDS"].get(decision)
     if not windows:
@@ -83,11 +98,13 @@ def record_query_volume(
             continue
         if count == threshold:
             logger.error(
-                "MCP query-volume tripwire: user=%s (pk=%s) decision=%s reached "
-                "%d within a %ds window (threshold=%d) — alert only, the query "
-                "was not blocked.",
+                "MCP query-volume tripwire: user=%s (pk=%s) client=%s (%s) "
+                "decision=%s reached %d within a %ds window (threshold=%d) — "
+                "alert only, the query was not blocked.",
                 user_label or "?",
                 user_id,
+                client_name or "?",
+                client_kind or "?",
                 decision,
                 count,
                 window,
