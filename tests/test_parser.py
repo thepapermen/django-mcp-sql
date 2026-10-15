@@ -1217,6 +1217,42 @@ class TestValidationScales:
         assert large < self._CEILING, large
         assert large < 24 * small, (small, large)
 
+    # A `JOIN` with no `ON` after its table: sqlglot tries what follows as a
+    # nested join and parses it again when that fails, twice the work per
+    # `JOIN`: 21 of them took about 17 s, 24 over 2 minutes (GLM, review
+    # round 4). Postgres rejects the bare ones; the others are valid shapes
+    # the same code reads.
+    @staticmethod
+    def _joined(n: int, join: str, each: str = "", tail: str = "") -> str:
+        joins = "".join(f" {join} auth_permission t{i}{each}" for i in range(1, n))
+        return f"SELECT 1 AS x FROM auth_permission t0{joins}{tail}"  # noqa: S608
+
+    _JOINS = {
+        "bare": lambda n: TestValidationScales._joined(n, "JOIN"),
+        "one_on": lambda n: TestValidationScales._joined(n, "JOIN", tail=" ON true"),
+        "nested": lambda n: TestValidationScales._joined(
+            n, "JOIN", tail=" ON true" * (n - 1)
+        ),
+        "left_on_each": lambda n: TestValidationScales._joined(
+            n, "LEFT JOIN", each=" ON true"
+        ),
+    }
+
+    @pytest.mark.parametrize("shape", sorted(_JOINS))
+    def test_joins(self, shape):
+        assert self._seconds(21, self._JOINS[shape]) < self._CEILING
+
+    def test_nested_joins_keep_their_shape(self):
+        parsed = parse_and_validate(
+            self._JOINS["nested"](3),
+            allowed_tables={"auth_permission"},
+            table_columns=self._COLUMNS,
+        )
+        assert parsed.normalized_sql == (
+            "SELECT 1 AS x FROM auth_permission AS t0 JOIN auth_permission AS t1 "
+            "JOIN auth_permission AS t2 ON TRUE ON TRUE"
+        )
+
     @pytest.mark.parametrize(
         ("shape", "n"), [("plus", 500), ("and", 400), ("union", 250), ("exists", 200)]
     )

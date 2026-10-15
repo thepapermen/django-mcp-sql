@@ -1498,6 +1498,39 @@ class FaithfulPostgres(Postgres):
                 return False
             return word is None or _keyword(self._tokens[i].text) == word
 
+        def _parse_join(self, *args: Any, **kwargs: Any) -> exp.Join | None:
+            # sqlglot's own, parsed once per token position. A `JOIN` with no
+            # `ON`/`USING` after its table makes sqlglot try the joins that
+            # follow as a nested join (`a JOIN b JOIN c ON p ON q`), retreat
+            # when no `ON` closes them, and parse them again: twice the work
+            # per bare `JOIN`, so 24 of them (600 bytes) took minutes, all
+            # before Postgres is reached (GLM r4). The parse from a position
+            # depends on nothing but the tokens from there, so a repeat gets
+            # a copy of the first result and continues where it ended.
+            memo = self._joins_parsed
+            if memo is None or memo[0] is not self._tokens:
+                memo = self._joins_parsed = (self._tokens, {})
+            key = (
+                self._index,
+                self.error_level,
+                tuple(map(id, args)),
+                tuple((name, id(value)) for name, value in sorted(kwargs.items())),
+            )
+            if key in memo[1]:
+                end, join, _ = memo[1][key]
+                self._retreat(end)
+                return join.copy() if join is not None else None
+            parsed: exp.Join | None = super()._parse_join(*args, **kwargs)
+            # The arguments stay referenced, so their ids are not reused.
+            memo[1][key] = (
+                self._index,
+                parsed.copy() if parsed is not None else None,
+                (args, kwargs),
+            )
+            return parsed
+
+        _joins_parsed: tuple[list[Token], dict[Any, Any]] | None = None
+
         def _parse_json_object_or_call(self) -> exp.Expression | None:
             """`json_object(...)`: Postgres's function `json_object(text[]
             [, text[]])` when the arguments parse as plain expressions up to

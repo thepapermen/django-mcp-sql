@@ -16,7 +16,7 @@ from sqlglot.dialects.postgres import Postgres
 _OWN_PARSER_HELPERS = frozenset({
     "_ARROWS", "_adjacent", "_array_bound", "_array_keyword", "_array_suffix",
     "_arrow_operand", "_at", "_bit_varying", "_interval_alias",
-    "_interval_field", "_interval_qualifier", "_is_unquoted",
+    "_interval_field", "_interval_qualifier", "_is_unquoted", "_joins_parsed",
     "_key_keyword_argument", "_nchar_varying", "_no_array_typed_literal",
     "_no_interval_constant", "_no_more_fields", "_number_as_written",
     "_operator_name", "_parse_at_operator", "_parse_json_object_or_call",

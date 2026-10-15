@@ -367,7 +367,11 @@ below precisely because they do **not** announce themselves.
   Deep chains (`a + b + ...`, `x AND y AND ...`, `UNION ALL`), which sqlglot
   builds as one branch a level per term, made every column and table walk
   to the root: depth squared, about half an hour for one 1 MiB request;
-  each node's enclosing scopes are now built once from its parent's. Every
+  each node's enclosing scopes are now built once from its parent's. Parsing
+  itself doubled per `JOIN` with no `ON` after its table (sqlglot tries the
+  joins that follow as a nested join, then parses them again): 24 such
+  joins, 600 bytes, took over 2 minutes, though Postgres rejects the query;
+  each join is now parsed once per position, 24 taking under 0.01 s. Every
   shape measured now grows about linearly; scaling tests guard them. A
   1 MiB query still costs tens of seconds of CPU (about 15 to 80 s by
   shape, validation and rendering together); the package sets no size
