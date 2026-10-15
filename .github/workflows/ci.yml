@@ -8,10 +8,13 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Weekly on main: every job resolves the newest in-range dependencies, so a
-  # new sqlglot minor (the parser overrides its private internals; pinned by
-  # tests/test_sqlglot_internals.py and the functional corpus) is tested
-  # before a consumer installs it, not at the next push.
+  # Weekly on main: the jobs that resolve the newest in-range dependencies
+  # (all but test-min-versions and test-legacy-drf, which pin) test a new
+  # sqlglot minor (the parser overrides its private internals; pinned by
+  # tests/test_sqlglot_internals.py and the functional corpus) before a
+  # consumer installs it, not at the next push. GitHub disables a scheduled
+  # workflow after 60 days without repository activity: re-enable it from
+  # the Actions tab. (release.yml runs on tag pushes only.)
   schedule:
     - cron: "17 5 * * 1"
   workflow_dispatch:

@@ -97,7 +97,10 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 
 A single nested dict `MCP_SQL`, validated on startup by
 `McpSqlConfig.ready()` against the `McpSqlSettings` TypedDict in
-`mcp_sql/validation.py`.
+`mcp_sql/validation.py`. `ready()` also refuses to start when the parser's
+dialect cannot be built (`check_sql_dialect` → `parser.dialect_problem`):
+sqlglot's compiled build (`sqlglot[c]`, package `sqlglotc`) cannot be
+subclassed, and every query would otherwise be refused as `parse_error`.
 
 **Every key has an in-package default** (`conf.DEFAULTS`), so a consumer
 declares only what they change — `MCP_SQL` may be absent entirely. One merge

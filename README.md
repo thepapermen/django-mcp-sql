@@ -487,6 +487,13 @@ Django needs a higher minimum DRF:
   6.1 yet; the suite passes on 6.1 with DOT 3.4.1. `oauthlib` (3.3.0+, below
   5) is declared directly because the package builds its OAuth server from
   oauthlib's classes.
+- **sqlglot's compiled build is not supported.** sqlglot suggests installing
+  `sqlglot[c]` (package `sqlglotc`, mypyc-compiled). The package's parser
+  subclasses sqlglot's parser and generator, which compiled classes forbid, so
+  with `sqlglotc` installed the app refuses to start (`ImproperlyConfigured`
+  from `McpSqlConfig.ready()` — the whole Django project, not just the MCP
+  endpoint) and names the remedy: `pip uninstall sqlglotc`. Install plain
+  `sqlglot`.
 
 ### Dropping into an existing app with an older pinned DRF
 

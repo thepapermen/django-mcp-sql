@@ -61,6 +61,47 @@ def test_own_helpers_shadow_nothing(part, own):
     assert own <= set(_defined(part)), sorted(own - set(_defined(part)))
 
 
+def _named(parameters) -> list[inspect.Parameter]:
+    return [
+        p
+        for name, p in parameters.items()
+        if name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+    ]
+
+
+def _signature_problems(
+    ours: inspect.Signature, theirs: inspect.Signature
+) -> list[str]:
+    """What breaks when sqlglot calls our override as it calls its own:
+    - each parameter we name is sqlglot's parameter at the same position,
+      under the same name (an inserted, removed or renamed one upstream
+      would otherwise bind an argument to the wrong name, or to none);
+    - each parameter sqlglot has that we do not name reaches us through
+      `*args` (any) or `**kwargs` (passed by keyword: sqlglot passes these
+      by keyword, a positional call remains this test's blind spot)."""
+    problems = []
+    ours_named, theirs_named = _named(ours.parameters), _named(theirs.parameters)
+    for position, parameter in enumerate(ours_named):
+        if position >= len(theirs_named):
+            problems.append(f"{parameter.name!r} is not sqlglot's")
+        elif theirs_named[position].name != parameter.name:
+            problems.append(
+                f"position {position}: ours {parameter.name!r}, "
+                f"sqlglot's {theirs_named[position].name!r}"
+            )
+    kinds = {p.kind for p in ours.parameters.values()}
+    for parameter in theirs_named[len(ours_named) :]:
+        if inspect.Parameter.VAR_POSITIONAL in kinds:
+            continue
+        if (
+            inspect.Parameter.VAR_KEYWORD in kinds
+            and parameter.kind is not parameter.POSITIONAL_ONLY
+        ):
+            continue
+        problems.append(f"sqlglot's {parameter.name!r} does not reach the override")
+    return problems
+
+
 @pytest.mark.parametrize(("part", "own"), _PARTS, ids=[p for p, _ in _PARTS])
 def test_overridden_methods_take_what_sqlglot_passes(part, own):
     base = getattr(Postgres, part)
@@ -68,19 +109,41 @@ def test_overridden_methods_take_what_sqlglot_passes(part, own):
     for name, attr in _defined(part).items():
         if name in own or not inspect.isfunction(attr):
             continue
-        ours = inspect.signature(attr).parameters
-        if any(p.kind is p.VAR_KEYWORD for p in ours.values()):
-            continue
-        theirs = inspect.signature(getattr(base, name)).parameters
-        missing = [
-            p
-            for p in theirs
-            if p not in ours
-            and theirs[p].kind not in (theirs[p].VAR_POSITIONAL, theirs[p].VAR_KEYWORD)
-        ]
-        if missing:
-            mismatched.append(f"{name}: {missing}")
+        problems = _signature_problems(
+            inspect.signature(attr), inspect.signature(getattr(base, name))
+        )
+        mismatched += [f"{name}: {problem}" for problem in problems]
     assert mismatched == [], mismatched
+
+
+def _sig(text: str) -> inspect.Signature:
+    namespace: dict = {}
+    exec(f"def f{text}: pass", namespace)  # noqa: S102 — fixed test strings
+    return inspect.signature(namespace["f"])
+
+
+@pytest.mark.parametrize(
+    ("theirs", "problem"),
+    [
+        # an upstream parameter inserted before ones we name
+        ("(self, new, check_func=False, schema=False)", "position 0"),
+        # renamed upstream
+        ("(self, check=False, schema=False)", "position 0"),
+        # removed upstream: we still name it
+        ("(self, check_func=False)", "'schema' is not sqlglot's"),
+    ],
+)
+def test_the_signature_rule_catches(theirs, problem):
+    ours = _sig("(self, check_func=False, schema=False, **kwargs)")
+    assert any(problem in p for p in _signature_problems(ours, _sig(theirs)))
+
+
+def test_the_signature_rule_accepts_forwarded_extras():
+    ours = _sig("(self, this, *args, **kwargs)")
+    assert _signature_problems(ours, _sig("(self, this, a=1, *, b=2)")) == []
+    keywords = _sig("(self, this, **kwargs)")
+    assert _signature_problems(keywords, _sig("(self, this, a=1)")) == []
+    assert _signature_problems(keywords, _sig("(self, this, a, /)")) != []
 
 
 def test_the_tokenizer_is_sqlglots_own():

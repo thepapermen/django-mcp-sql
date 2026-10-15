@@ -1108,9 +1108,10 @@ def _executed(limit: str) -> str:
 class TestValidationScales:
     """Validation runs in Python before any SQL reaches Postgres, so
     `statement_timeout` does not bound it. Scope resolution for qualified
-    columns cost about n**3 for n CTEs referenced n times each (an 18 KB
-    query took about 50 s; kubedo8 on #5). 8 times the query must cost far
-    less than the 64 times a quadratic would; the best of three runs."""
+    columns cost about n**3 for n CTEs referenced n times each (20 KB: about
+    11 s to validate, as long again to render; kubedo8 on #5), and deep
+    chains cost depth**2. 8 times the query must cost far less than the 64
+    times a quadratic would; the best of three runs."""
 
     _COLUMNS = {"auth_permission": frozenset({"id", "name"})}
 
@@ -1156,6 +1157,102 @@ class TestValidationScales:
         small, large = self._seconds(250, self._wide), self._seconds(2000, self._wide)
         assert large < self._CEILING, large
         assert large < 24 * small, (small, large)
+
+    # sqlglot builds these as one long branch, a level per term: every
+    # column, table or `x.f` walked to the root (Opus, review round 4).
+    _CHAINS = {
+        "plus": lambda n: (
+            "SELECT " + " + ".join(["t.id"] * n) + " AS s FROM auth_permission t"  # noqa: S608
+        ),
+        "and": lambda n: (
+            "SELECT t.id FROM auth_permission t WHERE "  # noqa: S608
+            + " AND ".join(f"t.id > {i}" for i in range(n))
+        ),
+        "union": lambda n: " UNION ALL ".join(
+            ["SELECT t.id FROM auth_permission t"] * n
+        ),
+        "exists": lambda n: (
+            "SELECT t.id FROM auth_permission t WHERE "  # noqa: S608
+            + " AND ".join(
+                ["EXISTS (SELECT 1 FROM auth_permission u WHERE u.id = t.id)"] * n
+            )
+        ),
+    }
+
+    # Each needs one of the scope memos to stay linear: a wide derived table
+    # read by many qualified columns (a FROM item's columns), many CTEs read
+    # from many FROM items (a WITH's name index), one CTE reference with a
+    # long alias list read by many columns (the reference's renames).
+    _WIDE = {
+        "derived": lambda n: (
+            "SELECT "  # noqa: S608
+            + ", ".join(f"s.c{i}" for i in range(n))
+            + " FROM (SELECT "
+            + ", ".join(f"1 AS c{i}" for i in range(n))
+            + ") s"
+        ),
+        "ctes": lambda n: (
+            "WITH "  # noqa: S608
+            + ", ".join(f"c{i} AS (SELECT 1 AS a)" for i in range(n))
+            + " SELECT 1 AS one FROM "
+            + ", ".join(f"c{i}" for i in range(n))
+        ),
+        "renamed": lambda n: (
+            "WITH c AS (SELECT "  # noqa: S608
+            + ", ".join(["1"] * n)
+            + ") SELECT "
+            + ", ".join(f"x.a{i}" for i in range(n))
+            + " FROM c AS x("
+            + ", ".join(f"a{i}" for i in range(n))
+            + ")"
+        ),
+    }
+
+    @pytest.mark.parametrize(
+        ("shape", "n"), [("derived", 250), ("ctes", 250), ("renamed", 250)]
+    )
+    def test_wide_scopes(self, shape, n):
+        build = self._WIDE[shape]
+        small, large = self._seconds(n, build), self._seconds(8 * n, build)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+    @pytest.mark.parametrize(
+        ("shape", "n"), [("plus", 500), ("and", 400), ("union", 250), ("exists", 200)]
+    )
+    def test_deep_chains(self, shape, n):
+        build = self._CHAINS[shape]
+        small, large = self._seconds(n, build), self._seconds(8 * n, build)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+
+class TestScopeMemo:
+    """The scope memo lives for one validation only (it holds the tree's
+    nodes) and a nested one shares the outer."""
+
+    def test_gone_after_a_validation(self):
+        from mcp_sql.parser import _SCOPE_MEMO
+
+        parse_and_validate("SELECT t.id FROM auth_group t", allowed_tables=ALLOWED)
+        assert _SCOPE_MEMO.get() is None
+        with pytest.raises(QueryRejectedError):
+            parse_and_validate(
+                "SELECT t.to_jsonb FROM auth_group t", allowed_tables=ALLOWED
+            )
+        assert _SCOPE_MEMO.get() is None
+
+    def test_a_nested_memo_shares_the_outer(self):
+        from mcp_sql.parser import _SCOPE_MEMO
+        from mcp_sql.parser import _scope_memo
+
+        with _scope_memo():
+            outer = _SCOPE_MEMO.get()
+            assert outer is not None
+            with _scope_memo():
+                assert _SCOPE_MEMO.get() is outer
+            assert _SCOPE_MEMO.get() is outer
+        assert _SCOPE_MEMO.get() is None
 
 
 class TestExtractLimit:

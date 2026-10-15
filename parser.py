@@ -2869,7 +2869,7 @@ def _attribute_calls_in(ast: exp.Query, table_columns: RelationColumns) -> list[
     for dot in ast.find_all(exp.Dot):
         if not isinstance(dot.expression, exp.Identifier):
             continue
-        if dot.find_ancestor(exp.DataType) is not None:
+        if _ancestors("types", dot.parent, lambda n: isinstance(n, exp.DataType)):
             continue
         if not _is_field_read(dot, table_columns):
             names.append(dot.expression.name.lower())
@@ -2966,14 +2966,45 @@ def _name_key(identifier: exp.Expression) -> str:
     return str(identifier.name).translate(_ASCII_LOWER)
 
 
-def _scopes(node: exp.Expression) -> list[exp.Select]:
-    selects = []
-    scope = node.parent
-    while scope is not None:
-        if isinstance(scope, exp.Select):
-            selects.append(scope)
-        scope = scope.parent
+def _scopes(node: exp.Expression) -> tuple[exp.Select, ...]:
+    """The SELECTs enclosing `node`, innermost first."""
+    selects: tuple[exp.Select, ...] = _ancestors(
+        "selects", node.parent, lambda n: isinstance(n, exp.Select)
+    )
     return selects
+
+
+def _ancestors(kind: str, node: Any, keep: Callable[[Any], bool]) -> tuple[Any, ...]:
+    """`node` and its ancestors that `keep` accepts, innermost first.
+
+    Within a validation each node's answer is built once from its parent's
+    (`_SCOPE_MEMO`), so asking for every node of a deep tree is linear:
+    sqlglot builds `a + b + ...`, `x AND y AND ...` and `UNION ALL` chains as
+    one long branch, tens of thousands of levels deep in 1 MiB, and walking
+    to the root from each of their nodes cost depth**2 (Opus, review round
+    4: about half an hour for one request, before any SQL ran)."""
+    memo = _SCOPE_MEMO.get()
+    if memo is None:
+        found = []
+        while node is not None:
+            if keep(node):
+                found.append(node)
+            node = node.parent
+        return tuple(found)
+    path = []
+    above: tuple[Any, ...] = ()
+    while node is not None:
+        hit = memo.get((kind, id(node)))
+        if hit is not None:
+            above = hit[1]
+            break
+        path.append(node)
+        node = node.parent
+    for walked in reversed(path):
+        if keep(walked):
+            above = (walked, *above)
+        memo[(kind, id(walked))] = (walked, above)
+    return above
 
 
 def _is_column_of(
@@ -3331,8 +3362,9 @@ def _cte_named_of(table: exp.Table) -> exp.CTE | None:
         return None  # `public.t` is the table, whatever CTE `t` exists
     key = _name_key(table.this)
     inside: exp.Expression | None = None
-    node = table.parent
-    while node is not None:
+    # Only a CTE, or a node holding CTEs, does anything below: the ancestors
+    # in between are skipped (`_ancestors`, linear over a deep tree).
+    for node in _ancestors("cte_scopes", table.parent, _holds_or_is_cte):
         ctes = getattr(node, "ctes", ())
         if ctes:
             first, positions = _cte_index(node, ctes)
@@ -3345,8 +3377,11 @@ def _cte_named_of(table: exp.Table) -> exp.CTE | None:
                 return found
         if isinstance(node, exp.CTE):
             inside = node
-        node = node.parent
     return None
+
+
+def _holds_or_is_cte(node: Any) -> bool:
+    return isinstance(node, exp.CTE) or bool(getattr(node, "ctes", ()))
 
 
 def _cte_index(
