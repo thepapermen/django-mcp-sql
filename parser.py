@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
 import sqlglot
@@ -2986,6 +2987,10 @@ def _is_column_of(
     for select in _scopes(node):
         source = _scope_of(select, table_columns).items.get(item)
         if source is not None:
+            reference = _cte_reference(source)
+            if reference is not None:
+                shape, renamed, start = reference
+                return name in renamed or shape.last.get(name, -1) >= start
             certain, _possible = _item_columns(source, table_columns)
             return name in certain
     return False
@@ -3037,26 +3042,69 @@ def _scope_of(select: exp.Select, table_columns: RelationColumns) -> _Scope:
 
 
 def _scope_summary(select: exp.Select, table_columns: RelationColumns) -> _Scope:
-    items: dict[str, exp.Expression] = {}
-    certain: set[str] = set()
-    possible: set[str] | None = set()
-    unlisted = False
+    """Every set grows in place, and a CTE referenced many times adds its
+    columns once (from the first position any reference leaves unrenamed):
+    the work is linear in the query, not references times columns."""
+    builder = _ScopeBuilder()
     for source in _from_items(select):
         key = _from_item_key(source)
         if key is not None:
-            items.setdefault(key, source)
+            builder.items.setdefault(key, source)
+        reference = _cte_reference(source)
+        if reference is not None:
+            builder.add_cte_reference(*reference)
+        else:
+            builder.add_item(source, table_columns)
+    return builder.finish()
+
+
+@dataclass
+class _ScopeBuilder:
+    items: dict[str, exp.Expression] = field(default_factory=dict)
+    certain: set[str] = field(default_factory=set)
+    possible: set[str] | None = field(default_factory=set)
+    unlisted: bool = False
+    # Per CTE (by identity): its shape and the first position any of its
+    # references in this scope leaves unrenamed.
+    cte_suffixes: dict[int, tuple["_CteShape", int]] = field(default_factory=dict)
+
+    def add_cte_reference(
+        self, shape: "_CteShape", renamed: frozenset[str], start: int
+    ) -> None:
+        """`_renamed` over the CTE's columns, without copying them here."""
+        self.certain |= renamed
+        if shape.columns is None or shape.unknown_from >= start:
+            self.possible = None
+        elif self.possible is not None:
+            self.possible |= renamed
+        known = self.cte_suffixes.get(id(shape))
+        if known is None or start < known[1]:
+            self.cte_suffixes[id(shape)] = (shape, start)
+
+    def add_item(self, source: exp.Expression, table_columns: RelationColumns) -> None:
         item_certain, item_possible = _item_columns(source, table_columns)
-        certain |= item_certain
-        if possible is not None:
-            possible = None if item_possible is None else possible | item_possible
+        self.certain |= item_certain
+        if item_possible is None:
+            self.possible = None
+        elif self.possible is not None:
+            self.possible |= item_possible
         if not isinstance(source, (exp.Subquery, exp.Table, exp.Values)):
-            unlisted = True
-    return _Scope(
-        items=items,
-        certain=frozenset(certain),
-        possible=None if possible is None else frozenset(possible),
-        unlisted=unlisted,
-    )
+            self.unlisted = True
+
+    def finish(self) -> "_Scope":
+        for shape, start in self.cte_suffixes.values():
+            if shape.columns is None:
+                continue
+            suffix = {name for name in shape.columns[start:] if name is not None}
+            self.certain |= suffix
+            if self.possible is not None:
+                self.possible |= suffix
+        return _Scope(
+            items=self.items,
+            certain=frozenset(self.certain),
+            possible=None if self.possible is None else frozenset(self.possible),
+            unlisted=self.unlisted,
+        )
 
 
 def _from_items(select: exp.Select) -> list[exp.Expression]:
@@ -3182,6 +3230,65 @@ def _renamed(renamed: list[str], columns: list[str | None] | None) -> _ItemColum
     names = renamed + columns[len(renamed) :]
     certain = frozenset(name for name in names if name is not None)
     return certain, None if None in names else certain
+
+
+@dataclass(frozen=True)
+class _CteShape:
+    """A CTE's output columns (`_cte_columns`), indexed once per validation:
+    `last`, each name's last position; `unknown_from`, the last position of
+    a name not known (-1: none). A reference renaming the first k columns
+    (`c AS x(a, b)`) has the column `n` iff `n` is one of its new names or
+    `last[n] >= k`, and has a name not known iff `unknown_from >= k`."""
+
+    columns: list[str | None] | None
+    last: dict[str, int]
+    unknown_from: int
+
+
+def _cte_shape(cte: exp.CTE) -> _CteShape:
+    shape: _CteShape = _memoized("cte_shape", cte, lambda: _cte_shape_of(cte))
+    return shape
+
+
+def _cte_shape_of(cte: exp.CTE) -> _CteShape:
+    columns = _cte_columns(cte)
+    last: dict[str, int] = {}
+    unknown_from = -1
+    for position, name in enumerate(columns or ()):
+        if name is None:
+            unknown_from = position
+        else:
+            last[name] = position
+    return _CteShape(columns=columns, last=last, unknown_from=unknown_from)
+
+
+_CteReference = tuple["_CteShape", frozenset[str], int]
+
+
+def _cte_reference(source: exp.Expression) -> _CteReference | None:
+    """For a FROM item naming a CTE: the CTE's shape, the names the
+    item's alias list renames its first columns to, and how many columns
+    that list renames (its length: the CTE's own names count from there);
+    else `None`."""
+    reference: _CteReference | None = _memoized(
+        "cte_reference", source, lambda: _cte_reference_of(source)
+    )
+    return reference
+
+
+def _cte_reference_of(source: exp.Expression) -> _CteReference | None:
+    if not (isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier)):
+        return None
+    cte = _cte_named(source)
+    if cte is None:
+        return None
+    alias = source.args.get("alias")
+    renamed = (
+        [_name_key(column) for column in alias.columns]
+        if isinstance(alias, exp.TableAlias)
+        else []
+    )
+    return _cte_shape(cte), frozenset(renamed), len(renamed)
 
 
 def _cte_columns(cte: exp.CTE) -> list[str | None] | None:

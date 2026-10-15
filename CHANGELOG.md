@@ -361,8 +361,10 @@ below precisely because they do **not** announce themselves.
   to render). It all ran in Python before any SQL reached Postgres, so
   `statement_timeout` did not bound it, and any token holder could pin a
   worker. Each SELECT's scope and each CTE lookup are now worked out once
-  per validation: the same 20 KB query takes 0.15 s, and the cost grows
-  about linearly. A scaling test guards it.
+  per validation, and a CTE referenced many times contributes its columns
+  once (one wide CTE referenced from every FROM item cost references times
+  columns: 31 KB, 6.5 s, now 0.5 s): the same 20 KB query takes 0.2 s, and
+  the cost grows about linearly. Scaling tests guard both shapes.
 - **Security: a NUL character or an unpaired UTF-16 surrogate in the SQL
   suppressed its audit row.** Postgres refuses NUL in a `text` column, so the
   `MCPQueryLog` insert failed (logged only) and a query carrying one in a

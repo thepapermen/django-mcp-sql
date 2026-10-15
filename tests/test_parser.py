@@ -1124,8 +1124,16 @@ class TestValidationScales:
         items = ", ".join(f"c{i}" for i in range(n))
         return f"WITH {ctes} SELECT {refs} FROM {items}"  # noqa: S608
 
-    def _seconds(self, n: int) -> float:
-        sql = self._query(n)
+    @staticmethod
+    def _wide(n: int) -> str:
+        # One CTE of n columns referenced n/2 times (GLM, review round 4):
+        # each reference copied the CTE's columns, n * n/2 work.
+        projection = ", ".join(["1"] * n)
+        items = ", ".join(f"c x{i}" for i in range(n // 2))
+        return f"WITH c AS (SELECT {projection}) SELECT x0.column1 FROM {items}"  # noqa: S608
+
+    def _seconds(self, n: int, shape=None) -> float:
+        sql = (shape or self._query)(n)
         runs = []
         for _ in range(3):
             start = time.perf_counter()
@@ -1141,6 +1149,11 @@ class TestValidationScales:
 
     def test_ctes_referenced_by_qualified_columns(self):
         small, large = self._seconds(30), self._seconds(240)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
+
+    def test_one_wide_cte_referenced_many_times(self):
+        small, large = self._seconds(250, self._wide), self._seconds(2000, self._wide)
         assert large < self._CEILING, large
         assert large < 24 * small, (small, large)
 
