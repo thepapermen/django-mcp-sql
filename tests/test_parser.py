@@ -8,6 +8,7 @@ over-reject normal SELECT shapes.
 """
 
 import re
+import time
 
 import pytest
 from mcp_sql.parser import QueryRejectedError
@@ -1102,6 +1103,46 @@ def _executed(limit: str) -> str:
     sql = f"SELECT id FROM auth_permission {limit}"  # noqa: S608
     parsed = parse_and_validate(sql, allowed_tables=ALLOWED)
     return render_for_execution(parsed.ast, 11, allowed_tables=ALLOWED)
+
+
+class TestValidationScales:
+    """Validation runs in Python before any SQL reaches Postgres, so
+    `statement_timeout` does not bound it. Scope resolution for qualified
+    columns cost about n**3 for n CTEs referenced n times each (an 18 KB
+    query took about 50 s; kubedo8 on #5). 8 times the query must cost far
+    less than the 64 times a quadratic would; the best of three runs."""
+
+    _COLUMNS = {"auth_permission": frozenset({"id", "name"})}
+
+    @staticmethod
+    def _query(n: int) -> str:
+        ctes = ", ".join(
+            f"c{i} AS (SELECT id AS a FROM auth_permission)"  # noqa: S608
+            for i in range(n)
+        )
+        refs = ", ".join(f"c{j % n}.a AS r{j}" for j in range(4 * n))
+        items = ", ".join(f"c{i}" for i in range(n))
+        return f"WITH {ctes} SELECT {refs} FROM {items}"  # noqa: S608
+
+    def _seconds(self, n: int) -> float:
+        sql = self._query(n)
+        runs = []
+        for _ in range(3):
+            start = time.perf_counter()
+            parse_and_validate(
+                sql, allowed_tables={"auth_permission"}, table_columns=self._COLUMNS
+            )
+            runs.append(time.perf_counter() - start)
+            if runs[-1] > self._CEILING:
+                break  # already failing: no need to wait for more runs
+        return min(runs)
+
+    _CEILING = 5.0
+
+    def test_ctes_referenced_by_qualified_columns(self):
+        small, large = self._seconds(30), self._seconds(240)
+        assert large < self._CEILING, large
+        assert large < 24 * small, (small, large)
 
 
 class TestExtractLimit:

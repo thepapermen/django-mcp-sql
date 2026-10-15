@@ -343,6 +343,15 @@ below precisely because they do **not** announce themselves.
   in the transaction that saves the tokens: the other exchange is refused
   with nothing minted. Tokens already issued from a code presented again are
   still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **Security: validating a query could take minutes of CPU.** Resolving
+  qualified columns (`c1.a`) asked every FROM item in scope, and each of
+  those scanned every CTE, for every reference: about n**3 for a query of n
+  CTEs referenced n times each (20 KB: 11 s to validate, and as long again
+  to render). It all ran in Python before any SQL reached Postgres, so
+  `statement_timeout` did not bound it, and any token holder could pin a
+  worker. Each SELECT's scope and each CTE lookup are now worked out once
+  per validation: the same 20 KB query takes 0.15 s, and the cost grows
+  about linearly. A scaling test guards it.
 - **Security: a NUL character or an unpaired UTF-16 surrogate in the SQL
   suppressed its audit row.** Postgres refuses NUL in a `text` column, so the
   `MCPQueryLog` insert failed (logged only) and a query carrying one in a

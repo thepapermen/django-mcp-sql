@@ -2,11 +2,14 @@
 no Django imports). See `docs/architecture.md` for design /
 "Watch out" / parser-check ordering rules."""
 
+import contextlib
 import itertools
 import re
 import string
 from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -1798,13 +1801,14 @@ def _checked(
     `PARSE_ERROR` (see `parse_and_validate`)."""
     try:
         _refuse_unsendable_text(raw_sql)
-        return _parse_and_validate(
-            raw_sql,
-            allowed_tables=allowed_tables,
-            ban_select_star=ban_select_star,
-            normalize=normalize,
-            table_columns=table_columns,
-        )
+        with _scope_memo():
+            return _parse_and_validate(
+                raw_sql,
+                allowed_tables=allowed_tables,
+                ban_select_star=ban_select_star,
+                normalize=normalize,
+                table_columns=table_columns,
+            )
     except QueryRejectedError:
         raise
     except Exception as exc:
@@ -2821,7 +2825,18 @@ def _attribute_calls(ast: exp.Query, table_columns: RelationColumns) -> list[str
     - `(t.*).f` where `t` is such a FROM item with a column `f`.
     Everything else counts as a call: `(expr).f`, `t.c.f`. A name inside a
     type (`pg_catalog.pg_lsn`) is not a call. Quoted identifiers compare
-    case-sensitively, unquoted ones folded (`_name_key`)."""
+    case-sensitively, unquoted ones folded (`_name_key`).
+
+    Each SELECT's scope and each table's CTE are worked out once per
+    validation (`_scope_memo`): every qualified column asked about every
+    FROM item in scope, and each of those scanned every CTE, so a query of
+    n CTEs and as many references cost about n**3 in Python before any SQL
+    ran (`statement_timeout` does not bound it)."""
+    with _scope_memo():
+        return _attribute_calls_in(ast, table_columns)
+
+
+def _attribute_calls_in(ast: exp.Query, table_columns: RelationColumns) -> list[str]:
     names = []
     for col in ast.find_all(exp.Column):
         qualifier = col.args.get("table")
@@ -2951,7 +2966,7 @@ def _is_column_of(
     """True if the FROM item `item`, in scope at `node` (the innermost
     match), provably has a column `name`."""
     for select in _scopes(node):
-        source = _from_item(select, item)
+        source = _scope_of(select, table_columns).items.get(item)
         if source is not None:
             certain, _possible = _item_columns(source, table_columns)
             return name in certain
@@ -2971,16 +2986,59 @@ def _is_column_name_in_scope(
     where Postgres reads the FROM item `t` anyway) only an item whose
     columns cannot be listed at all (a function in FROM) counts."""
     for select in _scopes(node):
-        for source in _from_items(select):
-            certain, possible = _item_columns(source, table_columns)
-            if strict:
-                if possible is None or name in possible:
-                    return True
-            elif name in certain or not isinstance(
-                source, (exp.Subquery, exp.Table, exp.Values)
-            ):
+        scope = _scope_of(select, table_columns)
+        if strict:
+            if scope.possible is None or name in scope.possible:
                 return True
+        elif name in scope.certain or scope.unlisted:
+            return True
     return False
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """One SELECT's FROM items, summed up once (`_scope_of`).
+
+    `items`: each FROM item by the name it is in scope under (the first, as
+    `_from_item` finds it). `certain` / `possible`: the union of the items'
+    certain / possible column names (`possible` is `None` when any item's
+    names are not all known). `unlisted`: some item's columns cannot be
+    listed at all (a function in FROM)."""
+
+    items: dict[str, exp.Expression]
+    certain: frozenset[str]
+    possible: frozenset[str] | None
+    unlisted: bool
+
+
+def _scope_of(select: exp.Select, table_columns: RelationColumns) -> _Scope:
+    scope: _Scope = _memoized(
+        "scope", select, lambda: _scope_summary(select, table_columns)
+    )
+    return scope
+
+
+def _scope_summary(select: exp.Select, table_columns: RelationColumns) -> _Scope:
+    items: dict[str, exp.Expression] = {}
+    certain: set[str] = set()
+    possible: set[str] | None = set()
+    unlisted = False
+    for source in _from_items(select):
+        key = _from_item_key(source)
+        if key is not None:
+            items.setdefault(key, source)
+        item_certain, item_possible = _item_columns(source, table_columns)
+        certain |= item_certain
+        if possible is not None:
+            possible = None if item_possible is None else possible | item_possible
+        if not isinstance(source, (exp.Subquery, exp.Table, exp.Values)):
+            unlisted = True
+    return _Scope(
+        items=items,
+        certain=frozenset(certain),
+        possible=None if possible is None else frozenset(possible),
+        unlisted=unlisted,
+    )
 
 
 def _from_items(select: exp.Select) -> list[exp.Expression]:
@@ -2990,17 +3048,16 @@ def _from_items(select: exp.Select) -> list[exp.Expression]:
     return sources
 
 
-def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
-    for source in _from_items(select):
-        alias = source.args.get("alias")
-        identifier = (
-            alias.this
-            if isinstance(alias, exp.TableAlias) and alias.this is not None
-            else source.this
-        )
-        if isinstance(identifier, exp.Identifier) and _name_key(identifier) == item:
-            found: exp.Expression = source
-            return found
+def _from_item_key(source: exp.Expression) -> str | None:
+    """The name a FROM item is in scope under: its alias, else its own."""
+    alias = source.args.get("alias")
+    identifier = (
+        alias.this
+        if isinstance(alias, exp.TableAlias) and alias.this is not None
+        else source.this
+    )
+    if isinstance(identifier, exp.Identifier):
+        return _name_key(identifier)
     return None
 
 
@@ -3009,7 +3066,48 @@ def _from_item(select: exp.Select, item: str) -> exp.Expression | None:
 _ItemColumns = tuple[frozenset[str], frozenset[str] | None]
 
 
+# Scope answers computed once per validation (`_checked`), keyed by node
+# identity: a FROM item's columns, a SELECT's scope, a table's CTE. The
+# checks read the tree and change nothing (only parsing and rendering do),
+# so an answer cannot go stale; each entry keeps its node alive, so no id
+# is reused. Outside a validation nothing is cached.
+_SCOPE_MEMO: ContextVar[dict[tuple[str, int], tuple[object, Any]] | None] = ContextVar(
+    "_SCOPE_MEMO", default=None
+)
+
+
+@contextlib.contextmanager
+def _scope_memo() -> Iterator[None]:
+    if _SCOPE_MEMO.get() is not None:
+        yield  # already inside one: share it
+        return
+    token = _SCOPE_MEMO.set({})
+    try:
+        yield
+    finally:
+        _SCOPE_MEMO.reset(token)
+
+
+def _memoized(kind: str, node: object, compute: Callable[[], Any]) -> Any:
+    memo = _SCOPE_MEMO.get()
+    if memo is None:
+        return compute()
+    key = (kind, id(node))
+    if key not in memo:
+        memo[key] = (node, compute())
+    return memo[key][1]
+
+
 def _item_columns(
+    source: exp.Expression, table_columns: RelationColumns
+) -> _ItemColumns:
+    result: _ItemColumns = _memoized(
+        "item_columns", source, lambda: _item_columns_of(source, table_columns)
+    )
+    return result
+
+
+def _item_columns_of(
     source: exp.Expression, table_columns: RelationColumns
 ) -> _ItemColumns:
     alias = source.args.get("alias")
@@ -3099,26 +3197,51 @@ def _cte_key(cte: exp.CTE) -> str | None:
 def _cte_named(table: exp.Table) -> exp.CTE | None:
     """The CTE an unqualified `table` names, in scope for it (see
     `_resolves_to_cte`); names compare as Postgres compares them."""
+    found: exp.CTE | None = _memoized("cte_named", table, lambda: _cte_named_of(table))
+    return found
+
+
+def _cte_named_of(table: exp.Table) -> exp.CTE | None:
     if table.args.get("db") is not None or table.args.get("catalog") is not None:
         return None  # `public.t` is the table, whatever CTE `t` exists
     key = _name_key(table.this)
     inside: exp.Expression | None = None
     node = table.parent
     while node is not None:
-        ctes = list(getattr(node, "ctes", ()))
-        position = next((i for i, cte in enumerate(ctes) if cte is inside), None)
-        if position is not None:
+        ctes = getattr(node, "ctes", ())
+        if ctes:
+            first, positions = _cte_index(node, ctes)
+            index = first.get(key)
             # Inside a (non-recursive) CTE's body only the CTEs before it are
             # visible: `WITH t AS (SELECT ... FROM t)` reads the table `t`.
-            ctes = ctes[:position]
-        for cte in ctes:
-            if _cte_key(cte) == key:
-                found: exp.CTE = cte
+            position = positions.get(id(inside))
+            if index is not None and (position is None or index < position):
+                found: exp.CTE = ctes[index]
                 return found
         if isinstance(node, exp.CTE):
             inside = node
         node = node.parent
     return None
+
+
+def _cte_index(
+    node: object, ctes: list[exp.CTE]
+) -> tuple[dict[str, int], dict[int, int]]:
+    """For a node's CTE list: the index of the first CTE of each name, and
+    each CTE's index by identity."""
+    index: tuple[dict[str, int], dict[int, int]] = _memoized(
+        "cte_index", node, lambda: _cte_index_of(ctes)
+    )
+    return index
+
+
+def _cte_index_of(ctes: list[exp.CTE]) -> tuple[dict[str, int], dict[int, int]]:
+    first: dict[str, int] = {}
+    for i, cte in enumerate(ctes):
+        key = _cte_key(cte)
+        if key is not None:
+            first.setdefault(key, i)
+    return first, {id(cte): i for i, cte in enumerate(ctes)}
 
 
 def _output_columns(query: exp.Expression) -> list[str | None] | None:
