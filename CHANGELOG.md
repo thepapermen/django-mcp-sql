@@ -378,6 +378,12 @@ below precisely because they do **not** announce themselves.
   stores any NUL as U+2400 (␀) and any unpaired surrogate as U+FFFD, and a
   value the driver cannot adapt is logged like a database error instead of
   escaping.
+- **An `ALLOWED_MODELS` entry Django cannot resolve left no audit row.**
+  Boot defers model resolution to the query, and the whitelist was resolved
+  before the first audited step: `run_query`, `list_tables` and
+  `describe_table` raised `LookupError` with no `MCPQueryLog` row. `run_query`
+  now writes a `misconfigured` row and raises `ExecutorMisconfiguredError`,
+  like a missing read alias; the two metadata tools write their row first.
 - **A `LIMIT` of over 4300 digits escaped `run_query` with no audit row.**
   Python 3.11+ refuses `int()` of so long a digit string with a
   `ValueError`, raised before any handler. Such a `LIMIT` now runs capped

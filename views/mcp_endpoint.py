@@ -291,8 +291,9 @@ def _build_mcp_server(
         # Resolution is pure-Python (no DB); the audit row is the only ORM
         # write, so this tool is `async def` + `sync_to_async` for the same
         # reason as `run_query` (a sync tool would trip Django's
-        # async-context guard on the insert).
-        tables = sorted(grants.declared_tables(profile).values())
+        # async-context guard on the insert). Audited first: an
+        # `ALLOWED_MODELS` entry Django cannot resolve raises below, after the
+        # row is written.
         await sync_to_async(
             _close_conns_after(executor.audit_tool_call), thread_sensitive=False
         )(
@@ -303,7 +304,7 @@ def _build_mcp_server(
             client_ip=client_ip,
             client=client,
         )
-        return tables
+        return sorted(grants.declared_tables(profile).values())
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -320,10 +321,11 @@ def _build_mcp_server(
         tables not on the MCP whitelist — `pg_*` and other catalogs are
         unreachable.
         """
-        tables = grants.declared_tables(profile)
-        # Audit MUST precede the whitelist check: every call (hit or miss) is
-        # recorded with the requested table in `detail`, so a probe for a
-        # non-whitelisted name leaves a trail. `test_describe_table_rejects_
+        # Audit MUST precede the whitelist check (and the whitelist's
+        # resolution, which raises for an `ALLOWED_MODELS` entry Django cannot
+        # resolve): every call (hit or miss) is recorded with the requested
+        # table in `detail`, so a probe for a non-whitelisted name leaves a
+        # trail. `test_describe_table_rejects_
         # non_whitelisted` pins this ordering — moving the audit below the
         # early-return makes that test's `audited[0]` raise.
         await sync_to_async(
@@ -337,6 +339,7 @@ def _build_mcp_server(
             client=client,
             detail=f"describe_table({name!r})",
         )
+        tables = grants.declared_tables(profile)
         if name not in tables.values():
             return {"error": f"Table '{name}' is not on the MCP whitelist."}
         model_label = next(label for label, t in tables.items() if t == name)
