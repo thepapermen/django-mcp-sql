@@ -106,7 +106,14 @@ dependencies = [
     "oauthlib>=3.3.0,<5",
     # The parser is the security boundary and sqlglot bumps majors often
     # with breaking AST changes — deliberately the tightest cap; widen
-    # per-major only after the CI matrix proves it.
+    # per-major only after the CI matrix proves it. Within a major the
+    # parser still overrides private internals that move between minors:
+    # tests/test_sqlglot_internals.py fails on a renamed or reshaped one,
+    # CI tests the floor (30.7) and the newest 30.x, and runs weekly so a
+    # new minor is tested before consumers install it. The lexical-fidelity
+    # round trip keeps a missed change from executing anything unchecked.
+    # The compiled build (`sqlglot[c]`, `sqlglotc`) cannot be subclassed:
+    # startup refuses it (`McpSqlConfig.check_sql_dialect`).
     "sqlglot>=30.7,<31",
     # Official MCP SDK; the FastMCP / ToolAnnotations surface used is stable
     # within 1.x. Floor 1.28.1 so the range no longer admits 1.27.0/1.27.1

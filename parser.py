@@ -1718,6 +1718,24 @@ class ParsedQuery:
     referenced_tables: set[str]
 
 
+def dialect_problem() -> str | None:
+    """Why `FaithfulPostgres` cannot parse and render here, or `None`.
+
+    sqlglot's compiled build (the `sqlglot[c]` extra, package `sqlglotc`)
+    replaces `sqlglot.parser`, `sqlglot.generator` and the postgres dialect
+    with mypyc-compiled modules, which a Python class cannot subclass
+    (`TypeError: interpreted classes cannot inherit from compiled`): every
+    query would be refused as `parse_error`, and the audit log would read as
+    agents writing bad SQL. `McpSqlConfig.ready` refuses to start instead."""
+    try:
+        sqlglot.parse_one("SELECT 1", dialect=FaithfulPostgres).sql(
+            dialect=FaithfulPostgres
+        )
+    except Exception as exc:  # noqa: BLE001 — any failure is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def parse_and_validate(
     raw_sql: str,
     *,

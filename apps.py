@@ -8,6 +8,7 @@ class McpSqlConfig(AppConfig):
 
     def ready(self):
         self.validate_settings()
+        self.check_sql_dialect()
         self.warn_if_mfa_unconfigured()
         # Importing the modules wires their @receiver-decorated handlers
         # and @register-ed system checks.
@@ -34,6 +35,25 @@ class McpSqlConfig(AppConfig):
 
         validate_mcp_sql_settings(getattr(settings, "MCP_SQL", {}))
         validate_oauth2_validator_class()
+
+    @staticmethod
+    def check_sql_dialect():
+        """Refuse to start where the parser's dialect cannot be built
+        (`parser.dialect_problem`: sqlglot's compiled build), instead of
+        refusing every query as `parse_error`."""
+        from django.core.exceptions import ImproperlyConfigured
+        from mcp_sql.parser import dialect_problem
+
+        problem = dialect_problem()
+        if problem is not None:
+            msg = (
+                f"mcp_sql cannot build its SQL dialect ({problem}). sqlglot's "
+                "compiled build (the `sqlglot[c]` extra, package `sqlglotc`) "
+                "cannot be subclassed, so every query would be refused as "
+                "parse_error. Uninstall it (`pip uninstall sqlglotc`) and "
+                "depend on plain `sqlglot`."
+            )
+            raise ImproperlyConfigured(msg)
 
     @staticmethod
     def warn_if_mfa_unconfigured():

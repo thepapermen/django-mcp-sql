@@ -343,6 +343,17 @@ below precisely because they do **not** announce themselves.
   in the transaction that saves the tokens: the other exchange is refused
   with nothing minted. Tokens already issued from a code presented again are
   still not revoked (RFC 6749 §4.1.2's SHOULD).
+- **sqlglot's compiled build refused every query, silently.** With the
+  `sqlglot[c]` extra (package `sqlglotc`), which sqlglot recommends, the
+  parser's dialect cannot subclass sqlglot's compiled classes: every query,
+  even `SELECT name FROM auth_permission`, was refused as `parse_error`, and
+  the audit log read as agents writing bad SQL. Startup now refuses with
+  `ImproperlyConfigured` naming the remedy (`pip uninstall sqlglotc`); a CI
+  job installs the compiled build and checks the refusal.
+- **CI: sqlglot internals pinned, weekly run.** The parser overrides private
+  sqlglot methods that move between minor releases; a test now fails when
+  one is renamed or gains a parameter the override does not take, and CI
+  runs weekly so a new 30.x is tested before consumers install it.
 - **Security: validating a query could take minutes of CPU.** Resolving
   qualified columns (`c1.a`) asked every FROM item in scope, and each of
   those scanned every CTE, for every reference: about n**3 for a query of n

@@ -195,3 +195,29 @@ class TestMfaUnconfiguredStartupWarning:
         assert not any(
             "fail-closed default MFA checker" in r.message for r in caplog.records
         )
+
+
+class TestSqlDialectStartupCheck:
+    """`McpSqlConfig.ready()` refuses to start where the parser's dialect
+    cannot be built (sqlglot's compiled build, `sqlglotc`; CI's
+    `test-compiled-sqlglot` job runs the real thing)."""
+
+    def test_the_installed_sqlglot_builds_the_dialect(self):
+        from mcp_sql.parser import dialect_problem
+
+        assert dialect_problem() is None
+
+    def test_a_dialect_that_cannot_be_built_refuses_startup(self, monkeypatch):
+        from django.core.exceptions import ImproperlyConfigured
+        from mcp_sql.apps import McpSqlConfig
+        from mcp_sql.parser import FaithfulPostgres
+
+        def compiled(self, **opts):
+            msg = "interpreted classes cannot inherit from compiled"
+            raise TypeError(msg)
+
+        monkeypatch.setattr(FaithfulPostgres, "parser", compiled)
+        with pytest.raises(ImproperlyConfigured) as exc:
+            McpSqlConfig.check_sql_dialect()
+        assert "interpreted classes cannot inherit from compiled" in str(exc.value)
+        assert "pip uninstall sqlglotc" in str(exc.value)

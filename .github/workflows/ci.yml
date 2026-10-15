@@ -8,6 +8,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly on main: every job resolves the newest in-range dependencies, so a
+  # new sqlglot minor (the parser overrides its private internals; pinned by
+  # tests/test_sqlglot_internals.py and the functional corpus) is tested
+  # before a consumer installs it, not at the next push.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -217,6 +224,35 @@ jobs:
         env:
           MCP_SQL_TEST_POSTURE: minimal
         run: pytest --pyargs mcp_sql.tests --create-db --nomigrations
+
+  # sqlglot recommends its compiled build (the `sqlglot[c]` extra, package
+  # `sqlglotc`), whose classes the parser cannot subclass. The app must refuse
+  # to start saying so (`McpSqlConfig.check_sql_dialect`), not refuse every
+  # query as parse_error. No database needed: the check runs in `ready()`.
+  test-compiled-sqlglot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install package with sqlglot's compiled build
+        run: pip install -e '.[allauth,test]' 'sqlglot[c]'
+      - name: Startup refuses the compiled build
+        env:
+          DJANGO_SETTINGS_MODULE: mcp_sql.tests.settings
+        run: |
+          python - <<'EOF'
+          import django
+          from django.core.exceptions import ImproperlyConfigured
+          try:
+              django.setup()
+          except ImproperlyConfigured as exc:
+              assert "sqlglotc" in str(exc), exc
+              print("refused as expected:", exc)
+          else:
+              raise SystemExit("django.setup() accepted sqlglot's compiled build")
+          EOF
 
   # Single representative run (newest-resolve on the current Python) that
   # measures coverage and uploads it to Codecov. One job, not the whole matrix
