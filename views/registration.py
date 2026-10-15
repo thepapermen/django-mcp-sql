@@ -2,7 +2,7 @@
 JSON POST mints an `mcp-sql-<token>` Application with
 `skip_authorization=False` (so the client hits the consent screen,
 preventing silent-consent token theft) and loopback-only
-`redirect_uris` (`_is_loopback_redirect`, which `oauth.MCPOAuth2Validator`
+`redirect_uris` (`is_loopback_redirect`, which `oauth.MCPOAuth2Validator`
 re-applies at `/o/authorize/`) — the request's non-loopback URIs are filtered
 out and the registered subset echoed back, per RFC 7591 §3.2.1. See
 `docs/architecture.md` "OAuth surface" + the `docs/oauth.md` runbook for the
@@ -15,8 +15,6 @@ import secrets
 import unicodedata
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import urlparse
-from urllib.parse import urlsplit
 
 from django.http import HttpRequest
 from django.http import JsonResponse
@@ -30,19 +28,10 @@ from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import absolute_url
+from mcp_sql.redirects import is_loopback_redirect
 from oauth2_provider.models import Application
 
 logger = logging.getLogger(__name__)
-
-# RFC 8252 §7.3 specifies `127.0.0.1` and `[::1]` as the loopback hostnames
-# and "SHOULD NOT" `localhost`. In practice Anthropic's MCP SDK, Google's
-# native-app OAuth, GitHub's, etc. all use `http://localhost:<port>`, and
-# dynamically-registered Applications store the exact URI they provided,
-# so DOT's path-exact matching at `/o/authorize/` and `/o/token/` works
-# uniformly for any of the three hostnames. We accept all three rather
-# than break interop on a SHOULD that the broader OAuth ecosystem
-# universally ignores.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 # Upper bound on the redirect_uris an anonymous caller may submit. Whatever
 # survives the loopback filter is stored verbatim on the Application, so
@@ -477,76 +466,6 @@ def _error(
     )
 
 
-def _is_parseable_uri(uri: str) -> bool:
-    """True if `urllib` parses `uri`, port and host included, without raising.
-
-    `urlsplit` raises `ValueError` for a malformed bracketed host
-    (`http://[::1`, `http://[127.0.0.1]/cb`) and for a netloc that changes
-    under NFKC normalisation (a fullwidth solidus, U+2100); `.port` raises for a
-    port that is not a number in range. A URI that fails this is not
-    registered (it drops out of the loopback subset like any other URI we do
-    not support). In 0.1.0b5 the first two kinds raised inside the loopback
-    filter (an anonymous 500), and a loopback URI with a bad port
-    (`http://127.0.0.1:99999/cb`), whose port the filter never read, was
-    registered verbatim.
-    """
-    try:
-        parsed = urlsplit(uri)
-        _ = parsed.port, parsed.hostname, parsed.username, parsed.password
-    except ValueError:
-        return False
-    return True
-
-
-def _is_loopback_redirect(uri: str) -> bool:
-    if not uri.isascii() or not uri.isprintable():
-        # RFC 3986 URIs are printable ASCII. Anything else is either rewritten
-        # before parsing (`urlsplit` silently strips leading C0 controls, so
-        # the string we validated is not the one we would store) or rejected
-        # by the database on INSERT (NUL, lone surrogates — an uncaught 500).
-        # Refuse the whole class rather than enumerate the harmful characters.
-        # (`/o/register` refuses the invisible ones for the whole request
-        # first, `_requested_uris_error`; this predicate also judges the
-        # stored redirects `oauth.MCPOAuth2Validator` re-checks at
-        # `/o/authorize/`.)
-        return False
-    if not _is_parseable_uri(uri):
-        return False
-    parsed = urlparse(uri)
-    if parsed.scheme != "http":
-        # RFC 8252 §7.3 — loopback uses http (no CA issues certs for 127.0.0.1).
-        return False
-    if "@" in parsed.netloc:
-        # Reject a userinfo component (`http://user:pass@127.0.0.1/cb`): the
-        # host is still loopback, so the bare hostname check below would pass,
-        # but the userinfo is attacker-chosen and would be stored verbatim on
-        # the Application. Refuse it so a registered redirect URI is exactly
-        # scheme + host + port + path with nothing to smuggle. Test the raw
-        # `@`, not `.username`/`.password`: an EMPTY userinfo
-        # (`http://@127.0.0.1/cb`) parses to falsy `""`/`None` and would slip
-        # past (DOT 3.4.1+ tests for `@` in the netloc the same way).
-        return False
-    if uri.split() != [uri]:
-        # Whitespace smuggling. `Application.redirect_uris` stores the list as
-        # `" ".join(...)` and DOT matches with `redirect_uris.split()`, so ONE
-        # submitted string containing whitespace becomes TWO registered URIs.
-        # `urlparse("http://127.0.0.1/cb http://evil.example/steal")` reports
-        # hostname `127.0.0.1` — the host check below passes, the string is
-        # stored verbatim, and DOT then exact-matches `http://evil.example/
-        # steal` as a valid redirect for this client. That delivers the
-        # authorization code off-machine, defeating the whole reason loopback-
-        # only registration is safe; PKCE does not help, because the attacker
-        # registered the client and holds the verifier.
-        #
-        # `uri.split() != [uri]` is deliberately the same operation DOT
-        # performs, so this cannot drift from it — and it covers tab / newline
-        # / CR as well as the space (`str.split()` splits on all whitespace,
-        # and `urlparse` silently strips some of it while we store the raw
-        # value, which would otherwise hide the payload from the host check).
-        return False
-    return parsed.hostname in _LOOPBACK_HOSTS
-
-
 def _registered_grant_types(requested: list[str]) -> list[str]:
     """RFC 7591 §3.2.1: the supported subset of the requested grant types,
     which the response echoes — `refresh_token` only while the opt-in
@@ -644,7 +563,7 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
       stored, echoed or logged (a NUL or lone surrogate failed at the
       INSERT, an anonymous 500; invisible ones would spoof the audit trail);
     - whitespace inside an entry (a space included): a whitespace-smuggling
-      attempt (`_is_loopback_redirect`), never a callback a client uses.
+      attempt (`is_loopback_redirect`), never a callback a client uses.
 
     Everything else is judged per URI by the subset filter: a URI that is
     well-formed text but not a valid loopback callback (non-loopback,
@@ -672,7 +591,7 @@ def _requested_uris_error(requested_uris: Any) -> JsonResponse | None:
             "format or other invisible characters",
         )
     if any(uri.split() != [uri] for uri in requested_uris):
-        # Whitespace smuggling (`_is_loopback_redirect`): DOT reads the stored
+        # Whitespace smuggling (`is_loopback_redirect`): DOT reads the stored
         # list back with `str.split()`, so one such string would become two
         # registered redirects. Never a real callback, so the whole request
         # is refused, not just that entry.
@@ -714,8 +633,8 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
     # the loopback URIs and echoing only those tells the client exactly what
     # it may use. Nothing is widened — a non-loopback URI is still never
     # registered, and a client that sends none at all is still refused. The
-    # same goes for a URI `urllib` cannot parse (`_is_loopback_redirect` calls
-    # `_is_parseable_uri` first): it is not a loopback callback we could
+    # same goes for a URI `urllib` cannot parse (`is_loopback_redirect` calls
+    # `is_parseable_uri` first): it is not a loopback callback we could
     # register, so it drops out like any other unsupported URI.
     redirect_uris = list(
         dict.fromkeys(
@@ -728,7 +647,7 @@ def register_client(request):  # noqa: PLR0911 — each validation produces a di
             # exactly the all-or-nothing behaviour this filter replaced.
             # Cursor sends a hosted callback alongside its loopback one, and
             # that hosted URL can carry a long `state` query.
-            if len(uri) <= _MAX_REDIRECT_URI_LENGTH and _is_loopback_redirect(uri)
+            if len(uri) <= _MAX_REDIRECT_URI_LENGTH and is_loopback_redirect(uri)
         )
     )
     if not redirect_uris:

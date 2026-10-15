@@ -1431,7 +1431,7 @@ class TestUnacceptableCharactersAreA400:
     def test_ordinary_non_ascii_uri_is_not_refused_as_invisible(self, client):
         # Not one of the whole-request character refusals: it is judged per
         # URI, and the loopback predicate takes printable ASCII only (RFC 3986
-        # URIs; `_is_loopback_redirect`), so it is not registered.
+        # URIs; `is_loopback_redirect`), so it is not registered.
         uri = "http://localhost:8787/callbäck"
         response = _post(client, {"redirect_uris": [uri]})
         assert response.status_code == HTTPStatus.BAD_REQUEST

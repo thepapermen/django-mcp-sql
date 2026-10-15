@@ -35,7 +35,7 @@ from mcp_sql.consts import classify_application_name
 from mcp_sql.consts import identify_application
 from mcp_sql.consts import is_mcp_application
 from mcp_sql.oauth import MCPOAuth2Validator
-from mcp_sql.oauth import _redirect_under_prefix
+from mcp_sql.redirects import redirect_under_prefix
 from mcp_sql.schemas import AuthRejectionReason
 from mcp_sql.signals import _revoke_and_audit_on_logout
 from mcp_sql.signals import provision_mcp_clients
@@ -622,7 +622,7 @@ class TestRedirectUnderPrefix:
         ],
     )
     def test_accepts_under_prefix(self, uri):
-        assert _redirect_under_prefix(uri, _PREFIX) is True
+        assert redirect_under_prefix(uri, _PREFIX) is True
 
     @pytest.mark.parametrize(
         "uri",
@@ -694,7 +694,7 @@ class TestRedirectUnderPrefix:
         ],
     )
     def test_rejects_bypass_attempts(self, uri):
-        assert _redirect_under_prefix(uri, _PREFIX) is False
+        assert redirect_under_prefix(uri, _PREFIX) is False
 
     def test_bare_prefix_is_still_segment_anchored(self):
         # Even handed a prefix without the trailing slash (which validation
@@ -702,9 +702,9 @@ class TestRedirectUnderPrefix:
         # name merely begins with the last segment is rejected, a true child
         # is accepted.
         bare = "https://chatgpt.com/connector/oauth"
-        assert _redirect_under_prefix(f"{bare}EVIL/steal", bare) is False
-        assert _redirect_under_prefix(f"{bare}-attacker", bare) is False
-        assert _redirect_under_prefix(f"{bare}/inst-42", bare) is True
+        assert redirect_under_prefix(f"{bare}EVIL/steal", bare) is False
+        assert redirect_under_prefix(f"{bare}-attacker", bare) is False
+        assert redirect_under_prefix(f"{bare}/inst-42", bare) is True
 
 
 @pytest.mark.django_db
@@ -870,7 +870,7 @@ class TestValidateRedirectUriOverride:
         settings.MCP_SQL = _cfg({"claude": CLAUDE})
         prefix_calls: list = []
         monkeypatch.setattr(
-            "mcp_sql.oauth._redirect_under_prefix",
+            "mcp_sql.oauth.redirect_under_prefix",
             lambda *a, **k: prefix_calls.append(a) or True,
         )
 
@@ -975,7 +975,7 @@ class TestValidateRedirectUriOverride:
         ],
     )
     def test_userinfo_at_the_prefix_rules_own_path_is_refused(self, settings, uri):
-        """A prefix rule is not an exact callback: only `_redirect_under_prefix`
+        """A prefix rule is not an exact callback: only `redirect_under_prefix`
         sees its URI, and it refuses any userinfo. The supported DOT (3.4.1+)
         refuses userinfo in its own matcher too, so here this pins that the
         refusal does not depend on DOT: a matcher that compares only the

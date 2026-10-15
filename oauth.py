@@ -10,8 +10,6 @@ import re
 from datetime import timedelta
 from typing import TYPE_CHECKING
 from typing import Any
-from urllib.parse import unquote
-from urllib.parse import urlsplit
 
 from django.db import router
 from django.db import transaction
@@ -23,7 +21,8 @@ from mcp_sql.conf import refresh_tokens_enabled
 from mcp_sql.consts import CODE_EXCHANGE_GRANT_TYPES
 from mcp_sql.consts import is_mcp_application
 from mcp_sql.models import MCPRefreshTokenFamily
-from mcp_sql.views.registration import _is_loopback_redirect
+from mcp_sql.redirects import is_loopback_redirect
+from mcp_sql.redirects import redirect_under_prefix
 from oauth2_provider.models import AccessToken
 from oauth2_provider.models import Application
 from oauth2_provider.models import Grant
@@ -136,82 +135,6 @@ def has_control_character(*params: "QueryDict") -> bool:
     )
 
 
-def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
-    """True iff `redirect_uri` is a safe https URL sitting under `prefix`.
-
-    Used only for `MATCH: "prefix"` rules (ChatGPT / Codex-cloud), whose
-    callback is per-instance — `https://chatgpt.com/connector/oauth/{id}` —
-    and so cannot be pre-registered as an exact URI. The match is deliberately
-    strict, hardened against the classic redirect-allowlist bypasses so the
-    relaxation stays bounded to the provider's own origin:
-
-    - scheme MUST be https (no downgrade),
-    - no `@` anywhere in the authority — no userinfo component at all, not even
-      an empty one (`https://chatgpt.com@evil.com/...`, `https://@chatgpt.com/`),
-    - no query, fragment or `;params` — not even a bare trailing `?` / `#`, which
-      parse to an empty `.query` / `.fragment`, so the raw string is tested.
-      The callback is a plain path, and DOT 3.4.1+ matches an exact URI the same
-      way (RFC 9700 §2.1). `urlsplit` (not `urlparse`) keeps `;params` in the
-      path, where they are refused — also percent-encoded (`%3b`), since the
-      check runs on the decoded path,
-    - host must EXACTLY equal the prefix host (not `endswith`, so
-      `chatgpt.com.evil.com` is rejected), and port must match with only a
-      MISSING port normalised to the https default (an explicit `:443` equals
-      an implicit one; an explicit `:0` stays distinct),
-    - no `..` path segment — literal or single/multi-level percent-encoded
-      (`%2e%2e`, `%252e%252e`, ...) — above the prefix path,
-    - path must start with the prefix path, anchored at a `/` segment boundary
-      so a sibling like `.../oauthEVIL` cannot slip past a bare prefix (also
-      enforced at config time by `validation._validate_redirect_uri`).
-
-    Mirrors the care in `views/registration.py::_is_loopback_redirect`.
-    """
-    try:
-        got = urlsplit(redirect_uri)
-        want = urlsplit(prefix)
-        got_port, want_port = got.port, want.port
-    except ValueError:
-        # Malformed authority (e.g. a non-numeric port) — reject, fail-closed.
-        return False
-    # Anchor the prefix to a segment boundary. Validation already requires a
-    # trailing slash on a "prefix" REDIRECT_URI; this keeps the predicate
-    # correct on its own even if handed a bare prefix.
-    want_path = want.path if want.path.endswith("/") else want.path + "/"
-    # Fully percent-decode the path (bounded) before the traversal check, so a
-    # single- OR multi-encoded `..` (`%2e%2e`, `%252e%252e`, ...) can't slip
-    # past. `unquote` is idempotent-converging; 5 layers is far more than any
-    # real callback needs. Only the traversal check sees the decoded form —
-    # `startswith` stays on the raw path, matched against the raw prefix.
-    decoded_path = got.path
-    for _ in range(5):
-        step = unquote(decoded_path)
-        if step == decoded_path:
-            break
-        decoded_path = step
-    # Normalise only a MISSING port to the https default — an explicit `:0` is
-    # falsy but not None, so keep it distinct rather than aliasing the default.
-    got_port = 443 if got_port is None else got_port
-    want_port = 443 if want_port is None else want_port
-    return (
-        got.scheme == "https"  # no downgrade
-        and "@" not in got.netloc  # no userinfo, not even an empty one
-        and "?" not in redirect_uri  # no query, not even a bare `?` ...
-        and "#" not in redirect_uri  # ... nor a fragment / bare `#`
-        and ";" not in decoded_path  # no `;params`, raw or percent-encoded
-        and bool(got.hostname)
-        and got.hostname == want.hostname  # exact host, never `endswith`
-        and got_port == want_port  # exact port (:443 == implicit https)
-        and ".." not in decoded_path.split("/")  # no traversal (literal/encoded)
-        # ...and no backslash, which a browser's WHATWG parser treats as `/`
-        # in an https URL, so `..\` would be traversal by another spelling.
-        # oauthlib's absolute-URI check and Django's `iri_to_uri` (`\` ->
-        # `%5C`) each already stop it upstream; refused here as well so the
-        # path anchor does not depend on either.
-        and "\\" not in decoded_path
-        and got.path.startswith(want_path)  # under the allowlisted path
-    )
-
-
 def _is_declared_cloud(declared: "DeclaredClient | None") -> bool:
     """True for a settings-declared client of kind `cloud` — the only clients
     whose callbacks may leave the machine."""
@@ -221,7 +144,7 @@ def _is_declared_cloud(declared: "DeclaredClient | None") -> bool:
 def _declared_redirect_allowed(declared: "DeclaredClient", redirect_uri: str) -> bool:
     """A declared client's redirect, decided from SETTINGS alone.
 
-    Prefix rules through `_redirect_under_prefix`; exact rules through DOT's
+    Prefix rules through `redirect_under_prefix`; exact rules through DOT's
     own matcher (`redirect_to_uri_allowed`, the function behind
     `Application.redirect_uri_allowed`) run on the declared exact URIs, so an
     exact rule means exactly what DOT's matching of a stored `redirect_uris`
@@ -234,7 +157,7 @@ def _declared_redirect_allowed(declared: "DeclaredClient", redirect_uri: str) ->
     A `ValueError` from DOT's parsing (a request port no parser takes, e.g.
     `:99999`, on a declared host) is a refusal, not a 500.
     """
-    if any(_redirect_under_prefix(redirect_uri, p) for p in declared.prefixes):
+    if any(redirect_under_prefix(redirect_uri, p) for p in declared.prefixes):
         return True
     try:
         return bool(redirect_to_uri_allowed(redirect_uri, list(declared.exact_uris)))
@@ -289,7 +212,7 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         For a settings-declared client (`mcp_sql_settings.clients()`), only
         `_declared_redirect_allowed` decides: its prefix rules
-        (`_redirect_under_prefix`, for ChatGPT / Codex-cloud's per-instance
+        (`redirect_under_prefix`, for ChatGPT / Codex-cloud's per-instance
         callbacks) and its exact rules (DOT's matcher on the declared exact
         URIs). There is no fall-through to `super()`: the provisioned row's
         `redirect_uris` is a copy refreshed only on `migrate`, and recognition
@@ -301,11 +224,11 @@ class MCPOAuth2Validator(OAuth2Validator):
 
         EVERY client that is not a declared cloud client — the canonical
         `mcp-sql` row, every DCR client, every declared local client — must
-        ALSO pass `_is_loopback_redirect` (the `/o/register` predicate) on the
+        ALSO pass `is_loopback_redirect` (the `/o/register` predicate) on the
         requested URI first. Only declared cloud clients may redirect
         off-machine; DOT's matching alone trusts whatever the row stores, and
         a DCR row minted by <= 0.1.0b5 can store an off-machine redirect
-        smuggled through whitespace (see `_is_loopback_redirect`). This
+        smuggled through whitespace (see `is_loopback_redirect`). This
         re-check refuses such an entry here without needing the operator to
         find and delete the row first (its loopback entries keep working, like
         any DCR client's). A declared local client's callbacks are
@@ -321,7 +244,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         loopback.) The same holds for the settings path
         (`_declared_redirect_allowed`). A REQUEST port no parser takes
         (`http://localhost:99999/cb`) never reaches DOT for a curated or DCR
-        client: `_is_loopback_redirect` refuses it first.
+        client: `is_loopback_redirect` refuses it first.
 
         The default used when a request omits `redirect_uri` never reaches
         this method — `get_default_redirect_uri` below holds it to the same
@@ -331,7 +254,7 @@ class MCPOAuth2Validator(OAuth2Validator):
         `docs/oauth.md` → "Clients".
         """
         declared = mcp_sql_settings.clients().get(client_id)
-        if not _is_declared_cloud(declared) and not _is_loopback_redirect(redirect_uri):
+        if not _is_declared_cloud(declared) and not is_loopback_redirect(redirect_uri):
             return False
         if declared is not None:
             return _declared_redirect_allowed(declared, redirect_uri)
@@ -373,7 +296,7 @@ class MCPOAuth2Validator(OAuth2Validator):
             uri = declared.exact_uris[0]
         else:
             uri = None
-        if uri and not _is_declared_cloud(declared) and not _is_loopback_redirect(uri):
+        if uri and not _is_declared_cloud(declared) and not is_loopback_redirect(uri):
             return None
         return uri
 

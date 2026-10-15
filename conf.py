@@ -254,7 +254,7 @@ DEFAULTS: dict[str, Any] = {
         "chatgpt": {
             "LABEL": "ChatGPT",
             # Per-instance callback (`/connector/oauth/{id}`) — prefix-matched
-            # by `oauth._redirect_under_prefix`, anchored at the trailing `/`.
+            # by `redirects.redirect_under_prefix`, anchored at the trailing `/`.
             "REDIRECTS": [
                 {"MATCH": "prefix", "URI": "https://chatgpt.com/connector/oauth/"},
             ],

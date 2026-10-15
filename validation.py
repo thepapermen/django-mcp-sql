@@ -334,7 +334,7 @@ def _validate_redirect_uri(name: str, match: str, uri: str) -> None:
       literals, which would quietly widen an exact rule into "any port on the
       user's machine".
 
-    Mirrors the care in `views/registration.py::_is_loopback_redirect`.
+    Mirrors the care in `redirects.is_loopback_redirect`.
     """
     kind = redirect_kind(uri)
     if kind is None:
@@ -498,7 +498,7 @@ def _universal_redirect_problems(uri: str, parsed: ParseResult) -> list[str]:
         # second, unvalidated URI. Operator-authored rather than attacker-
         # supplied here, but the same storage contract applies, and the
         # matching guard on the anonymous DCR path is
-        # `registration._is_loopback_redirect`.
+        # `redirects.is_loopback_redirect`.
         problems.append("contain no whitespace")
     if ".." in unquote(parsed.path).split("/"):
         problems.append("contain no '..' path segment (literal or encoded)")
@@ -536,7 +536,7 @@ def _validate_redirect_schemes(kinds: set[ClientKind]) -> None:
     `ALLOWED_REDIRECT_URI_SCHEMES` is enforced by DOT when it issues the 302,
     so a mismatch fails opaquely at `/o/authorize/` — long after the operator
     could connect it to their config. Check it at boot instead. (A "prefix"
-    client bypasses DOT's stock check via the `_redirect_under_prefix`
+    client bypasses DOT's stock check via the `redirect_under_prefix`
     override, but the requirement is applied uniformly anyway, so a
     prefix-only setup can't silently break the day an exact client is added.)
 
