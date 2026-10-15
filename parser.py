@@ -490,6 +490,13 @@ _STOCK_PARAMETER_PARSER = Postgres.Parser.PLACEHOLDER_PARSERS[TokenType.PARAMETE
 _STOCK_NOT_PARSER = Postgres.Parser.UNARY_PARSERS[TokenType.NOT]
 
 
+# sqlglot 30.21+ has a binary-operator table for `->` / `->>`; 30.7 does not
+# (read once here, so a type checker on either sqlglot sees one branch).
+_STOCK_JSON_OPERATORS: dict[Any, Any] | None = getattr(
+    Postgres.Parser, "JSON_OPERATORS", None
+)
+
+
 class FaithfulPostgres(Postgres):
     """sqlglot's postgres dialect, reading and rendering Postgres SQL as
     written. The executor runs sqlglot's rendering of the query, so any
@@ -668,8 +675,8 @@ class FaithfulPostgres(Postgres):
                 exp.JSONExtractScalar(this=this, expression=self._arrow_operand(path))
             ),
         }
-        if getattr(Postgres.Parser, "JSON_OPERATORS", None):
-            JSON_OPERATORS = {**Postgres.Parser.JSON_OPERATORS, **_ARROWS}
+        if _STOCK_JSON_OPERATORS:
+            JSON_OPERATORS = {**_STOCK_JSON_OPERATORS, **_ARROWS}
         else:
             # Every operator parsed this way (`#>`, `#>>`, `?`, ...) gets its
             # right operand's `::type` (see `_arrow_operand`).

@@ -322,6 +322,12 @@ jobs:
         run: mkdir -p .mypy-pkg && ln -sfn .. .mypy-pkg/mcp_sql
       - name: Run mypy
         run: mypy -p mcp_sql
+      - name: Run mypy against the sqlglot floor
+        # The parser's compat branches read sqlglot attributes one minor has
+        # and another lacks; type-check the oldest supported one too.
+        run: |
+          pip install 'sqlglot==30.7.*'
+          mypy -p mcp_sql
 
   build:
     runs-on: ubuntu-latest
