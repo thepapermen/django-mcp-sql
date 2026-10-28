@@ -4,6 +4,8 @@ from unittest.mock import patch
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import DEFAULT_DB_ALIAS
+from django.db import connections
 
 
 class TestVerifyDefaultAlias:
@@ -19,7 +21,11 @@ class TestVerifyDefaultAlias:
     def test_each_entry_point_raises_when_alias_is_not_default(self, monkeypatch):
         from mcp_sql import grants
 
-        monkeypatch.setattr(grants.connection, "alias", "mcp_readonly")
+        # Patch the wrapper itself, not the `grants.connection` proxy: since
+        # pytest 9.2, undo restores an attribute from the target's own
+        # `__dict__`, which the proxy lacks, so it would DELETE `alias`
+        # through the proxy from the real wrapper and break every later test.
+        monkeypatch.setattr(connections[DEFAULT_DB_ALIAS], "alias", "mcp_readonly")
 
         for callable_ in (
             grants.granted_tables,
