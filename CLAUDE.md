@@ -35,6 +35,15 @@ suite runs standalone via `make test` here (settings: `tests/settings.py`).
   `sync_to_async(..., thread_sensitive=False)`, and every dispatch is
   wrapped in `_close_conns_after` — keep all three properties for any new
   tool.
+- **Tool surfaces never touch `/mcp/sql/`.** A consumer's own tools live on
+  a separate endpoint per `MCP_SQL["TOOL_SURFACES"]` entry (`surfaces.py`,
+  `views/surface_endpoint.py`), each with its own scope, permission and
+  discovery document; a token carries exactly ONE MCP scope
+  (`MCPOAuth2Validator.validate_scopes`) and every endpoint accepts only a
+  token carrying exactly its own (`_required_scope`). Tools are added only through `SurfaceServer.tool` (mandatory
+  annotations, `async def`, audited before they run) — never expose the
+  per-request `FastMCP` to consumer code, and never add a tool to the SQL
+  server.
 - **Curated-view migrations** live in the OWNING app, use
   `CREATE OR REPLACE VIEW` forward SQL (column-additive) and carry
   `state_operations=[CreateModel(..., managed=False)]`.

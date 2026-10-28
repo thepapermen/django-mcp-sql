@@ -18,6 +18,7 @@ from django.db import transaction
 from django.utils import timezone
 from mcp_sql import observability
 from mcp_sql.conf import Profile
+from mcp_sql.conf import ToolSurface
 from mcp_sql.conf import mcp_sql_config
 from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.grants import declared_tables
@@ -311,14 +312,16 @@ def run_query(  # noqa: PLR0913, PLR0915 — linear audited pipeline by design
 def audit_tool_call(  # noqa: PLR0913
     *,
     user: "AbstractBaseUser",
-    profile: Profile,
+    profile: Profile | ToolSurface,
     tool: str,
     token_id: str = "",
     client_ip: str | None = None,
     client_redirect: str = "",
     detail: str = "",
+    decision: str = MCPQueryLog.DECISION_ALLOWED,
+    rejection_reason: str = "",
 ) -> None:
-    """Write one `MCPQueryLog` row for a metadata tool call.
+    """Write one `MCPQueryLog` row for a tool call that is not a query.
 
     `list_tables` / `describe_table` never touch the readonly executor, so
     they record their usage here directly: `decision='allowed'`, the SQL
@@ -327,14 +330,23 @@ def audit_tool_call(  # noqa: PLR0913
     request representation — the `tool` field disambiguates it from an
     actual SQL string. Routes through `_audit_safely` so a `default`-DB
     blip is logged rather than surfaced to the agent.
+
+    A tool surface's tools record here too (`surfaces.py`): `profile` is
+    then the `ToolSurface` (its name goes to the `profile` column), `tool`
+    the consumer's tool name, `detail` the call's JSON arguments, and a call
+    refused by the surface's `CALL_LIMIT` is `decision='rejected'` with
+    `rejection_reason='call_limit'`. Those rows stay out of the per-user
+    query-volume tripwire: its thresholds are tuned for SQL traffic, and a
+    surface bounds its own volume with `CALL_LIMIT`.
     """
     _audit_safely(
+        count_volume=not isinstance(profile, ToolSurface),
         user=user,
         profile=profile.name,
         token_id=token_id,
-        decision=MCPQueryLog.DECISION_ALLOWED,
+        decision=decision,
         tool=tool,
-        rejection_reason="",
+        rejection_reason=rejection_reason,
         raw_sql=detail,
         started_at=timezone.now(),
         client_ip=client_ip,
@@ -453,7 +465,7 @@ class AuditFields(TypedDict):
     tool: NotRequired[str]
 
 
-def _audit_safely(**fields: Unpack[AuditFields]) -> None:
+def _audit_safely(*, count_volume: bool = True, **fields: Unpack[AuditFields]) -> None:
     """Best-effort wrapper for every `MCPQueryLog.objects.create` call site.
 
     Audit-row writes happen on the `default` alias after the readonly tx
@@ -485,8 +497,11 @@ def _audit_safely(**fields: Unpack[AuditFields]) -> None:
         return
     # Single chokepoint for the per-user volume tripwire: every audited row
     # — run_query and the metadata tools, allowed and rejected — flows
-    # through here, so counting on success keeps one counter per query. Only
-    # the id + decision cross into observability (no PII, no SQL). Broad
+    # through here, so counting on success keeps one counter per query
+    # (`count_volume=False` for a tool surface's rows, see `audit_tool_call`).
+    if not count_volume:
+        return
+    # Only the id + decision cross into observability (no PII, no SQL). Broad
     # guard because the tripwire is non-critical: a bug in it must never turn
     # a query that already ran + audited into a 500.
     try:

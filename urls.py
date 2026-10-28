@@ -10,20 +10,60 @@ Carries the seven routes the subsystem owns:
 - 1 RFC 7591 dynamic client registration endpoint at `/o/register`.
 - 1 MCP transport endpoint at `/mcp/sql/`.
 - 2 OAuth 2.0 discovery URLs (RFC 9728 + RFC 8414) at `.well-known/...`.
+- Per configured tool surface (`MCP_SQL["TOOL_SURFACES"]`, opt-in, none by
+  default): its transport at its `PATH` (plus a slash-less alias) and its
+  RFC 9728 document at `.well-known/oauth-protected-resource/<PATH>` —
+  `surface_urlpatterns()`, built from settings when this module is imported.
 
 Keeping the routes here makes the entire surface mount/unmountable from
 the project urlconf in one `include()` line. The URL names are the stable
 contract every `reverse(...)` call site depends on.
 """
 
+from django.urls import URLPattern
 from django.urls import path
+from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.decorators import cap_request_body
 from mcp_sql.views.discovery import authorization_server_metadata
 from mcp_sql.views.discovery import protected_resource_metadata
+from mcp_sql.views.discovery import surface_protected_resource_metadata
 from mcp_sql.views.mcp_endpoint import mcp_endpoint
 from mcp_sql.views.oauth_authorize import MCPAuthorizationView
 from mcp_sql.views.registration import register_client
+from mcp_sql.views.surface_endpoint import build_surface_endpoint
 from oauth2_provider import views as oauth2_views
+
+
+def surface_urlpatterns() -> list[URLPattern]:
+    """The routes of every configured tool surface, read from settings now.
+
+    Per surface: the transport at `PATH` (named `ToolSurface.url_name`, the
+    canonical spelling `reverse()` and the RFC 9728 `resource` use) plus the
+    slash-less alias (for the same reason `/mcp/sql` has one: a client that
+    strips the slash POSTs there, and `APPEND_SLASH` cannot redirect a POST),
+    and the discovery document at `.well-known/oauth-protected-resource/`
+    + `PATH` without its trailing slash — RFC 9728 §3.1 inserts the
+    well-known prefix between the host and the resource path, as for
+    `/mcp/sql`. The transport and the discovery document are not body-capped
+    here: the transport's auth class caps its body (1 MiB), and discovery is
+    GET-only.
+    """
+    patterns: list[URLPattern] = []
+    for surface in mcp_sql_settings.tool_surfaces().values():
+        endpoint = build_surface_endpoint(surface.name)
+        bare = surface.path.rstrip("/")
+        patterns += [
+            path(surface.path, endpoint, name=surface.url_name),
+            path(bare, endpoint),
+            path(
+                f".well-known/oauth-protected-resource/{bare}",
+                surface_protected_resource_metadata,
+                {"surface_name": surface.name},
+                name=surface.metadata_url_name,
+            ),
+        ]
+    return patterns
+
 
 urlpatterns = [
     # Curated subset of django-oauth-toolkit URLs. Each OAuth endpoint is
@@ -78,4 +118,5 @@ urlpatterns = [
         authorization_server_metadata,
         name="oauth_authorization_server_metadata",
     ),
+    *surface_urlpatterns(),
 ]

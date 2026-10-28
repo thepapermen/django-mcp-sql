@@ -13,8 +13,9 @@ responding to an incident.
 - Token lifetime: 6 h access, no refresh tokens, 60 s authorization code.
 - Custom DRF auth class `MCPOAuth2Authentication` mounted **only** on
   `/mcp/sql/` — never in `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`.
-- Issuance gate at `/o/authorize/`: `is_active AND is_staff AND
-  is_mfa_enabled AND resolve_profile(user) binds exactly one profile`
+- Issuance gate at `/o/authorize/`: `is_active AND is_mfa_enabled AND
+  resolve_profile(user) binds exactly one profile` (no `is_staff`
+  requirement — the profile group is the grant)
   (the profile gate reads the user's EXPLICIT permission assignments —
   see [Profiles](architecture.md#profiles-access-tiers); 0 → denied,
   >1 → denied as ambiguous).
@@ -35,10 +36,11 @@ discovery surface comprises two anonymous-GET endpoints plus the
 | `/.well-known/oauth-protected-resource/mcp/sql` | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) | Protected Resource Metadata: `resource` (the MCP endpoint URL), `resource_name` (the env's human-readable identity, from `MCP_SQL["RESOURCE_NAME"]`), `authorization_servers`, `scopes_supported=["mcp:sql"]`, `bearer_methods_supported=["header"]`. |
 | `/.well-known/oauth-authorization-server/o` | [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) | Authorization Server Metadata: `issuer` (`https://<host>/o`, scoped to DOT's mount per RFC 8414 §3.1), `authorization_endpoint=/o/authorize/`, `token_endpoint=/o/token/`, `revocation_endpoint=/o/revoke_token/`, `scopes_supported`, `response_types_supported=["code"]`, `grant_types_supported=["authorization_code"]`, `code_challenge_methods_supported=["S256"]` (SHA-256 PKCE; enforced by `MCPOAuth2Validator`), `token_endpoint_auth_methods_supported=["none"]` (public client). |
 
-The `/mcp/sql/` 401 response advertises the RFC 9728 URL:
+The `/mcp/sql/` 401 response advertises the RFC 9728 URL and the one scope
+the endpoint accepts:
 
 ```
-WWW-Authenticate: Bearer realm="api", resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp/sql"
+WWW-Authenticate: Bearer realm="api", resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp/sql", scope="mcp:sql"
 ```
 
 A compliant MCP client follows this chain end to end without any
@@ -46,7 +48,7 @@ out-of-band configuration:
 
 ```
 1. POST <host>/mcp/sql/
-   → 401, WWW-Authenticate: Bearer realm="api", resource_metadata="<PRM>"
+   → 401, WWW-Authenticate: Bearer realm="api", resource_metadata="<PRM>", scope="mcp:sql"
 2. GET  <PRM>      (i.e. <host>/.well-known/oauth-protected-resource/mcp/sql)
    → 200, JSON document, authorization_servers=["<issuer>"]
 3. GET  <issuer>/.well-known/oauth-authorization-server  (path-suffixed per
@@ -123,7 +125,7 @@ curl -s -X POST https://<host>/o/register \
 **Security**: the structural mitigations are the loopback-only
 `redirect_uris` restriction (a rogue registered client can only redirect to
 its own machine — useless for cross-machine token theft) and the
-`/o/authorize/` issuance gate (real user with is_staff + MFA + perm
+`/o/authorize/` issuance gate (real active user with MFA + perm
 required to consent). On top of those, a **silent per-IP block** (shared
 with the `/mcp/sql/` bad-token throttle; same
 `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]`)
@@ -162,8 +164,9 @@ full threat-model analysis.
 
 ## Onboarding a user to the MCP cohort
 
-1. **Pre-flight**: the user must be `is_staff=True` and satisfy your
-   configured `MCP_SQL["MFA_CHECKER"]` (MFA is opt-in — the default
+1. **Pre-flight**: the user must be active (staff status is NOT required —
+   the profile group is the grant) and satisfy your configured
+   `MCP_SQL["MFA_CHECKER"]` (MFA is opt-in — the default
    `deny_unconfigured_mfa` denies everyone until you wire a real predicate,
    e.g. `allauth.mfa.utils.is_mfa_enabled`). If not, sort that first via the
    user admin.
@@ -450,6 +453,103 @@ docstrings point back to):
   [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252); dynamic client
   registration — [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591).
 
+## Tool surfaces (opt-in)
+
+A tool surface is a separate MCP endpoint for your OWN tools (design and
+threat model: `docs/architecture.md` → "Tool surfaces"). It reuses this
+authorization server, every gate above and the audit tables; what it adds is
+its own URL, scope, group and discovery document.
+
+**1. Declare it.** The scope must also be known to DOT — its description is
+what the consent screen lists:
+
+```python
+OAUTH2_PROVIDER = {
+    # ... your other settings ...
+    "SCOPES": {
+        "mcp:sql": "Read-only SQL surface for MCP agents",
+        "mcp:pricing": "Price routes with the pricing engine",
+    },
+}
+
+MCP_SQL = {
+    # ... your other settings ...
+    "TOOL_SURFACES": {
+        "pricing": {
+            "PATH": "mcp/pricing/",
+            "SCOPE": "mcp:pricing",
+            "RESOURCE_NAME": "Pricing (production)",
+            "PERMISSION_CODENAME": "use_mcp_pricing",
+            "GROUP_NAME": "mcp_pricing_users",
+            "TOOLS": "myapp.mcp.register_tools",
+            "INSTRUCTIONS": "Ask for the pickup and delivery city before pricing.",
+            "CALL_LIMIT": {"CALLS": 60, "WINDOW_SECONDS": 3600},
+        },
+    },
+}
+```
+
+`DEFAULT_SCOPES` stays `["mcp:sql"]`; clients learn the surface's scope from
+its discovery document and its 401 challenge.
+
+**2. Write the tools** (`myapp/mcp.py`):
+
+```python
+from mcp_sql.surfaces import SurfaceContext, SurfaceServer, ToolError
+
+
+def register_tools(server: SurfaceServer, ctx: SurfaceContext) -> None:
+    @server.tool(
+        title="Price a route",
+        read_only=False,      # it records the request upstream
+        destructive=False,
+        idempotent=False,
+        open_world=True,      # it calls another service
+    )
+    async def price_route(pickup_city: str, delivery_city: str) -> dict:
+        """Price a road transport between two cities."""
+        if pickup_city == delivery_city:
+            raise ToolError("Pickup and delivery must differ.")
+        return await ctx.run_sync(quote_price, ctx.user, pickup_city, delivery_city)
+```
+
+Bound every outbound call with a timeout, and check inside the tool what
+THIS user may act on — holding the surface only means "may call its tools".
+
+**3. `migrate`** — provisions the surface's group and permission (the
+`TOOLS` path is import-checked at boot, so a typo fails startup).
+
+**4. Grant it**: add the user to `mcp_pricing_users`. That group is the
+grant: the account must be active and pass MFA (and hold a live session if
+`SESSION_MODEL` is set); it need not be staff. A surface does NOT need an
+SQL profile, and an SQL profile does not grant a surface. Each grant pages once (`ERROR`, "GAINED MCP
+tool surface access").
+
+**5. Connect**: the surface is its own connector.
+
+```bash
+claude mcp add --transport http pricing https://<host>/mcp/pricing/
+```
+
+Claude.ai / ChatGPT: a new custom connector with URL
+`https://<host>/mcp/pricing/` and the same OAuth client ID as for
+`/mcp/sql/` (one Application per client serves every endpoint — the scope
+tells them apart). The consent screen names the surface's `RESOURCE_NAME`.
+
+**If a client ignores the advertised scope** it asks for the default,
+`mcp:sql`: a surface-only user is refused at consent (403), and a user who
+holds a profile gets an SQL token that the surface refuses (`bad_scope` in
+`MCPAuthRejectionLog`). Reconnect after updating the client; the refusal is
+the safe failure.
+
+**Auditing**: every call that reaches a tool is one `MCPQueryLog` row whose
+`profile` is the surface name and whose `raw_sql` holds the call's JSON
+arguments; a call refused by `CALL_LIMIT` is `rejected` / `call_limit`.
+Filter the admin by the surface name. (A call whose arguments do not fit
+the tool's signature is refused by FastMCP before it reaches the tool and
+leaves no row.) Surface rows do not count toward the query-volume
+tripwires; `CALL_LIMIT` bounds a surface's volume.
+
 ## Revoking access
 
 Three paths by urgency:
@@ -651,7 +751,7 @@ volume.
 
 - `"Token was not issued by an mcp-sql Application."`
 - `"Token does not carry the mcp:sql scope."`
-- `"User is not an active staff member."`
+- `"User account is inactive."`
 - `"User does not have a verified TOTP device."`
 - `"User holds no MCP profile permission."` (resolves to no profile)
 - `"User is assigned to more than one MCP profile; access is denied …"`
@@ -661,7 +761,7 @@ volume.
 
 These reach the MCP client (typically Claude Code) as the body of a 401
 response, and from there the user sees them. The verbosity is **deliberate**:
-the consumers are internal staff members onboarding to the surface, and
+the consumers are an operator-curated cohort onboarding to the surface, and
 "your MFA device was removed, re-set it up" is faster to act on than a
 generic "Token is no longer valid." If the threat model ever changes —
 the surface gets opened to external partners, or token-holders need to be

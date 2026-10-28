@@ -397,7 +397,9 @@ def _build_mcp_server(
     return mcp
 
 
-def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpResponse:
+def _invoke_wsgi_app(
+    wsgi_app: WSGIApplication, request: Request, *, script_name: str = "/mcp/sql"
+) -> HttpResponse:
     """Bridge a Django request through a WSGI callable and capture the response.
 
     DRF has already read `request.body` (content negotiation, etc.), so the
@@ -436,7 +438,8 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     # dance. Rewrite the WSGI environ so FastMCP sees the path it expects
     # while SCRIPT_NAME advertises our actual mount prefix for any code
     # path inside FastMCP that uses `request.url_for(...)` or similar.
-    environ["SCRIPT_NAME"] = "/mcp/sql"
+    # A tool surface's transport passes its own mount (`script_name`).
+    environ["SCRIPT_NAME"] = script_name
     environ["PATH_INFO"] = "/mcp"
 
     status_code = 500
@@ -463,6 +466,24 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     for key, value in response_headers:
         response[key] = value
     return response
+
+
+class _EveryAlias(set[str]):
+    """A `_non_atomic_requests` set that contains every database alias.
+
+    The MCP transports are non-atomic: inside a consumer's `ATOMIC_REQUESTS`
+    transaction, DRF's exception handler (`set_rollback`) would roll back the
+    auth gates' `MCPAuthRejectionLog` rows together with the 401. Django's
+    `non_atomic_requests` records one alias per application (the bare
+    decorator: only `default`), and `BaseHandler.make_view_atomic` wraps the
+    view in `transaction.atomic(using=alias)` for every `ATOMIC_REQUESTS`
+    alias NOT in the set. Answering "yes" for any alias covers a consumer
+    whose router sends the audit tables elsewhere, and aliases configured
+    later. Django only ever tests membership on, or `add`s to, it.
+    """
+
+    def __contains__(self, alias: object) -> bool:
+        return True
 
 
 @csrf_exempt

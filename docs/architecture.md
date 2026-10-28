@@ -33,7 +33,7 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
   claim — revisit when DOT releases first-class RFC 8707 support). See
   `docs/oauth.md` for the operational profile.
 - **Authorization**: layered — issuance gate at `/o/authorize/` (Option D
-  session-trust: `is_active AND is_staff AND is_mfa_enabled AND an
+  session-trust: `is_active AND is_mfa_enabled AND an
   unambiguous single-profile assignment (resolve_profile)`, no fresh-TOTP
   timestamp check — the consumer's `SESSION_COOKIE_AGE` forces re-MFA at the
   boundary naturally), per-request token validation re-running the same gate
@@ -63,9 +63,11 @@ Operational runbooks: `docs/role-setup.md` (DB role + grants) and
 | `executor.py` | `run_query(*, user, raw_sql, limit=None, token_id="", client_ip=None) -> QueryResult`. Pipeline: parse → extract user's SQL `LIMIT N` → resolve effective cap as `min(kwarg, sql_LIMIT, HARD_LIMIT)` defaulting to `DEFAULT_LIMIT` (`limit=0` short-circuits without touching DB) → inject `LIMIT N+1` → open `mcp_readonly` tx → `enter_readonly_session` → execute → per-cell + total byte caps → write one `MCPQueryLog` row → return. Every code path (parser reject, executor error, timeout, success, `limit=0` short-circuit, `ExecutorMisconfiguredError`) writes exactly one audit row. The audit row carries `raw_sql`, `normalized_sql`, `wrapped_sql`, `row_count`, `result_bytes`, `duration_ms`, `decision`, and `rejection_reason` — never the actual row contents (privacy / retention concern on a CRM with shipper PII). |
 | `observability.py` | `record_query_volume(*, user_id, decision, user_label="")` — per-(user, decision, window) fixed-window cache counters (mirrors `throttle`'s `cache.add`+`incr` primitive), called from `executor._audit_safely` on every audited row. Emits ONE `logger.error` (Sentry event) at each crossing of `MCP_SQL["VOLUME_ALERT_THRESHOLDS"][decision][window]` (hour + day, allowed + rejected). ALERTS, never blocks; fail-open on cache trouble. The alert names the user (pk + `get_username()`); it never logs SQL. |
 | `oauth.py` | `MCPOAuth2Validator` — rejects any client_id that isn't the `mcp-sql` Application and any scope set that isn't `{"mcp:sql"}`. |
-| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_staff`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. |
-| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` and runs the issuance gate (`is_active + is_staff + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects `resource_name = RESOURCE_NAME` so the consent page shows the configured server name (the same identity in the RFC 9728 metadata) instead of DOT's opaque per-client `application.name` (`mcp-sql-<token>` for every DCR client). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
+| `auth.py` | `MCPOAuth2Authentication` — DRF auth class subclassing DOT's `OAuth2Authentication` with per-request re-validation of `is_active`, `is_mfa_enabled`, and an unambiguous single-profile assignment via `resolve_profile` (binds `request.mcp_profile`; a revoked assignment, ambiguity, or removed MFA device invalidates outstanding tokens immediately, without waiting for the 6h hard cap). The view layers `@permission_classes([IsAuthenticated])` on top of this so the package's "you must be authenticated" contract is self-contained — anonymous fall-through is rejected by the view's own decorator, never by the consumer's `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` (stock DRF defaults to `AllowAny`, which would silently let probes reach the bridge and break OAuth bootstrap). **Mounted only on `/mcp/sql/`**; never added to `REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]`. |
+| `views/oauth_authorize.py` | `MCPAuthorizationView` — subclasses DOT's `AuthorizationView` and runs the issuance gate (`is_active + is_mfa_enabled` + an unambiguous single-profile binding via `resolve_profile`, denying `NO_PERM` / `AMBIGUOUS_PROFILE`) before delegating to upstream `dispatch`. Failed gates raise `PermissionDenied` (HTTP 403); unauthenticated requests fall through to DOT's `LoginRequiredMixin` (redirect to login). Renders a **package-owned** consent template, `template_name = "mcp_sql/authorize.html"` (uniquely named so it is never shadowed by DOT's bundled `oauth2_provider/authorize.html` regardless of `INSTALLED_APPS` order, and so a consumer can re-theme it by overriding `mcp_sql/authorize.html` in their own template dir). `render_to_response` injects `resource_name = RESOURCE_NAME` so the consent page shows the configured server name (the same identity in the RFC 9728 metadata) instead of DOT's opaque per-client `application.name` (`mcp-sql-<token>` for every DCR client). `render_to_response` is the single chokepoint for the view's only two template renders — the consent page (`get`) and the fatal-client-error page (`error_response` when oauthlib refuses to redirect: unknown `client_id` / untrusted `redirect_uri`); recoverable OAuth errors 302 back to the client, success 302s with the code, and the gate's `PermissionDenied` renders the consumer's `403.html` — none of those go through here. The error branch ignores `resource_name`; `setdefault` leaves a preset value untouched. |
 | `views/mcp_endpoint.py` | `/mcp/sql/` view. Per-request `FastMCP` instantiation with three tool callables (`list_tables`, `describe_table`, `run_query`) closed over the authenticated `user`/`token_id`/`client_ip`. Mounted via `a2wsgi.ASGIMiddleware`; the DRF auth class decorator runs first, so anonymous / wrong-scope requests are rejected before the bridge runs. CSRF exempt (bearer auth, not cookies). The `FastMCP` carries `instructions=_SERVER_INSTRUCTIONS` (the standing untrusted-data + human-in-the-loop security posture, delivered once in the `initialize` response — see "Watch out") and each tool carries honest `readOnlyHint=True` / `openWorldHint=False` `ToolAnnotations`. **Routed (`urls.py`) at BOTH `/mcp/sql/` (canonical — named, what `reverse()` + the RFC 9728 `resource` advertise) and the slash-less alias `/mcp/sql`**: Claude.ai's web connector normalises the trailing slash off and POSTs to `/mcp/sql`, and `APPEND_SLASH` can't 301-redirect a POST without dropping the body, so a slash-only route 500s the instant the transport opens (`docs/oauth.md` → "Cloud clients" → Troubleshooting; pinned by `test_mcp_endpoint.py::TestEndpointRouting`). |
+| `surfaces.py` | Tool surfaces (opt-in, `MCP_SQL["TOOL_SURFACES"]`) — the consumer-facing API for a separate MCP endpoint carrying the consumer's own tools. `SurfaceServer.tool(...)` is the only way to register one: the four MCP behaviour annotations (`read_only` / `destructive` / `idempotent` / `open_world`) are mandatory bools (`read_only` + `destructive` refused), the function must be `async def`, the name fits `MCPQueryLog.tool` (≤ 32 chars) and is unique. Each registered tool is wrapped: one `MCPQueryLog` row BEFORE it runs (`executor.audit_tool_call` with the surface as `profile`, the JSON arguments as `raw_sql`), the per-user `CALL_LIMIT` budget (cache fixed window, fail-open), and an error screen (a `ToolError` reaches the agent, anything else is logged and answered generically). `SurfaceContext` carries the authenticated principal and `run_sync` (`sync_to_async(..., thread_sensitive=False)` + `close_old_connections`). `build_surface_server` builds the per-request `FastMCP` whose `instructions` always open with the package preamble. See "Tool surfaces". |
+| `views/surface_endpoint.py` | `build_surface_endpoint(name)` — one transport view per configured surface, mounted by `urls.py` at the surface's `PATH` (plus a slash-less alias). POST only (405 before DRF), non-atomic on every alias, `SurfaceOAuth2Authentication` + `IsAuthenticated`, then the same a2wsgi bridge as `/mcp/sql/` (`_invoke_wsgi_app` with the surface's `SCRIPT_NAME`). |
 | `views/discovery.py` | OAuth 2.0 discovery surface. `protected_resource_metadata` (RFC 9728) at `/.well-known/oauth-protected-resource/mcp/sql` advertises the MCP endpoint's `resource`, the env's `resource_name` (sourced from `MCP_SQL["RESOURCE_NAME"]`; consuming projects typically override this to an env-distinct value), and the AS URL. `authorization_server_metadata` (RFC 8414) at `/.well-known/oauth-authorization-server/o` (path-suffix per RFC 8414 §3.1, matching the `https://<host>/o` issuer) advertises `issuer`, the three OAuth endpoints, the `registration_endpoint`, scopes, grant types, `code_challenge_methods_supported=["S256"]`, and `token_endpoint_auth_methods_supported=["none"]` (public client). Both anonymous-GET, CSRF-exempt. Referenced by `MCPOAuth2Authentication.authenticate_header()` via the `resource_metadata` parameter in `WWW-Authenticate` so MCP clients can bootstrap the OAuth dance off a 401. |
 | `throttle.py` | Shared per-IP fixed-window block backed by the Django cache (use a SHARED backend — Redis, Memcached — in production: with a per-process backend like LocMem the counters, and therefore the block, are per-worker). One primitive, two surfaces: `auth` (`bad_token` scope, silent 401) and `views/registration` (`register` scope, silent inert 201). Both share `MCP_SQL["BAD_TOKEN_IP_THRESHOLD"]` / `["BAD_TOKEN_IP_WINDOW_SECONDS"]`; keys are scope-namespaced so one surface never depletes the other's budget. Keys on `REMOTE_ADDR` — sound only behind a hardened edge proxy (see "Watch out: the per-IP throttle trusts the proxy's IP handling"). |
 | `decorators.py` | `cap_request_body(max_bytes)` — the body-size cap on the OAuth endpoints, applied in `urls.py` (64 KiB; `OAUTH_REQUEST_BODY_MAX_BYTES`). Header-only `CONTENT_LENGTH` check (Django's `LimitedStream` truncates an under-declared body to the lie, so the header is the only gate needed), returning a plain 413 before the view reads the body; `functools.wraps` preserves each view's `csrf_exempt` flag. `/mcp/sql/` is capped separately and higher (1 MiB) in `auth.py`, since its body carries the SQL query. |
@@ -105,8 +107,30 @@ MCP_SQL = {
         "allowed": {3600: 50, 86400: 150},
         "rejected": {3600: 50, 86400: 150},
     },
+    "TOOL_SURFACES": {                    # opt-in; {} (the default) = off
+        "pricing": {                      # surface name (audit `profile`)
+            "PATH": "mcp/pricing/",
+            "SCOPE": "mcp:pricing",       # also in OAUTH2_PROVIDER["SCOPES"]
+            "RESOURCE_NAME": "Pricing",
+            "PERMISSION_CODENAME": "use_mcp_pricing",
+            "GROUP_NAME": "mcp_pricing_users",
+            "TOOLS": "myapp.mcp.register_tools",   # register(server, ctx)
+            # "INSTRUCTIONS": "...",                # appended to the preamble
+            # "CALL_LIMIT": {"CALLS": 60, "WINDOW_SECONDS": 3600},
+        },
+    },
 }
 ```
+
+`TOOL_SURFACES` validation (`validation._validate_tool_surfaces`): the name
+is a slug that is not a profile name; `PATH` is lowercase segments ending in
+`/`, outside `o/`, and neither equal to, nor nested in or around, `mcp/sql/`
+or another surface's path; `SCOPE` is one scope token, unique, not
+`MCP_SQL["SCOPE"]`, and listed in `OAUTH2_PROVIDER["SCOPES"]` (unless a
+custom `SCOPES_BACKEND_CLASS` owns the list); `PERMISSION_CODENAME` /
+`GROUP_NAME` are unique across profiles and surfaces (and not a Django
+default codename); `TOOLS` imports and is callable; `CALL_LIMIT` members are
+positive ints; unknown keys are refused.
 
 ## Profiles (access tiers)
 
@@ -331,16 +355,152 @@ column-level grants scattered in tooling state.
 
 - **Application identity**: three recognised shapes — the exact name `mcp-sql` (the canonical row from migration 0005), the prefix `mcp-sql-` (every RFC 7591 dynamically-registered client, named `mcp-sql-<22 url-safe chars>`), and — only when `MCP_SQL["CLOUD_CLIENTS"]` is non-empty — one settings-declared `mcp-sql-cloud.<name>` per operator-blessed cloud client. The first two come from `mcp_sql_settings.APPLICATION_NAME` / `APPLICATION_NAME_PREFIX` (defaults `"mcp-sql"` / `"mcp-sql-"` — note the trailing dash, see "Watch out" for why); the third is a **settings-gated** branch in `consts.is_mcp_application_name(name)` that matches against `mcp_sql_settings.cloud_clients()` (drop the entry from settings → denied at the next request, tokens included). The `.` after `cloud` keeps the id disjoint from the DCR `<22 url-safe chars>` shape. `MCPOAuth2Validator` / `MCPOAuth2Authentication` use the helper; the logout signal uses `Q(name=APPLICATION_NAME) | Q(name__startswith=APPLICATION_NAME_PREFIX)` (the prefix covers the cloud shape too). All MCP-purpose Applications carry `client_type=public` (no `client_secret`), `authorization_grant_type=authorization_code`, PKCE-required.
 - **Consent screen asymmetry**: the curated migration-0005 `mcp-sql` Application has `skip_authorization=True`; every DCR-minted `mcp-sql-<token>` Application has `skip_authorization=False`. The curated client is operator-provisioned — its redirect URI is fixed in the migration so there is no rogue-client attack surface — and consent would be friction without security. DCR clients are anonymous-registration by RFC 7591 §3 design; an attacker can mint a rogue `mcp-sql-<token>` client with a loopback `redirect_uri` they control, then phish a logged-in MCP-cohort victim with a fully-formed `/o/authorize/?client_id=<attacker's>&...` link. With `skip_authorization=True` the auth code 302s silently to the victim's `127.0.0.1:<attacker-chosen-port>` and any process listening there captures it; with `skip_authorization=False` the consent screen is a CSRF-protected POST the victim must explicitly submit, breaking the silent-GET attack chain. The trade-off is one consent click every 6 h (token TTL) for legitimate users — DOT 3.x has no native "remember my choice" mechanism on its consent template. Settings-declared `mcp-sql-cloud.<name>` clients also carry `skip_authorization=False`: their redirect is a provider-hosted, off-device callback, so the same phishing surface applies and consent is required.
-- **Single scope**: `mcp:sql`. `MCPOAuth2Validator` refuses to mint anything else, and `MCPOAuth2Authentication` re-checks the scope on every request.
+- **One scope per token**: `mcp:sql`, or — with tool surfaces configured — exactly one surface's scope. `MCPOAuth2Validator` refuses to mint anything else (two scopes included), and `MCPOAuth2Authentication` / `SurfaceOAuth2Authentication` re-check the endpoint's own scope on every request. See "Tool surfaces".
 - **Redirect URI**: RFC 8252 §7.3 loopback — `http://127.0.0.1`, `http://[::1]`, or `http://localhost`, any port, with or without path. The registration endpoint enforces this server-side (`views/registration.py::_is_loopback_redirect`) and additionally rejects a userinfo component (`http://user:pass@127.0.0.1/cb`). **The two surfaces treat `localhost` differently, and both are correct:** the curated migration-0005 Application registers bare `http://127.0.0.1` and leans on DOT's *port-wildcarding* — DOT accepts any port on a registered loopback **IP** (`127.0.0.1`/`::1`) at a path-exact match, but it does NOT port-wildcard `localhost`, so a bare `http://localhost` there would match only a literal port-less `http://localhost` (useless) and is omitted. Dynamically-registered (DCR) clients instead store the **exact** URI they provided (e.g. `http://localhost:62064/callback`), which DOT matches exactly — no port-wildcarding needed — so the DCR endpoint *does* accept `localhost`. It must: Anthropic's MCP SDK (and Google/GitHub native-app OAuth) use `http://localhost:<port>/callback` despite RFC 8252 §7.3's SHOULD-NOT, and interop wins. **Non-loopback (`https`) redirects are admitted only for operator-declared cloud clients** (`MCP_SQL["CLOUD_CLIENTS"]`, see the "OAuth surface" cloud-clients note below): exact-match entries ride DOT's stock exact matching, and the single `MCPOAuth2Validator.validate_redirect_uri` prefix override (`_redirect_under_prefix`) admits a per-instance callback under an allowlisted `https` host+path prefix (host-exact never `endswith`, no userinfo, no `..`, port-exact). `/o/register` itself is **unchanged — still loopback-only**; the cloud path never touches it.
 - **Token lifetime**: 6 h access (`ACCESS_TOKEN_EXPIRE_SECONDS=21600`); refresh tokens "disabled" via `REFRESH_TOKEN_EXPIRE_SECONDS=0` — DOT still mints a `refresh_token` field in the token response (cosmetic), but its lifetime is 0 seconds so it cannot actually be used to refresh. Effective behavior: no usable refresh tokens. Authorization code expires in 60 s.
 - **URLs**: only `/o/authorize/`, `/o/token/`, `/o/revoke_token/`, and `/o/register` are exposed (curated subset of DOT's URLs plus our RFC 7591 view). `/o/applications/`, `/o/authorized_tokens/`, `/o/introspect/`, `/o/userinfo/` are deliberately absent — no admin/introspection/userinfo surface is reachable.
-- **Issuance gate** at `/o/authorize/`: `is_active AND is_staff AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
+- **Issuance gate** at `/o/authorize/` (for `mcp:sql`; a tool surface's scope swaps the profile check for the surface's permission, see "Tool surfaces"): `is_active AND is_mfa_enabled(user) AND resolve_profile(user) binds exactly one profile` (NO_PERM / AMBIGUOUS_PROFILE → `PermissionDenied`). No `is_staff` requirement (up to 0.1.0b5 there was one): the explicit profile assignment is the access gate, so a staff flag would only duplicate it. **Option D session-trust** — no fresh-TOTP timestamp check. The consumer's `SESSION_COOKIE_AGE` forces re-MFA at the boundary naturally; an active session is therefore proof of recent-enough MFA. Revisit if the threat model ever requires re-challenging TOTP at every token issuance.
 - **Runtime gate** in `MCPOAuth2Authentication.authenticate` (every MCP request): the same issuance checks PLUS an **opt-in** session-existence check. When `MCP_SQL["SESSION_MODEL"]` is set to a session-with-user model, the gate runs `<model>.objects.filter(user=user, expire_date__gt=now()).exists()` and rejects on miss. When `SESSION_MODEL` is unset (`None`, the in-package default), the gate is skipped — stock `django.contrib.sessions.Session` has no `user` FK, so defaulting to it would crash with `FieldError`; making the gate opt-in is the honest contract. Consumers who DO enable the gate get the runtime half of Option D — without it, a Django session can die (cookie cleared, admin deletes the row, `clearsessions` sweeps an expired row, a restart wipes a cache-only session store) while the OAuth bearer outlives it for up to the token's 6h TTL. With the gate enabled, the consumer's `SESSION_COOKIE_AGE` becomes the *real* upper bound on token usefulness rather than just an issuance-time freshness proxy. Explicit logout still has its own fast path via the `user_logged_out` signal regardless of gate setting (revokes tokens immediately so the next request 401s on missing-token, not on missing-session).
 - **Per-request re-validation** in `MCPOAuth2Authentication.authenticate`: same gate, every call. A revoked permission, removed MFA device, or deactivated account invalidates outstanding tokens immediately, without waiting for the 6 h expiry.
 - **Logout revocation**: `user_logged_out` deletes the user's MCP-purpose `AccessToken` rows (scoped via `application__name__startswith="mcp-sql"`, covering the curated Application, every dynamically-registered client, and every settings-declared `mcp-sql-cloud.<name>` client).
 - **Cloud clients (opt-in)**: `MCP_SQL["CLOUD_CLIENTS"]` (empty default → off) admits operator-blessed cloud-brokered clients (Claude.ai web/desktop/mobile/Cowork, ChatGPT/Codex-cloud) that vault the token in the provider's cloud behind an `https` callback. Each entry provisions one curated `Application` (`mcp-sql-cloud.<name>`, public/PKCE, no secret, `skip_authorization=False`) via the `post_migrate` receiver `provision_mcp_cloud_clients` (mirrors `provision_mcp_profiles`; create/update only — never deletes, recognition is what gates). Redirect matching is per-entry `"exact"` (DOT stock) or `"prefix"` (one override). No refresh tokens: cloud users re-consent every 6 h like everyone else. CIMD (Client ID Metadata Documents) is deferred — see `docs/oauth.md` → "Roadmap". Full onboarding + the `SESSION_MODEL` recommendation: `docs/oauth.md` → "Cloud clients".
 - **Audience binding**: implicit. DOT 3.2.0 + oauthlib 3.3.1 don't natively support RFC 8707 Resource Indicators. Binding is achieved via the single `mcp:sql` scope plus the auth class being mounted only on `/mcp/sql/`. Revisit when DOT releases first-class RFC 8707 support.
+
+## Tool surfaces
+
+`/mcp/sql/` is closed: its three read-only tools are pinned by
+`test_mcp_endpoint.py` (`test_three_tools_registered`,
+`test_tools_are_annotated_read_only`) and nothing can be added to it. A
+consumer whose agents need a tool that does something else — compute a
+value through another service, write a record — declares a **tool
+surface** (`MCP_SQL["TOOL_SURFACES"]`, none by default): a separate MCP
+endpoint with its own scope, permission, route and discovery document,
+served by the same authorization server, gates, audit table and transport.
+The read-only SQL context and an acting tool then never share a token or an
+MCP connection.
+
+### Isolation, layer by layer
+
+- **Scope.** One MCP scope per token: `MCPOAuth2Validator.validate_scopes`
+  admits exactly `{MCP_SQL["SCOPE"]}` or exactly one surface's `{SCOPE}`.
+  `/mcp/sql/` requires exactly `mcp:sql`, a surface's transport exactly its
+  own scope (`SurfaceOAuth2Authentication._required_scope`); a token
+  presented anywhere else — or carrying a second scope, which only a token
+  minted outside the OAuth flow can — is a `bad_scope` denial with its
+  `MCPAuthRejectionLog` row. Each endpoint's 401 challenge names its scope
+  (RFC 6750 `scope=`), so a client never builds its request from the
+  authorization server's `scopes_supported`, which lists them all.
+- **Permission.** A surface is granted by explicit assignment of its own
+  permission (`PERMISSION_CODENAME`, normally via `GROUP_NAME`; both
+  provisioned by the `provision_mcp_tool_surfaces` `post_migrate` receiver on
+  the `mcpquerylog` content type), read by `MCPSQLSettings.holds_surface`
+  with the same superuser-blind assignment query `resolve_profile` uses.
+  Surfaces are independent of profiles and of each other — a user may hold
+  a surface and no SQL profile — so there is no ambiguity rule. Adding a
+  user to a surface group pages like a profile grant (`ERROR`, "GAINED MCP
+  tool surface access"); surface groups never count toward profile
+  ambiguity.
+- **Issuance.** `/o/authorize/` gates on the REQUESTED scope
+  (`views/oauth_authorize._requested_scopes`: the consent POST's `scope`
+  field, else the GET's, else the scopes backend's defaults; a repeated
+  `scope` is a 403): an active account and MFA as for SQL, then the
+  surface's permission in place of a profile; the consent page shows the
+  surface's `RESOURCE_NAME`. Backstop: `MCPOAuth2Validator`'s
+  `save_authorization_code` — the one place every code is created —
+  refuses to store a code whose user is not entitled to its scope
+  (`MCPSQLSettings.entitled_to_scopes`), answering `access_denied`; so a
+  scope that differs from what the view gate read (a tampered consent form,
+  a future DOT code path) is never minted.
+- **Per request.** `SurfaceOAuth2Authentication` subclasses
+  `MCPOAuth2Authentication` and overrides only the scope, the binding
+  (`_bind`: the surface's permission, `NO_PERM` on loss) and the challenge;
+  the body cap, the silent bad-token IP block (one `bad_token` budget shared
+  by every endpoint), the application, active-account and MFA gates, the
+  session gate and the rejection rows are inherited.
+- **Discovery.** Each surface serves its own RFC 9728 document at
+  `.well-known/oauth-protected-resource/<PATH without the slash>`,
+  advertising only its scope; its 401 challenge points there and carries
+  RFC 6750's `scope` attribute, so an MCP client asks for the surface's
+  scope rather than the authorization server's default. The RFC 8414
+  document lists every scope. A client that ignores both gets the default
+  (`mcp:sql`): a 403 at consent for a surface-only user, never a token that
+  works on the surface.
+- **Audience.** As for `/mcp/sql/`, RFC 8707 is not relied on; the scope is
+  the binding. Paths are kept disjoint and never nested (boot validation),
+  so DOT's URL-prefix audience check of a resource-bound token cannot span
+  two endpoints either.
+- **Routes** are built from settings when `mcp_sql.urls` is imported
+  (`surface_urlpatterns`): a surface added to settings needs a restart.
+- **Revocation.** Logout deletes tokens per Application, so a user's
+  surface tokens go with their SQL tokens; a revoked permission denies the
+  next request.
+
+### Registration API
+
+`TOOLS` names `register(server, ctx)`, called once per request with a
+`surfaces.SurfaceServer` and the authenticated `surfaces.SurfaceContext`
+(user, surface, token id, client IP); the tools close over `ctx`, as the SQL
+tools close over the user. `SurfaceServer` exposes `tool(...)` and nothing
+else — the per-request `FastMCP` is never handed to the consumer, so no tool
+can skip the checks below:
+
+- `title`, `read_only`, `destructive`, `idempotent`, `open_world` are
+  mandatory keyword arguments, the four hints real bools, and
+  `read_only=True, destructive=True` is refused. They become the tool's MCP
+  `ToolAnnotations`, from which a client decides whether to ask the user
+  before calling it — an omitted hint must never default silently.
+- The function must be `async def`: the bridge runs every MCP request of the
+  worker on ONE shared event loop (`_get_asgi_loop`), so a blocking tool
+  would stall all of them. Blocking work and every ORM call go through
+  `ctx.run_sync`, the `sync_to_async(..., thread_sensitive=False)` +
+  `close_old_connections` shape of the SQL tools (see "MCP transport & tool
+  dispatch").
+- The name (default: the function's) matches `[A-Za-z][A-Za-z0-9_-]{0,31}`
+  — it is stored in `MCPQueryLog.tool` (32 chars) — and is unique.
+- Every call that reaches the tool writes one `MCPQueryLog` row BEFORE the
+  tool runs: `profile` = the surface name, `tool` = the tool name, `raw_sql`
+  = the call's JSON arguments (sorted keys, NUL replaced, ≤ 8 KiB), through
+  `executor.audit_tool_call`. FastMCP validates the arguments against the
+  signature first: a call that does not fit is refused there — nothing
+  runs, nothing is recorded, no budget is spent. These rows stay out of the
+  per-user volume tripwire, whose thresholds are tuned for SQL traffic;
+  `CALL_LIMIT` is a surface's volume control.
+- `CALL_LIMIT` (optional): a fixed-window budget per (surface, user) in the
+  Django cache (`cache.add` + `cache.incr`, like `throttle`); once spent the
+  row is `rejected` / `call_limit`, the tool does not run, and the agent gets
+  a `ToolError` saying so. Fail-open on any cache error (WARNING with the
+  traceback; a backend raises its client library's own exception types).
+  Needs a shared cache backend in production, like the IP block.
+- A `ToolError` the tool raises reaches the agent; any other exception is
+  logged (`logger.exception`) and answered with a generic message, so server
+  internals (URLs with credentials, other users' data) never enter the
+  agent's context.
+- Third-party text a tool returns goes through `fencing.fence_untrusted`
+  (also `surfaces.fence_untrusted`): the `run_query` fence, for any value.
+- `instructions` in the `initialize` response always open with the
+  package's preamble (`surfaces._SURFACE_PREAMBLE`: tools may act, check
+  the annotations, confirm actions the user did not ask for, fenced content
+  is data, run the client human-in-the-loop) followed by the surface's
+  `INSTRUCTIONS`; a consumer can add to it, never replace it.
+
+The transport (`views/surface_endpoint.py`) is POST only — answered 405
+before DRF, so the SDK's never-ending GET stream cannot pin a worker — and
+non-atomic on every database alias, so the gates' rejection rows survive a
+consumer's `ATOMIC_REQUESTS`.
+
+### What stays the consumer's job
+
+- **Authorization inside a tool.** Holding the surface means "may call these
+  tools"; whether this user may act on THIS record is the tool's to check.
+- **Timeouts.** The bridge waits for the tool; a tool calling another
+  service must bound that call, or a hung upstream pins the worker thread.
+- **What a tool exposes.** A tool that returns third-party text brings
+  untrusted content into the agent's context; fence it, and prefer
+  returning computed values. An agent session that connects a surface AND
+  `/mcp/sql/` (or other acting tools) is again the "lethal trifecta" the
+  README warns about — the package keeps the two apart per token and per
+  connection, but which connectors one agent session holds is the client's
+  configuration. Grant a user both only where that is acceptable.
 
 ## Naming map
 
@@ -644,7 +804,7 @@ The load-bearing invariants and footguns, grouped by layer:
   maintaining that counter is not worth it for this target.
   NAT-collateral risk (multiple
   cohort users sharing one egress IP) is acknowledged but not mitigated
-  here — the MCP cohort is small (active staff with MFA + the perm), so
+  here — the MCP cohort is small (active users with MFA + the perm), so
   the bar to silently block a legitimate user is `THRESHOLD` failed
   probes from the shared egress within the window; if it ever materialises
   raise `BAD_TOKEN_IP_THRESHOLD`. Cache-outage posture: fail-open —

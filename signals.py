@@ -1,12 +1,15 @@
-"""Signal receivers: revoke MCP tokens on user_logged_out; provision the
-per-profile groups/permissions on post_migrate; alert (Sentry ERROR) when a
-user is added to an MCP profile group (and, layered on top, when the addition
-leaves them in >1 profile = ambiguous); log a WARNING on grants drift after
+"""Signal receivers: revoke MCP tokens on user_logged_out (every MCP
+Application's tokens, so tool-surface tokens too); provision the per-profile
+and per-tool-surface groups/permissions on post_migrate; alert (Sentry ERROR)
+when a user is added to an MCP profile group (and, layered on top, when the
+addition leaves them in >1 profile = ambiguous) or to a tool-surface group;
+log a WARNING on grants drift after
 post_migrate (advisory only — apply happens via `mcp_sql_grants --apply`).
 See `docs/architecture.md` file-map row for `signals.py`."""
 
 import logging
 from typing import TYPE_CHECKING
+from typing import Any
 
 from django.apps import AppConfig
 from django.contrib.auth import get_user_model
@@ -159,6 +162,41 @@ def provision_mcp_profiles(sender: AppConfig | None, **kwargs: object) -> None:
 
 
 @receiver(post_migrate)
+def provision_mcp_tool_surfaces(sender: AppConfig | None, **kwargs: object) -> None:
+    """Ensure one Permission + one Group per `MCP_SQL["TOOL_SURFACES"]` entry.
+
+    The same idempotent, config-derived shape as `provision_mcp_profiles`
+    (same content type, so `conf.MCPSQLSettings.holds_surface` finds the
+    permission the way `resolve_profile` finds a profile's). Create only: a
+    surface removed from settings keeps its rows, but no route, scope or
+    gate refers to them any more. Empty TOOL_SURFACES (the default) is a
+    no-op.
+    """
+    if sender is None or getattr(sender, "label", None) != "mcp_sql":
+        return
+    using = kwargs.get("using")
+    if using and using != "default":
+        return
+
+    from django.contrib.auth.models import Permission
+    from django.contrib.contenttypes.models import ContentType
+    from mcp_sql.models import MCPQueryLog
+
+    surfaces = mcp_sql_settings.tool_surfaces().values()
+    if not surfaces:
+        return
+    content_type = ContentType.objects.get_for_model(MCPQueryLog)
+    for surface in surfaces:
+        perm, _ = Permission.objects.get_or_create(
+            codename=surface.codename,
+            content_type=content_type,
+            defaults={"name": f"Can use the MCP tool surface {surface.name}"},
+        )
+        group, _ = Group.objects.get_or_create(name=surface.group_name)
+        group.permissions.add(perm)
+
+
+@receiver(post_migrate)
 def provision_mcp_cloud_clients(sender: AppConfig | None, **kwargs: object) -> None:
     """Materialise one OAuth `Application` row per `MCP_SQL["CLOUD_CLIENTS"]`
     entry (opt-in cloud-client support).
@@ -290,6 +328,41 @@ def _mcp_group_pks() -> dict[int, str]:
     }
 
 
+def _surface_group_pks() -> dict[int, str]:
+    """Map each existing tool-surface group's pk → its surface name. Kept
+    apart from `_mcp_group_pks`: surface groups never count toward profile
+    ambiguity (a user may hold a profile and any number of surfaces)."""
+    name_to_surface = {
+        s.group_name: s.name for s in mcp_sql_settings.tool_surfaces().values()
+    }
+    if not name_to_surface:
+        return {}
+    return {
+        g.pk: name_to_surface[g.name]
+        for g in Group.objects.filter(name__in=name_to_surface).only("pk", "name")
+    }
+
+
+def _alert_surface_group_grant(user_ids: set[int], surfaces: list[str]) -> None:
+    """Page once per user who was added to a tool-surface group: their
+    agents may now call that surface's tools (which can act, not only read)."""
+    if not user_ids:
+        return
+    try:
+        users = {u.pk: u for u in User.objects.filter(pk__in=user_ids)}
+    except DatabaseError:
+        users = {}
+    for uid in user_ids:
+        label = _user_label(users[uid]) if uid in users else "?"
+        logger.error(
+            "MCP cohort change: %s (pk=%s) GAINED MCP tool surface access via "
+            "group(s) [%s] — confirm this grant was authorized.",
+            label,
+            uid,
+            ", ".join(sorted(surfaces)) or "?",
+        )
+
+
 def _user_label(user: "AbstractBaseUser") -> str:
     """`get_username()` (the email here), guarded so an alert never raises."""
     try:
@@ -350,7 +423,8 @@ def _alert_mcp_group_grant(user_ids: set[int], mcp_group_pks: dict[int, str]) ->
 
 @receiver(m2m_changed, sender=User.groups.through)
 def alert_on_mcp_group_grant(sender, instance, action, pk_set, reverse, **kwargs):
-    """Alert (Sentry ERROR) when a user is ADDED to an MCP profile group.
+    """Alert (Sentry ERROR) when a user is ADDED to an MCP profile group
+    (or a tool-surface group: `_alert_on_surface_group_grant`).
 
     Two layered alerts: the "gained access" page (any addition to a profile
     group is the privilege-escalation signal worth paging on) and, on top, an
@@ -365,6 +439,7 @@ def alert_on_mcp_group_grant(sender, instance, action, pk_set, reverse, **kwargs
     """
     if action != "post_add":
         return
+    _alert_on_surface_group_grant(instance, pk_set, reverse=reverse)
     mcp_group_pks = _mcp_group_pks()
     if not mcp_group_pks:
         return
@@ -376,3 +451,28 @@ def alert_on_mcp_group_grant(sender, instance, action, pk_set, reverse, **kwargs
     # (e.g. `group.user_set.add(user)`).
     elif instance.pk in mcp_group_pks:
         _alert_mcp_group_grant(set(pk_set or set()), mcp_group_pks)
+
+
+def _alert_on_surface_group_grant(
+    instance: Any, pk_set: set[int] | None, *, reverse: bool
+) -> None:
+    """The tool-surface half of `alert_on_mcp_group_grant`: the same
+    gain-only, group-only page, for the groups of `MCP_SQL["TOOL_SURFACES"]`
+    (no ambiguity rule). Never raises into the m2m save."""
+    try:
+        surface_group_pks = _surface_group_pks()
+    except DatabaseError:
+        logger.exception("MCP surface group lookup failed; no grant alert")
+        return
+    if not surface_group_pks:
+        return
+    if not reverse:
+        added = surface_group_pks.keys() & (pk_set or set())
+        if added:
+            _alert_surface_group_grant(
+                {instance.pk}, [surface_group_pks[pk] for pk in added]
+            )
+    elif instance.pk in surface_group_pks:
+        _alert_surface_group_grant(
+            set(pk_set or set()), [surface_group_pks[instance.pk]]
+        )

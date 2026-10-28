@@ -43,6 +43,9 @@ class AuthRejectionReason(StrEnum):
 
     BAD_APPLICATION = "bad_application"
     BAD_SCOPE = "bad_scope"
+    # An inactive account. The value (and its model choice label) predates
+    # dropping the `is_staff` requirement and is kept as is: renaming it
+    # would need a migration and would split the audit history.
     INACTIVE_OR_NON_STAFF = "inactive_or_non_staff"
     NO_MFA = "no_mfa"
     NO_PERM = "no_perm"
@@ -82,6 +85,9 @@ class OutcomeReason(StrEnum):
     EXECUTION_ERROR = "execution_error"
     TIMEOUT = "timeout"
     MISCONFIGURED = "misconfigured"
+    # Tool surfaces only (`surfaces.py`): the user's per-surface
+    # `CALL_LIMIT` budget was spent, so the tool did not run.
+    CALL_LIMIT = "call_limit"
 
 
 class ToolName(StrEnum):
