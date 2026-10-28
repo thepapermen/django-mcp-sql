@@ -115,6 +115,18 @@ silent per-IP block, not the audit table — use a shared cache backend
 (Redis, Memcached) in production: with a per-process backend like LocMem
 the counters, and therefore the block, are per-worker).
 
+**Tool surfaces (opt-in)** — when your agents need a tool that is *not*
+read-only SQL ("price this route", "draft a reply"), don't bolt it onto
+`/mcp/sql/` (it stays exactly the three tools above). Declare a tool surface
+in `MCP_SQL["TOOL_SURFACES"]` instead: a separate MCP endpoint (e.g.
+`/mcp/pricing/`) with its own OAuth scope, its own Django group and its own
+discovery document, reusing the same authorization server, gates, audit
+table and transport. A token for one endpoint is refused by every other.
+Tools are registered through a strict API — every behaviour annotation is
+mandatory, tools are `async`, every call that reaches a tool is audited
+before it runs, and an optional per-user call budget applies. See
+[docs/architecture.md → Tool surfaces](docs/architecture.md#tool-surfaces).
+
 **Observability** — per-user query-volume tripwires (one `ERROR` per
 `(user, decision, window)` crossing of `VOLUME_ALERT_THRESHOLDS`; alerts,
 never blocks), an `ERROR` when a user is added to the MCP permission group,
@@ -149,7 +161,10 @@ the package itself never imports `sentry_sdk`.
 >   tables.
 > - **Don't expose this surface to a privileged agent.** Keep the read-only
 >   SQL context separate from any agent that also holds act/exfiltrate tools,
->   so a malicious row has nothing to pivot into.
+>   so a malicious row has nothing to pivot into. Your own acting tools belong
+>   on a [tool surface](docs/architecture.md#tool-surfaces) — a separate
+>   endpoint and credential — and the users who get one need not get SQL
+>   access at all.
 >
 > Further reading (the prior art this fence design follows):
 > [Defense in Depth for MCP Servers](https://supabase.com/blog/defense-in-depth-mcp) ·

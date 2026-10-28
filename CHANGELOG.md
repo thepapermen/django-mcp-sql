@@ -7,6 +7,63 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Added
+
+- **Opt-in tool surfaces** (`MCP_SQL["TOOL_SURFACES"]`, empty default =
+  feature off). A tool surface is a separate MCP endpoint for the consumer's
+  OWN tools (e.g. `/mcp/pricing/`), so an agent can call an action tool
+  without that tool ever sitting next to `run_query` — `/mcp/sql/` keeps
+  exactly its three read-only tools.
+  - Each surface has its own `PATH`, OAuth `SCOPE` (also listed in
+    `OAUTH2_PROVIDER["SCOPES"]`), `RESOURCE_NAME`, `PERMISSION_CODENAME` /
+    `GROUP_NAME` (provisioned at `migrate`, like a profile's; explicit
+    assignment only, superuser-blind; independent of SQL profiles) and RFC
+    9728 document at `.well-known/oauth-protected-resource/<PATH>`. The 401
+    challenge names the surface's scope.
+  - One MCP scope per token: `MCPOAuth2Validator.validate_scopes` admits
+    exactly `mcp:sql` or exactly one surface's scope, `/o/authorize/` gates on
+    the requested scope (the surface's permission instead of a profile), and
+    `save_authorization_code` refuses to store a code for a scope its user is
+    not entitled to (`access_denied`). Every endpoint refuses another's token
+    (`bad_scope`, audited), as does every endpoint a token carrying a second
+    scope besides its own.
+  - `SurfaceOAuth2Authentication` runs the same per-request gates as
+    `/mcp/sql/` (application, scope, active account, MFA, permission,
+    session); the transport is POST-only and non-atomic on every alias.
+  - Tools are registered by the consumer's `TOOLS` callable,
+    `register(server, ctx)`, through `mcp_sql.surfaces.SurfaceServer.tool`:
+    the four MCP behaviour annotations are mandatory, tools must be `async`
+    (blocking work via `ctx.run_sync`), names fit `MCPQueryLog.tool`. Every
+    call that passes FastMCP's argument validation writes one `MCPQueryLog`
+    row before the tool runs (`profile` = the surface, `raw_sql` = the JSON
+    arguments), outside the SQL query-volume tripwire; an optional
+    `CALL_LIMIT` budgets calls per user (`rejection_reason="call_limit"`,
+    fail-open on any cache error); an unexpected exception is logged and
+    answered generically. The `initialize` instructions always open with the
+    package's security preamble.
+  - `fencing.fence_untrusted` fences third-party text in a tool result.
+  - Boot validation keeps everything a surface owns disjoint from the SQL
+    surface, the profiles and other surfaces (paths never nested).
+
+### Changed
+
+- **`is_staff` is no longer required** — neither at `/o/authorize/` nor per
+  request on `/mcp/sql/` (or a tool surface). The explicit profile (or
+  surface) assignment is the access grant, so the staff flag only
+  duplicated it; an active account, MFA and the assignment remain. An
+  inactive account is still refused (401 `"User account is inactive."`); its
+  audit rows keep the `inactive_or_non_staff` reason code. Operators who
+  relied on the staff flag as a second gate should review their profile
+  groups' membership.
+- `/mcp/sql/` accepts a token carrying exactly `mcp:sql`: one carrying a
+  further scope is refused (`bad_scope`, `"Token carries scopes other than
+  mcp:sql."`). Tokens from `/o/token/` always carried exactly `mcp:sql`; only
+  a token minted another way (admin, shell) is affected.
+- The `/mcp/sql/` 401 challenge names its scope: `WWW-Authenticate: Bearer
+  realm="api", resource_metadata="…", scope="mcp:sql"` (RFC 6750), so a
+  client requests it rather than every scope the authorization server
+  lists.
+
 ## 0.1.0b5 - 2026-07-01
 
 ### Added
