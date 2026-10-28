@@ -465,6 +465,24 @@ def _invoke_wsgi_app(wsgi_app: WSGIApplication, request: Request) -> HttpRespons
     return response
 
 
+class _EveryAlias(set[str]):
+    """A `_non_atomic_requests` set that contains every database alias.
+
+    The MCP transports are non-atomic: inside a consumer's `ATOMIC_REQUESTS`
+    transaction, DRF's exception handler (`set_rollback`) would roll back the
+    auth gates' `MCPAuthRejectionLog` rows together with the 401. Django's
+    `non_atomic_requests` records one alias per application (the bare
+    decorator: only `default`), and `BaseHandler.make_view_atomic` wraps the
+    view in `transaction.atomic(using=alias)` for every `ATOMIC_REQUESTS`
+    alias NOT in the set. Answering "yes" for any alias covers a consumer
+    whose router sends the audit tables elsewhere, and aliases configured
+    later. Django only ever tests membership on, or `add`s to, it.
+    """
+
+    def __contains__(self, alias: object) -> bool:
+        return True
+
+
 @csrf_exempt
 @api_view(["GET", "POST", "DELETE"])
 @authentication_classes([MCPOAuth2Authentication])
@@ -536,6 +554,12 @@ def mcp_endpoint(request):
         ),
     )
     return _invoke_wsgi_app(wsgi_app, request)
+
+
+# Non-atomic on every alias (see `_EveryAlias`): the auth gates'
+# `MCPAuthRejectionLog` rows must outlive the 401 under a consumer's
+# `ATOMIC_REQUESTS`.
+mcp_endpoint._non_atomic_requests = _EveryAlias()  # type: ignore[attr-defined]
 
 
 def _wrap_lifespan(asgi_app):

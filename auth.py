@@ -378,15 +378,15 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         bad-token path is intercepted earlier and writes to a Redis
         counter instead (see `throttle.record_attempt`).
 
-        Sits inside DRF's request `ATOMIC_REQUESTS=True` transaction on
-        the default alias. The row commits when DRF turns the subsequent
-        `AuthenticationFailed` into the 401 response (DRF treats 4xx as a
-        successful HTTP cycle and commits the request transaction). If a
-        future caller ever wraps an explicit `transaction.atomic()` block
-        around the gate sequence in `authenticate()` and re-raises inside
-        it, the audit write would roll back with the inner block — guard
-        such a wrapper with `savepoint=False` or move the audit write to
-        `transaction.on_commit` to preserve the invariant.
+        Runs in autocommit: the transport is non-atomic on every alias
+        (`views.mcp_endpoint._EveryAlias`). Inside a consumer's
+        `ATOMIC_REQUESTS` transaction this row would NOT survive — DRF's
+        exception handler marks the request transaction for rollback
+        (`set_rollback`) when it turns the subsequent
+        `AuthenticationFailed` into the 401. For the same reason, never
+        wrap the gate sequence in `authenticate()` in a
+        `transaction.atomic()` block that the `AuthenticationFailed`
+        leaves: the audit write would roll back with it.
         """
         try:
             # `user` is the package-agnostic `AbstractBaseUser`; django-stubs
