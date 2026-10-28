@@ -7,6 +7,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Fixed
+
+- **`MCPAuthRejectionLog` rows were lost under `ATOMIC_REQUESTS`.** With
+  `ATOMIC_REQUESTS=True` on the alias holding the audit tables, every
+  per-request gate denial on `/mcp/sql/` (removed MFA, revoked profile, dead
+  session, wrong scope or application, inactive account) was rolled back
+  together with the 401 by DRF's exception handler, so the denial trail
+  stayed empty. The endpoint is now non-atomic on every alias; the auth
+  docstring that claimed DRF commits on a 4xx is corrected.
+
 ## 0.1.0b5 - 2026-07-01
 
 ### Added

@@ -528,6 +528,16 @@ The load-bearing invariants and footguns, grouped by layer:
   `tests/test_mcp_endpoint.py::TestStockDRFDefaultsDoNotPiercePackage`.
 ### MCP transport & tool dispatch
 
+- **The endpoint is non-atomic on every database alias.**
+  `mcp_endpoint._non_atomic_requests` is `_EveryAlias()`: inside a
+  consumer's `ATOMIC_REQUESTS` transaction, DRF's exception handler
+  (`set_rollback`) rolls the request transaction back when it turns an
+  `AuthenticationFailed` into the 401 — and with it the gate's
+  `MCPAuthRejectionLog` row (up to 0.1.0b5 the denial trail stayed empty for
+  every consumer with `ATOMIC_REQUESTS=True`). Nothing else writes on the
+  request thread: the tools and the executor run on pool threads in
+  autocommit. Pinned by
+  `test_mcp_endpoint.py::test_gate_denial_row_survives_atomic_requests`.
 - **`run_query` results are fenced; `rows` is a string, not a list.** The
   `run_query` tool passes `asdict(QueryResult)` through
   `fencing.fence_query_result` before returning, so `rows` (and `error`,

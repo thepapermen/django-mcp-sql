@@ -8,12 +8,14 @@ from unittest.mock import MagicMock
 
 import pytest
 from asgiref.sync import async_to_sync
+from django.db import connections
 from django.test import override_settings
 from django.urls import resolve
 from django.urls import reverse
 from django.utils import timezone
 from mcp_sql import fencing
 from mcp_sql.conf import Profile
+from mcp_sql.models import MCPAuthRejectionLog
 from mcp_sql.schemas import ToolName
 from mcp_sql.views.mcp_endpoint import _SERVER_INSTRUCTIONS
 from mcp_sql.views.mcp_endpoint import _build_mcp_server
@@ -305,6 +307,23 @@ class TestMcpEndpointAuthGate:
         api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {bad_token.token}")
         response = api_client.post(reverse("mcp_sql_endpoint"), data={}, format="json")
         assert response.status_code in {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_gate_denial_row_survives_atomic_requests(
+    mcp_access_token, mcp_mfa_off, monkeypatch
+):
+    """Under a consumer's `ATOMIC_REQUESTS`, DRF's exception handler rolls the
+    request transaction back together with the 401; the endpoint is
+    non-atomic on every alias (`_EveryAlias`), so the gate's
+    `MCPAuthRejectionLog` row is kept."""
+    db_settings = connections["default"].settings_dict
+    monkeypatch.setitem(db_settings, "ATOMIC_REQUESTS", value=True)
+    api_client = APIClient()
+    api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {mcp_access_token.token}")
+    response = api_client.post(reverse("mcp_sql_endpoint"), data={}, format="json")
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert MCPAuthRejectionLog.objects.get().reason == "no_mfa"
 
 
 @pytest.mark.django_db
