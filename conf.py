@@ -20,6 +20,7 @@ Cached values flush on `setting_changed` so `pytest-django`'s
 """
 
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -79,6 +80,54 @@ class CloudClient:
     client_id: str
     redirect_match: str
     redirect_uri: str
+
+
+@dataclass(frozen=True)
+class CallLimit:
+    """A tool surface's per-user call budget: at most `calls` tool calls per
+    fixed window of `window_seconds` (`surfaces._consume_call_budget`)."""
+
+    calls: int
+    window_seconds: int
+
+
+@dataclass(frozen=True)
+class ToolSurface:
+    """One operator-declared tool surface (opt-in).
+
+    A separate MCP endpoint carrying the consumer's OWN tools — never the
+    read-only SQL tools, and never on `/mcp/sql/`. Built by
+    `MCPSQLSettings.tool_surfaces()` from each `MCP_SQL["TOOL_SURFACES"]`
+    entry. Each surface has its own URL (`path`), its own OAuth scope
+    (`scope`: a token minted for one surface or for `/mcp/sql/` is refused
+    everywhere else), its own RFC 9728 discovery document and its own Django
+    permission + group (`codename` / `group_name`, explicit assignment only,
+    like a profile's). `register` is the consumer's
+    `callable(server, ctx) -> None`, already resolved from its dotted path,
+    that adds the surface's tools per request (`surfaces.SurfaceServer`).
+    `instructions` is appended to the package's standing security posture in
+    the MCP `initialize` response. See `docs/architecture.md` "Tool surfaces".
+    """
+
+    name: str
+    path: str
+    scope: str
+    resource_name: str
+    codename: str
+    group_name: str
+    instructions: str
+    register: Callable[..., None]
+    call_limit: CallLimit | None = None
+
+    @property
+    def url_name(self) -> str:
+        """The surface's transport route name (`reverse()` target)."""
+        return f"mcp_sql_surface_{self.name}"
+
+    @property
+    def metadata_url_name(self) -> str:
+        """The route name of the surface's RFC 9728 discovery document."""
+        return f"mcp_sql_surface_{self.name}_protected_resource_metadata"
 
 
 class ResolutionOutcome(Enum):
@@ -206,7 +255,7 @@ DEFAULTS: dict[str, Any] = {
     #                         unique across profiles (resolution counts
     #                         distinct codenames — see `resolve_profile`).
     #   GROUP_NAME          — Django Group carrying that permission; admins
-    #                         add staff to it to confer the tier.
+    #                         add users to it to confer the tier.
     #   ALLOWED_MODELS      — this tier's `app_label.ModelName` whitelist.
     #   SESSION_CONTEXT     — OPTIONAL dotted path to
     #                         `callable(user, profile) -> Mapping[str, str]
@@ -247,6 +296,39 @@ DEFAULTS: dict[str, Any] = {
     # "exact" | "prefix"; REDIRECT_URI = the https callback or host+path prefix.
     # Runbook (onboarding, prerequisites, matching): docs/oauth.md "Cloud clients".
     "CLOUD_CLIENTS": [],
+    # === Tool surfaces (opt-in) ===
+    #
+    # Separate MCP endpoints for the consumer's OWN tools (e.g. "price this
+    # route"), kept apart from the read-only SQL surface: `/mcp/sql/` stays
+    # exactly the three read-only tools. Keyed by surface name (a slug, also
+    # written to `MCPQueryLog.profile` on every tool-call row, so it must not
+    # equal a profile name). Each entry:
+    #   PATH                — URL path of the transport, e.g. "mcp/pricing/"
+    #                         (served with and without the trailing slash);
+    #                         discovery lives at
+    #                         `.well-known/oauth-protected-resource/<PATH>`.
+    #   SCOPE               — the surface's own OAuth scope, e.g.
+    #                         "mcp:pricing"; must also be listed in
+    #                         OAUTH2_PROVIDER["SCOPES"]. A token carries
+    #                         exactly one MCP scope, so it works on exactly
+    #                         one surface (or on `/mcp/sql/`).
+    #   RESOURCE_NAME       — display name (discovery + consent screen).
+    #   PERMISSION_CODENAME — Django permission (content_type `mcpquerylog`)
+    #   GROUP_NAME            whose EXPLICIT assignment (directly or via the
+    #                         group) grants the surface. Independent of the
+    #                         SQL profiles: a user may hold a profile, a
+    #                         surface, both, or several surfaces.
+    #   TOOLS               — dotted path to `register(server, ctx)`, called
+    #                         per request to add the surface's tools; import-
+    #                         checked at boot (`surfaces.SurfaceServer`).
+    #   INSTRUCTIONS        — OPTIONAL text appended to the package's standing
+    #                         security posture in the MCP `initialize` reply.
+    #   CALL_LIMIT          — OPTIONAL {"CALLS": n, "WINDOW_SECONDS": s}:
+    #                         per-user budget of tool calls on this surface.
+    # Empty (default) = OFF: no extra route, scope or group exists. Groups and
+    # permissions are provisioned by `post_migrate` like a profile's.
+    # See docs/architecture.md "Tool surfaces".
+    "TOOL_SURFACES": {},
 }
 
 
@@ -275,6 +357,7 @@ class MCPSQLSettings:
         self._cached: dict[str, Any] = {}
         self._profiles: dict[str, Profile] | None = None
         self._cloud_clients: dict[str, CloudClient] | None = None
+        self._tool_surfaces: dict[str, ToolSurface] | None = None
 
     def __getattr__(self, name: str) -> Any:
         # `__getattr__` is only called when the attribute is NOT already
@@ -304,6 +387,7 @@ class MCPSQLSettings:
         self._cached.clear()
         self._profiles = None
         self._cloud_clients = None
+        self._tool_surfaces = None
 
     def profiles(self) -> dict[str, Profile]:
         """Resolve `MCP_SQL["PROFILES"]` into `{name: Profile}`.
@@ -358,6 +442,80 @@ class MCPSQLSettings:
         self._cloud_clients = built
         return built
 
+    def tool_surfaces(self) -> dict[str, ToolSurface]:
+        """Resolve `MCP_SQL["TOOL_SURFACES"]` into `{name: ToolSurface}`.
+
+        Each entry's `TOOLS` dotted path is resolved to its `register`
+        callable here, eagerly (like a profile's `SESSION_CONTEXT`); boot
+        validation has already import-checked it. Cached until `reload()`, so
+        `@override_settings(MCP_SQL=...)` re-reads between tests. Empty (the
+        default) means the opt-in feature is off.
+        """
+        if self._tool_surfaces is not None:
+            return self._tool_surfaces
+        user_cfg = getattr(settings, "MCP_SQL", {})
+        raw = user_cfg.get("TOOL_SURFACES", DEFAULTS["TOOL_SURFACES"])
+        built: dict[str, ToolSurface] = {}
+        for name, entry in raw.items():
+            limit = entry.get("CALL_LIMIT")
+            built[name] = ToolSurface(
+                name=name,
+                path=entry["PATH"],
+                scope=entry["SCOPE"],
+                resource_name=entry["RESOURCE_NAME"],
+                codename=entry["PERMISSION_CODENAME"],
+                group_name=entry["GROUP_NAME"],
+                instructions=entry.get("INSTRUCTIONS") or "",
+                register=import_string(entry["TOOLS"]),
+                call_limit=(
+                    CallLimit(
+                        calls=limit["CALLS"], window_seconds=limit["WINDOW_SECONDS"]
+                    )
+                    if limit
+                    else None
+                ),
+            )
+        self._tool_surfaces = built
+        return built
+
+    def surface_for_scope(self, scope: str) -> ToolSurface | None:
+        """The tool surface whose OAuth scope is `scope`, or None (the SQL
+        scope, or a scope nothing here owns)."""
+        return next(
+            (s for s in self.tool_surfaces().values() if s.scope == scope), None
+        )
+
+    def holds_surface(self, user: Any, surface: ToolSurface) -> bool:
+        """True iff `user` is EXPLICITLY assigned `surface`'s permission.
+
+        The same assignment query `resolve_profile` runs
+        (`_assigned_codenames`), never `has_perm`: an active superuser "has"
+        every permission, and a surface — whose tools can act, not just
+        read — must never be conferred by superuser status alone. Surfaces
+        are independent of profiles and of each other, so there is no
+        ambiguity rule here: holding the permission is the whole test.
+        """
+        return surface.codename in self._assigned_codenames(user, [surface.codename])
+
+    def entitled_to_scopes(self, user: Any, scopes: "list[str] | set[str]") -> bool:
+        """True iff `user` may be issued a token for exactly `scopes`.
+
+        `{SCOPE}` needs an unambiguous profile (`resolve_profile`), a tool
+        surface's `{scope}` needs that surface (`holds_surface`), and any
+        other set — empty, two scopes, an unknown one — is never issued
+        (`oauth.MCPOAuth2Validator.validate_scopes` refuses it too). Only the
+        scope-specific half of the issuance gate: the active-account and MFA
+        checks are the caller's (`views.oauth_authorize.MCPAuthorizationView`).
+        """
+        requested = set(scopes)
+        if requested == {self.SCOPE}:
+            return isinstance(self.resolve_profile(user), Profile)
+        if len(requested) == 1:
+            surface = self.surface_for_scope(next(iter(requested)))
+            if surface is not None:
+                return self.holds_surface(user, surface)
+        return False
+
     def resolve_profile(self, user: Any) -> Profile | ResolutionOutcome:
         """Bind `user` to exactly one profile by EXPLICIT permission assignment.
 
@@ -370,27 +528,37 @@ class MCPSQLSettings:
         A codename held via BOTH a group and a direct grant collapses to one
         (distinct), so it is not falsely flagged ambiguous.
         """
-        from django.contrib.auth.models import Permission
-        from django.db.models import Q
-
         by_codename = {p.codename: p for p in self.profiles().values()}
-        matched = set(
-            Permission.objects.filter(
-                Q(group__user=user) | Q(user=user),
-                # Pin to the exact content type the provisioning signal
-                # (`signals.provision_mcp_profiles`) creates these perms on, so
-                # a profile codename can never collide with a default
-                # add/change/delete/view permission on another mcp_sql model.
-                content_type__app_label="mcp_sql",
-                content_type__model="mcpquerylog",
-                codename__in=list(by_codename),
-            ).values_list("codename", flat=True)
-        )
+        matched = self._assigned_codenames(user, by_codename)
         if not matched:
             return ResolutionOutcome.NO_PERM
         if len(matched) > 1:
             return ResolutionOutcome.AMBIGUOUS_PROFILE
         return by_codename[next(iter(matched))]
+
+    @staticmethod
+    def _assigned_codenames(user: Any, codenames: Iterable[str]) -> set[str]:
+        """Which of `codenames` `user` is assigned explicitly: the assignment
+        rows themselves (group-held OR directly granted), never `has_perm`.
+
+        Pinned to the exact content type the provisioning signals
+        (`signals.provision_mcp_profiles` / `provision_mcp_tool_surfaces`)
+        create these permissions on, so a codename can never collide with a
+        default add/change/delete/view permission on another mcp_sql model.
+        The one query behind both access grants (`resolve_profile`,
+        `holds_surface`).
+        """
+        from django.contrib.auth.models import Permission
+        from django.db.models import Q
+
+        return set(
+            Permission.objects.filter(
+                Q(group__user=user) | Q(user=user),
+                content_type__app_label="mcp_sql",
+                content_type__model="mcpquerylog",
+                codename__in=list(codenames),
+            ).values_list("codename", flat=True)
+        )
 
 
 mcp_sql_settings = MCPSQLSettings()

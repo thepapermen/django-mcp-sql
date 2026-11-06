@@ -84,19 +84,31 @@ class TestMCPOAuth2AuthenticationRejections:
         with pytest.raises(AuthenticationFailed, match="mcp:sql scope"):
             MCPOAuth2Authentication().authenticate(request)
 
+    def test_extra_scope_rejected(self, mcp_access_token, mcp_mfa_on):
+        # `/o/token/` never mints two scopes; a token that carries one besides
+        # `mcp:sql` came from somewhere else and is refused.
+        mcp_access_token.scope = "mcp:sql read"
+        mcp_access_token.save()
+        request = _bearer_request(mcp_access_token.token)
+        with pytest.raises(AuthenticationFailed, match="scopes other than mcp:sql"):
+            MCPOAuth2Authentication().authenticate(request)
+
     def test_inactive_user_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
         mcp_user.is_active = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
+        with pytest.raises(AuthenticationFailed, match="inactive"):
             MCPOAuth2Authentication().authenticate(request)
 
-    def test_non_staff_user_rejected(self, mcp_user, mcp_access_token, mcp_mfa_on):
+    def test_non_staff_user_accepted(
+        self, mcp_user, mcp_access_token, mcp_mfa_on, mcp_active_session
+    ):
+        """No `is_staff` requirement: the profile assignment is the grant."""
         mcp_user.is_staff = False
         mcp_user.save()
         request = _bearer_request(mcp_access_token.token)
-        with pytest.raises(AuthenticationFailed, match="active staff"):
-            MCPOAuth2Authentication().authenticate(request)
+        user, _ = MCPOAuth2Authentication().authenticate(request)
+        assert user.pk == mcp_user.pk
 
     def test_no_mfa_rejected(self, mcp_access_token, mcp_mfa_off):
         request = _bearer_request(mcp_access_token.token)
@@ -723,6 +735,9 @@ class TestWWWAuthenticateAdvertisesDiscovery:
         expected_path = reverse("mcp_sql_protected_resource_metadata")
         assert 'resource_metadata="' in challenge
         assert expected_path in challenge
+        # RFC 6750 `scope`: the one scope this endpoint accepts, so a client
+        # never asks for every scope the authorization server lists.
+        assert challenge.endswith(', scope="mcp:sql"')
 
 
 class TestBodySizeCap:

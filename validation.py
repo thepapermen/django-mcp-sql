@@ -38,7 +38,13 @@ else:
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
+from pydantic import ConfigDict
 from pydantic import TypeAdapter
+
+# `extra="forbid"` on the tool-surface shapes: a typo'd key (`CALL_LIMITS`,
+# `INSTRUCTION`) would otherwise be ignored with nothing in the logs — for a
+# call budget, a budget silently off.
+_FORBID_EXTRA = ConfigDict(extra="forbid")
 
 
 class McpSqlLimits(TypedDict):
@@ -68,6 +74,31 @@ class CloudClientEntry(TypedDict):
     REDIRECT_URI: str
 
 
+class CallLimitEntry(TypedDict):
+    """A tool surface's `CALL_LIMIT`. See `conf.CallLimit`."""
+
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
+    CALLS: int
+    WINDOW_SECONDS: int
+
+
+class ToolSurfaceEntry(TypedDict):
+    """One `MCP_SQL["TOOL_SURFACES"]` entry. See `conf.ToolSurface`."""
+
+    __pydantic_config__ = _FORBID_EXTRA  # type: ignore[misc]  # pydantic's TypedDict config hook; mypy only expects field declarations here.
+
+    PATH: str
+    SCOPE: str
+    RESOURCE_NAME: str
+    PERMISSION_CODENAME: str
+    GROUP_NAME: str
+    # Dotted path to `register(server, ctx)`; import-checked at boot.
+    TOOLS: str
+    INSTRUCTIONS: NotRequired[str]
+    CALL_LIMIT: NotRequired[CallLimitEntry | None]
+
+
 class McpSqlSettings(TypedDict):
     # Required: every consumer must declare these.
     # One entry per access tier; keys are profile names (e.g. "default").
@@ -92,6 +123,8 @@ class McpSqlSettings(TypedDict):
     DB_ALIAS: NotRequired[str]
     # Opt-in cloud clients. Empty / absent = feature off.
     CLOUD_CLIENTS: NotRequired[list[CloudClientEntry]]
+    # Opt-in tool surfaces, keyed by surface name. Empty / absent = off.
+    TOOL_SURFACES: NotRequired[dict[str, ToolSurfaceEntry]]
 
 
 _MCP_SQL_MODEL_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]+$")
@@ -322,6 +355,176 @@ def _validate_cloud_clients(clients: list[Mapping[str, Any]]) -> None:
             raise ImproperlyConfigured(msg)
 
 
+# A surface name is written to `MCPQueryLog.profile` (max_length=64) on every
+# tool-call row and embedded in its URL names, hence a slug that fits.
+_SURFACE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# One or more lowercase segments, each ending in `/`, no leading slash — the
+# shape `path()` routes and `reverse()` returns (with a leading `/` added).
+# A `.` cannot appear, so a surface can never claim a `.well-known/` path.
+_SURFACE_PATH_RE = re.compile(r"^(?:[a-z0-9][a-z0-9_-]*/)+$")
+# RFC 6749 §3.3 scope-token: printable ASCII except space, `"` and `\`.
+_SCOPE_TOKEN_RE = re.compile(r"^[\x21\x23-\x5b\x5d-\x7e]+$")
+# The SQL transport's path, and the authorization server's mount.
+_SQL_PATH = "mcp/sql/"
+_RESERVED_PATH_PREFIXES = ("o/",)
+
+
+def _paths_overlap(first: str, second: str) -> bool:
+    """True when one surface path is the other or nested under it.
+
+    Disjoint paths keep every surface's RFC 9728 `resource` from being a URL
+    prefix of another's: DOT (3.4+) audience-checks a resource-bound token
+    with a URL-PREFIX match, so a token bound to `.../mcp/a` would otherwise
+    pass the audience check at `.../mcp/a/b/` (the scope check still refuses
+    it — this keeps the two layers from disagreeing)."""
+    return first.startswith(second) or second.startswith(first)
+
+
+def _validate_call_limit(name: str, limit: Mapping[str, Any] | None) -> None:
+    """Both members positive ints, checked on the RAW values: pydantic's lax
+    mode would take "60" or 60.0."""
+    if limit is None:
+        return
+    for key in ("CALLS", "WINDOW_SECONDS"):
+        value = limit[key]
+        if type(value) is not int or value <= 0:
+            msg = (
+                f"MCP_SQL.TOOL_SURFACES[{name!r}].CALL_LIMIT.{key} must be a "
+                f"positive int (got {value!r})"
+            )
+            raise ImproperlyConfigured(msg)
+
+
+def _validate_surface_scope_registered(name: str, scope: str) -> None:
+    """The surface's scope must be one DOT knows, or every authorization for
+    it fails with an opaque `invalid_scope`: DOT's own `validate_scopes`
+    (which `MCPOAuth2Validator` delegates to after its own check) admits only
+    scopes its scopes backend lists. Checked for DOT's default backend (the
+    `OAUTH2_PROVIDER["SCOPES"]` dict); a consumer with a custom
+    `SCOPES_BACKEND_CLASS` owns that list themselves."""
+    oauth_cfg = getattr(settings, "OAUTH2_PROVIDER", {})
+    if "SCOPES_BACKEND_CLASS" in oauth_cfg:
+        return
+    if scope not in oauth_cfg.get("SCOPES", {}):
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].SCOPE {scope!r} is not listed in "
+            "OAUTH2_PROVIDER['SCOPES']; add it (with a description — it is shown "
+            "on the consent screen), or every authorization for this surface "
+            "fails with invalid_scope."
+        )
+        raise ImproperlyConfigured(msg)
+
+
+def _validate_surface_entry(name: str, entry: Mapping[str, Any]) -> None:
+    """Per-surface field checks (cross-surface uniqueness lives in the caller)."""
+    if not _SURFACE_NAME_RE.fullmatch(name):
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES key {name!r} must be a slug: a lowercase "
+            "letter followed by up to 63 lowercase letters, digits or underscores"
+        )
+        raise ImproperlyConfigured(msg)
+    path = entry["PATH"]
+    if (
+        not _SURFACE_PATH_RE.fullmatch(path)
+        or "//" in path
+        or path.startswith(_RESERVED_PATH_PREFIXES)
+    ):
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].PATH {path!r} must be lowercase "
+            "path segments ending in '/', without a leading '/' and outside the "
+            "authorization server's 'o/' (e.g. 'mcp/pricing/')"
+        )
+        raise ImproperlyConfigured(msg)
+    if _paths_overlap(path, _SQL_PATH):
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].PATH {path!r} overlaps the read-only "
+            f"SQL transport '{_SQL_PATH}'; a tool surface needs its own path"
+        )
+        raise ImproperlyConfigured(msg)
+    scope = entry["SCOPE"]
+    if not _SCOPE_TOKEN_RE.fullmatch(scope):
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].SCOPE {scope!r} must be one OAuth "
+            "scope token (printable ASCII, no space, quote or backslash)"
+        )
+        raise ImproperlyConfigured(msg)
+    if not entry["RESOURCE_NAME"].strip():
+        msg = f"MCP_SQL.TOOL_SURFACES[{name!r}].RESOURCE_NAME must be non-empty"
+        raise ImproperlyConfigured(msg)
+    if entry["PERMISSION_CODENAME"] in _RESERVED_CODENAMES:
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].PERMISSION_CODENAME "
+            f"{entry['PERMISSION_CODENAME']!r} collides with a Django default "
+            "model permission on the mcpquerylog content type — provisioning "
+            "would adopt it and silently grant this surface to its holders"
+        )
+        raise ImproperlyConfigured(msg)
+    tools_path = entry["TOOLS"]
+    try:
+        register = import_string(tools_path)
+    except ImportError as exc:
+        msg = (
+            f"MCP_SQL.TOOL_SURFACES[{name!r}].TOOLS {tools_path!r} does not "
+            f"import: {exc}"
+        )
+        raise ImproperlyConfigured(msg) from exc
+    if not callable(register):
+        msg = f"MCP_SQL.TOOL_SURFACES[{name!r}].TOOLS {tools_path!r} is not callable"
+        raise ImproperlyConfigured(msg)
+    _validate_call_limit(name, entry.get("CALL_LIMIT"))
+    _validate_surface_scope_registered(name, scope)
+
+
+def _validate_tool_surfaces(cfg: Mapping[str, Any]) -> None:
+    """Each TOOL_SURFACES entry is well-formed, and nothing a surface owns is
+    shared with the SQL surface, a profile or another surface: its name (the
+    audit row's `profile`), PATH (disjoint, never nested — `_paths_overlap`),
+    SCOPE (one scope ↔ one surface is what keeps a token on its surface),
+    PERMISSION_CODENAME and GROUP_NAME (a shared one would grant two things
+    at once). Empty (the default) is a no-op — the feature is off."""
+    surfaces = cfg.get("TOOL_SURFACES") or {}
+    if not surfaces:
+        return
+    profiles = cfg["PROFILES"]
+    sql_scope = cfg.get("SCOPE", "mcp:sql")
+    codenames = {
+        p["PERMISSION_CODENAME"]: f"profile {n!r}" for n, p in profiles.items()
+    }
+    groups = {p["GROUP_NAME"]: f"profile {n!r}" for n, p in profiles.items()}
+    scopes = {sql_scope: "the SQL surface (MCP_SQL.SCOPE)"}
+    paths: dict[str, str] = {}
+    for name, entry in surfaces.items():
+        _validate_surface_entry(name, entry)
+        owner = f"tool surface {name!r}"
+        if name in profiles:
+            msg = (
+                f"MCP_SQL.TOOL_SURFACES key {name!r} is also a profile name; audit "
+                "rows record either in the same column, so they must differ"
+            )
+            raise ImproperlyConfigured(msg)
+        for field, registry in (
+            ("SCOPE", scopes),
+            ("PERMISSION_CODENAME", codenames),
+            ("GROUP_NAME", groups),
+        ):
+            value = entry[field]
+            if value in registry:
+                msg = (
+                    f"MCP_SQL.TOOL_SURFACES[{name!r}].{field} {value!r} is also "
+                    f"used by {registry[value]}; it must be unique"
+                )
+                raise ImproperlyConfigured(msg)
+            registry[value] = owner
+        for other_path, other in paths.items():
+            if _paths_overlap(entry["PATH"], other_path):
+                msg = (
+                    f"MCP_SQL.TOOL_SURFACES[{name!r}].PATH {entry['PATH']!r} "
+                    f"overlaps the PATH {other_path!r} of {other}"
+                )
+                raise ImproperlyConfigured(msg)
+        paths[entry["PATH"]] = owner
+
+
 def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
     """Validate the `MCP_SQL` settings dict on startup.
 
@@ -372,3 +575,4 @@ def validate_mcp_sql_settings(cfg: Mapping[str, Any]) -> None:
 
     _validate_profiles(cfg["PROFILES"])
     _validate_cloud_clients(cfg.get("CLOUD_CLIENTS", []))
+    _validate_tool_surfaces(cfg)

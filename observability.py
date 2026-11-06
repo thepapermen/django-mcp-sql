@@ -26,8 +26,9 @@ counting every rejected row; it is independently escalated via its own
 `logger.error`, so the extra increment is accepted noise, not a second
 signal.) The alert names the user — pk plus `get_username()` (the email for
 an email-keyed user model) —
-so a responder can act without a DB lookup; this is appropriate because the
-MCP surface is staff-only (employees, not clients). It never includes the
+so a responder can act without a DB lookup; this is appropriate because
+MCP access is granted only by explicit group / permission assignment (an
+operator-curated cohort, not self-service sign-up). It never includes the
 SQL text.
 """
 
