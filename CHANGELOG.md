@@ -36,11 +36,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     (blocking work via `ctx.run_sync`), names fit `MCPQueryLog.tool`. Every
     call that passes FastMCP's argument validation writes one `MCPQueryLog`
     row before the tool runs (`profile` = the surface, `raw_sql` = the JSON
-    arguments), outside the SQL query-volume tripwire; an optional
-    `CALL_LIMIT` budgets calls per user (`rejection_reason="call_limit"`,
-    fail-open on any cache error); an unexpected exception is logged and
-    answered generically. The `initialize` instructions always open with the
-    package's security preamble.
+    arguments), outside the SQL query-volume tripwire. The write fails
+    closed: a call whose row cannot be written is refused and the tool does
+    not run. An optional `CALL_LIMIT` budgets calls per user
+    (`rejection_reason="call_limit"`, fail-open on any cache error); an
+    unexpected exception is logged and answered generically. The
+    `initialize` instructions always open with the package's security
+    preamble.
   - `fencing.fence_untrusted` fences third-party text in a tool result.
   - Boot validation keeps everything a surface owns disjoint from the SQL
     surface, the profiles and other surfaces (paths never nested).

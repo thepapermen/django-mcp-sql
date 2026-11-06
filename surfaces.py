@@ -5,9 +5,11 @@ tests and nothing can be added to it. A consumer that needs an MCP tool that
 does something else ("price this route", which calls another service and
 writes there) declares a TOOL SURFACE instead (`MCP_SQL["TOOL_SURFACES"]`):
 its own URL, its own OAuth scope, its own Django group and its own RFC 9728
-discovery document, so the README's advice holds by construction — the
-read-only SQL context and an agent's act/exfiltrate tools stay in separate
-MCP connections, and a token for one is refused by the other.
+discovery document. The package keeps the read-only SQL context and an
+agent's acting tools apart per token and per connection — a token for one
+is refused by the other — but one agent session can still connect both:
+which connectors a session holds is the client's configuration (the
+README's advice; `docs/architecture.md` "What stays the consumer's job").
 
 This module is the consumer-facing API. The surface's `TOOLS` setting names a
 `register(server, ctx)` callable, called once per request (like the SQL
@@ -37,14 +39,14 @@ do blocking and ORM work through `ctx.run_sync`), and the name must fit the
 audit column. Every call that reaches the tool writes one `MCPQueryLog` row
 BEFORE the tool runs (`profile` = the surface name, `tool` = the tool name,
 `raw_sql` = the JSON arguments), so an attempt leaves a trail even if the tool
-then fails, and the surface's optional `CALL_LIMIT` is enforced there too. A
-call whose arguments do not fit the tool's signature is refused by FastMCP's
+then fails; a call whose row cannot be written is refused and the tool does
+not run. The surface's optional `CALL_LIMIT` is enforced there too. A call
+whose arguments do not fit the tool's signature is refused by FastMCP's
 argument validation before that point: nothing runs, nothing is recorded, no
-budget is spent. An exception other
-than `ToolError` is logged and answered with a generic message, so server
-internals never reach the agent; raise `ToolError("...")` for a message the
-agent should see. Third-party text in a result goes through
-`fencing.fence_untrusted`.
+budget is spent. An exception other than `ToolError` is logged and answered
+with a generic message, so server internals never reach the agent; raise
+`ToolError("...")` for a message the agent should see. Third-party text in a
+result goes through `fencing.fence_untrusted`.
 
 See `docs/architecture.md` "Tool surfaces" for the threat model.
 """
@@ -63,12 +65,13 @@ from typing import TypeVar
 
 from asgiref.sync import sync_to_async
 from django.core.cache import cache
+from django.db import DatabaseError
+from django.utils import timezone
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.context_injection import find_context_parameter
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from mcp_sql import executor
 from mcp_sql import fencing
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.schemas import OutcomeReason
@@ -92,7 +95,7 @@ logger = logging.getLogger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Awaitable[Any]])
 
 # `MCPQueryLog.tool` is `max_length=32`; a longer name would make every audit
-# insert of the tool fail (`DataError`, logged and swallowed — no trail).
+# insert of the tool fail (`DataError`), so every call of it would be refused.
 # Within the MCP spec's tool-name alphabet (letters, digits, `_`, `-`, `.`),
 # minus `.`, and starting with a letter.
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
@@ -223,23 +226,45 @@ def _record_call(
     `CALL_LIMIT` is then returned and the tool does not run; None lets it
     run. Synchronous ORM work — the caller runs it through
     `SurfaceContext.run_sync`.
+
+    Fail-closed, unlike the SQL tools' best-effort `executor._audit_safely`:
+    their row follows a read-only query that already ran, this one precedes
+    a tool that may act. If the insert fails, the call is refused with a
+    `ToolError` and the tool does not run — no call without its row. Written
+    here rather than through `_audit_safely`, the row also stays out of the
+    per-user query-volume tripwire, whose thresholds are tuned for SQL
+    traffic (`CALL_LIMIT` is a surface's volume control).
     """
     within_budget = _consume_call_budget(ctx)
-    executor.audit_tool_call(
-        user=ctx.user,
-        profile=ctx.surface,
-        tool=tool,
-        token_id=ctx.token_id,
-        client_ip=ctx.client_ip,
-        client_redirect=ctx.client_redirect,
-        detail=_audit_arguments(arguments),
-        decision=(
-            MCPQueryLog.DECISION_ALLOWED
-            if within_budget
-            else MCPQueryLog.DECISION_REJECTED
-        ),
-        rejection_reason="" if within_budget else OutcomeReason.CALL_LIMIT,
-    )
+    try:
+        MCPQueryLog.objects.create(
+            # Any user model is accepted; django-stubs types the FK as the
+            # concrete AUTH_USER_MODEL (as in
+            # `MCPOAuth2Authentication._audit_rejection`).
+            user=ctx.user,  # type: ignore[misc]
+            profile=ctx.surface.name,
+            token_id=ctx.token_id,
+            decision=(
+                MCPQueryLog.DECISION_ALLOWED
+                if within_budget
+                else MCPQueryLog.DECISION_REJECTED
+            ),
+            tool=tool,
+            rejection_reason="" if within_budget else OutcomeReason.CALL_LIMIT,
+            raw_sql=_audit_arguments(arguments),
+            started_at=timezone.now(),
+            client_ip=ctx.client_ip,
+            client_redirect=ctx.client_redirect,
+        )
+    except DatabaseError:
+        logger.exception(
+            "MCP surface %s audit row write failed (user pk=%s, tool %s); call refused",
+            ctx.surface.name,
+            ctx.user.pk,
+            tool,
+        )
+        msg = f"{tool} was not run: the audit log is unavailable. Try again later."
+        raise ToolError(msg) from None
     # The budget can only be spent when a CALL_LIMIT is set.
     return None if within_budget else ctx.surface.call_limit
 

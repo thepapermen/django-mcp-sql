@@ -13,12 +13,14 @@ import logging
 import secrets
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 import pytest
 from asgiref.sync import async_to_sync
 from django.core.exceptions import ImproperlyConfigured
+from django.db import DatabaseError
 from django.db import connections
 from django.urls import reverse
 from django.utils import timezone
@@ -750,6 +752,27 @@ class TestSurfaceTransportEndToEnd:
         assert INTERNAL_FAILURE_DETAIL in caplog.text
         # The attempt was recorded before the tool ran.
         assert MCPQueryLog.objects.get().tool == "explode"
+
+    def test_audit_failure_refuses_the_call(self, client, surface_access_token, caplog):
+        # Fail-closed, unlike the SQL tools' best-effort audit: the row comes
+        # before a tool that may act, so no row means the tool does not run.
+        db_detail = "could not connect to server at 10.0.0.5"
+        with (
+            patch.object(
+                MCPQueryLog.objects, "create", side_effect=DatabaseError(db_detail)
+            ),
+            caplog.at_level(logging.ERROR, logger="mcp_sql.surfaces"),
+        ):
+            result = _call(
+                client, surface_access_token.token, "add_widget", {"name": "w"}
+            )
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "add_widget was not run: the audit log is unavailable" in text
+        assert db_detail not in text
+        assert "audit row write failed" in caplog.text
+        assert not Widget.objects.exists()
+        assert not MCPQueryLog.objects.exists()
 
 
 @pytest.mark.django_db(transaction=True)

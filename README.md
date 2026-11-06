@@ -124,7 +124,8 @@ discovery document, reusing the same authorization server, gates, audit
 table and transport. A token for one endpoint is refused by every other.
 Tools are registered through a strict API — every behaviour annotation is
 mandatory, tools are `async`, every call that reaches a tool is audited
-before it runs, and an optional per-user call budget applies. See
+before it runs (no audit row, no call), and an optional per-user call budget
+applies. See
 [docs/architecture.md → Tool surfaces](docs/architecture.md#tool-surfaces).
 
 **Observability** — per-user query-volume tripwires (one `ERROR` per

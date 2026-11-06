@@ -545,7 +545,9 @@ the safe failure.
 **Auditing**: every call that reaches a tool is one `MCPQueryLog` row whose
 `profile` is the surface name and whose `raw_sql` holds the call's JSON
 arguments; a call refused by `CALL_LIMIT` is `rejected` / `call_limit`.
-Filter the admin by the surface name. (A call whose arguments do not fit
+The row is written before the tool runs, and a call whose row cannot be
+written (the `default` database is down) is refused rather than run
+unaudited. Filter the admin by the surface name. (A call whose arguments do not fit
 the tool's signature is refused by FastMCP before it reaches the tool and
 leaves no row.) Surface rows do not count toward the query-volume
 tripwires; `CALL_LIMIT` bounds a surface's volume.
