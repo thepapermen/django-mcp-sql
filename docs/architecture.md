@@ -486,7 +486,9 @@ can skip the checks below:
   it against the output schema only after the wrapper returns, and its
   `ValidationError` quotes the value, so the wrapper runs the same
   conversion (`func_metadata(...).convert_result`) first, inside the
-  screen. A tool that returns the wrong type gets the generic message.
+  screen. A tool that returns the wrong type gets the generic message. A
+  returned iterator is materialized into a list first, so both passes see
+  the same value (see "Known limitations").
 - Third-party text a tool returns goes through `fencing.fence_untrusted`
   (also `surfaces.fence_untrusted`): the `run_query` fence, for any value.
 - `instructions` in the `initialize` response always open with the
@@ -513,6 +515,22 @@ consumer's `ATOMIC_REQUESTS`.
   README warns about — the package keeps the two apart per token and per
   connection, but which connectors one agent session holds is the client's
   configuration. Grant a user both only where that is acceptable.
+
+### Known limitations
+
+- **A tool's result is converted twice.** The wrapper runs FastMCP's result
+  conversion inside its error screen, and FastMCP converts the same value
+  again after the wrapper returns. That is harmless for ordinary values,
+  but not for single-pass ones:
+  - A returned iterator or generator is materialized into a list before
+    the first pass, so both passes see the same value. Its content is then
+    what returning that list gives: for a tool without a return
+    annotation, one content block per item rather than one JSON text.
+  - A single-pass value *nested* in the result — e.g. a generator inside a
+    returned dict — is consumed by the first pass and reaches the agent
+    empty (`{"rows": []}`), as a successful result, with nothing logged.
+
+  Return lists, not generators or iterators, inside a tool's result.
 
 ## Naming map
 

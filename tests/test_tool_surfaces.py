@@ -711,6 +711,7 @@ class TestSurfaceTransportEndToEnd:
             "explode",
             "mistyped",
             "take_line",
+            "count",
         }
         assert tools["add_widget"]["annotations"] == {
             "title": "Add a widget",
@@ -853,6 +854,17 @@ class TestSurfaceTransportEndToEnd:
         assert INTERNAL_FAILURE_DETAIL not in text
         assert "mistyped failed" in text
         assert "mistyped failed" in caplog.text
+
+    def test_returned_iterator_is_not_consumed_by_the_check(
+        self, client, surface_access_token
+    ):
+        # The wrapper's conversion and FastMCP's both run on the result: an
+        # iterator is materialized first, or the second pass would find it
+        # exhausted and send the agent a successful empty result.
+        result = _call(client, surface_access_token.token, "count")
+        assert result["isError"] is False, result
+        # As for a returned list: one content block per item.
+        assert [block["text"] for block in result["content"]] == ["1", "2", "3"]
 
     def test_model_argument_audited_as_json(self, client, surface_access_token):
         line = {"sku": "A", "qty": 3, "note": "hidden from repr"}

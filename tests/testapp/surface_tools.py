@@ -104,6 +104,17 @@ def register(server: SurfaceServer, ctx: SurfaceContext) -> None:
         """Take a nested model argument."""
         return line.qty
 
+    @server.tool(
+        title="Count",
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+    )
+    async def count():  # unannotated on purpose: no output schema
+        """Return an iterator: a single-pass value."""
+        return iter([1, 2, 3])
+
 
 # A non-callable a validation test points `TOOLS` at.
 NOT_CALLABLE = "not a function"

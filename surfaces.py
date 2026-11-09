@@ -60,6 +60,7 @@ import logging
 import re
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
@@ -438,8 +439,12 @@ class SurfaceServer:
         → `convert_result`), and puts a failure's text in the agent's result
         — a pydantic `ValidationError` quotes the returned value as
         `input_value`. So the wrapper runs that conversion first, inside the
-        screen, with the metadata `Tool.from_function` builds for it; once it
-        passed here, FastMCP's own pass over the same value passes too.
+        screen, with the metadata `Tool.from_function` builds for it. A
+        returned iterator is materialized into a list before it, so both
+        passes see the same value and FastMCP's pass gives the same content;
+        a single-pass value NESTED in the result is consumed by the first
+        pass and reaches the agent empty (`docs/architecture.md`, "Known
+        limitations").
         """
         ctx = self._ctx
         context_kwarg = find_context_parameter(fn)
@@ -457,6 +462,8 @@ class SurfaceServer:
                 raise ToolError(msg)
             try:
                 result = await fn(*args, **kwargs)
+                if isinstance(result, Iterator):
+                    result = list(result)
                 func_metadata(
                     call, skip_names=[context_kwarg] if context_kwarg else []
                 ).convert_result(result)

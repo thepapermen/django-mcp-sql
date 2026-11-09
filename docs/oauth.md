@@ -515,6 +515,8 @@ def register_tools(server: SurfaceServer, ctx: SurfaceContext) -> None:
 
 Bound every outbound call with a timeout, and check inside the tool what
 THIS user may act on — holding the surface only means "may call its tools".
+Return lists, not generators: a generator nested in a tool's result reaches
+the agent empty (`docs/architecture.md` → "Known limitations").
 
 **3. `migrate`** — provisions the surface's group and permission (the
 `TOOLS` path is import-checked at boot, so a typo fails startup).
