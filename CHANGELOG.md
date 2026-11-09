@@ -5,7 +5,7 @@ All notable changes to `django-mcp-sql` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.1.0b6 - 2026-11-09
 
 ### Added
 
@@ -67,6 +67,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   realm="api", resource_metadata="…", scope="mcp:sql"` (RFC 6750), so a
   client requests it rather than every scope the authorization server
   lists.
+
+### Known issues
+
+Fixed in the next release; listed here so operators can plan around them.
+
+- **Refresh tokens are usable.** `OAUTH2_PROVIDER["REFRESH_TOKEN_EXPIRE_SECONDS"]
+  = 0`, as the README and `docs/oauth.md` recommend, does not disable them:
+  django-oauth-toolkit treats `0` as "no age expiry", so a client can keep
+  exchanging its refresh token for new access tokens past the documented
+  6-hour cap. Every request still re-checks the account (active, MFA, the
+  profile or surface assignment, the opt-in session gate), so revoking any
+  of those still cuts the client off.
+- **The consent screen can be skipped.** A client that sends
+  `approval_prompt=auto` while it holds an unexpired token for the same user
+  and scope gets a code without the consent page (django-oauth-toolkit's
+  stock behaviour). The curated `mcp-sql` application never shows the page
+  (`skip_authorization=True`), and that now includes tool-surface scopes.
+- **"prefix" cloud-client redirects** accept a backslash in the path, which
+  browsers read as `/`, so a redirect can leave the configured path prefix.
+  It stays on the configured https host.
+- **Some `/mcp/sql/` calls leave no audit row** (the best-effort SQL audit;
+  the tool-surface audit is fail-closed and not affected): a call whose
+  client redirect URI is longer than 1024 characters, and a call whose
+  arguments contain a lone UTF-16 surrogate (the agent then gets the
+  encoder's error text).
+- **`/mcp/sql/` needs `REMOTE_ADDR` to be one address.** Under psycopg 3, a
+  `REMOTE_ADDR` that is not a single IP address (e.g. a forwarded list a
+  real-IP middleware passes through) makes every `/mcp/sql/` tool call fail
+  with an error, with no audit row. Make sure your proxy setup sets
+  `REMOTE_ADDR` to the client's address alone. Tool surfaces store such an
+  address as empty and run the call.
 
 ## 0.1.0b5 - 2026-07-01
 
