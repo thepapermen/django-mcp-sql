@@ -1,10 +1,15 @@
 """DRF auth class + 413 body cap for the `/mcp/sql/` endpoint.
 
 `MCPOAuth2Authentication` re-runs every issuance-time gate on every
-request (scope, application-name match, is_active+is_staff, MFA,
+request (scope, application-name match, is_active, MFA,
 single-profile assignment via `resolve_profile`, live Django session).
 Mounted on the MCP
-view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. See
+view only — never in DRF's `DEFAULT_AUTHENTICATION_CLASSES`. Its subclass
+`SurfaceOAuth2Authentication` runs the same chain on a tool surface's
+transport, with the surface's scope and permission in place of `mcp:sql` and
+the profile (`surface_authentication` binds one per surface). Neither
+requires `is_staff`: the explicit profile / surface assignment is the access
+grant. See
 `docs/architecture.md` "OAuth surface" + "Watch out" for
 Option D session-trust, the body-cap rationale, and the isolation
 contract pinned by `tests/test_auth_class.py::TestOAuthTokenIsolationFromGlobalDRF`.
@@ -26,6 +31,7 @@ is `logger.exception`-logged but does not mask the underlying
 
 import logging
 from typing import TYPE_CHECKING
+from typing import Any
 
 from django.apps import apps
 from django.core.cache import cache
@@ -48,6 +54,8 @@ from rest_framework.request import Request
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
+    from mcp_sql.conf import Profile
+    from mcp_sql.conf import ToolSurface
     from oauth2_provider.models import AccessToken
 
 logger = logging.getLogger(__name__)
@@ -115,13 +123,19 @@ class MCPOAuth2Authentication(OAuth2Authentication):
         # Without it the client receives a clean 401 but has nowhere to
         # discover the authorization endpoint and the flow stalls.
         # The absolute URL is built per request so the value is correct
-        # behind any reverse proxy / hostname.
-        metadata_url = request.build_absolute_uri(
-            reverse("mcp_sql_protected_resource_metadata")
+        # behind any reverse proxy / hostname. RFC 6750's `scope` attribute
+        # names the one scope this endpoint accepts: the MCP authorization
+        # spec has clients request the scope a challenge names, so a client
+        # never builds its request from the authorization server's metadata,
+        # which lists every surface's scope (`validate_scopes` refuses more
+        # than one).
+        metadata_url = request.build_absolute_uri(reverse(self._metadata_url_name()))
+        return (
+            f'Bearer realm="api", resource_metadata="{metadata_url}", '
+            f'scope="{self._required_scope()}"'
         )
-        return f'Bearer realm="api", resource_metadata="{metadata_url}"'
 
-    def authenticate(self, request):  # noqa: C901, PLR0912 — linear defense-in-depth chain reads better than extracted helpers
+    def authenticate(self, request):  # noqa: C901 — linear defense-in-depth chain reads better than extracted helpers
         # DOT's parent class calls `oauthlib_core.verify_request`, which
         # extracts the body via `request.POST.items()`. For application/json
         # request bodies (the MCP wire protocol's content type), DRF's
@@ -235,9 +249,19 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             )
             raise exceptions.AuthenticationFailed(msg)
 
-        scopes = (token.scope or "").split()
-        if mcp_sql_settings.SCOPE not in scopes:
-            msg = "Token does not carry the mcp:sql scope."
+        # Exactly the endpoint's scope, nothing besides: the issuance path
+        # (`MCPOAuth2Validator.validate_scopes`) only ever mints one MCP
+        # scope per token, so a token carrying two was minted some other way
+        # (admin, shell) and must not open the SQL endpoint and a tool
+        # surface at once.
+        scopes = set((token.scope or "").split())
+        required_scope = self._required_scope()
+        if scopes != {required_scope}:
+            msg = (
+                f"Token does not carry the {required_scope} scope."
+                if required_scope not in scopes
+                else f"Token carries scopes other than {required_scope}."
+            )
             self._audit_rejection(
                 request,
                 reason=AuthRejectionReason.BAD_SCOPE,
@@ -246,8 +270,12 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 token=token,
             )
             raise exceptions.AuthenticationFailed(msg)
-        if not (user.is_active and user.is_staff):
-            msg = "User is not an active staff member."
+        # No `is_staff` requirement: the explicit profile (or surface)
+        # assignment checked below is the access grant, so a staff flag
+        # would only duplicate it. Denials keep the `inactive_or_non_staff`
+        # reason code the audit table has always used.
+        if not user.is_active:
+            msg = "User account is inactive."
             self._audit_rejection(
                 request,
                 reason=AuthRejectionReason.INACTIVE_OR_NON_STAFF,
@@ -266,9 +294,66 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                 token=token,
             )
             raise exceptions.AuthenticationFailed(msg)
-        # Profile binding replaces the old single `use_mcp_session` perm gate.
-        # `resolve_profile` reads the user's EXPLICIT permission assignments
-        # (blind to is_superuser) and binds exactly one profile, or denies.
+        # What this endpoint binds the user to (a profile here; a tool
+        # surface in `SurfaceOAuth2Authentication`). Audits and raises on a
+        # denial.
+        bound = self._bind(request, user, token)
+        # Session-existence gate (opt-in): see module docstring for the
+        # design rationale. One indexed lookup against the configured
+        # session table by `user_id` + `expire_date`. Kept last so the
+        # cheaper in-memory checks above short-circuit before the DB
+        # round-trip.
+        #
+        # **Opt-in**: when `MCP_SQL["SESSION_MODEL"]` is set (e.g. to a
+        # `django-user-sessions` fork or any session-with-user model),
+        # the gate fires. When unset (`None`, the in-package default),
+        # the gate is skipped — the OAuth token's 6h expiry plus the
+        # `user_logged_out` revocation signal are the only
+        # token-lifetime bounds. Stock `django.contrib.sessions.Session`
+        # has no `user` FK and would raise `FieldError` here; refusing
+        # to default to it is honest about that constraint.
+        session_model_name = mcp_sql_settings.SESSION_MODEL
+        if session_model_name:
+            session_model = apps.get_model(session_model_name)
+            if not session_model.objects.filter(
+                user=user, expire_date__gt=timezone.now()
+            ).exists():
+                msg = (
+                    "No active web session — re-login at the Django UI to "
+                    "re-issue MCP access."
+                )
+                self._audit_rejection(
+                    request,
+                    reason=AuthRejectionReason.NO_SESSION,
+                    error=msg,
+                    user=user,
+                    token=token,
+                )
+                raise exceptions.AuthenticationFailed(msg)
+
+        # All gates passed — bind the resolved profile for the view's tool
+        # closures. Set on the underlying HttpRequest; DRF's Request proxies
+        # attribute access to it, so the view reads `request.mcp_profile`.
+        self._attach(django_request, bound)
+        return user, token
+
+    def _required_scope(self) -> str:
+        """The one OAuth scope a token must carry on this endpoint."""
+        return str(mcp_sql_settings.SCOPE)
+
+    def _metadata_url_name(self) -> str:
+        """The URL name of this endpoint's RFC 9728 discovery document."""
+        return "mcp_sql_protected_resource_metadata"
+
+    def _bind(
+        self, request: Request, user: "AbstractBaseUser", token: "AccessToken"
+    ) -> "Profile | ToolSurface":
+        """Bind the user to exactly one profile, or audit + deny.
+
+        Profile binding replaces the old single `use_mcp_session` perm gate.
+        `resolve_profile` reads the user's EXPLICIT permission assignments
+        (blind to is_superuser) and binds exactly one profile, or denies.
+        """
         outcome = mcp_sql_settings.resolve_profile(user)
         if outcome is ResolutionOutcome.NO_PERM:
             msg = "User holds no MCP profile permission."
@@ -306,44 +391,11 @@ class MCPOAuth2Authentication(OAuth2Authentication):
                     user.pk,
                 )
             raise exceptions.AuthenticationFailed(msg)
-        # Session-existence gate (opt-in): see module docstring for the
-        # design rationale. One indexed lookup against the configured
-        # session table by `user_id` + `expire_date`. Kept last so the
-        # cheaper in-memory checks above short-circuit before the DB
-        # round-trip.
-        #
-        # **Opt-in**: when `MCP_SQL["SESSION_MODEL"]` is set (e.g. to a
-        # `django-user-sessions` fork or any session-with-user model),
-        # the gate fires. When unset (`None`, the in-package default),
-        # the gate is skipped — the OAuth token's 6h expiry plus the
-        # `user_logged_out` revocation signal are the only
-        # token-lifetime bounds. Stock `django.contrib.sessions.Session`
-        # has no `user` FK and would raise `FieldError` here; refusing
-        # to default to it is honest about that constraint.
-        session_model_name = mcp_sql_settings.SESSION_MODEL
-        if session_model_name:
-            session_model = apps.get_model(session_model_name)
-            if not session_model.objects.filter(
-                user=user, expire_date__gt=timezone.now()
-            ).exists():
-                msg = (
-                    "No active web session — re-login at the Django UI to "
-                    "re-issue MCP access."
-                )
-                self._audit_rejection(
-                    request,
-                    reason=AuthRejectionReason.NO_SESSION,
-                    error=msg,
-                    user=user,
-                    token=token,
-                )
-                raise exceptions.AuthenticationFailed(msg)
+        return outcome
 
-        # All gates passed — bind the resolved profile for the view's tool
-        # closures. Set on the underlying HttpRequest; DRF's Request proxies
-        # attribute access to it, so the view reads `request.mcp_profile`.
-        django_request.mcp_profile = outcome
-        return user, token
+    def _attach(self, django_request: HttpRequest, bound: Any) -> None:
+        """Expose what `_bind` returned to the view."""
+        django_request.mcp_profile = bound  # type: ignore[attr-defined]
 
     def _audit_rejection(
         self,
@@ -406,3 +458,66 @@ class MCPOAuth2Authentication(OAuth2Authentication):
             )
         except DatabaseError:
             logger.exception("Failed to write MCPAuthRejectionLog (reason=%s)", reason)
+
+
+class SurfaceOAuth2Authentication(MCPOAuth2Authentication):
+    """The same bearer auth and per-request gates, for ONE tool surface.
+
+    Mounted on that surface's transport only (`surface_authentication` makes
+    the per-surface subclass `urls.py` mounts). Differences from `/mcp/sql/`,
+    each confined to an override:
+
+    - the token must carry the SURFACE's scope (`_required_scope`), so a
+      `mcp:sql` token — or another surface's — is a `bad_scope` denial here,
+      exactly as a surface token is on `/mcp/sql/`;
+    - the user must hold the surface's permission by explicit assignment
+      (`_bind` → `conf.MCPSQLSettings.holds_surface`, superuser-blind) —
+      instead of a profile; surfaces have no ambiguity rule;
+    - the 401 challenge points at the surface's own discovery document and
+      names its scope (`_metadata_url_name`, `_required_scope`).
+
+    Everything else is inherited unchanged: the body cap, the silent per-IP
+    bad-token block (one shared `bad_token` budget across the package's
+    endpoints), the application and MFA gates, the session gate and the
+    `MCPAuthRejectionLog` rows.
+    """
+
+    surface_name: str = ""
+
+    def _surface(self) -> "ToolSurface":
+        return mcp_sql_settings.tool_surfaces()[self.surface_name]
+
+    def _required_scope(self) -> str:
+        return self._surface().scope
+
+    def _metadata_url_name(self) -> str:
+        return self._surface().metadata_url_name
+
+    def _bind(
+        self, request: Request, user: "AbstractBaseUser", token: "AccessToken"
+    ) -> "ToolSurface":
+        surface = self._surface()
+        if not mcp_sql_settings.holds_surface(user, surface):
+            msg = f"User does not hold the {surface.name} tool surface permission."
+            self._audit_rejection(
+                request,
+                reason=AuthRejectionReason.NO_PERM,
+                error=msg,
+                user=user,
+                token=token,
+            )
+            raise exceptions.AuthenticationFailed(msg)
+        return surface
+
+    def _attach(self, django_request: HttpRequest, bound: Any) -> None:
+        django_request.mcp_surface = bound  # type: ignore[attr-defined]
+
+
+def surface_authentication(surface_name: str) -> type[SurfaceOAuth2Authentication]:
+    """The `SurfaceOAuth2Authentication` subclass bound to one surface (DRF
+    instantiates authentication classes without arguments)."""
+    return type(
+        f"SurfaceOAuth2Authentication[{surface_name}]",
+        (SurfaceOAuth2Authentication,),
+        {"surface_name": surface_name},
+    )

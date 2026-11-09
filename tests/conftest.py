@@ -20,6 +20,12 @@ absent and no consumer patching happens.
 import secrets
 from datetime import timedelta
 
+# Import the package urlconf NOW, under the suite's base settings: it builds
+# the tool-surface routes from settings once, at import, and a lazy first
+# import inside a test that switched a surface on would bake that surface's
+# routes into every later test. Tests that need a surface get their routes
+# from `configure_surface`.
+import mcp_sql.urls  # noqa: F401 — import-time side effect, see above
 import pytest
 from django.conf import settings as django_settings
 from django.contrib.auth.models import Permission
@@ -322,3 +328,115 @@ def two_profiles(db, settings):
     settings.MCP_SQL = _two_profile_config(settings.MCP_SQL)
     provision_mcp_profiles(sender=django_apps.get_app_config("mcp_sql"))
     return mcp_sql_settings.profiles()
+
+
+# --- Tool surfaces ----------------------------------------------------------
+# One surface (`pricing`) backed by the package-owned test tools in
+# `mcp_sql.tests.testapp.surface_tools`. `tests/settings.py` declares none, so
+# every other test pins the default (no surface) behaviour; the fixtures below
+# switch it on per test, routes included.
+
+SURFACE_NAME = "pricing"
+SURFACE_PATH = "mcp/pricing/"
+SURFACE_SCOPE = "mcp:pricing"
+SURFACE_RESOURCE_NAME = "Test Pricing"
+SURFACE_CODENAME = "use_mcp_pricing"
+SURFACE_GROUP = "mcp_pricing_users"
+SURFACE_INSTRUCTIONS = "Call echo to check the connection."
+
+
+def surface_entry(**overrides) -> dict:
+    """The `pricing` TOOL_SURFACES entry, with `overrides` applied."""
+    return {
+        "PATH": SURFACE_PATH,
+        "SCOPE": SURFACE_SCOPE,
+        "RESOURCE_NAME": SURFACE_RESOURCE_NAME,
+        "PERMISSION_CODENAME": SURFACE_CODENAME,
+        "GROUP_NAME": SURFACE_GROUP,
+        "TOOLS": "mcp_sql.tests.testapp.surface_tools.register",
+        "INSTRUCTIONS": SURFACE_INSTRUCTIONS,
+        **overrides,
+    }
+
+
+def _surface_urlconf():
+    """A root urlconf with the configured surfaces' routes in front of the
+    suite's own: `mcp_sql.urls` reads TOOL_SURFACES once, at import, so a
+    surface switched on by a test needs its routes built again."""
+    import types
+
+    from mcp_sql.tests import urls as base_urls
+    from mcp_sql.urls import surface_urlpatterns
+
+    module = types.ModuleType("mcp_sql_tests_surface_urls")
+    module.urlpatterns = [*surface_urlpatterns(), *base_urls.urlpatterns]  # type: ignore[attr-defined]
+    return module
+
+
+def configure_surface(settings, **overrides):
+    """Switch the `pricing` surface on: MCP_SQL, its scope in DOT's SCOPES,
+    its routes, and its group + permission (the real `post_migrate`
+    receiver). Returns the resolved `ToolSurface`."""
+    from django.apps import apps as django_apps
+    from mcp_sql.conf import mcp_sql_settings
+    from mcp_sql.signals import provision_mcp_tool_surfaces
+
+    settings.OAUTH2_PROVIDER = {
+        **settings.OAUTH2_PROVIDER,
+        "SCOPES": {
+            **settings.OAUTH2_PROVIDER["SCOPES"],
+            SURFACE_SCOPE: "Price routes",
+        },
+    }
+    settings.MCP_SQL = {
+        **settings.MCP_SQL,
+        "TOOL_SURFACES": {SURFACE_NAME: surface_entry(**overrides)},
+    }
+    settings.ROOT_URLCONF = _surface_urlconf()
+    provision_mcp_tool_surfaces(sender=django_apps.get_app_config("mcp_sql"))
+    return mcp_sql_settings.tool_surfaces()[SURFACE_NAME]
+
+
+@pytest.fixture
+def tool_surface(db, settings):
+    """The `pricing` tool surface, switched on (see `configure_surface`)."""
+    return configure_surface(settings)
+
+
+@pytest.fixture
+def surface_perm(tool_surface):
+    """The surface's permission, provisioned by the `post_migrate` receiver."""
+    return Permission.objects.get(
+        codename=SURFACE_CODENAME,
+        content_type__app_label="mcp_sql",
+        content_type__model="mcpquerylog",
+    )
+
+
+@pytest.fixture
+def surface_user(db, surface_perm, mcp_user_factory):
+    """Active, NON-staff user holding the surface permission — and no SQL
+    profile: a surface needs neither the staff flag nor a profile."""
+    user = mcp_user_factory(is_active=True, is_staff=False)
+    user.user_permissions.add(surface_perm)
+    return user
+
+
+@pytest.fixture
+def surface_session(db, surface_user, mcp_session_factory):
+    """A live session for `surface_user` (the opt-in session gate)."""
+    return mcp_session_factory(user=surface_user)
+
+
+@pytest.fixture
+def surface_access_token(db, surface_user, mcp_app):
+    """A valid `mcp:pricing` AccessToken for `surface_user`."""
+    from oauth2_provider.models import AccessToken
+
+    return AccessToken.objects.create(
+        user=surface_user,
+        token="test_" + secrets.token_urlsafe(24),
+        application=mcp_app,
+        expires=timezone.now() + timedelta(hours=1),
+        scope=SURFACE_SCOPE,
+    )

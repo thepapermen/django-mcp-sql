@@ -454,7 +454,9 @@ class AuditFields(TypedDict):
 
 
 def _audit_safely(**fields: Unpack[AuditFields]) -> None:
-    """Best-effort wrapper for every `MCPQueryLog.objects.create` call site.
+    """Best-effort wrapper for every SQL-surface `MCPQueryLog.objects.create`
+    call site. (A tool surface's row is written before a tool that may act,
+    so it fails closed instead: `surfaces._record_call`.)
 
     Audit-row writes happen on the `default` alias after the readonly tx
     (or the parser-reject path) has already produced its side effects.

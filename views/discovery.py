@@ -75,6 +75,44 @@ def protected_resource_metadata(request):
 
 @csrf_exempt
 @require_safe
+def surface_protected_resource_metadata(request, surface_name):
+    """RFC 9728 Protected Resource Metadata for one tool surface.
+
+    The same document as the SQL surface's, about the surface's own
+    transport: its URL as `resource`, its `RESOURCE_NAME`, and ONLY its
+    scope in `scopes_supported` — MCP clients request the scopes a resource
+    advertises, so a client connecting here asks for the surface's scope
+    and the token it gets works here and nowhere else. One authorization
+    server (`/o`) serves every surface. `surface_name` comes from the route
+    (`urls.py` mounts one route per configured surface), never from the
+    client.
+    """
+    surface = mcp_sql_settings.tool_surfaces()[surface_name]
+    return _cors(
+        JsonResponse(
+            {
+                "resource": request.build_absolute_uri(reverse(surface.url_name)),
+                "resource_name": surface.resource_name,
+                "authorization_servers": [_issuer(request)],
+                "scopes_supported": [surface.scope],
+                "bearer_methods_supported": ["header"],
+            }
+        )
+    )
+
+
+def _scopes_supported() -> list[str]:
+    """Every scope the authorization server issues: the SQL surface's, then
+    each tool surface's (`MCPOAuth2Validator.validate_scopes` admits exactly
+    one of them per token)."""
+    return [
+        mcp_sql_settings.SCOPE,
+        *(s.scope for s in mcp_sql_settings.tool_surfaces().values()),
+    ]
+
+
+@csrf_exempt
+@require_safe
 def authorization_server_metadata(request):
     """RFC 8414 Authorization Server Metadata for the DOT-backed AS.
 
@@ -99,7 +137,7 @@ def authorization_server_metadata(request):
                 "registration_endpoint": request.build_absolute_uri(
                     reverse("oauth_dynamic_client_registration")
                 ),
-                "scopes_supported": [mcp_sql_settings.SCOPE],
+                "scopes_supported": _scopes_supported(),
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
                 "code_challenge_methods_supported": ["S256"],

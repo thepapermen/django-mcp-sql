@@ -66,7 +66,8 @@ _USER_LOOKUP = f"user__{get_user_model().USERNAME_FIELD}"
 
 
 class _ProfileListFilter(admin.SimpleListFilter):
-    """Filter by configured tier names from `MCP_SQL["PROFILES"]`.
+    """Filter by configured tier names from `MCP_SQL["PROFILES"]` (and
+    tool-surface names from `MCP_SQL["TOOL_SURFACES"]`).
 
     NOT the stock `AllValuesFieldListFilter` a bare `"profile"` entry would
     give: `profile` is an unindexed, choice-less CharField, so the stock
@@ -80,7 +81,9 @@ class _ProfileListFilter(admin.SimpleListFilter):
     parameter_name = "profile"
 
     def lookups(self, request, model_admin):
-        return [(name, name) for name in sorted(mcp_sql_settings.profiles())]
+        # Tool surfaces record their name in the same column.
+        names = {*mcp_sql_settings.profiles(), *mcp_sql_settings.tool_surfaces()}
+        return [(name, name) for name in sorted(names)]
 
     def queryset(self, request, queryset):
         if self.value():

@@ -1,5 +1,7 @@
-"""Custom DOT validator pinned to mcp-sql Applications + the single
-`mcp:sql` scope. S256-only PKCE enforcement lives here too. See
+"""Custom DOT validator pinned to mcp-sql Applications + one MCP scope per
+token (`mcp:sql`, or one tool surface's). S256-only PKCE enforcement lives
+here too, and the issuance backstop that a code is only ever saved for a
+scope its user is entitled to. See
 `docs/architecture.md` "OAuth surface" for the full picture
 (consent-screen asymmetry, audience-binding policy, prefix semantics)."""
 
@@ -10,6 +12,7 @@ from mcp_sql.conf import mcp_sql_settings
 from mcp_sql.consts import is_mcp_application_name
 from oauth2_provider.models import Application
 from oauth2_provider.oauth2_validators import OAuth2Validator
+from oauthlib.oauth2.rfc6749.errors import AccessDeniedError
 
 
 def _redirect_under_prefix(redirect_uri: str, prefix: str) -> bool:
@@ -117,11 +120,22 @@ class MCPOAuth2Validator(OAuth2Validator):
         )
 
     def validate_scopes(self, client_id, scopes, client, request, *args, **kwargs):
-        """Reject any token request that asks for scopes other than `mcp:sql`."""
+        """Admit exactly ONE MCP scope: `mcp:sql`, or one tool surface's.
+
+        One scope per token is what keeps a token on one endpoint: `/mcp/sql/`
+        and each tool surface's transport accept only their own scope, and a
+        token carrying two would be accepted by both — the read-only SQL
+        context and an acting tool surface reachable with one credential.
+        So `{"mcp:sql", "mcp:pricing"}` is refused like any unknown scope.
+        """
         if not scopes:
             return False
         # Reject anything with extra or different scopes. `scopes` is a list of strings.
-        if set(scopes) != {mcp_sql_settings.SCOPE}:
+        allowed = [
+            {mcp_sql_settings.SCOPE},
+            *({s.scope} for s in mcp_sql_settings.tool_surfaces().values()),
+        ]
+        if set(scopes) not in allowed:
             return False
         return super().validate_scopes(
             client_id, scopes, client, request, *args, **kwargs
@@ -139,3 +153,28 @@ class MCPOAuth2Validator(OAuth2Validator):
         the discovery doc promises.
         """
         return code_challenge_method == "S256"
+
+    def save_authorization_code(self, client_id, code, request, *args, **kwargs):
+        """Store the code only if its user is entitled to its scope.
+
+        The backstop behind `MCPAuthorizationView`'s gate, at the one place
+        every authorization code is created: the scope the code is saved
+        with (`request.scopes` — the consent form's, or the query string's
+        on DOT's skip-authorization path) must be one its user
+        (`request.user`, DOT's `credentials["user"]`) may hold
+        (`conf.MCPSQLSettings.entitled_to_scopes`): a profile for `mcp:sql`,
+        the surface's permission for a tool surface's scope. The view gate
+        reads the scope from the request parameters before DOT runs; this
+        reads what oauthlib actually issues, so a scope that differs from
+        what the gate saw (a tampered consent form, a future DOT path) is
+        refused rather than minted. `access_denied` goes back to the client
+        like a declined consent.
+        """
+        user = getattr(request, "user", None)
+        if user is None or not mcp_sql_settings.entitled_to_scopes(
+            user, request.scopes or []
+        ):
+            raise AccessDeniedError(request=request)
+        return super().save_authorization_code(
+            client_id, code, request, *args, **kwargs
+        )
