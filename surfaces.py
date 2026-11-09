@@ -43,8 +43,9 @@ then fails; a call whose row cannot be written is refused and the tool does
 not run. The surface's optional `CALL_LIMIT` is enforced there too. A call
 whose arguments do not fit the tool's signature is refused by FastMCP's
 argument validation before that point: nothing runs, nothing is recorded, no
-budget is spent. An exception other than `ToolError` is logged and answered
-with a generic message, so server internals never reach the agent; raise
+budget is spent. An exception other than `ToolError` — and a return value
+that does not fit the tool's return annotation — is logged and answered with a
+generic message, so server internals never reach the agent; raise
 `ToolError("...")` for a message the agent should see. Third-party text in a
 result goes through `fencing.fence_untrusted`.
 
@@ -53,6 +54,7 @@ See `docs/architecture.md` "Tool surfaces" for the threat model.
 
 import functools
 import inspect
+import ipaddress
 import json
 import logging
 import re
@@ -65,17 +67,18 @@ from typing import TypeVar
 
 from asgiref.sync import sync_to_async
 from django.core.cache import cache
-from django.db import DatabaseError
 from django.utils import timezone
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.context_injection import find_context_parameter
+from mcp.server.fastmcp.utilities.func_metadata import func_metadata
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from mcp_sql import fencing
 from mcp_sql.models import MCPQueryLog
 from mcp_sql.schemas import OutcomeReason
 from mcp_sql.views.mcp_endpoint import _close_conns_after
+from pydantic_core import to_jsonable_python
 
 if TYPE_CHECKING:
     from django.contrib.auth.models import AbstractBaseUser
@@ -104,6 +107,10 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 # a tool's arguments are agent-supplied, and the table is append-only.
 _AUDIT_ARGUMENTS_MAX_CHARS = 8192
 _TRUNCATION_MARK = "…[truncated]"
+
+# A lone UTF-16 surrogate survives JSON decoding (`"\ud800"` is valid JSON) but
+# not UTF-8 encoding: psycopg would refuse the audit insert.
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 
 # The standing posture every tool surface's `initialize` response opens with,
 # before the consumer's own INSTRUCTIONS — the same channel `/mcp/sql/` uses
@@ -206,14 +213,37 @@ def _consume_call_budget(ctx: SurfaceContext) -> bool:
 
 
 def _audit_arguments(arguments: dict[str, Any]) -> str:
-    """The call's arguments as stored in `raw_sql`: sorted-key JSON (values
-    the encoder cannot represent as their `str`), NUL replaced — Postgres
-    refuses it in text, and the insert would fail — and bounded."""
-    text = json.dumps(arguments, default=str, ensure_ascii=False, sort_keys=True)
-    text = text.replace("\x00", "␀")
+    """The call's arguments as stored in `raw_sql`: what the tool received,
+    as JSON-compatible values (a pydantic-model argument as its fields, not
+    its `str()`; a value with no JSON form as its `str`), in sorted-key
+    JSON, with what Postgres refuses in text replaced — NUL, and a lone
+    surrogate (by U+FFFD) — so the insert cannot fail on it, and bounded.
+    (A lone surrogate in a mapping KEY makes `to_jsonable_python` raise;
+    `_record_call` then refuses the call, as for any failed insert.)"""
+    jsonable = to_jsonable_python(arguments, fallback=str)
+    text = json.dumps(jsonable, ensure_ascii=False, sort_keys=True)
+    text = _LONE_SURROGATE_RE.sub("\ufffd", text.replace("\x00", "␀"))
     if len(text) > _AUDIT_ARGUMENTS_MAX_CHARS:
         text = text[:_AUDIT_ARGUMENTS_MAX_CHARS] + _TRUNCATION_MARK
     return text
+
+
+def _storable_ip(client_ip: str | None) -> str | None:
+    """`client_ip` as the audit row's `GenericIPAddressField` stores it: one
+    address, or None. `REMOTE_ADDR` is whatever the WSGI server or a
+    real-IP middleware set — a forwarded list such as `"1.2.3.4, 5.6.7.8"`
+    (psycopg 3's inet adapter refuses it with `ValueError`), or an IPv6
+    zone (`fe80::1%eth0`, which inet has no syntax for) — and a call is not
+    refused over its attribution."""
+    if not client_ip:
+        return None
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        return None
+    return str(address)
 
 
 def _record_call(
@@ -229,8 +259,10 @@ def _record_call(
 
     Fail-closed, unlike the SQL tools' best-effort `executor._audit_safely`:
     their row follows a read-only query that already ran, this one precedes
-    a tool that may act. If the insert fails, the call is refused with a
-    `ToolError` and the tool does not run — no call without its row. Written
+    a tool that may act. If the insert fails — for ANY reason, a database
+    error or a value the driver cannot adapt — the call is refused with a
+    generic `ToolError` and the tool does not run: no call without its row,
+    and no error text in front of the agent. Written
     here rather than through `_audit_safely`, the row also stays out of the
     per-user query-volume tripwire, whose thresholds are tuned for SQL
     traffic (`CALL_LIMIT` is a surface's volume control).
@@ -253,10 +285,10 @@ def _record_call(
             rejection_reason="" if within_budget else OutcomeReason.CALL_LIMIT,
             raw_sql=_audit_arguments(arguments),
             started_at=timezone.now(),
-            client_ip=ctx.client_ip,
+            client_ip=_storable_ip(ctx.client_ip),
             client_redirect=ctx.client_redirect,
         )
-    except DatabaseError:
+    except Exception:
         logger.exception(
             "MCP surface %s audit row write failed (user pk=%s, tool %s); call refused",
             ctx.surface.name,
@@ -400,6 +432,14 @@ class SurfaceServer:
         and output schemas), so the agent sees exactly `fn`'s arguments.
         A FastMCP `Context` parameter `fn` may declare is passed through but
         not audited.
+
+        The screen also covers the return value. FastMCP converts it against
+        the tool's output schema only AFTER this wrapper returns (`Tool.run`
+        → `convert_result`), and puts a failure's text in the agent's result
+        — a pydantic `ValidationError` quotes the returned value as
+        `input_value`. So the wrapper runs that conversion first, inside the
+        screen, with the metadata `Tool.from_function` builds for it; once it
+        passed here, FastMCP's own pass over the same value passes too.
         """
         ctx = self._ctx
         context_kwarg = find_context_parameter(fn)
@@ -416,7 +456,10 @@ class SurfaceServer:
                 )
                 raise ToolError(msg)
             try:
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
+                func_metadata(
+                    call, skip_names=[context_kwarg] if context_kwarg else []
+                ).convert_result(result)
             except ToolError:
                 raise
             except Exception:
@@ -430,6 +473,7 @@ class SurfaceServer:
                 )
                 msg = f"{tool_name} failed; the error was logged on the server."
                 raise ToolError(msg) from None
+            return result
 
         return call
 

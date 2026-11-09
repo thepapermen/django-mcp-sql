@@ -58,7 +58,14 @@ def _settings_with(base: dict, **entry_overrides) -> dict:
     return {**base, "TOOL_SURFACES": {SURFACE_NAME: surface_entry(**entry_overrides)}}
 
 
-def _rpc(client, token: str, method: str, params: dict | None = None, path=SURFACE_URL):
+def _rpc(
+    client,
+    token: str,
+    method: str,
+    params: dict | None = None,
+    path=SURFACE_URL,
+    **extra,
+):
     body: dict = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         body["params"] = params
@@ -68,12 +75,19 @@ def _rpc(client, token: str, method: str, params: dict | None = None, path=SURFA
         content_type="application/json",
         HTTP_ACCEPT=MCP_ACCEPT,
         HTTP_AUTHORIZATION=f"Bearer {token}",
+        **extra,
     )
 
 
-def _call(client, token: str, tool: str, arguments: dict | None = None) -> dict:
+def _call(
+    client, token: str, tool: str, arguments: dict | None = None, **extra
+) -> dict:
     response = _rpc(
-        client, token, "tools/call", {"name": tool, "arguments": arguments or {}}
+        client,
+        token,
+        "tools/call",
+        {"name": tool, "arguments": arguments or {}},
+        **extra,
     )
     assert response.status_code == HTTPStatus.OK, response.content
     return response.json()["result"]
@@ -689,7 +703,15 @@ class TestSurfaceTransportEndToEnd:
     ):
         response = _rpc(client, surface_access_token.token, "tools/list")
         tools = {t["name"]: t for t in response.json()["result"]["tools"]}
-        assert set(tools) == {"echo", "add_widget", "quote", "refuse", "explode"}
+        assert set(tools) == {
+            "echo",
+            "add_widget",
+            "quote",
+            "refuse",
+            "explode",
+            "mistyped",
+            "take_line",
+        }
         assert tools["add_widget"]["annotations"] == {
             "title": "Add a widget",
             "readOnlyHint": False,
@@ -753,13 +775,18 @@ class TestSurfaceTransportEndToEnd:
         # The attempt was recorded before the tool ran.
         assert MCPQueryLog.objects.get().tool == "explode"
 
-    def test_audit_failure_refuses_the_call(self, client, surface_access_token, caplog):
+    @pytest.mark.parametrize("error_type", [DatabaseError, ValueError])
+    def test_audit_failure_refuses_the_call(
+        self, client, surface_access_token, caplog, error_type
+    ):
         # Fail-closed, unlike the SQL tools' best-effort audit: the row comes
         # before a tool that may act, so no row means the tool does not run.
+        # Any error, not only the database's: a driver's adapter raises its
+        # own types (`ValueError`, `UnicodeEncodeError`).
         db_detail = "could not connect to server at 10.0.0.5"
         with (
             patch.object(
-                MCPQueryLog.objects, "create", side_effect=DatabaseError(db_detail)
+                MCPQueryLog.objects, "create", side_effect=error_type(db_detail)
             ),
             caplog.at_level(logging.ERROR, logger="mcp_sql.surfaces"),
         ):
@@ -773,6 +800,66 @@ class TestSurfaceTransportEndToEnd:
         assert "audit row write failed" in caplog.text
         assert not Widget.objects.exists()
         assert not MCPQueryLog.objects.exists()
+
+    def test_lone_surrogate_argument_is_audited(self, client, surface_access_token):
+        # `"\ud800"` is valid JSON but not encodable as UTF-8: unreplaced, it
+        # made the audit insert raise `UnicodeEncodeError` — no row, and the
+        # codec's message in the tool result.
+        result = _call(
+            client,
+            surface_access_token.token,
+            "add_widget",
+            {"name": "ok-\ud800-x"},
+        )
+        row = MCPQueryLog.objects.get()
+        assert json.loads(row.raw_sql) == {"name": "ok-\ufffd-x"}
+        # The tool ran and failed on its own insert, behind the screen.
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert "add_widget failed" in text
+        assert "codec" not in text
+        assert not Widget.objects.exists()
+
+    @pytest.mark.parametrize(
+        ("remote_addr", "stored"),
+        [
+            ("203.0.113.7", "203.0.113.7"),
+            ("1.2.3.4, 5.6.7.8", None),  # a forwarded list passed through
+            ("fe80::1%eth0", None),  # an IPv6 zone: no inet syntax for it
+        ],
+    )
+    def test_client_address_stored_only_when_one_address(
+        self, client, surface_access_token, remote_addr, stored
+    ):
+        result = _call(
+            client,
+            surface_access_token.token,
+            "echo",
+            {"text": "a"},
+            REMOTE_ADDR=remote_addr,
+        )
+        assert result["isError"] is False, result
+        assert MCPQueryLog.objects.get().client_ip == stored
+
+    def test_mistyped_result_stays_on_the_server(
+        self, client, surface_access_token, caplog
+    ):
+        # FastMCP validates the result against the output schema after the
+        # wrapper returns, and its ValidationError quotes the value.
+        with caplog.at_level(logging.ERROR, logger="mcp_sql.surfaces"):
+            result = _call(client, surface_access_token.token, "mistyped")
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        assert INTERNAL_FAILURE_DETAIL not in text
+        assert "mistyped failed" in text
+        assert "mistyped failed" in caplog.text
+
+    def test_model_argument_audited_as_json(self, client, surface_access_token):
+        line = {"sku": "A", "qty": 3, "note": "hidden from repr"}
+        result = _call(client, surface_access_token.token, "take_line", {"line": line})
+        assert result["isError"] is False, result
+        assert result["structuredContent"] == {"result": 3}
+        assert json.loads(MCPQueryLog.objects.get().raw_sql) == {"line": line}
 
 
 @pytest.mark.django_db(transaction=True)
@@ -965,3 +1052,26 @@ def test_audit_arguments_bounded_and_storable():
     assert "\x00" not in text
     assert text.endswith("…[truncated]")
     assert len(text) <= 8192 + len("…[truncated]")
+    text = surfaces._audit_arguments({"k": ["a\ud800b", {"n": "\udfff"}]})
+    assert json.loads(text) == {"k": ["a\ufffdb", {"n": "\ufffd"}]}
+    text.encode("utf-8")  # what psycopg does with it
+    # In a mapping KEY, `to_jsonable_python` itself raises: `_record_call`
+    # then refuses the call like any failed insert (fail-closed).
+    with pytest.raises(UnicodeEncodeError):
+        surfaces._audit_arguments({"d": {"k\udfff": 1}})
+
+
+@pytest.mark.parametrize(
+    ("client_ip", "stored"),
+    [
+        ("10.0.0.1", "10.0.0.1"),
+        ("2001:db8::1", "2001:db8::1"),
+        ("1.2.3.4, 5.6.7.8", None),
+        ("fe80::1%eth0", None),
+        ("unknown", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_storable_ip(client_ip, stored):
+    assert surfaces._storable_ip(client_ip) == stored

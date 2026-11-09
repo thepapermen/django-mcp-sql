@@ -9,9 +9,19 @@ from mcp_sql.surfaces import SurfaceServer
 from mcp_sql.surfaces import ToolError
 from mcp_sql.surfaces import fence_untrusted
 from mcp_sql.tests.testapp.models import Widget
+from pydantic import BaseModel
+from pydantic import Field
 
 # Text a failing tool raises; the tests assert it never reaches the agent.
 INTERNAL_FAILURE_DETAIL = "internal detail that must stay on the server"
+
+
+class Line(BaseModel):
+    """A nested argument: FastMCP hands the tool the model instance."""
+
+    sku: str
+    qty: int
+    note: str = Field(default="", repr=False)
 
 
 def register(server: SurfaceServer, ctx: SurfaceContext) -> None:
@@ -71,6 +81,28 @@ def register(server: SurfaceServer, ctx: SurfaceContext) -> None:
     async def explode() -> str:
         """Fail with an unexpected exception."""
         raise RuntimeError(INTERNAL_FAILURE_DETAIL)
+
+    @server.tool(
+        title="Mistyped",
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+    )
+    async def mistyped() -> str:
+        """Return a value that does not fit the return annotation."""
+        return {"detail": INTERNAL_FAILURE_DETAIL}  # type: ignore[return-value]
+
+    @server.tool(
+        title="Take a line",
+        read_only=True,
+        destructive=False,
+        idempotent=True,
+        open_world=False,
+    )
+    async def take_line(line: Line) -> int:
+        """Take a nested model argument."""
+        return line.qty
 
 
 # A non-callable a validation test points `TOOLS` at.

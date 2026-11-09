@@ -547,7 +547,9 @@ the safe failure.
 arguments; a call refused by `CALL_LIMIT` is `rejected` / `call_limit`.
 The row is written before the tool runs, and a call whose row cannot be
 written (the `default` database is down) is refused rather than run
-unaudited. Filter the admin by the surface name. (A call whose arguments do not fit
+unaudited. `client_ip` is left empty when `REMOTE_ADDR` is not one address
+(e.g. a forwarded list your proxy setup passes through). Filter the admin by
+the surface name. (A call whose arguments do not fit
 the tool's signature is refused by FastMCP before it reaches the tool and
 leaves no row.) Surface rows do not count toward the query-volume
 tripwires; `CALL_LIMIT` bounds a surface's volume.
